@@ -399,6 +399,9 @@ class DynamicInferenceEngine(AbstractEngine):
             )
 
             # Add request.
+            # >>>
+            # pax("request")
+            # <<<
             self.context.add_request(
                 request_id,
                 tokens,
