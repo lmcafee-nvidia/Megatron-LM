@@ -458,7 +458,7 @@ class DynamicInferenceEngine(AbstractEngine):
             )
 
         # >>>
-        pax("futures")
+        # pax("futures")
         # <<<
 
         return futures
