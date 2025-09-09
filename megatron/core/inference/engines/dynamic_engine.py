@@ -453,13 +453,7 @@ class DynamicInferenceEngine(AbstractEngine):
             self.context.deallocate_all_tensors()
 
         # Clear cuda graphs.
-        # >>>
-        # if self.enable_cuda_graph:
-        # <<<
         self.clear_cuda_graphs()
-        # >>>
-        # raise Exception("hi.")
-        # <<<
 
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
@@ -486,9 +480,6 @@ class DynamicInferenceEngine(AbstractEngine):
             self.request_completion_futures: Dict[int, asyncio.Future] = {}
 
             # Create cuda graphs (before adding requests, to be in decode mode).
-            # >>>
-            # if self.enable_cuda_graph:
-            # <<<
             self.create_cuda_graphs()
 
             # Add requests.
