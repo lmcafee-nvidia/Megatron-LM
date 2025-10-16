@@ -1139,6 +1139,9 @@ class DynamicInferenceEngine(AbstractEngine):
         self, sampling_params: SamplingParams, *, verbose: Optional[bool] = False
     ):
         """Continually steps the engine asynchronously."""
+        # >>>
+        n_steps = 0
+        # <<<
         try:
             while True:
                 self.schedule_requests()
@@ -1168,7 +1171,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 # >>>
                 else:
-                    print("+++++++++++++++ resume.")
+                    print("+++++++++++++++ resume ... step %d." % n_steps)
                     self.resume()
                 # <<<
 
@@ -1182,6 +1185,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 engine_output = await self.async_step(
                     sampling_params=sampling_params, verbose=verbose
                 )
+                # >>>
+                n_steps += 1
+                # <<<
 
                 is_tp0_and_pp0 = (
                     parallel_state.get_tensor_model_parallel_rank() == 0
