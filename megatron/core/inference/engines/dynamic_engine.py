@@ -1139,9 +1139,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self, sampling_params: SamplingParams, *, verbose: Optional[bool] = False
     ):
         """Continually steps the engine asynchronously."""
-        # >>>
-        n_steps = 0
-        # <<<
         try:
             while True:
                 self.schedule_requests()
@@ -1162,18 +1159,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 # todo [Siddharth]: Can this hardcoded sleep be avoided
                 # with asyncio zmq sockets?
                 if self.paused:
-                    # >>>
-                    print("+++++++++++++++ suspend.")
                     self.suspend()
-                    # <<<
                     await asyncio.sleep(0.02)
                     continue
 
-                # >>>
                 else:
-                    print("+++++++++++++++ resume ... step %d." % n_steps)
                     self.resume()
-                # <<<
 
                 if (
                     self.context.get_active_request_count() == 0
@@ -1185,9 +1176,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 engine_output = await self.async_step(
                     sampling_params=sampling_params, verbose=verbose
                 )
-                # >>>
-                n_steps += 1
-                # <<<
 
                 is_tp0_and_pp0 = (
                     parallel_state.get_tensor_model_parallel_rank() == 0
