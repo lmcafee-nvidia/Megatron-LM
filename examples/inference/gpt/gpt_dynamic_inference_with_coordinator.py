@@ -1,30 +1,45 @@
-from megatron.core.inference.inference_client import InferenceClient
-from examples.inference.gpt.utils import add_common_inference_args
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+
 import asyncio
-import torch.distributed as dist
-from examples.inference.gpt.gpt_dynamic_inference import get_model, get_inference_context, get_inference_controller, add_dynamic_inference_args
-from megatron.core.inference.inference_request import DynamicInferenceRequest
-from megatron.training import initialize_megatron
-import torch
+import json
 import os 
-from megatron.training import get_args, get_tokenizer 
-from megatron.core.inference.sampling_params import SamplingParams
-from examples.inference.gpt.utils import build_requests, build_dynamic_engine_setup_prefix, Request
-from megatron.core.inference.engines import DynamicInferenceEngine
 import time
+import torch
+import torch.distributed as dist
+from collections import defaultdict
 from tqdm import tqdm
 from typing import List
-import json
-from megatron.training.arguments import parse_args
+
+from examples.inference.gpt.gpt_dynamic_inference import (
+    get_model,
+    get_inference_context,
+    get_inference_controller,
+    add_dynamic_inference_args,
+)
+from examples.inference.gpt.utils import (
+    add_common_inference_args,
+    build_requests,
+    build_dynamic_engine_setup_prefix,
+    Request,
+)
 from megatron.core import parallel_state
+from megatron.core.inference.engines import DynamicInferenceEngine
+from megatron.core.inference.inference_client import InferenceClient
+from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.sampling_params import SamplingParams
+from megatron.training import get_args, get_tokenizer, initialize_megatron
+from megatron.training.arguments import parse_args
 
 async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling_params: SamplingParams, port: int):
     # once you call engine.start_listening_to_data_parallel_coordinator,
     # the engine will start accepting requests from the data parallel coordinator.
     # and processing them in an asyncio coroutine. 
-    await engine.start_listening_to_data_parallel_coordinator(sampling_params, 
-                                                inference_coordinator_port=port,
-                                                launch_inference_coordinator=True)   
+    await engine.start_listening_to_data_parallel_coordinator(
+        sampling_params, 
+        inference_coordinator_port=port,
+        launch_inference_coordinator=True,
+        verbose=True,
+    )
     # if you want to use your own inference coordinator - 
     # 1. set launch_inference_coordinator to False
     # 2. setup a router socket at tcp://MASTER_ADDR:PORT
@@ -32,6 +47,28 @@ async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling
     # 4. look at InferenceCoordinator.start() to see how we can route requests from users <-> data parallel groups
     #   based on headers. 
     # 5. look at InferenceClient to see how we create requests with headers. 
+
+    args = get_args()
+
+    # Test suspend/resume intervals.
+    if args.suspend_resume_interval is not None:
+        # Since the client doesn't directly call engine.async_step here, we test
+        # the suspend-resume system ~4 times.
+        suspend_resume_interval = max(1, len(requests) // 4)
+        suspend_idxs = set(range(
+            suspend_resume_interval,
+            len(requests) + 1,
+            suspend_resume_interval,
+        ))
+        resume_idxs = set(
+            min(len(requests), i + suspend_resume_interval // 2)
+            for i in suspend_idxs
+        )
+    else:
+        suspend_idxs = set()
+        resume_idxs = set()
+
+    # Create client and run example.
     if dist.get_rank() == 0: 
         client = InferenceClient(port) # submits requests to the inference coordinator
         await client.start()
@@ -41,7 +78,6 @@ async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling
         futures = []
         num_requests_total = len(requests)
         num_requests_added = 0
-        #tbar = tqdm(total=num_requests_total)
         while True:
             current_time = time.time_ns() / 10**9
             # Only add requests that have arrived at the current time.
@@ -53,14 +89,19 @@ async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling
                 futures.append(client.add_request(request.prompt_text, 
                                                         sampling_params))
                 num_requests_added += 1
-                #tbar.update(1)
+
+                # Test suspend/resume.
+                if num_requests_added in suspend_idxs:
+                    client.pause_engines()
+                if num_requests_added in resume_idxs:
+                    client.unpause_engines()
+
             if num_requests_added == num_requests_total:
                 break
             # Relinquish control since there are no more requests to add at the moment. This allows the engine to run. 
             await asyncio.sleep(0)
         # While we wait for the requests to complete, the engine runs in the background.
         results: List[DynamicInferenceRequest] = await asyncio.gather(*futures)
-        
 
     if dist.get_rank() == 0:
         # Write results to JSON. Primarily used for functional testing.
@@ -81,8 +122,17 @@ async def main(engine: DynamicInferenceEngine, requests: List[Request], sampling
                 json.dump(json_results, fp, indent=4)
         else:
             print("Results:")
+            unique_prompt_map = defaultdict(list)
             for req in results:
-                print(f"rid: {req.request_id}\nprompt: {req.prompt!r}\noutput: {req.generated_text!r}\n\n")
+                unique_prompt_map[req.prompt].append(req)
+            for idx, (prompt_text, reqs) in enumerate(unique_prompt_map.items()):
+                print(f"%d/%d. prompt '%s' ... [%d] output '%s'." % (
+                    idx,
+                    len(unique_prompt_map),
+                    prompt_text.replace("\n", "\\n"),
+                    len(reqs),
+                    reqs[0].generated_text.replace("\n", "\\n"),
+                ))
  
         # kill the engines and suspend the client
         client.stop_engines()
@@ -96,7 +146,6 @@ if __name__ == "__main__":
     # check for it.
     with torch.inference_mode():
         initialize_megatron(
-            #parsed_args=args
             extra_args_provider=add_dynamic_inference_args,
             args_defaults={'no_load_rng': True, 'no_load_optim': True},
         )
