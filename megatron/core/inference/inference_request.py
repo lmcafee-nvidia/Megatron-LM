@@ -36,8 +36,9 @@ class Status(Enum):
     WAITING_IN_QUEUE = 1
     ACTIVE_AND_GENERATING_TOKENS = 2
     ACTIVE_BUT_NOT_GENERATING_TOKENS = 3
-    COMPLETED = 4
-    FAILED = 5
+    SUSPENDED = 4
+    COMPLETED = 5
+    FAILED = 6
 
 
 @dataclass(kw_only=True)

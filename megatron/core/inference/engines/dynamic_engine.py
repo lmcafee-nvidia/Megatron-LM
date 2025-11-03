@@ -171,6 +171,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.request_counter = Counter()
         self.requests: Dict[int, DynamicInferenceRequest] = {}
         self.request_completion_futures: Dict[int, asyncio.Future] = {}
+        self.suspended_request_data: Dict[int, Dict] = {}
         self.step_start_event = torch.cuda.Event(enable_timing=True)
         self.step_end_event = torch.cuda.Event(enable_timing=True)
         self.paused = False
@@ -461,6 +462,20 @@ class DynamicInferenceEngine(AbstractEngine):
         ):
             self.context.deallocate_all_tensors()
 
+        # Change all requests' status to SUSPENDED.
+        waiting_request_ids = list(self.waiting_request_ids)
+        active_request_ids = set(self.requests.keys()) - set(self.waiting_request_ids)
+        for request_id in active_request_ids:
+            request = self.requests[request_id]
+            assert request.status == Status.ACTIVE_AND_GENERATING_TOKENS
+            request.status = Status.SUSPENDED
+            self.suspended_request_data[request_id] = {
+                "sampling_params": request.sampling_params,
+                "generated_tokens": request.generated_tokens,
+                "prompt": request.prompt,
+                "prompt_tokens": request.prompt_tokens,
+            } # and more?
+
         # Delete cuda graphs when not using unified memory at all (level 0). For
         # levels 1 and 2, the context's tensors maintain static memory addresses,
         # so the cuda graphs are re-used.
@@ -731,6 +746,10 @@ class DynamicInferenceEngine(AbstractEngine):
                         finished_request.generated_tokens
                     )
                     self.request_completion_futures[request_id].set_result(finished_request)
+                elif request_id in suspended_request_data:
+                    request.status = Status.ACTIVE_AND_GENERATING_TOKENS
+                    for key, value in suspended_request_data[request_id].items():
+                        setattr(request, key, value)
                 else:
                     active_requests.append(request)
             else:
