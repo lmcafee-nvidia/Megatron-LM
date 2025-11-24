@@ -298,22 +298,36 @@ def get_requests_from_file(
         raise ValueError("Prompt file is required to read requests from a file.")
 
     # Load prompts.
-    n_prompts = sum(1 for _ in open(args.prompt_file))
-    prompts = []
-    sampling_params = get_default_sampling_params(tokenizer.eod)
-    sampling_params_list = []
-    with open(args.prompt_file) as f:
-        for line in tqdm(f.readlines(), "read prompt file", total=n_prompts):
-            line_dict = json.loads(line)
-            prompts.append(line_dict["text"])
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    # n_prompts = sum(1 for _ in open(args.prompt_file))
+    # prompts = []
+    # sampling_params = get_default_sampling_params(tokenizer.eod)
+    # sampling_params_list = []
+    # with open(args.prompt_file) as f:
+    #     for line in tqdm(f.readlines(), "read prompt file", total=n_prompts):
+    #         line_dict = json.loads(line)
+    #         prompts.append(line_dict["text"])
 
-            sp = copy.deepcopy(sampling_params)
-            if args.num_tokens_from_file:
-                sp.num_tokens_to_generate = line_dict["chatgpt_output_token_length"]
-            sampling_params_list.append(sp)
+    #         sp = copy.deepcopy(sampling_params)
+    #         if args.num_tokens_from_file:
+    #             sp.num_tokens_to_generate = line_dict["chatgpt_output_token_length"]
+    #         sampling_params_list.append(sp)
 
-            if len(prompts) == args.prompt_file_num_truncate:
-                break
+    #         if len(prompts) == args.prompt_file_num_truncate:
+    #             break
+    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+    with open(args.prompt_file, "r") as f:
+        dataset = json.load(f)
+        prompts = [ a[0] for a in dataset ]
+        # >>>
+        import os
+        prompts = prompts[:int(os.environ["MAX_NUM_REQUESTS"])] # 200, *2000
+        # <<<
+        sampling_params = get_default_sampling_params(tokenizer.eod)
+        sampling_params_list = [ copy.deepcopy(sampling_params) for _ in range(len(prompts)) ]
+        # pax({"prompts": [ "%d | %s" % (len(p), p) for p in prompts ]})
+        # pax("sampling_params_list")
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     # Get time offsets.
     time_offsets: list[float] = get_time_offsets(
@@ -322,6 +336,13 @@ def get_requests_from_file(
         args.incoming_requests_per_sec,
         len(prompts),
     )
+
+    # >>>
+    # pax({
+    #     "time_offsets" : "%d | %d [ %f, %f ]" % (args.incoming_requests_per_sec, len(time_offsets), time_offsets[0], time_offsets[-1]),
+    #     "incoming_requests_per_sec" : args.incoming_requests_per_sec,
+    # })
+    # <<<
 
     # Init requests.
     requests = [

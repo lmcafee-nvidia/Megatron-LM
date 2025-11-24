@@ -35,6 +35,12 @@ from megatron.core.utils import get_mamba_inference_state_config_from_model
 from megatron.training import get_args, get_tokenizer, initialize_megatron
 from megatron.training.arguments import parse_args
 
+# >>>
+from lutil import pax as _pax
+import builtins
+builtins.pax = _pax
+# <<<
+
 # pylint: disable=line-too-long
 
 logging.basicConfig(level=logging.INFO, force=True)
@@ -99,7 +105,10 @@ async def main(
         futures = []
         num_requests_total = len(requests)
         num_requests_added = 0
-        
+
+        # >>>
+        time_start = time.time()
+        # <<<
         while True:
             current_time = time.time_ns() / 10**9
             if args.incoming_requests_per_step is None:
@@ -144,6 +153,9 @@ async def main(
         
         # While we wait for the requests to complete, the engine runs in the background.
         results: List[DynamicInferenceRequestRecord] = await asyncio.gather(*futures)
+        # >>>
+        time_total = time.time() - time_start
+        # <<<
 
     if dist.get_rank() == 0:
         # Write results to JSON. Primarily used for functional testing.
@@ -171,6 +183,13 @@ async def main(
                 json.dump(json_results, fp, indent=4)
         else:
             print("Results:")
+            # >>>
+            # raise Exception("what results.")
+            print("~~~")
+            print("... requests %d, rate %d, uvm %d, time %f." % (len(requests), args.incoming_requests_per_sec, engine.context.unified_memory_level, time_total))
+            exit()
+            pax({"requests / 0": requests[0]})
+            # <<<
             unique_prompt_map = defaultdict(list)
             for record in results:
                 req = record.merge()
