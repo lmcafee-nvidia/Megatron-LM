@@ -184,9 +184,21 @@ async def main(
         else:
             print("Results:")
             # >>>
-            # raise Exception("what results.")
+
             print("~~~")
-            print("... requests %d, rate %d, uvm %d, time %f." % (len(requests), args.incoming_requests_per_sec, engine.context.unified_memory_level, time_total))
+            for record in results:
+                for request in record.requests:
+                    pax("request", {"events": request.events})
+                pax("record")
+
+            print("~~~")
+            print("... requests %d, rate %d, uvm %d, buf %d, time %f." % (
+                len(requests),
+                args.incoming_requests_per_sec,
+                engine.context.unified_memory_level,
+                args.inference_dynamic_batching_buffer_size_gb,
+                time_total,
+            ))
             exit()
             pax({"requests / 0": requests[0]})
             # <<<
@@ -262,6 +274,9 @@ if __name__ == "__main__":
             enable_cuda_graph=args.cuda_graph_impl == "local",
             random_seed=args.seed,
             enable_chunked_prefill=not args.disable_chunked_prefill,
+            # >>>
+            track_paused_request_events=True,
+            # <<<
         )
 
         if dist.get_rank() == 0:

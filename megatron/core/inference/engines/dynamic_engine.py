@@ -712,11 +712,17 @@ class DynamicInferenceEngine(AbstractEngine):
             > self.context.max_sequence_length
         ):
             request.status = Status.FAILED
-            request.add_event_error_nontransient(MaxSequenceLengthOverflowError(request_id))
+            # >>>
+            # request.add_event_error_nontransient(MaxSequenceLengthOverflowError(request_id))
+            request.add_event_error_nontransient(self.context, MaxSequenceLengthOverflowError(request_id))
+            # <<<
 
         if len(request.prompt_tokens) > self.context.max_tokens and not self.enable_chunked_prefill:
             request.status = Status.FAILED
-            request.add_event_error_nontransient(TokenOverflowError(request_id))
+            # >>>
+            # request.add_event_error_nontransient(TokenOverflowError(request_id))
+            request.add_event_error_nontransient(self.context, TokenOverflowError(request_id))
+            # <<<
 
         if request.status != Status.FAILED:
             self.waiting_request_ids.append(request_id)
@@ -893,7 +899,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._loop.create_task, self._notify_cond_for_new_request()
                 )
                 req.remaining_prompt_tokens = req.remaining_prompt_tokens.new_empty(0)
-                req.add_event_add()
+                # >>>
+                # req.add_event_add()
+                req.add_event_add(self.context)
+                # <<<
                 self.waiting_request_ids.popleft()
             else:
                 break
@@ -939,7 +948,10 @@ class DynamicInferenceEngine(AbstractEngine):
                         self._loop.create_task, self._notify_cond_for_new_request()
                     )
                     req.remaining_prompt_tokens = req.remaining_prompt_tokens.new_empty(0)
-                    req.add_event_add()
+                    # >>>
+                    # req.add_event_add()
+                    req.add_event_add(self.context)
+                    # <<<
                     # Fully scheduled, so we remove from waiting pool
                     self.waiting_request_ids.popleft()
                     # Only this case we keep checking the rest of the waiting queue
@@ -1063,10 +1075,16 @@ class DynamicInferenceEngine(AbstractEngine):
             # Add paused events.
             if newly_paused_request_ids is not None and self.track_paused_request_events:
                 newly_paused_request_ids = newly_paused_request_ids.tolist()
-                [self.get_request(i).add_event_pause() for i in newly_paused_request_ids]
+                # >>>
+                # [self.get_request(i).add_event_pause() for i in newly_paused_request_ids]
+                [self.get_request(i).add_event_pause(self.context) for i in newly_paused_request_ids]
+                # <<<
 
             # Mark requests finished.
-            [self.get_request(i).add_event_finish() for i in finished_request_ids.tolist()]
+            # >>>
+            # [self.get_request(i).add_event_finish() for i in finished_request_ids.tolist()]
+            [self.get_request(i).add_event_finish(self.context) for i in finished_request_ids.tolist()]
+            # <<<
 
             # Add finished events.
             active_request_ids, finished_request_records = self.post_process_requests(
@@ -1082,7 +1100,10 @@ class DynamicInferenceEngine(AbstractEngine):
             failed_entry = self.requests.pop(failed_request_id)
             failed_request = failed_entry.record[-1]
             failed_request.status = Status.FAILED
-            failed_request.add_event_fail()
+            # >>>
+            # failed_request.add_event_fail()
+            failed_request.add_event_fail(self.context)
+            # <<<
             finished_request_records.append(failed_entry.record)
             failed_entry.future.set_result(failed_entry.record)
         self.failed_request_ids.clear()

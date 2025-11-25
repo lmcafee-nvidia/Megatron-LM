@@ -162,6 +162,14 @@ class DynamicInferenceEvent:
     timestamp: Optional[float] = None
     type: DynamicInferenceEventType
     payload: Optional[Any] = None
+    # >>>
+    total_request_count: int
+    paused_request_count: int
+    blocks_total_count: int
+    blocks_total_avail: int
+    blocks_active_count: int
+    blocks_active_avail: int
+    # <<<
 
     def __post_init__(self):
 
@@ -328,33 +336,42 @@ class DynamicInferenceRequest(InferenceRequest):
         ]
         return {k: v for v, k in enumerate(ret)}
 
-    def add_event(self, type: DynamicInferenceEventType, payload: Optional[Any] = None) -> None:
+    def add_event(self, context: "DynamicInferenceContext", type: DynamicInferenceEventType, payload: Optional[Any] = None) -> None:
         """Add event."""
-        self.events.append(DynamicInferenceEvent(type=type, payload=payload))
+        self.events.append(DynamicInferenceEvent(
+            type=type,
+            payload=payload,
+            total_request_count=context.total_request_count,
+            paused_request_count=context.paused_request_count,
+            blocks_total_count=context.block_allocator.total_count,
+            blocks_total_avail=context.block_allocator.total_avail,
+            blocks_active_count=context.block_allocator.active_count,
+            blocks_active_avail=context.block_allocator.get_active_avail(),
+        ))
 
-    def add_event_add(self):
+    def add_event_add(self, context):
         """Add 'add' event."""
-        return self.add_event(DynamicInferenceEventType.ADD)
+        return self.add_event(context, DynamicInferenceEventType.ADD)
 
-    def add_event_pause(self):
+    def add_event_pause(self, context):
         """Add 'pause' event."""
-        return self.add_event(DynamicInferenceEventType.PAUSE)
+        return self.add_event(context, DynamicInferenceEventType.PAUSE)
 
-    def add_event_finish(self):
+    def add_event_finish(self, context):
         """Add 'finish' event."""
-        return self.add_event(DynamicInferenceEventType.FINISH)
+        return self.add_event(context, DynamicInferenceEventType.FINISH)
 
-    def add_event_fail(self):
+    def add_event_fail(self, context):
         """Add 'fail' event."""
-        return self.add_event(DynamicInferenceEventType.FAIL)
+        return self.add_event(context, DynamicInferenceEventType.FAIL)
 
-    def add_event_error_transient(self, error: Exception):
+    def add_event_error_transient(self, context, error: Exception):
         """Add transient error event."""
-        return self.add_event(DynamicInferenceEventType.ERROR_TRANSIENT, error)
+        return self.add_event(context, DynamicInferenceEventType.ERROR_TRANSIENT, error)
 
-    def add_event_error_nontransient(self, error: Exception):
+    def add_event_error_nontransient(self, context, error: Exception):
         """Add non-transient error event."""
-        return self.add_event(DynamicInferenceEventType.ERROR_NONTRANSIENT, error)
+        return self.add_event(context, DynamicInferenceEventType.ERROR_NONTRANSIENT, error)
 
     def succeeded(self) -> bool:
         """Request experienced no non-transient errors."""
