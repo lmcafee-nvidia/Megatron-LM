@@ -352,6 +352,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         assert self.block_size_bytes > 0
 
+        # >>>
+        # pax({"block_size_bytes": self.block_size_bytes})
+        # <<<
+
         mamba_states_memory_per_request = 0
         if self.is_hybrid_model:
             mamba_states_memory_per_request += math.prod(self.mamba_conv_states_shape)

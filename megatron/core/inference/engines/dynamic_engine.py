@@ -275,6 +275,9 @@ class DynamicInferenceEngine(AbstractEngine):
             len(context.cuda_graph_token_counts),
             context.cuda_graph_token_counts,
         )
+        # >>>
+        mem_stats_0 = torch.cuda.memory_stats()
+        # <<<
         for warmup_engine_mode in [WarmupEngineMode.DECODE, WarmupEngineMode.NON_DECODE]:
             # Check whether to skip non-decode graphs.
             if (
@@ -321,6 +324,15 @@ class DynamicInferenceEngine(AbstractEngine):
                 if reset_context:
                     with torch.inference_mode():
                         context.reset()  # todo: @lmcafee, remove if unnecessary.
+
+        # >>>
+        mem_stats_1 = torch.cuda.memory_stats()
+        # pax({
+        #     "peak 0" : mem_stats_0["allocated_bytes.all.peak"],
+        #     "peak 1" : mem_stats_1["allocated_bytes.all.peak"],
+        #     "diff" : mem_stats_1["allocated_bytes.all.peak"] - mem_stats_0["allocated_bytes.all.peak"],
+        # })
+        # <<<
 
         # Memory usage.
         time_end = time.time()

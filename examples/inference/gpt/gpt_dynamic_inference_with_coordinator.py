@@ -36,6 +36,8 @@ from megatron.training import get_args, get_tokenizer, initialize_megatron
 from megatron.training.arguments import parse_args
 
 # >>>
+import json
+from dataclasses import asdict
 from lutil import pax as _pax
 import builtins
 builtins.pax = _pax
@@ -105,6 +107,10 @@ async def main(
         futures = []
         num_requests_total = len(requests)
         num_requests_added = 0
+
+        # >>>
+        pax()
+        # <<<
 
         # >>>
         time_start = time.time()
@@ -186,10 +192,31 @@ async def main(
             # >>>
 
             print("~~~")
+            events_json = {}
             for record in results:
+                events_json[record.request_id] = []
                 for request in record.requests:
-                    pax("request", {"events": request.events})
-                pax("record")
+                    for event in request.events:
+                        event_json = asdict(event)
+                        event_json["type"] = event_json["type"].name
+                        del event_json["payload"]
+                        # pax("event_json")
+                        events_json[record.request_id].append(event_json)
+                    # pax("request", {
+                    #     "events" : request.events,
+                    #     "events / 0" : request.events[0],
+                    # })
+                # pax("record")
+            # pax(events_json)
+
+            path = "/lustre/fsw/portfolios/adlr/projects/adlr_nlp_llmnext/users/lmcafee/inference/megatrons/optimize-context-uvm/lawrence/events/r%d_a%d_u%d_b%d.json" % (
+                len(requests),
+                args.incoming_requests_per_sec,
+                engine.context.unified_memory_level,
+                args.inference_dynamic_batching_buffer_size_gb,
+            )
+            # with open(path, "w") as f:
+            #     json.dump(events_json, f, indent=4)
 
             print("~~~")
             print("... requests %d, rate %d, uvm %d, buf %d, time %f." % (
@@ -258,6 +285,9 @@ if __name__ == "__main__":
             build_requests(args, tokenizer, sampling_params) if dist.get_rank() == 0 else None
         )
 
+        # >>>
+        # pax()
+        # <<<
         context = get_inference_context(
             None,
             None,
