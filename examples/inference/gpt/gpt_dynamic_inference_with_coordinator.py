@@ -109,7 +109,7 @@ async def main(
         num_requests_added = 0
 
         # >>>
-        pax()
+        # pax()
         # <<<
 
         # >>>
@@ -218,12 +218,14 @@ async def main(
             # with open(path, "w") as f:
             #     json.dump(events_json, f, indent=4)
 
+            mem_stats = torch.cuda.memory_stats()
             print("~~~")
-            print("... requests %d, rate %d, uvm %d, buf %d, time %f." % (
+            print("... requests %d, rate %d, uvm %d, buf %d, mem %.1f gb, time %f." % (
                 len(requests),
                 args.incoming_requests_per_sec,
                 engine.context.unified_memory_level,
                 args.inference_dynamic_batching_buffer_size_gb,
+                mem_stats["allocated_bytes.all.peak"] / 1024**3,
                 time_total,
             ))
             exit()

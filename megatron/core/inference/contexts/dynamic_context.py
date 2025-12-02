@@ -571,6 +571,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     device=torch.cuda.current_device(),
                 )
             else:
+                # >>>
                 self.memory_buffer = torch.empty(
                     (
                         2,  # key and value
@@ -583,6 +584,21 @@ class DynamicInferenceContext(BaseInferenceContext):
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
                 )
+                # +++
+                # self.memory_buffer = torch.full(
+                #     (
+                #         2,  # key and value
+                #         self.num_attention_layers,
+                #         self.block_allocator.total_count,
+                #         self.block_size_tokens,
+                #         self.num_attention_heads_per_partition,
+                #         self.hidden_size_per_attention_head,
+                #     ),
+                #     -1,
+                #     dtype=self.params_dtype,
+                #     device=torch.cuda.current_device(),
+                # )
+                # <<<
 
         # Optional state tensors for hybrid models
         def allocate_mamba_states():
