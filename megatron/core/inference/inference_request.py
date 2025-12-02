@@ -11,7 +11,6 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.tokenizers import MegatronTokenizer
 
 
 def serialize_tensor(tensor: torch.Tensor) -> bytes:
@@ -333,6 +332,8 @@ class DynamicInferenceRequest(InferenceRequest):
             "termination_id",
             "return_log_probs",
             "skip_prompt_log_probs",
+            "top_n_logprobs",
+            "return_prompt_top_n_logprobs",
         ]
         return {k: v for v, k in enumerate(ret)}
 
