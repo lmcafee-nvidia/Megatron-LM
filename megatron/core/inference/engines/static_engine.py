@@ -118,6 +118,7 @@ class StaticInferenceEngine(AbstractEngine):
                     enable_cuda_graph=True,
                 )
         except Exception as e:
+            raise e
             # Get exception details for better debugging
             exception_msg = str(e) if str(e) else f"{type(e).__name__}: {repr(e)}"
             warnings.warn(

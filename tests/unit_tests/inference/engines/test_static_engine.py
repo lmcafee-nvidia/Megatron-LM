@@ -369,3 +369,9 @@ class TestStaticInferenceEngine(StaticInferenceEngineTestHarness):
             ), f"Status should be completed but its {result.status}"
             assert result.generated_length > 0, f"Generated length should be greater than zero"
             assert result.generated_text is not None, f'Generated text should not be None'
+
+
+if __name__ == "__main__":
+    test = TestStaticInferenceEngine()
+    test.test_generate_dynamic(4, 1, False)
+    print("~~~\nsuccess.")
