@@ -1662,6 +1662,34 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.active_token_count : self.active_token_count + chunk_length
         ] = (token_offset_range % self.block_size_tokens)
 
+        # Store token IDs in their respective blocks for hash computation
+        for i in range(chunk_length):
+            token_offset = req.finished_chunk_token_count + i
+            block_position = token_offset // self.block_size_tokens
+            local_pos = token_offset % self.block_size_tokens
+            block_id = self.request_to_kv_block_ids[current_id][block_position].item()
+            self.block_allocator.block_to_token_ids[block_id, local_pos] = this_round_tokens[i]
+
+        # Compute hashes for completely filled blocks
+        total_tokens_after = req.finished_chunk_token_count + chunk_length
+        num_complete_blocks = total_tokens_after // self.block_size_tokens
+        previously_complete = req.finished_chunk_token_count // self.block_size_tokens
+
+        for block_pos in range(previously_complete, num_complete_blocks):
+            block_id = self.request_to_kv_block_ids[current_id][block_pos].item()
+
+            # Get parent hash (0 for first block)
+            if block_pos > 0:
+                parent_block_id = self.request_to_kv_block_ids[current_id][block_pos - 1].item()
+                parent_hash = self.block_allocator.get_block_hash(parent_block_id)
+            else:
+                parent_hash = 0
+
+            # Compute and set hash
+            block_tokens = self.block_allocator.block_to_token_ids[block_id]
+            block_hash = self.block_allocator.compute_block_hash(parent_hash, block_tokens)
+            self.block_allocator.set_block_hash(block_id, block_hash)
+
         if self.is_hybrid_model and not is_chunked_prefill:
             # Allocate a slot for Mamba states
             mamba_idx = self.mamba_metadata.allocate_slot()
@@ -2085,10 +2113,50 @@ class DynamicInferenceContext(BaseInferenceContext):
                 (active_requests_requiring_new_block == 1).sum().item()
             )
 
+            # Compute hashes for blocks that just filled
             if active_requests_requiring_new_block_count > 0:
+                filled_request_local_indices = torch.nonzero(
+                    active_requests_requiring_new_block
+                ).squeeze(-1)
+
+                for local_idx in filled_request_local_indices:
+                    request_idx = self.paused_request_count + local_idx.item()
+
+                    # Store the new token in the block (this completes the block)
+                    block_id = self.request_last_kv_block_id[request_idx].item()
+                    local_pos = self.request_last_kv_block_offset[request_idx].item()
+                    new_token = next_tokens[request_idx]
+                    self.block_allocator.block_to_token_ids[block_id, local_pos] = new_token
+
+                    # Get parent hash
+                    block_count = self.request_kv_block_counts[request_idx].item()
+                    if block_count > 1:
+                        parent_block_id = self.request_to_kv_block_ids[request_idx][
+                            block_count - 2
+                        ].item()
+                        parent_hash = self.block_allocator.get_block_hash(parent_block_id)
+                    else:
+                        parent_hash = 0
+
+                    # Compute and set hash
+                    block_tokens = self.block_allocator.block_to_token_ids[block_id]
+                    block_hash = self.block_allocator.compute_block_hash(parent_hash, block_tokens)
+                    self.block_allocator.set_block_hash(block_id, block_hash)
+
                 newly_paused_request_ids = self.request_ids[
                     torch.nonzero(active_requests_requiring_new_block) + self.paused_request_count
                 ]
+
+            # Store tokens for requests that don't fill their block (no hash computed yet)
+            non_filled_request_local_indices = torch.nonzero(
+                active_requests_requiring_new_block == 0
+            ).squeeze(-1)
+            for local_idx in non_filled_request_local_indices:
+                request_idx = self.paused_request_count + local_idx.item()
+                block_id = self.request_last_kv_block_id[request_idx].item()
+                local_pos = self.request_last_kv_block_offset[request_idx].item()
+                new_token = next_tokens[request_idx]
+                self.block_allocator.block_to_token_ids[block_id, local_pos] = new_token
 
             # Swap unfinished active requests on the left side with paused requests on the right side
             # NOTE : We add paused request count because we concatenate

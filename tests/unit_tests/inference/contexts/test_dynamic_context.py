@@ -1251,3 +1251,171 @@ class TestDynamicContext:
         assert (
             len(unique_counts) == 1
         ), f"Block counts were not synchronized across ranks. Gathered: {all_counts}"
+
+    @pytest.mark.internal
+    def test_block_hash_computation(self):
+        """Verify hash computation produces consistent positive values."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        block_allocator = dynamic_context.block_allocator
+
+        # Test 1: Hash should be positive for any valid input
+        token_ids = torch.arange(128, device=torch.cuda.current_device(), dtype=torch.int64)
+        hash_value = block_allocator.compute_block_hash(0, token_ids)
+        assert hash_value > 0, "Hash should be positive"
+
+        # Test 2: Same inputs should produce same hash
+        hash_value_2 = block_allocator.compute_block_hash(0, token_ids)
+        assert hash_value == hash_value_2, "Hash should be deterministic"
+
+        # Test 3: Different parent hash should produce different result
+        hash_with_parent = block_allocator.compute_block_hash(12345, token_ids)
+        assert hash_with_parent != hash_value, "Different parent should produce different hash"
+        assert hash_with_parent > 0, "Hash with parent should still be positive"
+
+        # Test 4: Different tokens should produce different hash
+        different_tokens = torch.arange(1, 129, device=torch.cuda.current_device(), dtype=torch.int64)
+        hash_different = block_allocator.compute_block_hash(0, different_tokens)
+        assert hash_different != hash_value, "Different tokens should produce different hash"
+
+        # Test 5: Block hashes tensor initialized to -1
+        assert (block_allocator.block_hashes == -1).all(), "Block hashes should initialize to -1"
+
+    @pytest.mark.internal
+    def test_block_hash_prefill_decode_release(self):
+        """Integration test for hash computation during prefill, decode, and release."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=1024,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,  # Small blocks for easier testing
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        block_allocator = dynamic_context.block_allocator
+        block_size = dynamic_context.block_size_tokens
+
+        # Create request with 2.5 blocks worth of tokens (80 tokens with block_size=32)
+        prompt_length = int(block_size * 2.5)  # 80 tokens
+        request = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=torch.arange(prompt_length, device=torch.cuda.current_device()),
+            sampling_params=SamplingParams(num_tokens_to_generate=50),
+        )
+
+        # Add request (prefill)
+        dynamic_context.add_request(request)
+
+        # Check: First 2 blocks should have hashes computed (they're complete)
+        block_0_id = dynamic_context.request_to_kv_block_ids[0][0].item()
+        block_1_id = dynamic_context.request_to_kv_block_ids[0][1].item()
+        block_2_id = dynamic_context.request_to_kv_block_ids[0][2].item()
+
+        assert block_allocator.block_hashes[block_0_id].item() > 0, "Block 0 should have hash"
+        assert block_allocator.block_hashes[block_1_id].item() > 0, "Block 1 should have hash"
+        assert block_allocator.block_hashes[block_2_id].item() == -1, "Block 2 incomplete, no hash"
+
+        # Release blocks (simulate request completion)
+        dynamic_context.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+
+        # Check: All released blocks should have hash reset to -1
+        assert block_allocator.block_hashes[block_0_id].item() == -1, "Block 0 hash should reset"
+        assert block_allocator.block_hashes[block_1_id].item() == -1, "Block 1 hash should reset"
+        assert block_allocator.block_hashes[block_2_id].item() == -1, "Block 2 hash should reset"
+
+    @pytest.mark.internal
+    def test_block_hash_consistency(self):
+        """Same token sequence should produce same hash chain across requests."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        block_allocator = dynamic_context.block_allocator
+        block_size = dynamic_context.block_size_tokens
+
+        # Create identical prompts that span 2 complete blocks
+        prompt_tokens = torch.arange(block_size * 2, device=torch.cuda.current_device())
+
+        # First request
+        request_1 = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt_tokens.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_1)
+
+        # Get hashes for request 1's blocks
+        req1_block_0_id = dynamic_context.request_to_kv_block_ids[0][0].item()
+        req1_block_1_id = dynamic_context.request_to_kv_block_ids[0][1].item()
+        req1_block_0_hash = block_allocator.block_hashes[req1_block_0_id].item()
+        req1_block_1_hash = block_allocator.block_hashes[req1_block_1_id].item()
+
+        # Second request with same tokens
+        request_2 = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=prompt_tokens.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_2)
+
+        # Get hashes for request 2's blocks (different block IDs but same content)
+        req2_block_0_id = dynamic_context.request_to_kv_block_ids[1][0].item()
+        req2_block_1_id = dynamic_context.request_to_kv_block_ids[1][1].item()
+        req2_block_0_hash = block_allocator.block_hashes[req2_block_0_id].item()
+        req2_block_1_hash = block_allocator.block_hashes[req2_block_1_id].item()
+
+        # Verify: Same token content should produce identical hashes
+        assert req1_block_0_hash == req2_block_0_hash, (
+            f"Block 0 hashes should match: {req1_block_0_hash} vs {req2_block_0_hash}"
+        )
+        assert req1_block_1_hash == req2_block_1_hash, (
+            f"Block 1 hashes should match: {req1_block_1_hash} vs {req2_block_1_hash}"
+        )
+
+        # Verify hash chaining: block 1 hash should differ from block 0
+        assert req1_block_0_hash != req1_block_1_hash, "Different blocks should have different hashes"
+
+        # Third request with different tokens
+        different_tokens = torch.arange(1, block_size * 2 + 1, device=torch.cuda.current_device())
+        request_3 = DynamicInferenceRequest(
+            request_id=3,
+            prompt_tokens=different_tokens,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_3)
+
+        req3_block_0_id = dynamic_context.request_to_kv_block_ids[2][0].item()
+        req3_block_0_hash = block_allocator.block_hashes[req3_block_0_id].item()
+
+        # Verify: Different tokens should produce different hash
+        assert req1_block_0_hash != req3_block_0_hash, (
+            "Different token sequences should produce different hashes"
+        )

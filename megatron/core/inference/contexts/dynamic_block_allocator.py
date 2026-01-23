@@ -37,6 +37,20 @@ class BlockAllocator:
             self.total_count, dtype=torch.int32, device=torch.cuda.current_device()
         )
 
+        # Block hash tracking for prefix caching: -1 = uncomputed, positive = valid hash
+        self.block_hashes = torch.full(
+            (self.total_count,), -1, dtype=torch.int64, device=torch.cuda.current_device()
+        )
+
+        # Store token IDs per block for hash computation
+        # Shape: [total_count, block_size_tokens]
+        self.block_to_token_ids = torch.full(
+            (self.total_count, context.block_size_tokens),
+            -1,
+            dtype=torch.int64,
+            device=torch.cuda.current_device(),
+        )
+
     def __str__(self):
         return (
             f"using: total {self.get_total_used()}/{self.total_count - 1}"
@@ -113,6 +127,10 @@ class BlockAllocator:
         self.block_bag[self.total_avail : (self.total_avail + num_blocks)] = blocks
         self.total_avail += num_blocks
 
+        # Reset block hashes and token storage to -1 (invalid)
+        self.block_hashes[blocks] = -1
+        self.block_to_token_ids[blocks] = -1
+
     def reset(self) -> None:
         """Reset the allocator to initial state.
 
@@ -133,3 +151,52 @@ class BlockAllocator:
         )
 
         self.total_avail = self.total_count - 1
+
+        # Reset all block hashes and token storage
+        self.block_hashes.fill_(-1)
+        self.block_to_token_ids.fill_(-1)
+
+    # Constants for hash computation
+    HASH_PRIME = 1000000007
+    HASH_BASE = 31
+
+    def compute_block_hash(self, parent_hash: int, token_ids: Tensor) -> int:
+        """Compute hash for a block from (parent_hash, token_ids).
+
+        Uses a GPU-based polynomial rolling hash combined with the parent hash.
+
+        Args:
+            parent_hash: Hash of parent block (0 for first block in sequence).
+            token_ids: Token IDs in this block, shape [block_size_tokens].
+
+        Returns:
+            Positive integer hash value (1 to HASH_PRIME).
+        """
+        block_size = token_ids.shape[0]
+        positions = torch.arange(block_size, device=token_ids.device, dtype=torch.int64)
+        powers = torch.pow(self.HASH_BASE, positions).to(torch.int64) % self.HASH_PRIME
+        token_hash = ((token_ids.to(torch.int64) * powers).sum() % self.HASH_PRIME).item()
+
+        # Combine with parent hash
+        combined = (parent_hash * self.HASH_BASE + token_hash) % self.HASH_PRIME
+        return combined + 1  # Ensure positive (1 to HASH_PRIME)
+
+    def set_block_hash(self, block_id: int, hash_value: int) -> None:
+        """Set the hash for a specific block.
+
+        Args:
+            block_id: The block ID to set hash for.
+            hash_value: The hash value to store.
+        """
+        self.block_hashes[block_id] = hash_value
+
+    def get_block_hash(self, block_id: int) -> int:
+        """Get the hash for a block.
+
+        Args:
+            block_id: The block ID to get hash for.
+
+        Returns:
+            Hash value (-1 if not computed).
+        """
+        return self.block_hashes[block_id].item()
