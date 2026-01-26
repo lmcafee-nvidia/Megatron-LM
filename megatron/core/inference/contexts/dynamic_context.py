@@ -1539,6 +1539,47 @@ class DynamicInferenceContext(BaseInferenceContext):
         kv_cache_available = self.block_allocator.is_memory_available(blocks)
         return request_can_be_added, request_tokens_can_be_added, kv_cache_available
 
+    def _find_matching_prefix_blocks(
+        self, prompt_tokens: Tensor
+    ) -> tuple[list[int], int]:
+        """Find cached blocks matching the prompt prefix.
+
+        Computes block hashes for complete blocks in the prompt and looks them up
+        in the block allocator's hash-to-block mapping. Stops at the first non-match.
+
+        Args:
+            prompt_tokens: Full prompt token IDs for this request.
+
+        Returns:
+            Tuple of:
+            - List of matched block IDs (in order from block 0)
+            - Parent hash for computing the next block's hash (0 if no matches)
+        """
+        matched_blocks: list[int] = []
+        parent_hash = 0
+
+        num_complete_blocks = len(prompt_tokens) // self.block_size_tokens
+
+        for block_pos in range(num_complete_blocks):
+            start = block_pos * self.block_size_tokens
+            end = start + self.block_size_tokens
+            block_tokens = prompt_tokens[start:end]
+
+            # Compute hash for this block
+            block_hash = self.block_allocator.compute_block_hash(parent_hash, block_tokens)
+
+            # Look up existing block with this hash
+            existing_block = self.block_allocator.lookup_block_by_hash(block_hash)
+
+            if existing_block is not None:
+                matched_blocks.append(existing_block)
+                parent_hash = block_hash
+            else:
+                # No match found, stop here
+                break
+
+        return matched_blocks, parent_hash
+
     def add_request(self, req: DynamicInferenceRequest, chunk_length: Optional[int] = None) -> None:
         """Add request to context. At this stage, we assume that the request is valid and can be added, as the checks are done in the schedule function.
 
@@ -1571,7 +1612,23 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Use the remaining prompt tokens for this chunk
         this_round_tokens = req.remaining_prompt_tokens[:chunk_length]
 
-        # only allocate new blocks
+        # =========================================================================
+        # Prefix caching: find matching prefix blocks
+        # =========================================================================
+        matched_block_ids: list[int] = []
+        prefix_parent_hash = 0
+        num_matched_blocks = 0
+
+        # Only attempt prefix matching on the first chunk of a new request
+        if not is_chunked_prefill:
+            matched_block_ids, prefix_parent_hash = self._find_matching_prefix_blocks(
+                req.prompt_tokens
+            )
+            num_matched_blocks = len(matched_block_ids)
+
+        # =========================================================================
+        # Block allocation
+        # =========================================================================
         already_allocated_blocks = (
             req.finished_chunk_token_count + self.block_size_tokens - 1
         ) // self.block_size_tokens  # ceiling division
@@ -1579,12 +1636,23 @@ class DynamicInferenceContext(BaseInferenceContext):
             req.finished_chunk_token_count + chunk_length + self.block_size_tokens - 1
         ) // self.block_size_tokens  # ceiling division
 
-        num_blocks_needed = overall_required_blocks - already_allocated_blocks
+        # Reduce blocks needed by the number of matched (shared) blocks
+        num_blocks_from_pool = overall_required_blocks - already_allocated_blocks - num_matched_blocks
+        num_blocks_from_pool = max(0, num_blocks_from_pool)
 
-        if num_blocks_needed > 0:
-            new_block_ids = self.block_allocator.allocate_memory_blocks(num_blocks_needed)
-            if new_block_ids is None or len(new_block_ids) != num_blocks_needed:
+        new_block_ids = None
+        if num_blocks_from_pool > 0:
+            new_block_ids = self.block_allocator.allocate_memory_blocks(num_blocks_from_pool)
+            if new_block_ids is None or len(new_block_ids) != num_blocks_from_pool:
                 raise BlockOverflowError(req.request_id)
+
+        # Increment ref counts and update timestamps for matched (shared) blocks
+        if num_matched_blocks > 0:
+            matched_tensor = torch.tensor(
+                matched_block_ids, dtype=torch.int32, device=torch.cuda.current_device()
+            )
+            self.block_allocator.increment_ref_count(matched_tensor)
+            self.block_allocator.update_timestamps(matched_tensor)
 
         # when a request already starts chunked prefill, it is exactly the last request in the current system
         # (see dynamic_engine.py, schedule_chunked_prefill invariants)
@@ -1625,10 +1693,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             + chunk_length
             + req.sampling_params.num_tokens_to_generate
         )
-        if num_blocks_needed > 0:
+
+        # Assign blocks: matched blocks first, then newly allocated blocks
+        if num_matched_blocks > 0:
+            matched_tensor = torch.tensor(
+                matched_block_ids, dtype=torch.int32, device=torch.cuda.current_device()
+            )
+            self.request_to_kv_block_ids[current_id][0:num_matched_blocks] = matched_tensor
+        if new_block_ids is not None:
             self.request_to_kv_block_ids[current_id][
-                already_allocated_blocks:overall_required_blocks
+                num_matched_blocks:num_matched_blocks + len(new_block_ids)
             ] = new_block_ids
+
         self.request_kv_length_offsets[current_id] = req.finished_chunk_token_count
         self.request_kv_block_counts[current_id] = overall_required_blocks
         self.request_last_kv_block_id[current_id] = self.request_to_kv_block_ids[current_id][
@@ -1663,32 +1739,44 @@ class DynamicInferenceContext(BaseInferenceContext):
         ] = (token_offset_range % self.block_size_tokens)
 
         # Store token IDs in their respective blocks for hash computation
+        # Skip tokens in matched (shared) blocks - they already have tokens stored
         for i in range(chunk_length):
             token_offset = req.finished_chunk_token_count + i
             block_position = token_offset // self.block_size_tokens
+
+            # Skip matched blocks - tokens are already stored
+            if block_position < num_matched_blocks:
+                continue
+
             local_pos = token_offset % self.block_size_tokens
             block_id = self.request_to_kv_block_ids[current_id][block_position].item()
             self.block_allocator.block_to_token_ids[block_id, local_pos] = this_round_tokens[i]
 
-        # Compute hashes for completely filled blocks
+        # Compute hashes for completely filled blocks (skip matched blocks)
         total_tokens_after = req.finished_chunk_token_count + chunk_length
         num_complete_blocks = total_tokens_after // self.block_size_tokens
         previously_complete = req.finished_chunk_token_count // self.block_size_tokens
 
-        for block_pos in range(previously_complete, num_complete_blocks):
+        # Start from the first non-matched block
+        first_block_to_hash = max(previously_complete, num_matched_blocks)
+
+        for block_pos in range(first_block_to_hash, num_complete_blocks):
             block_id = self.request_to_kv_block_ids[current_id][block_pos].item()
 
-            # Get parent hash (0 for first block)
-            if block_pos > 0:
+            # Get parent hash
+            if block_pos == num_matched_blocks and num_matched_blocks > 0:
+                # First new block after matched prefix - use prefix_parent_hash
+                parent_hash = prefix_parent_hash
+            elif block_pos > 0:
                 parent_block_id = self.request_to_kv_block_ids[current_id][block_pos - 1].item()
                 parent_hash = self.block_allocator.get_block_hash(parent_block_id)
             else:
                 parent_hash = 0
 
-            # Compute and set hash
+            # Compute and register hash (adds to hash-to-block mapping for prefix caching)
             block_tokens = self.block_allocator.block_to_token_ids[block_id]
             block_hash = self.block_allocator.compute_block_hash(parent_hash, block_tokens)
-            self.block_allocator.set_block_hash(block_id, block_hash)
+            self.block_allocator.register_block_hash(block_id, block_hash)
 
         if self.is_hybrid_model and not is_chunked_prefill:
             # Allocate a slot for Mamba states
