@@ -54,6 +54,7 @@ class TestDynamicContext:
         layer_type_list=None,
         rounder=64,
         paused_buffer_size_gb=None,
+        enable_prefix_caching=True,
     ):
         set_rounder(rounder)
 
@@ -86,6 +87,7 @@ class TestDynamicContext:
             use_flashinfer_fused_rope=None,  # default to using flash-infer if available
             # this is for compatibility with the LTS environment
             unified_memory_level=0,  # unit tests currently broken with UVM
+            enable_prefix_caching=enable_prefix_caching,
         )
         return dynamic_context
 
@@ -1733,3 +1735,227 @@ class TestDynamicContext:
         # All blocks should have ref_count=1
         for block_id in req1_blocks | req2_blocks:
             assert block_allocator.block_ref_counts[block_id].item() == 1
+
+    @pytest.mark.internal
+    def test_prefix_caching_disabled_no_sharing(self):
+        """Test that identical prefixes do NOT share blocks when prefix caching is disabled."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+            enable_prefix_caching=False,
+        )
+
+        block_allocator = dynamic_context.block_allocator
+        block_size = dynamic_context.block_size_tokens
+
+        # Create two requests with IDENTICAL prompts
+        prompt = torch.arange(block_size * 2, device=torch.cuda.current_device())
+
+        request_1 = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_1)
+
+        req1_blocks = set()
+        for i in range(2):
+            req1_blocks.add(dynamic_context.request_to_kv_block_ids[0][i].item())
+
+        request_2 = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_2)
+
+        req2_blocks = set()
+        for i in range(2):
+            req2_blocks.add(dynamic_context.request_to_kv_block_ids[1][i].item())
+
+        # With prefix caching disabled, blocks should NOT be shared even with identical prompts
+        assert req1_blocks.isdisjoint(req2_blocks), (
+            "With prefix caching disabled, identical prefixes should NOT share blocks"
+        )
+
+        # All blocks should have ref_count=1 (no sharing)
+        for block_id in req1_blocks | req2_blocks:
+            assert block_allocator.block_ref_counts[block_id].item() == 1
+
+    @pytest.mark.internal
+    def test_prefix_caching_disabled_deterministic_hashes(self):
+        """Test that blocks get deterministic unique hashes when prefix caching is disabled."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+            enable_prefix_caching=False,
+        )
+
+        block_allocator = dynamic_context.block_allocator
+        block_size = dynamic_context.block_size_tokens
+
+        # Add a request
+        prompt = torch.arange(block_size * 2, device=torch.cuda.current_device())
+        request = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request)
+
+        # Get block IDs
+        block_ids = [
+            dynamic_context.request_to_kv_block_ids[0][i].item() for i in range(2)
+        ]
+
+        # Verify hashes are set (not -1)
+        for block_id in block_ids:
+            block_hash = block_allocator.block_hashes[block_id].item()
+            assert block_hash != -1, "Block hash should be set"
+
+        # Verify hashes are different from each other (unique per block)
+        hashes = [block_allocator.block_hashes[bid].item() for bid in block_ids]
+        assert len(set(hashes)) == len(hashes), "Each block should have a unique hash"
+
+        # Verify hashes are deterministic (based on block_id)
+        # The formula is: (block_id * 2654435761) % HASH_PRIME + 1
+        for block_id in block_ids:
+            expected_hash = (block_id * 2654435761) % block_allocator.HASH_PRIME + 1
+            actual_hash = block_allocator.block_hashes[block_id].item()
+            assert actual_hash == expected_hash, (
+                f"Hash for block {block_id} should be deterministic: "
+                f"expected {expected_hash}, got {actual_hash}"
+            )
+
+    @pytest.mark.internal
+    def test_prefix_caching_performance_comparison(self):
+        """Test that prefix caching enabled uses fewer blocks and is faster."""
+        import time
+
+        self._setup_model_parallel_group(1, 1)
+
+        block_size = 32
+        num_blocks_in_prompt = 4  # 128 tokens
+
+        # Create identical prompt for all requests
+        prompt = torch.arange(
+            block_size * num_blocks_in_prompt, device=torch.cuda.current_device()
+        )
+        num_requests = 5
+
+        # --- Test with prefix caching ENABLED ---
+        context_enabled = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=1024,
+            buffer_size_gb=0.1,
+            block_size_tokens=block_size,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+            enable_prefix_caching=True,
+        )
+
+        start_enabled = time.perf_counter()
+        for i in range(num_requests):
+            request = DynamicInferenceRequest(
+                request_id=i + 1,
+                prompt_tokens=prompt.clone(),
+                sampling_params=SamplingParams(num_tokens_to_generate=10),
+            )
+            context_enabled.add_request(request)
+        time_enabled = time.perf_counter() - start_enabled
+
+        # Count unique blocks allocated
+        blocks_enabled = set()
+        for req_idx in range(num_requests):
+            for i in range(num_blocks_in_prompt):
+                blocks_enabled.add(
+                    context_enabled.request_to_kv_block_ids[req_idx][i].item()
+                )
+
+        # --- Test with prefix caching DISABLED ---
+        Utils.destroy_model_parallel()
+        self._setup_model_parallel_group(1, 1)
+
+        context_disabled = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=1024,
+            buffer_size_gb=0.1,
+            block_size_tokens=block_size,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+            enable_prefix_caching=False,
+        )
+
+        start_disabled = time.perf_counter()
+        for i in range(num_requests):
+            request = DynamicInferenceRequest(
+                request_id=i + 1,
+                prompt_tokens=prompt.clone(),
+                sampling_params=SamplingParams(num_tokens_to_generate=10),
+            )
+            context_disabled.add_request(request)
+        time_disabled = time.perf_counter() - start_disabled
+
+        # Count unique blocks allocated
+        blocks_disabled = set()
+        for req_idx in range(num_requests):
+            for i in range(num_blocks_in_prompt):
+                blocks_disabled.add(
+                    context_disabled.request_to_kv_block_ids[req_idx][i].item()
+                )
+
+        # --- Assertions ---
+
+        # Memory metric: With caching enabled, should use fewer blocks
+        # With 5 identical requests of 4 blocks each:
+        # - Enabled: Should use only 4 blocks (all shared)
+        # - Disabled: Should use 20 blocks (5 * 4, no sharing)
+        assert len(blocks_enabled) == num_blocks_in_prompt, (
+            f"With prefix caching enabled, should use only {num_blocks_in_prompt} blocks "
+            f"for {num_requests} identical requests, but used {len(blocks_enabled)}"
+        )
+        assert len(blocks_disabled) == num_requests * num_blocks_in_prompt, (
+            f"With prefix caching disabled, should use {num_requests * num_blocks_in_prompt} blocks "
+            f"for {num_requests} requests, but used {len(blocks_disabled)}"
+        )
+
+        # Verify significant memory savings
+        memory_ratio = len(blocks_enabled) / len(blocks_disabled)
+        assert memory_ratio <= 0.25, (  # Should be 4/20 = 0.2
+            f"Prefix caching should reduce block usage by at least 75%, "
+            f"but ratio was {memory_ratio:.2f}"
+        )
+
+        # Time metric: With caching enabled, should generally be faster
+        # Use generous tolerance since timing can be noisy
+        # We don't strictly assert on time, but log it for visibility
+        print(f"\nPrefix caching performance:")
+        print(f"  Enabled:  {len(blocks_enabled)} blocks, {time_enabled*1000:.3f}ms")
+        print(f"  Disabled: {len(blocks_disabled)} blocks, {time_disabled*1000:.3f}ms")
+        print(f"  Memory ratio: {memory_ratio:.2f} (lower is better)")

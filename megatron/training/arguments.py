@@ -1691,6 +1691,13 @@ def _add_inference_args(parser):
                        '1) allocate `memory_buffer` in unified memory. '
                        'Eventually, additional levels will be included to '
                        'control other tensors within the context.')
+    group.add_argument('--inference-dynamic-batching-disable-prefix-caching',
+                       action='store_false',
+                       dest='inference_dynamic_batching_enable_prefix_caching',
+                       help='Disable prefix caching for dynamic batching inference. '
+                       'When disabled, KV cache blocks cannot be shared between '
+                       'requests with identical prompt prefixes.')
+    group.set_defaults(inference_dynamic_batching_enable_prefix_caching=True)
     group.add_argument('--symmetric-ar-type', type=str, default=None,
                        choices=['two_shot', "one_shot", "multimem_all_reduce", None],
                        help='What type of symmetric all reduce to use. The default is none which is no use of symetric memory')

@@ -286,8 +286,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         metrics_writer: Optional['WandbModule'] = None,
         request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None,
         persist_cuda_graphs: Optional[bool] = False,
+        enable_prefix_caching: bool = True,
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
+
+        self.enable_prefix_caching = enable_prefix_caching
 
         self.cache_mla_latent = cache_mla_latent
         if self.cache_mla_latent:
@@ -1555,6 +1558,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             - List of matched block IDs (in order from block 0)
             - Parent hash for computing the next block's hash (0 if no matches)
         """
+        # Early return if prefix caching is disabled
+        if not self.enable_prefix_caching:
+            return [], 0
+
         matched_blocks: list[int] = []
         parent_hash = 0
 
@@ -1780,10 +1787,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             else:
                 parent_hash = 0
 
-            # Compute and register hash (adds to hash-to-block mapping for prefix caching)
-            block_tokens = self.block_allocator.block_to_token_ids[block_id]
-            block_hash = self.block_allocator.compute_block_hash(parent_hash, block_tokens)
-            self.block_allocator.register_block_hash(block_id, block_hash)
+            # Compute and register hash
+            if self.enable_prefix_caching:
+                # Use content-based hash and register for prefix matching
+                block_tokens = self.block_allocator.block_to_token_ids[block_id]
+                block_hash = self.block_allocator.compute_block_hash(parent_hash, block_tokens)
+                self.block_allocator.register_block_hash(block_id, block_hash)
+            else:
+                # Use deterministic unique hash based on block_id to prevent matching
+                # Knuth's multiplicative hash spreads IDs across hash space
+                unique_hash = (block_id * 2654435761) % self.block_allocator.HASH_PRIME + 1
+                self.block_allocator.set_block_hash(block_id, unique_hash)
 
         if self.is_hybrid_model and not is_chunked_prefill:
             # Allocate a slot for Mamba states
