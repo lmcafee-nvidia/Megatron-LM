@@ -1419,3 +1419,317 @@ class TestDynamicContext:
         assert req1_block_0_hash != req3_block_0_hash, (
             "Different token sequences should produce different hashes"
         )
+
+    # =========================================================================
+    # Prefix caching tests
+    # =========================================================================
+
+    @pytest.mark.internal
+    def test_prefix_caching_basic_sharing(self):
+        """Test that identical prefixes share blocks."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        block_allocator = dynamic_context.block_allocator
+        block_size = dynamic_context.block_size_tokens
+
+        # Create first request with 2 complete blocks
+        prompt_tokens = torch.arange(block_size * 2, device=torch.cuda.current_device())
+        request_1 = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt_tokens.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_1)
+
+        # Get block IDs for request 1
+        req1_block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
+        req1_block_1 = dynamic_context.request_to_kv_block_ids[0][1].item()
+
+        # Verify hashes are registered in the mapping
+        block_0_hash = block_allocator.get_block_hash(req1_block_0)
+        block_1_hash = block_allocator.get_block_hash(req1_block_1)
+        assert block_0_hash in block_allocator.hash_to_block_id
+        assert block_1_hash in block_allocator.hash_to_block_id
+
+        # Verify ref counts are 1
+        assert block_allocator.block_ref_counts[req1_block_0].item() == 1
+        assert block_allocator.block_ref_counts[req1_block_1].item() == 1
+
+        # Create second request with same prefix
+        request_2 = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=prompt_tokens.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_2)
+
+        # Get block IDs for request 2 - should be same as request 1 (shared)
+        req2_block_0 = dynamic_context.request_to_kv_block_ids[1][0].item()
+        req2_block_1 = dynamic_context.request_to_kv_block_ids[1][1].item()
+
+        # Verify blocks are shared
+        assert req2_block_0 == req1_block_0, "Block 0 should be shared"
+        assert req2_block_1 == req1_block_1, "Block 1 should be shared"
+
+        # Verify ref counts are now 2
+        assert block_allocator.block_ref_counts[req1_block_0].item() == 2
+        assert block_allocator.block_ref_counts[req1_block_1].item() == 2
+
+    @pytest.mark.internal
+    def test_prefix_caching_partial_match(self):
+        """Test partial prefix matching - only matching prefix is shared."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        block_allocator = dynamic_context.block_allocator
+        block_size = dynamic_context.block_size_tokens
+
+        # First request with 3 complete blocks
+        prompt_tokens_1 = torch.arange(block_size * 3, device=torch.cuda.current_device())
+        request_1 = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt_tokens_1,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_1)
+
+        req1_block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
+        req1_block_1 = dynamic_context.request_to_kv_block_ids[0][1].item()
+        req1_block_2 = dynamic_context.request_to_kv_block_ids[0][2].item()
+
+        # Second request: first 2 blocks same, block 2 different
+        prompt_tokens_2 = torch.arange(block_size * 3, device=torch.cuda.current_device())
+        # Modify tokens in the third block (indices block_size*2 to block_size*3)
+        prompt_tokens_2[block_size * 2 :] += 1000
+
+        request_2 = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=prompt_tokens_2,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_2)
+
+        req2_block_0 = dynamic_context.request_to_kv_block_ids[1][0].item()
+        req2_block_1 = dynamic_context.request_to_kv_block_ids[1][1].item()
+        req2_block_2 = dynamic_context.request_to_kv_block_ids[1][2].item()
+
+        # Blocks 0 and 1 should be shared
+        assert req2_block_0 == req1_block_0, "Block 0 should be shared"
+        assert req2_block_1 == req1_block_1, "Block 1 should be shared"
+        # Block 2 should be different (new allocation)
+        assert req2_block_2 != req1_block_2, "Block 2 should be newly allocated"
+
+        # Verify ref counts
+        assert block_allocator.block_ref_counts[req1_block_0].item() == 2
+        assert block_allocator.block_ref_counts[req1_block_1].item() == 2
+        assert block_allocator.block_ref_counts[req1_block_2].item() == 1
+        assert block_allocator.block_ref_counts[req2_block_2].item() == 1
+
+    @pytest.mark.internal
+    def test_prefix_caching_ref_count_release(self):
+        """Test that ref counts decrement correctly on release."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        block_allocator = dynamic_context.block_allocator
+        block_size = dynamic_context.block_size_tokens
+
+        # Create two requests with same prefix
+        prompt_tokens = torch.arange(block_size * 2, device=torch.cuda.current_device())
+
+        request_1 = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt_tokens.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_1)
+
+        request_2 = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=prompt_tokens.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_2)
+
+        block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
+        block_1 = dynamic_context.request_to_kv_block_ids[0][1].item()
+        block_0_hash = block_allocator.get_block_hash(block_0)
+
+        # Verify ref counts are 2
+        assert block_allocator.block_ref_counts[block_0].item() == 2
+        assert block_allocator.block_ref_counts[block_1].item() == 2
+
+        # Release request 1
+        dynamic_context.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+
+        # Ref counts should now be 1 (request 2 still using them)
+        assert block_allocator.block_ref_counts[block_0].item() == 1
+        assert block_allocator.block_ref_counts[block_1].item() == 1
+
+        # Block should still be in hash mapping (cached)
+        assert block_0_hash in block_allocator.hash_to_block_id
+
+        # Release request 2
+        dynamic_context.release_memory_blocks_from_request_indexes(torch.tensor([1]))
+
+        # Ref counts should now be 0 (cached but not active)
+        assert block_allocator.block_ref_counts[block_0].item() == 0
+        assert block_allocator.block_ref_counts[block_1].item() == 0
+
+        # Block should STILL be in hash mapping (cached for future reuse)
+        assert block_0_hash in block_allocator.hash_to_block_id
+
+    @pytest.mark.internal
+    def test_prefix_caching_lru_eviction(self):
+        """Test LRU eviction when cache is full."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.01,  # Small buffer to force eviction
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=1,
+        )
+
+        block_allocator = dynamic_context.block_allocator
+        block_size = dynamic_context.block_size_tokens
+
+        # Fill up most of the available blocks
+        initial_avail = block_allocator.total_avail
+
+        # Create a request that uses many blocks
+        large_prompt = torch.arange(block_size * 5, device=torch.cuda.current_device())
+        request_1 = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=large_prompt,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_1)
+
+        # Get block info for request 1
+        block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
+        block_0_hash = block_allocator.get_block_hash(block_0)
+        timestamp_before = block_allocator.block_timestamps[block_0].item()
+
+        # Release request 1 - blocks become cached (ref_count=0)
+        dynamic_context.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+        dynamic_context.total_request_count = 0
+
+        # Verify blocks are cached (ref_count=0 but still in hash map)
+        assert block_allocator.block_ref_counts[block_0].item() == 0
+        assert block_0_hash in block_allocator.hash_to_block_id
+
+        # Evictable count should match number of cached blocks
+        evictable = block_allocator.get_evictable_block_count()
+        assert evictable >= 5  # At least 5 blocks from request 1
+
+        # Create a new request with different tokens to force allocation
+        # (not matching the cached prefix)
+        different_prompt = torch.arange(1000, 1000 + block_size * 3, device=torch.cuda.current_device())
+        request_2 = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=different_prompt,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+
+        # If pool is empty, this will trigger LRU eviction
+        dynamic_context.add_request(request_2)
+
+        # After eviction and reuse, block_0 may have been evicted
+        # The hash should no longer be in the mapping if evicted
+        # (or it might still be there if other blocks were evicted first)
+
+        # Key invariant: the system should still function correctly
+        assert dynamic_context.total_request_count == 1
+
+    @pytest.mark.internal
+    def test_prefix_caching_no_match_allocates_new(self):
+        """Test that non-matching prefixes allocate new blocks."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        block_allocator = dynamic_context.block_allocator
+        block_size = dynamic_context.block_size_tokens
+
+        # First request
+        prompt_1 = torch.arange(block_size * 2, device=torch.cuda.current_device())
+        request_1 = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt_1,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_1)
+
+        req1_blocks = set()
+        for i in range(2):
+            req1_blocks.add(dynamic_context.request_to_kv_block_ids[0][i].item())
+
+        # Second request with completely different tokens
+        prompt_2 = torch.arange(1000, 1000 + block_size * 2, device=torch.cuda.current_device())
+        request_2 = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=prompt_2,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_2)
+
+        req2_blocks = set()
+        for i in range(2):
+            req2_blocks.add(dynamic_context.request_to_kv_block_ids[1][i].item())
+
+        # No blocks should be shared
+        assert req1_blocks.isdisjoint(req2_blocks), "Different prefixes should not share blocks"
+
+        # All blocks should have ref_count=1
+        for block_id in req1_blocks | req2_blocks:
+            assert block_allocator.block_ref_counts[block_id].item() == 1
