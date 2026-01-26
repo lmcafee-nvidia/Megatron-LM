@@ -1959,3 +1959,599 @@ class TestDynamicContext:
         print(f"  Enabled:  {len(blocks_enabled)} blocks, {time_enabled*1000:.3f}ms")
         print(f"  Disabled: {len(blocks_disabled)} blocks, {time_disabled*1000:.3f}ms")
         print(f"  Memory ratio: {memory_ratio:.2f} (lower is better)")
+
+    @pytest.mark.internal
+    def test_prefix_caching_reuse_after_release(self):
+        """Test that cached blocks with ref_count=0 are reused by new requests."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        block_allocator = dynamic_context.block_allocator
+        block_size = dynamic_context.block_size_tokens
+
+        # Add first request
+        prompt = torch.arange(block_size * 2, device=torch.cuda.current_device())
+        request_1 = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_1)
+
+        # Get block IDs and verify ref_count=1
+        block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
+        block_1 = dynamic_context.request_to_kv_block_ids[0][1].item()
+        assert block_allocator.block_ref_counts[block_0].item() == 1
+        assert block_allocator.block_ref_counts[block_1].item() == 1
+
+        # Release request 1 - blocks become cached (ref_count=0)
+        dynamic_context.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+        dynamic_context.total_request_count = 0
+
+        # Verify blocks are cached (ref_count=0 but still in hash map)
+        assert block_allocator.block_ref_counts[block_0].item() == 0
+        assert block_allocator.block_ref_counts[block_1].item() == 0
+        block_0_hash = block_allocator.get_block_hash(block_0)
+        assert block_0_hash in block_allocator.hash_to_block_id
+
+        # Add second request with same prefix - should REUSE cached blocks
+        request_2 = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_2)
+
+        # Verify same blocks are reused
+        new_block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
+        new_block_1 = dynamic_context.request_to_kv_block_ids[0][1].item()
+        assert new_block_0 == block_0, "Block 0 should be reused from cache"
+        assert new_block_1 == block_1, "Block 1 should be reused from cache"
+
+        # Verify ref_count went from 0 to 1
+        assert block_allocator.block_ref_counts[block_0].item() == 1
+        assert block_allocator.block_ref_counts[block_1].item() == 1
+
+    @pytest.mark.internal
+    def test_prefix_caching_many_requests_same_prefix(self):
+        """Test that 10 requests with identical prefix all share the same blocks."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=1024,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        block_allocator = dynamic_context.block_allocator
+        block_size = dynamic_context.block_size_tokens
+        num_requests = 10
+        num_blocks = 3
+
+        # Create identical prompt
+        prompt = torch.arange(block_size * num_blocks, device=torch.cuda.current_device())
+
+        # Add 10 requests
+        for i in range(num_requests):
+            request = DynamicInferenceRequest(
+                request_id=i + 1,
+                prompt_tokens=prompt.clone(),
+                sampling_params=SamplingParams(num_tokens_to_generate=10),
+            )
+            dynamic_context.add_request(request)
+
+        # Verify all requests share the same blocks
+        first_request_blocks = [
+            dynamic_context.request_to_kv_block_ids[0][j].item() for j in range(num_blocks)
+        ]
+
+        for req_idx in range(1, num_requests):
+            for block_idx in range(num_blocks):
+                block_id = dynamic_context.request_to_kv_block_ids[req_idx][block_idx].item()
+                assert block_id == first_request_blocks[block_idx], (
+                    f"Request {req_idx} block {block_idx} should match request 0"
+                )
+
+        # Verify ref_counts are 10
+        for block_id in first_request_blocks:
+            assert block_allocator.block_ref_counts[block_id].item() == num_requests, (
+                f"Block {block_id} should have ref_count={num_requests}"
+            )
+
+    @pytest.mark.internal
+    def test_prefix_caching_hash_chain_correctness(self):
+        """Test that block hashes depend on parent hash (hash chaining)."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        block_allocator = dynamic_context.block_allocator
+        block_size = dynamic_context.block_size_tokens
+
+        # Add request with 3 blocks
+        prompt = torch.arange(block_size * 3, device=torch.cuda.current_device())
+        request = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request)
+
+        # Get block hashes
+        block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
+        block_1 = dynamic_context.request_to_kv_block_ids[0][1].item()
+        block_2 = dynamic_context.request_to_kv_block_ids[0][2].item()
+
+        hash_0 = block_allocator.get_block_hash(block_0)
+        hash_1 = block_allocator.get_block_hash(block_1)
+        hash_2 = block_allocator.get_block_hash(block_2)
+
+        # All hashes should be different (due to chaining)
+        assert hash_0 != hash_1, "Block 0 and 1 should have different hashes"
+        assert hash_1 != hash_2, "Block 1 and 2 should have different hashes"
+        assert hash_0 != hash_2, "Block 0 and 2 should have different hashes"
+
+        # Verify hash chaining: same tokens with different parent = different hash
+        # Block 0's tokens with parent_hash=0
+        block_0_tokens = block_allocator.block_to_token_ids[block_0]
+        computed_hash_0 = block_allocator.compute_block_hash(0, block_0_tokens)
+        assert computed_hash_0 == hash_0, "Block 0 hash should match with parent=0"
+
+        # Same tokens with different parent should give different hash
+        hash_with_different_parent = block_allocator.compute_block_hash(12345, block_0_tokens)
+        assert hash_with_different_parent != hash_0, (
+            "Same tokens with different parent should produce different hash"
+        )
+
+    @pytest.mark.internal
+    def test_prefix_caching_available_blocks_preserved(self):
+        """Test that total_avail decreases less when sharing occurs."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        block_allocator = dynamic_context.block_allocator
+        block_size = dynamic_context.block_size_tokens
+        num_blocks = 2
+
+        # Record initial available blocks
+        initial_avail = block_allocator.total_avail
+
+        # Add first request
+        prompt = torch.arange(block_size * num_blocks, device=torch.cuda.current_device())
+        request_1 = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_1)
+
+        avail_after_first = block_allocator.total_avail
+        blocks_used_first = initial_avail - avail_after_first
+
+        # Add second request with identical prompt
+        request_2 = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_2)
+
+        avail_after_second = block_allocator.total_avail
+        blocks_used_second = avail_after_first - avail_after_second
+
+        # First request should use num_blocks
+        assert blocks_used_first == num_blocks, (
+            f"First request should use {num_blocks} blocks, used {blocks_used_first}"
+        )
+
+        # Second request should use 0 blocks (all shared)
+        assert blocks_used_second == 0, (
+            f"Second request should use 0 additional blocks (sharing), used {blocks_used_second}"
+        )
+
+    @pytest.mark.internal
+    def test_prefix_caching_memory_scaling_constant(self):
+        """Test that block count is O(1) for N identical requests, not O(N)."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=1024,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        block_allocator = dynamic_context.block_allocator
+        block_size = dynamic_context.block_size_tokens
+        num_blocks = 4
+        num_requests = 5
+
+        # Record initial available blocks
+        initial_avail = block_allocator.total_avail
+
+        # Add N identical requests
+        prompt = torch.arange(block_size * num_blocks, device=torch.cuda.current_device())
+        for i in range(num_requests):
+            request = DynamicInferenceRequest(
+                request_id=i + 1,
+                prompt_tokens=prompt.clone(),
+                sampling_params=SamplingParams(num_tokens_to_generate=10),
+            )
+            dynamic_context.add_request(request)
+
+        # Calculate total blocks used
+        final_avail = block_allocator.total_avail
+        total_blocks_used = initial_avail - final_avail
+
+        # Should be O(1) = num_blocks, not O(N) = num_requests * num_blocks
+        assert total_blocks_used == num_blocks, (
+            f"Should use {num_blocks} blocks (O(1)), not {num_requests * num_blocks} (O(N)). "
+            f"Actually used {total_blocks_used}"
+        )
+
+    @pytest.mark.internal
+    def test_prefix_caching_matched_blocks_tokens_preserved(self):
+        """Test that tokens in matched blocks are NOT overwritten."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        block_allocator = dynamic_context.block_allocator
+        block_size = dynamic_context.block_size_tokens
+
+        # Add first request with specific tokens
+        prompt = torch.arange(block_size * 2, device=torch.cuda.current_device())
+        request_1 = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_1)
+
+        # Record token IDs stored in blocks
+        block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
+        block_1 = dynamic_context.request_to_kv_block_ids[0][1].item()
+        original_tokens_0 = block_allocator.block_to_token_ids[block_0].clone()
+        original_tokens_1 = block_allocator.block_to_token_ids[block_1].clone()
+
+        # Add second request with same prefix
+        request_2 = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_2)
+
+        # Verify tokens are preserved (not overwritten)
+        current_tokens_0 = block_allocator.block_to_token_ids[block_0]
+        current_tokens_1 = block_allocator.block_to_token_ids[block_1]
+
+        assert torch.equal(original_tokens_0, current_tokens_0), (
+            "Block 0 tokens should not be overwritten"
+        )
+        assert torch.equal(original_tokens_1, current_tokens_1), (
+            "Block 1 tokens should not be overwritten"
+        )
+
+    @pytest.mark.internal
+    def test_prefix_caching_only_new_blocks_hashed(self):
+        """Test that matched blocks keep same hash, only new blocks get new hashes."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        block_allocator = dynamic_context.block_allocator
+        block_size = dynamic_context.block_size_tokens
+
+        # Add first request with 2 blocks
+        prompt_1 = torch.arange(block_size * 2, device=torch.cuda.current_device())
+        request_1 = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt_1,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_1)
+
+        # Record original hashes
+        block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
+        block_1 = dynamic_context.request_to_kv_block_ids[0][1].item()
+        original_hash_0 = block_allocator.get_block_hash(block_0)
+        original_hash_1 = block_allocator.get_block_hash(block_1)
+
+        # Add second request: same first block, different second block, new third block
+        prompt_2 = torch.cat([
+            prompt_1[:block_size],  # Same first block
+            torch.arange(1000, 1000 + block_size * 2, device=torch.cuda.current_device()),  # Different
+        ])
+        request_2 = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=prompt_2,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_2)
+
+        # Verify matched block (block 0) has SAME hash
+        req2_block_0 = dynamic_context.request_to_kv_block_ids[1][0].item()
+        assert req2_block_0 == block_0, "First block should be shared"
+        current_hash_0 = block_allocator.get_block_hash(block_0)
+        assert current_hash_0 == original_hash_0, (
+            "Matched block hash should not change"
+        )
+
+        # Verify new blocks have different hashes
+        req2_block_1 = dynamic_context.request_to_kv_block_ids[1][1].item()
+        req2_block_2 = dynamic_context.request_to_kv_block_ids[1][2].item()
+        assert req2_block_1 != block_1, "Second block should be newly allocated"
+        new_hash_1 = block_allocator.get_block_hash(req2_block_1)
+        new_hash_2 = block_allocator.get_block_hash(req2_block_2)
+        assert new_hash_1 != original_hash_1, "New block 1 should have different hash"
+        assert new_hash_1 != -1, "New block 1 should have hash computed"
+        assert new_hash_2 != -1, "New block 2 should have hash computed"
+
+    @pytest.mark.internal
+    def test_prefix_caching_single_block_prefix(self):
+        """Test that sharing works with just 1 complete block."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        block_allocator = dynamic_context.block_allocator
+        block_size = dynamic_context.block_size_tokens
+
+        # Add request with exactly 1 complete block
+        prompt = torch.arange(block_size, device=torch.cuda.current_device())
+        request_1 = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_1)
+
+        block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
+        assert block_allocator.block_ref_counts[block_0].item() == 1
+
+        # Add second request with same single block
+        request_2 = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_2)
+
+        # Verify block is shared
+        req2_block_0 = dynamic_context.request_to_kv_block_ids[1][0].item()
+        assert req2_block_0 == block_0, "Single block should be shared"
+        assert block_allocator.block_ref_counts[block_0].item() == 2
+
+    @pytest.mark.internal
+    def test_prefix_caching_incomplete_block_not_shared(self):
+        """Test that incomplete (partial) blocks are NOT shared."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        block_allocator = dynamic_context.block_allocator
+        block_size = dynamic_context.block_size_tokens
+
+        # Add request with 1.5 blocks (1 complete + 1 partial)
+        prompt_length = int(block_size * 1.5)
+        prompt = torch.arange(prompt_length, device=torch.cuda.current_device())
+
+        request_1 = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_1)
+
+        req1_block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
+        req1_block_1 = dynamic_context.request_to_kv_block_ids[0][1].item()
+
+        # Complete block should have hash, partial should not
+        assert block_allocator.block_hashes[req1_block_0].item() != -1, (
+            "Complete block should have hash"
+        )
+        assert block_allocator.block_hashes[req1_block_1].item() == -1, (
+            "Partial block should NOT have hash"
+        )
+
+        # Add second request with same 1.5 blocks
+        request_2 = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_2)
+
+        req2_block_0 = dynamic_context.request_to_kv_block_ids[1][0].item()
+        req2_block_1 = dynamic_context.request_to_kv_block_ids[1][1].item()
+
+        # Complete block SHOULD be shared
+        assert req2_block_0 == req1_block_0, "Complete block should be shared"
+
+        # Partial block should NOT be shared (different allocation)
+        assert req2_block_1 != req1_block_1, (
+            "Partial block should NOT be shared (no hash for matching)"
+        )
+
+    @pytest.mark.internal
+    def test_block_hash_computed_when_filled_during_decode(self):
+        """Test that hash is computed when a block is filled during decode."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        block_allocator = dynamic_context.block_allocator
+        block_size = dynamic_context.block_size_tokens
+
+        # Add request with 1 complete block + (block_size - 1) tokens in second block
+        # This leaves exactly 1 token slot to fill the second block
+        prompt_length = block_size + (block_size - 1)  # 63 tokens for block_size=32
+        prompt = torch.arange(prompt_length, device=torch.cuda.current_device())
+
+        request = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt,
+            sampling_params=SamplingParams(num_tokens_to_generate=50),
+        )
+        dynamic_context.add_request(request)
+
+        # Verify: block 0 has hash, block 1 is partial (no hash)
+        block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
+        block_1 = dynamic_context.request_to_kv_block_ids[0][1].item()
+
+        assert block_allocator.block_hashes[block_0].item() != -1, "Block 0 should have hash"
+        assert block_allocator.block_hashes[block_1].item() == -1, (
+            "Block 1 should NOT have hash (partial)"
+        )
+
+        # Run one decode step - this should fill block 1
+        active_mask = torch.ones(1, device=torch.cuda.current_device(), dtype=torch.int32)
+        new_tokens = torch.tensor([100], device=torch.cuda.current_device())
+        dynamic_context.update_requests(active_mask, new_tokens)
+
+        # Now block 1 should have hash computed
+        assert block_allocator.block_hashes[block_1].item() != -1, (
+            "Block 1 should have hash after being filled during decode"
+        )
+
+    @pytest.mark.internal
+    def test_block_hash_not_computed_for_partial_during_decode(self):
+        """Test that hash is NOT computed for partial blocks during decode."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        block_allocator = dynamic_context.block_allocator
+        block_size = dynamic_context.block_size_tokens
+
+        # Add request with 1 complete block + 10 tokens in second block
+        # After 5 decode steps, block 1 will have 15 tokens (still partial for block_size=32)
+        prompt_length = block_size + 10
+        prompt = torch.arange(prompt_length, device=torch.cuda.current_device())
+
+        request = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt,
+            sampling_params=SamplingParams(num_tokens_to_generate=50),
+        )
+        dynamic_context.add_request(request)
+
+        block_1 = dynamic_context.request_to_kv_block_ids[0][1].item()
+        assert block_allocator.block_hashes[block_1].item() == -1, (
+            "Block 1 should NOT have hash initially"
+        )
+
+        # Run 5 decode steps (10 + 5 = 15 tokens in block 1, still partial)
+        for _ in range(5):
+            active_mask = torch.ones(1, device=torch.cuda.current_device(), dtype=torch.int32)
+            new_tokens = torch.tensor([100], device=torch.cuda.current_device())
+            dynamic_context.update_requests(active_mask, new_tokens)
+
+        # Block 1 should STILL not have hash (15 < 32 tokens)
+        assert block_allocator.block_hashes[block_1].item() == -1, (
+            "Block 1 should STILL not have hash (only 15 tokens, need 32)"
+        )
