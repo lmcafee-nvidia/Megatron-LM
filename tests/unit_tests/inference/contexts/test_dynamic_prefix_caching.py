@@ -26,8 +26,8 @@ def set_rounder(value):
     DynamicInferenceContext.REQUEST_ROUNDER = value
 
 
-class TestDynamicPrefixCaching:
-    """Tests for prefix caching functionality in DynamicInferenceContext."""
+class TestDynamicPrefixCachingBase:
+    """Base class with shared setup for prefix caching tests."""
 
     def _setup_model_parallel_group(self, tensor_parallel_size, pipeline_parallel_size):
 
@@ -91,9 +91,9 @@ class TestDynamicPrefixCaching:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    # =========================================================================
-    # Block Hash Tests
-    # =========================================================================
+
+class TestBlockHash(TestDynamicPrefixCachingBase):
+    """Tests for block hash computation."""
 
     @pytest.mark.internal
     def test_block_hash_computation(self):
@@ -364,9 +364,9 @@ class TestDynamicPrefixCaching:
             "Block 1 should STILL not have hash - hashes only computed during prefill"
         )
 
-    # =========================================================================
-    # Prefix Caching Core Tests
-    # =========================================================================
+
+class TestPrefixCachingCore(TestDynamicPrefixCachingBase):
+    """Tests for core prefix caching functionality."""
 
     @pytest.mark.internal
     def test_prefix_caching_basic_sharing(self):
@@ -1391,9 +1391,9 @@ class TestDynamicPrefixCaching:
             "Partial block should NOT be shared (no hash for matching)"
         )
 
-    # =========================================================================
-    # Prefix Tree (Radix Tree) Unit Tests
-    # =========================================================================
+
+class TestPrefixTree(TestDynamicPrefixCachingBase):
+    """Tests for PrefixTree radix tree structure."""
 
     @pytest.mark.internal
     def test_tree_empty_operations(self):
@@ -1791,9 +1791,9 @@ class TestDynamicPrefixCaching:
         # Only 2 blocks should be registered (not 2 * num_requests)
         assert len(tree.hash_to_block_id) == 2
 
-    # =========================================================================
-    # Hybrid Model Prefix Caching Tests
-    # =========================================================================
+
+class TestHybridModelPrefixCaching(TestDynamicPrefixCachingBase):
+    """Tests for hybrid (mamba) model prefix caching."""
 
     @pytest.mark.internal
     def test_hybrid_prefix_caching_schedule_created(self):
@@ -2081,9 +2081,9 @@ class TestDynamicPrefixCaching:
         assert torch.allclose(conv_states, test_conv_state)
         assert torch.allclose(ssm_states, test_ssm_state)
 
-    # =========================================================================
-    # Mamba Memory Limit Tests
-    # =========================================================================
+
+class TestMambaMemoryLimit(TestDynamicPrefixCachingBase):
+    """Tests for mamba state memory limit."""
 
     @pytest.mark.internal
     def test_mamba_memory_limit_basic_tracking(self):
