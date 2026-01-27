@@ -1779,13 +1779,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                 block_tokens = req.prompt_tokens[start:end]
                 block_hash = self.prefix_tree.compute_block_hash(parent_hash, block_tokens)
 
-                # Create metadata with ref_count=1 (this request is using it)
-                self.prefix_tree.global_timestamp += 1
+                # Create metadata (ref_count and timestamp are now on PrefixNode, set by insert_blocks)
                 metadata = BlockMetadata(
                     block_id=block_id,
                     hash=block_hash,
-                    ref_count=1,
-                    timestamp=self.prefix_tree.global_timestamp,
                 )
                 new_block_metadatas.append(metadata)
                 parent_hash = block_hash

@@ -2020,9 +2020,8 @@ class TestHybridModelPrefixCaching(TestDynamicPrefixCachingBase):
             assert node.mamba_conv_states is not None
 
             # Simulate eviction by calling _remove_node
-            # First, set ref_count to 0 to make it evictable
-            for block in node.blocks:
-                block.ref_count = 0
+            # First, set ref_count to 0 to make it evictable (ref_count is on node, not blocks)
+            node.ref_count = 0
 
             tree._remove_node(node)
 
@@ -2317,8 +2316,7 @@ class TestMambaMemoryLimit(TestDynamicPrefixCachingBase):
         )
         if first_block_hash in tree.root.children:
             node = tree.root.children[first_block_hash]
-            for block in node.blocks:
-                block.ref_count = 0
+            node.ref_count = 0  # ref_count is on node, not blocks
             tree._remove_node(node)
 
             # Memory should be decremented

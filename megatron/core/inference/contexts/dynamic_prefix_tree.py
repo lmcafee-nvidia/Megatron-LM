@@ -13,8 +13,6 @@ class BlockMetadata:
 
     block_id: int
     hash: int
-    ref_count: int = 0
-    timestamp: int = 0
 
 
 class PrefixNode:
@@ -35,6 +33,8 @@ class PrefixNode:
         blocks: Optional[List[BlockMetadata]] = None,
         mamba_conv_states: Optional[Tensor] = None,
         mamba_ssm_states: Optional[Tensor] = None,
+        ref_count: int = 0,
+        timestamp: int = 0,
     ):
         self.parent = parent
         self.children = children if children is not None else {}
@@ -43,6 +43,9 @@ class PrefixNode:
         # Shape: [num_mamba_layers, *state_shape]
         self.mamba_conv_states = mamba_conv_states
         self.mamba_ssm_states = mamba_ssm_states
+        # Reference count and LRU timestamp (formerly on BlockMetadata)
+        self.ref_count = ref_count
+        self.timestamp = timestamp
 
     def is_leaf(self) -> bool:
         """Check if this node is a leaf (no children)."""
@@ -77,6 +80,7 @@ class PrefixTree:
         self.root = PrefixNode()
         self.hash_to_block_id: Dict[int, int] = {}
         self.block_id_to_metadata: Dict[int, BlockMetadata] = {}
+        self.block_id_to_node: Dict[int, PrefixNode] = {}
         self.global_timestamp: int = 0
         # Mamba state memory tracking
         self.mamba_state_bytes_per_node = mamba_state_bytes_per_node
@@ -87,6 +91,7 @@ class PrefixTree:
         self.root = PrefixNode()
         self.hash_to_block_id.clear()
         self.block_id_to_metadata.clear()
+        self.block_id_to_node.clear()
         self.global_timestamp = 0
         self.mamba_state_memory_bytes = 0
 
@@ -254,7 +259,7 @@ class PrefixTree:
         if not block_metadatas:
             return
 
-        # Register all blocks in lookup dicts
+        # Register all blocks in lookup dicts (block_id_to_node set after node assignment)
         for block in block_metadatas:
             self.hash_to_block_id[block.hash] = block.block_id
             self.block_id_to_metadata[block.block_id] = block
@@ -275,20 +280,32 @@ class PrefixTree:
                 # But handle gracefully by appending to existing child
                 existing_child = insertion_node.children[first_block_hash]
                 existing_child.blocks.extend(block_metadatas)
+                # Update block_id_to_node for appended blocks
+                for block in block_metadatas:
+                    self.block_id_to_node[block.block_id] = existing_child
             else:
-                # Create new child node
+                # Create new child node with ref_count=1 (this request references it)
+                self.global_timestamp += 1
                 new_node = PrefixNode(
                     parent=insertion_node,
                     children={},
                     blocks=block_metadatas,
+                    ref_count=1,
+                    timestamp=self.global_timestamp,
                 )
                 insertion_node.children[first_block_hash] = new_node
+                # Update block_id_to_node for new blocks
+                for block in block_metadatas:
+                    self.block_id_to_node[block.block_id] = new_node
 
     def _split_node(self, node: PrefixNode, split_idx: int) -> None:
         """Split node at split_idx.
 
         The node is truncated to blocks[:split_idx], and a new child is created
         with blocks[split_idx:] plus the original children.
+
+        The new child inherits the parent's ref_count and timestamp because any
+        requests still using the original node are also using the split-off blocks.
 
         Args:
             node: Node to split.
@@ -301,69 +318,88 @@ class PrefixTree:
         continuation_hash = node.blocks[split_idx].hash
 
         # Create child node with remaining blocks and original children
+        # Inherit ref_count and timestamp - original requests still use these blocks
         new_child = PrefixNode(
             parent=node,
             children=node.children,
             blocks=node.blocks[split_idx:],
+            ref_count=node.ref_count,
+            timestamp=node.timestamp,
         )
 
         # Update parent references in moved children
         for child in new_child.children.values():
             child.parent = new_child
 
+        # Update block_id_to_node for blocks moved to the new child
+        for block in new_child.blocks:
+            self.block_id_to_node[block.block_id] = new_child
+
         # Truncate original node and set new child
         node.blocks = node.blocks[:split_idx]
         node.children = {continuation_hash: new_child}
 
     def increment_ref_counts(self, block_ids: List[int]) -> None:
-        """Increment reference count for specified blocks.
+        """Increment reference count for nodes containing specified blocks.
 
         Args:
             block_ids: List of block IDs to increment.
         """
+        # Collect unique nodes to avoid incrementing the same node multiple times
+        nodes = set()
         for block_id in block_ids:
-            if block_id in self.block_id_to_metadata:
-                self.block_id_to_metadata[block_id].ref_count += 1
+            if block_id in self.block_id_to_node:
+                nodes.add(self.block_id_to_node[block_id])
+        for node in nodes:
+            node.ref_count += 1
 
     def decrement_ref_counts(self, block_ids: List[int]) -> None:
-        """Decrement reference count for specified blocks.
+        """Decrement reference count for nodes containing specified blocks.
 
         Args:
             block_ids: List of block IDs to decrement.
         """
+        # Collect unique nodes to avoid decrementing the same node multiple times
+        nodes = set()
         for block_id in block_ids:
-            if block_id in self.block_id_to_metadata:
-                self.block_id_to_metadata[block_id].ref_count -= 1
+            if block_id in self.block_id_to_node:
+                nodes.add(self.block_id_to_node[block_id])
+        for node in nodes:
+            node.ref_count -= 1
 
     def update_timestamps(self, block_ids: List[int]) -> None:
-        """Update timestamps for specified blocks (LRU tracking).
+        """Update timestamps for nodes containing specified blocks (LRU tracking).
 
         Args:
             block_ids: List of block IDs to update.
         """
         self.global_timestamp += 1
+        # Collect unique nodes to avoid updating the same node multiple times
+        nodes = set()
         for block_id in block_ids:
-            if block_id in self.block_id_to_metadata:
-                self.block_id_to_metadata[block_id].timestamp = self.global_timestamp
+            if block_id in self.block_id_to_node:
+                nodes.add(self.block_id_to_node[block_id])
+        for node in nodes:
+            node.timestamp = self.global_timestamp
 
     def get_evictable_block_count(self) -> int:
         """Count blocks in evictable leaf nodes.
 
-        A leaf node is evictable if all its blocks have ref_count == 0.
+        A leaf node is evictable if it has ref_count == 0.
 
         Returns:
             Total number of blocks in evictable leaf nodes.
         """
         count = 0
         for node in self._find_leaf_nodes():
-            if node.blocks and all(b.ref_count == 0 for b in node.blocks):
+            if node.blocks and node.ref_count == 0:
                 count += len(node.blocks)
         return count
 
     def evict_leaf_nodes(self, num_blocks_needed: int) -> List[int]:
         """Evict oldest leaf nodes until enough blocks are freed.
 
-        Only evicts complete leaf nodes (all blocks in node must have ref_count == 0).
+        Only evicts complete leaf nodes (node must have ref_count == 0).
         Evicts in LRU order (oldest timestamp first).
 
         Args:
@@ -378,22 +414,21 @@ class PrefixTree:
             # Find all leaf nodes (excluding root)
             leaf_nodes = self._find_leaf_nodes()
 
-            # Filter to evictable (all blocks have ref_count == 0)
-            evictable = [
-                n for n in leaf_nodes if n.blocks and all(b.ref_count == 0 for b in n.blocks)
-            ]
+            # Filter to evictable (node ref_count == 0)
+            evictable = [n for n in leaf_nodes if n.blocks and n.ref_count == 0]
 
             if not evictable:
                 break  # No more evictable nodes
 
-            # Sort by oldest timestamp (min timestamp of any block in node)
-            evictable.sort(key=lambda n: min(b.timestamp for b in n.blocks))
+            # Sort by oldest timestamp (node-level timestamp)
+            evictable.sort(key=lambda n: n.timestamp)
 
             # Evict oldest
             node = evictable[0]
             for block in node.blocks:
                 del self.hash_to_block_id[block.hash]
                 del self.block_id_to_metadata[block.block_id]
+                del self.block_id_to_node[block.block_id]
                 evicted.append(block.block_id)
 
             self._remove_node(node)
@@ -416,24 +451,23 @@ class PrefixTree:
         target_memory = memory_limit_bytes - bytes_needed
 
         while self.mamba_state_memory_bytes > target_memory:
-            # Find leaf nodes with mamba states that are evictable (all blocks ref_count=0)
+            # Find leaf nodes with mamba states that are evictable (ref_count=0)
             evictable = [
                 n for n in self._find_leaf_nodes()
-                if n.mamba_conv_states is not None
-                and n.blocks
-                and all(b.ref_count == 0 for b in n.blocks)
+                if n.mamba_conv_states is not None and n.blocks and n.ref_count == 0
             ]
             if not evictable:
                 return False
 
             # Sort by LRU (oldest timestamp first)
-            evictable.sort(key=lambda n: min(b.timestamp for b in n.blocks))
+            evictable.sort(key=lambda n: n.timestamp)
 
             # Evict oldest node entirely (removes blocks too)
             node = evictable[0]
             for block in node.blocks:
                 del self.hash_to_block_id[block.hash]
                 del self.block_id_to_metadata[block.block_id]
+                del self.block_id_to_node[block.block_id]
             self._remove_node(node)
 
         return True
@@ -500,10 +534,10 @@ class PrefixTree:
             block_id: Block ID to look up.
 
         Returns:
-            Reference count, or 0 if not found.
+            Reference count of the node containing this block, or 0 if not found.
         """
-        metadata = self.block_id_to_metadata.get(block_id)
-        return metadata.ref_count if metadata else 0
+        node = self.block_id_to_node.get(block_id)
+        return node.ref_count if node else 0
 
     def get_block_timestamp(self, block_id: int) -> int:
         """Get timestamp for a block by ID.
@@ -512,7 +546,7 @@ class PrefixTree:
             block_id: Block ID to look up.
 
         Returns:
-            Timestamp, or 0 if not found.
+            Timestamp of the node containing this block, or 0 if not found.
         """
-        metadata = self.block_id_to_metadata.get(block_id)
-        return metadata.timestamp if metadata else 0
+        node = self.block_id_to_node.get(block_id)
+        return node.timestamp if node else 0
