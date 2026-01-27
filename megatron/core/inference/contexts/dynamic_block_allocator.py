@@ -42,15 +42,6 @@ class BlockAllocator:
             (self.total_count,), -1, dtype=torch.int64, device=torch.cuda.current_device()
         )
 
-        # Store token IDs per block for hash computation
-        # Shape: [total_count, block_size_tokens]
-        self.block_to_token_ids = torch.full(
-            (self.total_count, context.block_size_tokens),
-            -1,
-            dtype=torch.int64,
-            device=torch.cuda.current_device(),
-        )
-
         # Prefix caching data structures
         # Hash-to-block mapping for O(1) prefix lookup
         self.hash_to_block_id: Dict[int, int] = {}
@@ -185,9 +176,8 @@ class BlockAllocator:
 
         self.total_avail = self.total_count - 1
 
-        # Reset all block hashes and token storage
+        # Reset all block hashes
         self.block_hashes.fill_(-1)
-        self.block_to_token_ids.fill_(-1)
 
         # Reset prefix caching state
         self.hash_to_block_id.clear()
@@ -343,7 +333,6 @@ class BlockAllocator:
 
         # Reset block state
         self.block_hashes[blocks_to_evict] = -1
-        self.block_to_token_ids[blocks_to_evict] = -1
         self.block_ref_counts[blocks_to_evict] = 0
         self.block_timestamps[blocks_to_evict] = 0
 
