@@ -22,6 +22,10 @@ class PrefixNode:
 
     Each node represents a sequence of blocks that share a common prefix path.
     The root node has no blocks and serves as the entry point for traversal.
+
+    For hybrid (Mamba) models, nodes also store mamba states at the end of the
+    last block in the node. These states enable skipping computation for cached
+    prefix tokens when a new request matches this prefix.
     """
 
     def __init__(
@@ -29,10 +33,16 @@ class PrefixNode:
         parent: Optional['PrefixNode'] = None,
         children: Optional[Dict[int, 'PrefixNode']] = None,
         blocks: Optional[List[BlockMetadata]] = None,
+        mamba_conv_states: Optional[Tensor] = None,
+        mamba_ssm_states: Optional[Tensor] = None,
     ):
         self.parent = parent
         self.children = children if children is not None else {}
         self.blocks = blocks if blocks is not None else []
+        # Mamba states at the end of the last block in this node (hybrid models only)
+        # Shape: [num_mamba_layers, *state_shape]
+        self.mamba_conv_states = mamba_conv_states
+        self.mamba_ssm_states = mamba_ssm_states
 
     def is_leaf(self) -> bool:
         """Check if this node is a leaf (no children)."""
@@ -119,7 +129,7 @@ class PrefixTree:
 
     def find_matching_prefix(
         self, prompt_tokens: Tensor, block_size: int
-    ) -> Tuple[List[int], int, PrefixNode, int]:
+    ) -> Tuple[List[int], int, PrefixNode, int, Optional[Tensor], Optional[Tensor]]:
         """Find cached blocks matching the prompt prefix.
 
         Traverses the tree following block hashes until divergence or end.
@@ -134,11 +144,15 @@ class PrefixTree:
                 - parent_hash: Hash of last matched block (for computing next hash)
                 - insertion_node: Node where new blocks should be inserted
                 - insertion_idx: Block index within node for insertion/split
+                - matched_mamba_conv_states: Mamba conv states at end of matched prefix (or None)
+                - matched_mamba_ssm_states: Mamba SSM states at end of matched prefix (or None)
         """
         matched_block_ids: List[int] = []
         parent_hash = 0
         current_node = self.root
         block_idx_in_node = 0
+        # Track the last node whose ALL blocks were matched (for mamba state retrieval)
+        last_fully_matched_node: Optional[PrefixNode] = None
 
         num_complete_blocks = len(prompt_tokens) // block_size
 
@@ -158,10 +172,16 @@ class PrefixTree:
                     matched_block_ids.append(existing_block.block_id)
                     parent_hash = block_hash
                     block_idx_in_node += 1
+                    # Check if we just finished matching all blocks in this node
+                    if block_idx_in_node == len(current_node.blocks):
+                        last_fully_matched_node = current_node
                     continue
                 else:
                     # Divergence within current node - need to split
-                    return matched_block_ids, parent_hash, current_node, block_idx_in_node
+                    # Return mamba state from last fully matched node (not current node)
+                    conv_states, ssm_states = self._get_mamba_states(last_fully_matched_node)
+                    return (matched_block_ids, parent_hash, current_node, block_idx_in_node,
+                            conv_states, ssm_states)
 
             # Finished current node's blocks, check for child with this hash
             if block_hash in current_node.children:
@@ -174,16 +194,40 @@ class PrefixTree:
                     matched_block_ids.append(current_node.blocks[0].block_id)
                     parent_hash = block_hash
                     block_idx_in_node = 1
+                    # Check if this single-block child is now fully matched
+                    if block_idx_in_node == len(current_node.blocks):
+                        last_fully_matched_node = current_node
                     continue
                 else:
                     # Child exists but hash mismatch (shouldn't happen in valid tree)
-                    return matched_block_ids, parent_hash, current_node, 0
+                    conv_states, ssm_states = self._get_mamba_states(last_fully_matched_node)
+                    return (matched_block_ids, parent_hash, current_node, 0,
+                            conv_states, ssm_states)
             else:
                 # No matching child - this is where we insert
-                return matched_block_ids, parent_hash, current_node, len(current_node.blocks)
+                conv_states, ssm_states = self._get_mamba_states(last_fully_matched_node)
+                return (matched_block_ids, parent_hash, current_node, len(current_node.blocks),
+                        conv_states, ssm_states)
 
         # All blocks matched
-        return matched_block_ids, parent_hash, current_node, block_idx_in_node
+        conv_states, ssm_states = self._get_mamba_states(last_fully_matched_node)
+        return (matched_block_ids, parent_hash, current_node, block_idx_in_node,
+                conv_states, ssm_states)
+
+    def _get_mamba_states(
+        self, node: Optional[PrefixNode]
+    ) -> Tuple[Optional[Tensor], Optional[Tensor]]:
+        """Get mamba states from a node if available.
+
+        Args:
+            node: PrefixNode to get states from (or None).
+
+        Returns:
+            Tuple of (mamba_conv_states, mamba_ssm_states), both None if not available.
+        """
+        if node is None:
+            return None, None
+        return node.mamba_conv_states, node.mamba_ssm_states
 
     def insert_blocks(
         self,
@@ -372,11 +416,17 @@ class PrefixTree:
     def _remove_node(self, node: PrefixNode) -> None:
         """Remove a leaf node from the tree.
 
+        Frees any associated mamba states when the node is removed.
+
         Args:
             node: Leaf node to remove (must have no children).
         """
         if not node.is_leaf() or node.is_root():
             return  # Can only remove leaf nodes, not root
+
+        # Free mamba states (Python GC will reclaim memory)
+        node.mamba_conv_states = None
+        node.mamba_ssm_states = None
 
         if node.parent:
             # Find and remove from parent's children

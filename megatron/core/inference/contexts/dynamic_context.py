@@ -16,7 +16,7 @@ from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
 )
-from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.inference_request import DynamicInferenceRequest, HybridPrefillSchedule
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
 )
@@ -459,6 +459,10 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Initialize prefix tree for block metadata (must be before BlockAllocator)
         self.prefix_tree = PrefixTree()
+
+        # Track pending mamba state stores: request_idx -> PrefixNode
+        # These are processed in update_requests before mamba slots are freed
+        self._pending_mamba_state_stores: dict[int, PrefixNode] = {}
 
         self.block_allocator = BlockAllocator(
             context=self,
@@ -1481,6 +1485,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             token_count=0, prefill_req_count=0, decode_req_count=0
         )
 
+        # Clear pending mamba state stores
+        self._pending_mamba_state_stores.clear()
+
     def current_input_and_position_ids(
         self, *, num_warmup_tokens: Optional[int] = None
     ) -> Tuple[Tensor, Tensor]:
@@ -1548,7 +1555,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def _find_matching_prefix_blocks(
         self, prompt_tokens: Tensor
-    ) -> tuple[list[int], int, PrefixNode, int]:
+    ) -> tuple[list[int], int, PrefixNode, int, Optional[Tensor], Optional[Tensor]]:
         """Find cached blocks matching the prompt prefix.
 
         Delegates to the prefix tree for traversal and matching.
@@ -1562,16 +1569,20 @@ class DynamicInferenceContext(BaseInferenceContext):
             - Parent hash for computing the next block's hash (0 if no matches)
             - Insertion node in tree where new blocks should be added
             - Insertion index within the node
+            - Matched mamba conv states (for hybrid models, or None)
+            - Matched mamba SSM states (for hybrid models, or None)
         """
         # Early return if prefix caching is disabled
         if not self.enable_prefix_caching:
-            return [], 0, self.prefix_tree.root, 0
+            return [], 0, self.prefix_tree.root, 0, None, None
 
-        matched_blocks, parent_hash, insertion_node, insertion_idx = (
+        (matched_blocks, parent_hash, insertion_node, insertion_idx,
+         mamba_conv_states, mamba_ssm_states) = (
             self.prefix_tree.find_matching_prefix(prompt_tokens, self.block_size_tokens)
         )
 
-        return matched_blocks, parent_hash, insertion_node, insertion_idx
+        return (matched_blocks, parent_hash, insertion_node, insertion_idx,
+                mamba_conv_states, mamba_ssm_states)
 
     def add_request(self, req: DynamicInferenceRequest, chunk_length: Optional[int] = None) -> None:
         """Add request to context. At this stage, we assume that the request is valid and can be added, as the checks are done in the schedule function.
@@ -1613,10 +1624,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         num_matched_blocks = 0
         insertion_node = self.prefix_tree.root
         insertion_idx = 0
+        matched_mamba_conv_states: Optional[Tensor] = None
+        matched_mamba_ssm_states: Optional[Tensor] = None
 
         # Only attempt prefix matching on the first chunk of a new request
         if not is_chunked_prefill:
-            matched_block_ids, prefix_parent_hash, insertion_node, insertion_idx = (
+            (matched_block_ids, prefix_parent_hash, insertion_node, insertion_idx,
+             matched_mamba_conv_states, matched_mamba_ssm_states) = (
                 self._find_matching_prefix_blocks(req.prompt_tokens)
             )
             num_matched_blocks = len(matched_block_ids)
@@ -1773,10 +1787,40 @@ class DynamicInferenceContext(BaseInferenceContext):
                 parent_hash = block_hash
 
             # Insert new blocks into tree at the found insertion point
+            store_mamba_state_node: Optional[PrefixNode] = None
             if new_block_metadatas:
                 self.prefix_tree.insert_blocks(
                     new_block_metadatas, insertion_node, insertion_idx
                 )
+                # Only store mamba state if prompt ends at block boundary (no partial tokens).
+                # Partial tokens would contaminate the mamba state with request-specific data.
+                prompt_length = len(req.prompt_tokens)
+                has_partial_tokens = (prompt_length % self.block_size_tokens) != 0
+                if self.is_hybrid_model and not has_partial_tokens:
+                    first_block_hash = new_block_metadatas[0].hash
+                    if first_block_hash in insertion_node.children:
+                        store_mamba_state_node = insertion_node.children[first_block_hash]
+
+            # Create HybridPrefillSchedule for hybrid models with prefix matches
+            if self.is_hybrid_model and num_matched_blocks > 0:
+                prompt_length = len(req.prompt_tokens)
+                divergence_token_idx = num_matched_blocks * self.block_size_tokens
+                last_complete_block_token_idx = (
+                    prompt_length // self.block_size_tokens
+                ) * self.block_size_tokens
+
+                req.hybrid_prefill_schedule = HybridPrefillSchedule(
+                    divergence_token_idx=divergence_token_idx,
+                    last_complete_block_token_idx=last_complete_block_token_idx,
+                    prompt_end_token_idx=prompt_length,
+                    matched_mamba_conv_states=matched_mamba_conv_states,
+                    matched_mamba_ssm_states=matched_mamba_ssm_states,
+                    store_mamba_state_node=store_mamba_state_node,
+                )
+
+                # Track pending mamba state store (will be executed after prefill forward pass)
+                if store_mamba_state_node is not None:
+                    self._pending_mamba_state_stores[self.total_request_count] = store_mamba_state_node
 
         if self.is_hybrid_model and not is_chunked_prefill:
             # Allocate a slot for Mamba states
@@ -1784,9 +1828,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             if mamba_idx is None:
                 raise ContextOverflowError(req.request_id, "No Mamba slots available")
 
-            # Initialize the allocated Mamba state
-            self.mamba_conv_states[:, mamba_idx] = 0.0
-            self.mamba_ssm_states[:, mamba_idx] = 0.0
+            # Initialize mamba states from prefix cache if available, otherwise zeros
+            schedule = req.hybrid_prefill_schedule
+            if (schedule is not None
+                and schedule.matched_mamba_conv_states is not None
+                and schedule.matched_mamba_ssm_states is not None):
+                # Initialize from cached states at divergence point
+                self.mamba_conv_states[:, mamba_idx] = schedule.matched_mamba_conv_states
+                self.mamba_ssm_states[:, mamba_idx] = schedule.matched_mamba_ssm_states
+            else:
+                # No cached states, initialize to zeros
+                self.mamba_conv_states[:, mamba_idx] = 0.0
+                self.mamba_ssm_states[:, mamba_idx] = 0.0
             self.mamba_metadata.request_to_mamba_state_idx[self.total_request_count] = mamba_idx
 
         self.active_token_count += chunk_length
@@ -2100,6 +2153,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         # finished_request_count are requests that have reached the termination criterion
 
         self.num_prefill_requests = 0  # all turns to decode
+
+        # Store mamba states to prefix nodes for hybrid models (before any state modifications)
+        if self._pending_mamba_state_stores:
+            for request_idx, node in self._pending_mamba_state_stores.items():
+                mamba_idx = self.mamba_metadata.request_to_mamba_state_idx[request_idx]
+                if mamba_idx >= 0:
+                    # Clone states to avoid aliasing issues when request is released
+                    node.mamba_conv_states = self.mamba_conv_states[:, mamba_idx].clone()
+                    node.mamba_ssm_states = self.mamba_ssm_states[:, mamba_idx].clone()
+            self._pending_mamba_state_stores.clear()
+
         if self.chunked_prefill_request_id != -1:
             active_requests_mask[-1] = (
                 1  # must keep this, next iteration will add a new chunk to it

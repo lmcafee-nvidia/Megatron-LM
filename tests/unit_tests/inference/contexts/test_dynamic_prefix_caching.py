@@ -1,14 +1,20 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+from typing import Optional
+
 import pytest
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.inference.contexts.attention_context.mamba_metadata import (
+    MambaInferenceStateConfig,
+)
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
 )
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from tests.unit_tests.test_utilities import Utils
 
@@ -46,8 +52,20 @@ class TestDynamicPrefixCaching:
         is_hybrid_model=False,
         rounder=64,
         enable_prefix_caching=True,
+        layer_type_list: Optional[list] = None,
     ):
         set_rounder(rounder)
+
+        # Configure mamba state for hybrid models
+        mamba_inference_state_config: Optional[MambaInferenceStateConfig] = None
+        if is_hybrid_model:
+            if layer_type_list is None:
+                layer_type_list = [Symbols.MAMBA, Symbols.MLP, Symbols.ATTENTION, Symbols.MLP]
+            mamba_conv_states_shape = (544, 4)
+            mamba_ssm_states_shape = (8, 64, 16)
+            mamba_inference_state_config = MambaInferenceStateConfig(
+                layer_type_list, mamba_conv_states_shape, mamba_ssm_states_shape
+            )
 
         dynamic_context = DynamicInferenceContext(
             params_dtype=params_dtype,
@@ -61,7 +79,7 @@ class TestDynamicPrefixCaching:
             paused_buffer_size_gb=0.2 * buffer_size_gb,
             block_size_tokens=block_size_tokens,
             max_tokens=max_tokens,
-            mamba_inference_state_config=None,
+            mamba_inference_state_config=mamba_inference_state_config,
             use_flashinfer_fused_rope=None,
             unified_memory_level=0,
             enable_prefix_caching=enable_prefix_caching,
@@ -1770,3 +1788,293 @@ class TestDynamicPrefixCaching:
 
         # Only 2 blocks should be registered (not 2 * num_requests)
         assert len(tree.hash_to_block_id) == 2
+
+    # =========================================================================
+    # Hybrid Model Prefix Caching Tests
+    # =========================================================================
+
+    @pytest.mark.internal
+    def test_hybrid_prefix_caching_schedule_created(self):
+        """Test that HybridPrefillSchedule is created for hybrid models with prefix matches."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=True,
+            rounder=64,
+        )
+
+        block_size = dynamic_context.block_size_tokens
+
+        # Add first request with 2 complete blocks (no partial tokens)
+        prompt1 = torch.arange(block_size * 2, device=torch.cuda.current_device())
+        request1 = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt1,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request1)
+
+        # First request should NOT have HybridPrefillSchedule (no prefix match)
+        assert request1.hybrid_prefill_schedule is None
+
+        # Add second request with same prefix
+        prompt2 = torch.arange(block_size * 2, device=torch.cuda.current_device())
+        request2 = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=prompt2,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request2)
+
+        # Second request SHOULD have HybridPrefillSchedule (prefix match)
+        assert request2.hybrid_prefill_schedule is not None
+        schedule = request2.hybrid_prefill_schedule
+        assert schedule.divergence_token_idx == block_size * 2  # All matched
+        assert schedule.last_complete_block_token_idx == block_size * 2
+        assert schedule.prompt_end_token_idx == block_size * 2
+
+    @pytest.mark.internal
+    def test_hybrid_prefix_caching_partial_match(self):
+        """Test HybridPrefillSchedule with partial prefix match."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=True,
+            rounder=64,
+        )
+
+        block_size = dynamic_context.block_size_tokens
+
+        # Add first request with 2 blocks
+        prompt1 = torch.arange(block_size * 2, device=torch.cuda.current_device())
+        request1 = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt1,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request1)
+
+        # Add second request: same first block, different second block
+        prompt2 = torch.cat([
+            torch.arange(block_size, device=torch.cuda.current_device()),  # Same as first block
+            torch.arange(1000, 1000 + block_size, device=torch.cuda.current_device()),  # Different
+        ])
+        request2 = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=prompt2,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request2)
+
+        # Should have schedule with partial match
+        assert request2.hybrid_prefill_schedule is not None
+        schedule = request2.hybrid_prefill_schedule
+        assert schedule.divergence_token_idx == block_size  # Only first block matched
+        assert schedule.last_complete_block_token_idx == block_size * 2
+        assert schedule.prompt_end_token_idx == block_size * 2
+
+    @pytest.mark.internal
+    def test_hybrid_prefix_caching_mamba_state_initialization(self):
+        """Test that mamba states are initialized from prefix cache when available."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=True,
+            rounder=64,
+        )
+
+        block_size = dynamic_context.block_size_tokens
+        tree = dynamic_context.prefix_tree
+
+        # Add first request with 2 complete blocks (no partial tokens)
+        prompt1 = torch.arange(block_size * 2, device=torch.cuda.current_device())
+        request1 = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt1,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request1)
+
+        # Simulate forward pass by setting mamba states
+        mamba_idx_1 = dynamic_context.mamba_metadata.request_to_mamba_state_idx[0]
+        dynamic_context.mamba_conv_states[:, mamba_idx_1] = 42.0
+        dynamic_context.mamba_ssm_states[:, mamba_idx_1] = 84.0
+
+        # Simulate update_requests (stores mamba states to prefix node)
+        active_mask = torch.ones(1, dtype=torch.uint8, device=torch.cuda.current_device())
+        new_tokens = torch.zeros(1, dtype=torch.int64, device=torch.cuda.current_device())
+        dynamic_context.update_requests(active_mask, new_tokens)
+
+        # Check that mamba states were stored in the prefix node
+        # Find the node containing our blocks
+        first_block_hash = tree.get_block_hash(
+            dynamic_context.request_to_kv_block_ids[0][0].item()
+        )
+        if first_block_hash in tree.root.children:
+            node = tree.root.children[first_block_hash]
+            assert node.mamba_conv_states is not None
+            assert node.mamba_ssm_states is not None
+            assert torch.allclose(node.mamba_conv_states, torch.full_like(node.mamba_conv_states, 42.0))
+            assert torch.allclose(node.mamba_ssm_states, torch.full_like(node.mamba_ssm_states, 84.0))
+
+    @pytest.mark.internal
+    def test_hybrid_prefix_caching_no_store_with_partial_tokens(self):
+        """Test that mamba states are NOT stored when prompt has partial tokens."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=True,
+            rounder=64,
+        )
+
+        block_size = dynamic_context.block_size_tokens
+        tree = dynamic_context.prefix_tree
+
+        # Add request with partial tokens (not aligned to block boundary)
+        prompt = torch.arange(block_size * 2 + 10, device=torch.cuda.current_device())
+        request = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request)
+
+        # No pending mamba state stores should be tracked (due to partial tokens)
+        assert len(dynamic_context._pending_mamba_state_stores) == 0
+
+    @pytest.mark.internal
+    def test_hybrid_prefix_caching_mamba_state_eviction(self):
+        """Test that mamba states are freed when prefix node is evicted."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.05,  # Small buffer to trigger eviction
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=True,
+            rounder=64,
+        )
+
+        block_size = dynamic_context.block_size_tokens
+        tree = dynamic_context.prefix_tree
+
+        # Add first request
+        prompt1 = torch.arange(block_size * 2, device=torch.cuda.current_device())
+        request1 = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt1,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request1)
+
+        # Set mamba states
+        mamba_idx = dynamic_context.mamba_metadata.request_to_mamba_state_idx[0]
+        dynamic_context.mamba_conv_states[:, mamba_idx] = 42.0
+        dynamic_context.mamba_ssm_states[:, mamba_idx] = 84.0
+
+        # Simulate update_requests
+        active_mask = torch.ones(1, dtype=torch.uint8, device=torch.cuda.current_device())
+        new_tokens = torch.zeros(1, dtype=torch.int64, device=torch.cuda.current_device())
+        dynamic_context.update_requests(active_mask, new_tokens)
+
+        # Get the node
+        first_block_hash = tree.get_block_hash(
+            dynamic_context.request_to_kv_block_ids[0][0].item()
+        )
+        if first_block_hash in tree.root.children:
+            node = tree.root.children[first_block_hash]
+            assert node.mamba_conv_states is not None
+
+            # Simulate eviction by calling _remove_node
+            # First, set ref_count to 0 to make it evictable
+            for block in node.blocks:
+                block.ref_count = 0
+
+            tree._remove_node(node)
+
+            # Node should have mamba states cleared
+            assert node.mamba_conv_states is None
+            assert node.mamba_ssm_states is None
+
+    @pytest.mark.internal
+    def test_hybrid_prefix_caching_find_matching_prefix_returns_mamba_states(self):
+        """Test that find_matching_prefix returns mamba states from matched nodes."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=True,
+            rounder=64,
+        )
+
+        block_size = dynamic_context.block_size_tokens
+        tree = dynamic_context.prefix_tree
+
+        # Add first request
+        prompt1 = torch.arange(block_size * 2, device=torch.cuda.current_device())
+        request1 = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt1,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request1)
+
+        # Set mamba states
+        mamba_idx = dynamic_context.mamba_metadata.request_to_mamba_state_idx[0]
+        test_conv_state = torch.randn_like(dynamic_context.mamba_conv_states[:, mamba_idx])
+        test_ssm_state = torch.randn_like(dynamic_context.mamba_ssm_states[:, mamba_idx])
+        dynamic_context.mamba_conv_states[:, mamba_idx] = test_conv_state
+        dynamic_context.mamba_ssm_states[:, mamba_idx] = test_ssm_state
+
+        # Simulate update_requests to store states
+        active_mask = torch.ones(1, dtype=torch.uint8, device=torch.cuda.current_device())
+        new_tokens = torch.zeros(1, dtype=torch.int64, device=torch.cuda.current_device())
+        dynamic_context.update_requests(active_mask, new_tokens)
+
+        # Now find matching prefix should return the mamba states
+        (matched_blocks, parent_hash, insertion_node, insertion_idx,
+         conv_states, ssm_states) = dynamic_context._find_matching_prefix_blocks(prompt1)
+
+        assert len(matched_blocks) == 2
+        assert conv_states is not None
+        assert ssm_states is not None
+        assert torch.allclose(conv_states, test_conv_state)
+        assert torch.allclose(ssm_states, test_ssm_state)

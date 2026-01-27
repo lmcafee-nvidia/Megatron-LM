@@ -5,9 +5,12 @@ import time
 import warnings
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
+
+if TYPE_CHECKING:
+    from megatron.core.inference.contexts.dynamic_prefix_tree import PrefixNode
 
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers import MegatronTokenizer
@@ -255,6 +258,35 @@ class DynamicInferenceEvent:
         return event
 
 
+@dataclass
+class HybridPrefillSchedule:
+    """Scheduling info for hybrid model prefix caching.
+
+    This dataclass captures information needed to manage the 3-group prefill
+    for a request when prefix caching is enabled for hybrid (Mamba) models.
+
+    The three groups are:
+    - Group 1: [0, divergence_token_idx) - Skip computation, read cached mamba state
+    - Group 2: [divergence_token_idx, last_complete_block_token_idx) - Compute, store state
+    - Group 3: [last_complete_block_token_idx, prompt_end_token_idx) - Compute as usual
+
+    Attributes:
+        divergence_token_idx: Token index where prefix match ends (end of Group 1).
+        last_complete_block_token_idx: End of last complete block (end of Group 2).
+        prompt_end_token_idx: End of prompt (end of Group 3).
+        matched_mamba_conv_states: Cached conv states from matched prefix node.
+        matched_mamba_ssm_states: Cached SSM states from matched prefix node.
+        store_mamba_state_node: PrefixNode where new mamba state should be stored.
+    """
+
+    divergence_token_idx: int
+    last_complete_block_token_idx: int
+    prompt_end_token_idx: int
+    matched_mamba_conv_states: Optional[torch.Tensor]
+    matched_mamba_ssm_states: Optional[torch.Tensor]
+    store_mamba_state_node: Optional['PrefixNode']
+
+
 @experimental_api
 @dataclass(kw_only=True)
 class DynamicInferenceRequest(InferenceRequest):
@@ -273,6 +305,8 @@ class DynamicInferenceRequest(InferenceRequest):
     latency: Optional[float] = None
     finished_chunk_token_count: int = 0
     stop_word_ids: Optional[List[List[int]]] = None  # Tokenized stop words (populated internally)
+    # Hybrid model prefix caching schedule (set during add_request for hybrid models)
+    hybrid_prefill_schedule: Optional[HybridPrefillSchedule] = None
 
     def __post_init__(self):
         self.sampling_params = copy.deepcopy(self.sampling_params)
