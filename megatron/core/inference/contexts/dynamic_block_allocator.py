@@ -103,6 +103,7 @@ class BlockAllocator:
         Return:
             (bool) Is memory available?
         """
+        # Fast path: avoid expensive evictable count computation when free pool suffices
         if self.total_avail >= num_blocks:
             return True
         # Also count evictable cached blocks
