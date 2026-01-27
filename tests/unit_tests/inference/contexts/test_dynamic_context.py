@@ -1292,8 +1292,8 @@ class TestDynamicContext:
         hash_different = block_allocator.compute_block_hash(0, different_tokens)
         assert hash_different != hash_value, "Different tokens should produce different hash"
 
-        # Test 5: Block hashes tensor initialized to -1
-        assert (block_allocator.block_hashes == -1).all(), "Block hashes should initialize to -1"
+        # Test 5: Prefix tree should start empty (no registered blocks)
+        assert len(dynamic_context.prefix_tree.hash_to_block_id) == 0, "Tree should start empty"
 
     @pytest.mark.internal
     def test_block_hash_prefill_decode_release(self):
@@ -1331,17 +1331,18 @@ class TestDynamicContext:
         block_1_id = dynamic_context.request_to_kv_block_ids[0][1].item()
         block_2_id = dynamic_context.request_to_kv_block_ids[0][2].item()
 
-        assert block_allocator.block_hashes[block_0_id].item() > 0, "Block 0 should have hash"
-        assert block_allocator.block_hashes[block_1_id].item() > 0, "Block 1 should have hash"
-        assert block_allocator.block_hashes[block_2_id].item() == -1, "Block 2 incomplete, no hash"
+        assert block_allocator.get_block_hash(block_0_id) > 0, "Block 0 should have hash"
+        assert block_allocator.get_block_hash(block_1_id) > 0, "Block 1 should have hash"
+        assert block_allocator.get_block_hash(block_2_id) == -1, "Block 2 incomplete, no hash"
 
         # Release blocks (simulate request completion)
         dynamic_context.release_memory_blocks_from_request_indexes(torch.tensor([0]))
 
-        # Check: All released blocks should have hash reset to -1
-        assert block_allocator.block_hashes[block_0_id].item() == -1, "Block 0 hash should reset"
-        assert block_allocator.block_hashes[block_1_id].item() == -1, "Block 1 hash should reset"
-        assert block_allocator.block_hashes[block_2_id].item() == -1, "Block 2 hash should reset"
+        # Check: Released blocks remain cached (ref_count=0) until eviction
+        # With prefix caching, blocks stay in tree for potential reuse
+        assert block_allocator.get_block_hash(block_0_id) > 0, "Block 0 hash should remain cached"
+        assert block_allocator.get_block_hash(block_1_id) > 0, "Block 1 hash should remain cached"
+        assert block_allocator.get_block_hash(block_2_id) == -1, "Block 2 incomplete, no hash"
 
     @pytest.mark.internal
     def test_block_hash_consistency(self):
@@ -1377,10 +1378,10 @@ class TestDynamicContext:
         # Get hashes for request 1's blocks
         req1_block_0_id = dynamic_context.request_to_kv_block_ids[0][0].item()
         req1_block_1_id = dynamic_context.request_to_kv_block_ids[0][1].item()
-        req1_block_0_hash = block_allocator.block_hashes[req1_block_0_id].item()
-        req1_block_1_hash = block_allocator.block_hashes[req1_block_1_id].item()
+        req1_block_0_hash = block_allocator.get_block_hash(req1_block_0_id)
+        req1_block_1_hash = block_allocator.get_block_hash(req1_block_1_id)
 
-        # Second request with same tokens
+        # Second request with same tokens - with prefix caching, it shares blocks
         request_2 = DynamicInferenceRequest(
             request_id=2,
             prompt_tokens=prompt_tokens.clone(),
@@ -1388,11 +1389,11 @@ class TestDynamicContext:
         )
         dynamic_context.add_request(request_2)
 
-        # Get hashes for request 2's blocks (different block IDs but same content)
+        # With prefix caching enabled, request 2 shares blocks with request 1
         req2_block_0_id = dynamic_context.request_to_kv_block_ids[1][0].item()
         req2_block_1_id = dynamic_context.request_to_kv_block_ids[1][1].item()
-        req2_block_0_hash = block_allocator.block_hashes[req2_block_0_id].item()
-        req2_block_1_hash = block_allocator.block_hashes[req2_block_1_id].item()
+        req2_block_0_hash = block_allocator.get_block_hash(req2_block_0_id)
+        req2_block_1_hash = block_allocator.get_block_hash(req2_block_1_id)
 
         # Verify: Same token content should produce identical hashes
         assert req1_block_0_hash == req2_block_0_hash, (
@@ -1415,7 +1416,7 @@ class TestDynamicContext:
         dynamic_context.add_request(request_3)
 
         req3_block_0_id = dynamic_context.request_to_kv_block_ids[2][0].item()
-        req3_block_0_hash = block_allocator.block_hashes[req3_block_0_id].item()
+        req3_block_0_hash = block_allocator.get_block_hash(req3_block_0_id)
 
         # Verify: Different tokens should produce different hash
         assert req1_block_0_hash != req3_block_0_hash, (
@@ -1466,8 +1467,8 @@ class TestDynamicContext:
         assert block_1_hash in block_allocator.hash_to_block_id
 
         # Verify ref counts are 1
-        assert block_allocator.block_ref_counts[req1_block_0].item() == 1
-        assert block_allocator.block_ref_counts[req1_block_1].item() == 1
+        assert block_allocator.get_block_ref_count(req1_block_0) == 1
+        assert block_allocator.get_block_ref_count(req1_block_1) == 1
 
         # Create second request with same prefix
         request_2 = DynamicInferenceRequest(
@@ -1486,8 +1487,8 @@ class TestDynamicContext:
         assert req2_block_1 == req1_block_1, "Block 1 should be shared"
 
         # Verify ref counts are now 2
-        assert block_allocator.block_ref_counts[req1_block_0].item() == 2
-        assert block_allocator.block_ref_counts[req1_block_1].item() == 2
+        assert block_allocator.get_block_ref_count(req1_block_0) == 2
+        assert block_allocator.get_block_ref_count(req1_block_1) == 2
 
     @pytest.mark.internal
     def test_prefix_caching_partial_match(self):
@@ -1545,10 +1546,10 @@ class TestDynamicContext:
         assert req2_block_2 != req1_block_2, "Block 2 should be newly allocated"
 
         # Verify ref counts
-        assert block_allocator.block_ref_counts[req1_block_0].item() == 2
-        assert block_allocator.block_ref_counts[req1_block_1].item() == 2
-        assert block_allocator.block_ref_counts[req1_block_2].item() == 1
-        assert block_allocator.block_ref_counts[req2_block_2].item() == 1
+        assert block_allocator.get_block_ref_count(req1_block_0) == 2
+        assert block_allocator.get_block_ref_count(req1_block_1) == 2
+        assert block_allocator.get_block_ref_count(req1_block_2) == 1
+        assert block_allocator.get_block_ref_count(req2_block_2) == 1
 
     @pytest.mark.internal
     def test_prefix_caching_ref_count_release(self):
@@ -1592,15 +1593,15 @@ class TestDynamicContext:
         block_0_hash = block_allocator.get_block_hash(block_0)
 
         # Verify ref counts are 2
-        assert block_allocator.block_ref_counts[block_0].item() == 2
-        assert block_allocator.block_ref_counts[block_1].item() == 2
+        assert block_allocator.get_block_ref_count(block_0) == 2
+        assert block_allocator.get_block_ref_count(block_1) == 2
 
         # Release request 1
         dynamic_context.release_memory_blocks_from_request_indexes(torch.tensor([0]))
 
         # Ref counts should now be 1 (request 2 still using them)
-        assert block_allocator.block_ref_counts[block_0].item() == 1
-        assert block_allocator.block_ref_counts[block_1].item() == 1
+        assert block_allocator.get_block_ref_count(block_0) == 1
+        assert block_allocator.get_block_ref_count(block_1) == 1
 
         # Block should still be in hash mapping (cached)
         assert block_0_hash in block_allocator.hash_to_block_id
@@ -1609,8 +1610,8 @@ class TestDynamicContext:
         dynamic_context.release_memory_blocks_from_request_indexes(torch.tensor([1]))
 
         # Ref counts should now be 0 (cached but not active)
-        assert block_allocator.block_ref_counts[block_0].item() == 0
-        assert block_allocator.block_ref_counts[block_1].item() == 0
+        assert block_allocator.get_block_ref_count(block_0) == 0
+        assert block_allocator.get_block_ref_count(block_1) == 0
 
         # Block should STILL be in hash mapping (cached for future reuse)
         assert block_0_hash in block_allocator.hash_to_block_id
@@ -1650,14 +1651,14 @@ class TestDynamicContext:
         # Get block info for request 1
         block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
         block_0_hash = block_allocator.get_block_hash(block_0)
-        timestamp_before = block_allocator.block_timestamps[block_0].item()
+        timestamp_before = block_allocator.get_block_timestamp(block_0)
 
         # Release request 1 - blocks become cached (ref_count=0)
         dynamic_context.release_memory_blocks_from_request_indexes(torch.tensor([0]))
         dynamic_context.total_request_count = 0
 
         # Verify blocks are cached (ref_count=0 but still in hash map)
-        assert block_allocator.block_ref_counts[block_0].item() == 0
+        assert block_allocator.get_block_ref_count(block_0) == 0
         assert block_0_hash in block_allocator.hash_to_block_id
 
         # Evictable count should match number of cached blocks
@@ -1734,7 +1735,7 @@ class TestDynamicContext:
 
         # All blocks should have ref_count=1
         for block_id in req1_blocks | req2_blocks:
-            assert block_allocator.block_ref_counts[block_id].item() == 1
+            assert block_allocator.get_block_ref_count(block_id) == 1
 
     @pytest.mark.internal
     def test_prefix_caching_disabled_no_sharing(self):
@@ -1789,11 +1790,11 @@ class TestDynamicContext:
 
         # All blocks should have ref_count=1 (no sharing)
         for block_id in req1_blocks | req2_blocks:
-            assert block_allocator.block_ref_counts[block_id].item() == 1
+            assert block_allocator.get_block_ref_count(block_id) == 1
 
     @pytest.mark.internal
-    def test_prefix_caching_disabled_deterministic_hashes(self):
-        """Test that blocks get deterministic unique hashes when prefix caching is disabled."""
+    def test_prefix_caching_disabled_no_tree_tracking(self):
+        """Test that blocks are not tracked in tree when prefix caching is disabled."""
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -1826,24 +1827,16 @@ class TestDynamicContext:
             dynamic_context.request_to_kv_block_ids[0][i].item() for i in range(2)
         ]
 
-        # Verify hashes are set (not -1)
+        # With prefix caching disabled, blocks are not tracked in the tree
+        # get_block_hash returns -1 for blocks not in tree
         for block_id in block_ids:
-            block_hash = block_allocator.block_hashes[block_id].item()
-            assert block_hash != -1, "Block hash should be set"
+            block_hash = block_allocator.get_block_hash(block_id)
+            assert block_hash == -1, "Block should not be tracked when prefix caching disabled"
 
-        # Verify hashes are different from each other (unique per block)
-        hashes = [block_allocator.block_hashes[bid].item() for bid in block_ids]
-        assert len(set(hashes)) == len(hashes), "Each block should have a unique hash"
-
-        # Verify hashes are deterministic (based on block_id)
-        # The formula is: (block_id * 2654435761) % HASH_PRIME + 1
-        for block_id in block_ids:
-            expected_hash = (block_id * 2654435761) % block_allocator.HASH_PRIME + 1
-            actual_hash = block_allocator.block_hashes[block_id].item()
-            assert actual_hash == expected_hash, (
-                f"Hash for block {block_id} should be deterministic: "
-                f"expected {expected_hash}, got {actual_hash}"
-            )
+        # Verify tree is empty (no blocks registered)
+        assert len(dynamic_context.prefix_tree.hash_to_block_id) == 0, (
+            "No blocks should be in tree when prefix caching is disabled"
+        )
 
     @pytest.mark.internal
     def test_prefix_caching_performance_comparison(self):
@@ -1992,16 +1985,16 @@ class TestDynamicContext:
         # Get block IDs and verify ref_count=1
         block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
         block_1 = dynamic_context.request_to_kv_block_ids[0][1].item()
-        assert block_allocator.block_ref_counts[block_0].item() == 1
-        assert block_allocator.block_ref_counts[block_1].item() == 1
+        assert block_allocator.get_block_ref_count(block_0) == 1
+        assert block_allocator.get_block_ref_count(block_1) == 1
 
         # Release request 1 - blocks become cached (ref_count=0)
         dynamic_context.release_memory_blocks_from_request_indexes(torch.tensor([0]))
         dynamic_context.total_request_count = 0
 
         # Verify blocks are cached (ref_count=0 but still in hash map)
-        assert block_allocator.block_ref_counts[block_0].item() == 0
-        assert block_allocator.block_ref_counts[block_1].item() == 0
+        assert block_allocator.get_block_ref_count(block_0) == 0
+        assert block_allocator.get_block_ref_count(block_1) == 0
         block_0_hash = block_allocator.get_block_hash(block_0)
         assert block_0_hash in block_allocator.hash_to_block_id
 
@@ -2020,8 +2013,8 @@ class TestDynamicContext:
         assert new_block_1 == block_1, "Block 1 should be reused from cache"
 
         # Verify ref_count went from 0 to 1
-        assert block_allocator.block_ref_counts[block_0].item() == 1
-        assert block_allocator.block_ref_counts[block_1].item() == 1
+        assert block_allocator.get_block_ref_count(block_0) == 1
+        assert block_allocator.get_block_ref_count(block_1) == 1
 
     @pytest.mark.internal
     def test_prefix_caching_many_requests_same_prefix(self):
@@ -2071,7 +2064,7 @@ class TestDynamicContext:
 
         # Verify ref_counts are 10
         for block_id in first_request_blocks:
-            assert block_allocator.block_ref_counts[block_id].item() == num_requests, (
+            assert block_allocator.get_block_ref_count(block_id) == num_requests, (
                 f"Block {block_id} should have ref_count={num_requests}"
             )
 
@@ -2381,7 +2374,7 @@ class TestDynamicContext:
         dynamic_context.add_request(request_1)
 
         block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
-        assert block_allocator.block_ref_counts[block_0].item() == 1
+        assert block_allocator.get_block_ref_count(block_0) == 1
 
         # Add second request with same single block
         request_2 = DynamicInferenceRequest(
@@ -2394,7 +2387,7 @@ class TestDynamicContext:
         # Verify block is shared
         req2_block_0 = dynamic_context.request_to_kv_block_ids[1][0].item()
         assert req2_block_0 == block_0, "Single block should be shared"
-        assert block_allocator.block_ref_counts[block_0].item() == 2
+        assert block_allocator.get_block_ref_count(block_0) == 2
 
     @pytest.mark.internal
     def test_prefix_caching_incomplete_block_not_shared(self):
@@ -2431,10 +2424,10 @@ class TestDynamicContext:
         req1_block_1 = dynamic_context.request_to_kv_block_ids[0][1].item()
 
         # Complete block should have hash, partial should not
-        assert block_allocator.block_hashes[req1_block_0].item() != -1, (
+        assert block_allocator.get_block_hash(req1_block_0) != -1, (
             "Complete block should have hash"
         )
-        assert block_allocator.block_hashes[req1_block_1].item() == -1, (
+        assert block_allocator.get_block_hash(req1_block_1) == -1, (
             "Partial block should NOT have hash"
         )
 
@@ -2493,19 +2486,20 @@ class TestDynamicContext:
         block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
         block_1 = dynamic_context.request_to_kv_block_ids[0][1].item()
 
-        assert block_allocator.block_hashes[block_0].item() != -1, "Block 0 should have hash"
-        assert block_allocator.block_hashes[block_1].item() == -1, (
+        assert block_allocator.get_block_hash(block_0) != -1, "Block 0 should have hash"
+        assert block_allocator.get_block_hash(block_1) == -1, (
             "Block 1 should NOT have hash (partial)"
         )
 
-        # Run one decode step - this should fill block 1
+        # Run one decode step - this fills block 1
         active_mask = torch.ones(1, device=torch.cuda.current_device(), dtype=torch.int32)
         new_tokens = torch.tensor([100], device=torch.cuda.current_device())
         dynamic_context.update_requests(active_mask, new_tokens)
 
-        # Now block 1 should have hash computed
-        assert block_allocator.block_hashes[block_1].item() != -1, (
-            "Block 1 should have hash after being filled during decode"
+        # Block 1 should STILL not have hash - we only compute hashes during prefill (add_request)
+        # not during decode (update_requests) - this is a simplification for prefix caching
+        assert block_allocator.get_block_hash(block_1) == -1, (
+            "Block 1 should NOT have hash - hashes only computed during prefill, not decode"
         )
 
     @pytest.mark.internal
@@ -2541,7 +2535,7 @@ class TestDynamicContext:
         dynamic_context.add_request(request)
 
         block_1 = dynamic_context.request_to_kv_block_ids[0][1].item()
-        assert block_allocator.block_hashes[block_1].item() == -1, (
+        assert block_allocator.get_block_hash(block_1) == -1, (
             "Block 1 should NOT have hash initially"
         )
 
@@ -2551,7 +2545,407 @@ class TestDynamicContext:
             new_tokens = torch.tensor([100], device=torch.cuda.current_device())
             dynamic_context.update_requests(active_mask, new_tokens)
 
-        # Block 1 should STILL not have hash (15 < 32 tokens)
-        assert block_allocator.block_hashes[block_1].item() == -1, (
-            "Block 1 should STILL not have hash (only 15 tokens, need 32)"
+        # Block 1 should STILL not have hash - hashes only computed during prefill
+        assert block_allocator.get_block_hash(block_1) == -1, (
+            "Block 1 should STILL not have hash - hashes only computed during prefill"
         )
+
+    # =========================================================================
+    # Prefix Tree (Radix Tree) Unit Tests
+    # =========================================================================
+
+    @pytest.mark.internal
+    def test_tree_empty_operations(self):
+        """Test operations on empty tree."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        tree = dynamic_context.prefix_tree
+
+        # Empty tree operations
+        assert tree.lookup_block_by_hash(12345) is None, "Lookup on empty tree should return None"
+        assert tree.get_block_hash(0) == -1, "Get hash for non-existent block should return -1"
+        assert tree.get_block_ref_count(0) == 0, "Get ref count for non-existent block should return 0"
+        assert tree.get_evictable_block_count() == 0, "Empty tree should have 0 evictable blocks"
+
+        # Eviction on empty tree should return empty list
+        evicted = tree.evict_leaf_nodes(10)
+        assert evicted == [], "Eviction on empty tree should return empty list"
+
+    @pytest.mark.internal
+    def test_tree_single_request(self):
+        """Test that one request creates a single child of root."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        tree = dynamic_context.prefix_tree
+        block_size = dynamic_context.block_size_tokens
+
+        # Add request with 2 complete blocks
+        prompt = torch.arange(block_size * 2, device=torch.cuda.current_device())
+        request = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request)
+
+        # Verify tree structure: root should have exactly 1 child
+        assert len(tree.root.children) == 1, "Root should have exactly 1 child after 1 request"
+
+        # The child node should have 2 blocks
+        child = list(tree.root.children.values())[0]
+        assert len(child.blocks) == 2, "Child node should contain 2 blocks"
+        assert child.is_leaf(), "Child should be a leaf node"
+
+        # Verify blocks are registered
+        assert len(tree.hash_to_block_id) == 2, "2 blocks should be registered in hash map"
+
+    @pytest.mark.internal
+    def test_tree_node_splitting_on_divergence(self):
+        """Test that divergence causes node splitting."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        tree = dynamic_context.prefix_tree
+        block_size = dynamic_context.block_size_tokens
+
+        # Request 1: [0,1,...,63] (2 blocks)
+        prompt_1 = torch.arange(block_size * 2, device=torch.cuda.current_device())
+        request_1 = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt_1,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_1)
+
+        # Request 2: Same first block, different second block
+        # First block: [0,1,...,31], Second block: [1000,1001,...,1031]
+        prompt_2 = torch.cat([
+            torch.arange(block_size, device=torch.cuda.current_device()),
+            torch.arange(1000, 1000 + block_size, device=torch.cuda.current_device()),
+        ])
+        request_2 = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=prompt_2,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_2)
+
+        # After divergence at block 1, tree should be split:
+        # Root
+        #  └─ Node (block 0) <- shared
+        #       ├─ Node (block 1 from req1)
+        #       └─ Node (block 1 from req2)
+
+        # Root should still have 1 child (the shared prefix node)
+        assert len(tree.root.children) == 1, "Root should have 1 child (shared prefix)"
+
+        # The shared prefix node should have 1 block (block 0) and 2 children
+        shared_node = list(tree.root.children.values())[0]
+        assert len(shared_node.blocks) == 1, "Shared node should have 1 block after split"
+        assert len(shared_node.children) == 2, "Shared node should have 2 children (divergent paths)"
+
+        # Both children should be leaf nodes with 1 block each
+        for child in shared_node.children.values():
+            assert len(child.blocks) == 1, "Each divergent child should have 1 block"
+            assert child.is_leaf(), "Divergent children should be leaves"
+
+    @pytest.mark.internal
+    def test_tree_ref_count_on_prefix_match(self):
+        """Test that matching prefix increments ref counts."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        tree = dynamic_context.prefix_tree
+        block_size = dynamic_context.block_size_tokens
+
+        # Request 1: 2 blocks
+        prompt = torch.arange(block_size * 2, device=torch.cuda.current_device())
+        request_1 = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_1)
+
+        # Get block IDs from request 1
+        block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
+        block_1 = dynamic_context.request_to_kv_block_ids[0][1].item()
+
+        # Initial ref counts should be 1
+        assert tree.get_block_ref_count(block_0) == 1
+        assert tree.get_block_ref_count(block_1) == 1
+
+        # Request 2: Same prefix - should share blocks and increment ref counts
+        request_2 = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_2)
+
+        # Verify blocks are shared
+        req2_block_0 = dynamic_context.request_to_kv_block_ids[1][0].item()
+        req2_block_1 = dynamic_context.request_to_kv_block_ids[1][1].item()
+        assert req2_block_0 == block_0, "Block 0 should be shared"
+        assert req2_block_1 == block_1, "Block 1 should be shared"
+
+        # Ref counts should be 2
+        assert tree.get_block_ref_count(block_0) == 2
+        assert tree.get_block_ref_count(block_1) == 2
+
+    @pytest.mark.internal
+    def test_tree_eviction_leaf_nodes_only(self):
+        """Test that only leaf nodes are evicted."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        tree = dynamic_context.prefix_tree
+        block_size = dynamic_context.block_size_tokens
+
+        # Create a tree with divergence to have non-leaf nodes
+        # Request 1: blocks [A, B]
+        prompt_1 = torch.arange(block_size * 2, device=torch.cuda.current_device())
+        request_1 = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt_1,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_1)
+
+        # Request 2: blocks [A, C] (diverges at second block)
+        prompt_2 = torch.cat([
+            torch.arange(block_size, device=torch.cuda.current_device()),
+            torch.arange(1000, 1000 + block_size, device=torch.cuda.current_device()),
+        ])
+        request_2 = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=prompt_2,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_2)
+
+        # Get block IDs
+        block_A = dynamic_context.request_to_kv_block_ids[0][0].item()  # Shared
+        block_B = dynamic_context.request_to_kv_block_ids[0][1].item()  # Req1 only
+        block_C = dynamic_context.request_to_kv_block_ids[1][1].item()  # Req2 only
+
+        # Release both requests - all ref counts go to 0
+        dynamic_context.release_memory_blocks_from_request_indexes(torch.tensor([0, 1]))
+
+        # All blocks should have ref_count = 0 now (cached)
+        assert tree.get_block_ref_count(block_A) == 0
+        assert tree.get_block_ref_count(block_B) == 0
+        assert tree.get_block_ref_count(block_C) == 0
+
+        # Evict 1 block - should evict oldest leaf (B or C, not A which is non-leaf)
+        evicted = tree.evict_leaf_nodes(1)
+        assert len(evicted) == 1, "Should evict 1 block"
+        assert evicted[0] in [block_B, block_C], "Should evict a leaf block, not the shared block A"
+        assert evicted[0] != block_A, "Should NOT evict non-leaf block A"
+
+        # Block A should still be in tree (it's a non-leaf)
+        assert tree.get_block_hash(block_A) > 0, "Block A should still be cached"
+
+    @pytest.mark.internal
+    def test_tree_eviction_lru_ordering(self):
+        """Test that eviction follows LRU order (oldest first)."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        tree = dynamic_context.prefix_tree
+        block_size = dynamic_context.block_size_tokens
+
+        # Add 3 separate requests with different prefixes (no sharing)
+        # This creates 3 independent leaf nodes
+        prompts = [
+            torch.arange(i * 1000, i * 1000 + block_size, device=torch.cuda.current_device())
+            for i in range(3)
+        ]
+
+        block_ids = []
+        for i, prompt in enumerate(prompts):
+            request = DynamicInferenceRequest(
+                request_id=i + 1,
+                prompt_tokens=prompt,
+                sampling_params=SamplingParams(num_tokens_to_generate=10),
+            )
+            dynamic_context.add_request(request)
+            block_ids.append(dynamic_context.request_to_kv_block_ids[i][0].item())
+
+        # Release all requests (makes all blocks evictable)
+        dynamic_context.release_memory_blocks_from_request_indexes(torch.tensor([0, 1, 2]))
+
+        # The first request's block should have the oldest timestamp
+        # Evicting 1 block should evict the first request's block
+        evicted = tree.evict_leaf_nodes(1)
+        assert len(evicted) == 1
+        assert evicted[0] == block_ids[0], "Should evict oldest block first (LRU)"
+
+    @pytest.mark.internal
+    def test_tree_hash_dict_consistency(self):
+        """Test that hash_to_block_id dict stays consistent through operations."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        tree = dynamic_context.prefix_tree
+        block_allocator = dynamic_context.block_allocator
+        block_size = dynamic_context.block_size_tokens
+
+        # Add request
+        prompt = torch.arange(block_size * 2, device=torch.cuda.current_device())
+        request = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request)
+
+        block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
+        block_1 = dynamic_context.request_to_kv_block_ids[0][1].item()
+        hash_0 = block_allocator.get_block_hash(block_0)
+        hash_1 = block_allocator.get_block_hash(block_1)
+
+        # Verify hash dict consistency
+        assert hash_0 in tree.hash_to_block_id
+        assert hash_1 in tree.hash_to_block_id
+        assert tree.hash_to_block_id[hash_0] == block_0
+        assert tree.hash_to_block_id[hash_1] == block_1
+
+        # Lookup should work
+        assert tree.lookup_block_by_hash(hash_0) == block_0
+        assert tree.lookup_block_by_hash(hash_1) == block_1
+
+        # Release and evict
+        dynamic_context.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+        evicted = tree.evict_leaf_nodes(2)
+
+        # After eviction, hashes should be removed from dict
+        for block_id in evicted:
+            block_hash = hash_0 if block_id == block_0 else hash_1
+            assert block_hash not in tree.hash_to_block_id, "Evicted block hash should be removed"
+
+    @pytest.mark.internal
+    def test_tree_many_requests_same_prefix(self):
+        """Test that many requests with same prefix all share blocks correctly."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.2,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        tree = dynamic_context.prefix_tree
+        block_size = dynamic_context.block_size_tokens
+        num_requests = 20
+
+        prompt = torch.arange(block_size * 2, device=torch.cuda.current_device())
+
+        # Add many requests with same prefix
+        for i in range(num_requests):
+            request = DynamicInferenceRequest(
+                request_id=i + 1,
+                prompt_tokens=prompt.clone(),
+                sampling_params=SamplingParams(num_tokens_to_generate=10),
+            )
+            dynamic_context.add_request(request)
+
+        # All requests should share the same 2 blocks
+        first_block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
+        first_block_1 = dynamic_context.request_to_kv_block_ids[0][1].item()
+
+        for i in range(1, num_requests):
+            assert dynamic_context.request_to_kv_block_ids[i][0].item() == first_block_0
+            assert dynamic_context.request_to_kv_block_ids[i][1].item() == first_block_1
+
+        # Ref counts should be num_requests
+        assert tree.get_block_ref_count(first_block_0) == num_requests
+        assert tree.get_block_ref_count(first_block_1) == num_requests
+
+        # Only 2 blocks should be registered (not 2 * num_requests)
+        assert len(tree.hash_to_block_id) == 2

@@ -1,6 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-from typing import Dict, Optional
+from typing import Optional
 
 import torch
 from torch import Tensor
@@ -13,6 +13,9 @@ class BlockAllocator:
     - Initializing a pool of block IDs
     - Allocating blocks from the pool
     - Releasing blocks back to the pool
+
+    Block metadata (hashes, ref_counts, timestamps) is managed by the PrefixTree
+    in the context, not by this allocator.
 
     Args:
         context (DynamicInferenceContext): Dynamic inference context.
@@ -36,26 +39,6 @@ class BlockAllocator:
         self.block_bag = torch.arange(
             self.total_count, dtype=torch.int32, device=torch.cuda.current_device()
         )
-
-        # Block hash tracking for prefix caching: -1 = uncomputed, positive = valid hash
-        self.block_hashes = torch.full(
-            (self.total_count,), -1, dtype=torch.int64, device=torch.cuda.current_device()
-        )
-
-        # Prefix caching data structures
-        # Hash-to-block mapping for O(1) prefix lookup
-        self.hash_to_block_id: Dict[int, int] = {}
-
-        # Reference count per block: 0 = cached (evictable), >0 = actively used
-        self.block_ref_counts = torch.zeros(
-            (self.total_count,), dtype=torch.int32, device=torch.cuda.current_device()
-        )
-
-        # LRU timestamps for eviction ordering (higher = more recently used)
-        self.block_timestamps = torch.zeros(
-            (self.total_count,), dtype=torch.int64, device=torch.cuda.current_device()
-        )
-        self.global_timestamp = 0
 
     def __str__(self):
         return (
@@ -106,8 +89,8 @@ class BlockAllocator:
         # Fast path: avoid expensive evictable count computation when free pool suffices
         if self.total_avail >= num_blocks:
             return True
-        # Also count evictable cached blocks
-        evictable_count = self.get_evictable_block_count()
+        # Also count evictable cached blocks from prefix tree
+        evictable_count = self.context.prefix_tree.get_evictable_block_count()
         return (self.total_avail + evictable_count) >= num_blocks
 
     def allocate_memory_blocks(self, num_blocks: int) -> Optional[Tensor]:
@@ -132,16 +115,15 @@ class BlockAllocator:
         block_ids = self.block_bag[self.total_avail : (self.total_avail + num_blocks)]
         assert num_blocks == block_ids.numel()
 
-        # Initialize ref counts and timestamps for newly allocated blocks
-        self.block_ref_counts[block_ids] = 1
-        self.update_timestamps(block_ids)
+        # Note: ref_counts and timestamps are managed by PrefixTree
+        # They will be set when blocks are inserted into the tree
 
         return block_ids
 
     def release_memory_blocks(self, blocks: Tensor) -> None:
         """Release memory blocks by decrementing reference counts.
 
-        Blocks with ref_count == 0 remain cached (in hash map) for potential reuse.
+        Blocks with ref_count == 0 remain cached (in prefix tree) for potential reuse.
         They will be evicted via LRU when space is needed.
 
         Args:
@@ -153,8 +135,9 @@ class BlockAllocator:
         if blocks.numel() == 0:
             return
 
-        # Decrement reference counts - blocks stay cached for prefix reuse
-        self.decrement_ref_count(blocks)
+        # Decrement reference counts via prefix tree - blocks stay cached for prefix reuse
+        block_ids_list = blocks.tolist()
+        self.context.prefix_tree.decrement_ref_counts(block_ids_list)
 
     def reset(self) -> None:
         """Reset the allocator to initial state.
@@ -177,135 +160,14 @@ class BlockAllocator:
 
         self.total_avail = self.total_count - 1
 
-        # Reset all block hashes
-        self.block_hashes.fill_(-1)
-
-        # Reset prefix caching state
-        self.hash_to_block_id.clear()
-        self.block_ref_counts.fill_(0)
-        self.block_timestamps.fill_(0)
-        self.global_timestamp = 0
-
-    # Constants for hash computation
-    HASH_PRIME = 1000000007
-    HASH_BASE = 31
-
-    def compute_block_hash(self, parent_hash: int, token_ids: Tensor) -> int:
-        """Compute hash for a block from (parent_hash, token_ids).
-
-        Uses a GPU-based polynomial rolling hash combined with the parent hash.
-
-        Args:
-            parent_hash: Hash of parent block (0 for first block in sequence).
-            token_ids: Token IDs in this block, shape [block_size_tokens].
-
-        Returns:
-            Positive integer hash value (1 to HASH_PRIME).
-        """
-        block_size = token_ids.shape[0]
-        positions = torch.arange(block_size, device=token_ids.device, dtype=torch.int64)
-        powers = torch.pow(self.HASH_BASE, positions).to(torch.int64) % self.HASH_PRIME
-        token_hash = ((token_ids.to(torch.int64) * powers).sum() % self.HASH_PRIME).item()
-
-        # Combine with parent hash
-        combined = (parent_hash * self.HASH_BASE + token_hash) % self.HASH_PRIME
-        return combined + 1  # Ensure positive (1 to HASH_PRIME)
-
-    def set_block_hash(self, block_id: int, hash_value: int) -> None:
-        """Set the hash for a specific block.
-
-        Args:
-            block_id: The block ID to set hash for.
-            hash_value: The hash value to store.
-        """
-        self.block_hashes[block_id] = hash_value
-
-    def get_block_hash(self, block_id: int) -> int:
-        """Get the hash for a block.
-
-        Args:
-            block_id: The block ID to get hash for.
-
-        Returns:
-            Hash value (-1 if not computed).
-        """
-        return self.block_hashes[block_id].item()
-
-    # =========================================================================
-    # Prefix caching methods
-    # =========================================================================
-
-    def lookup_block_by_hash(self, block_hash: int) -> Optional[int]:
-        """Look up a cached block by its hash.
-
-        Args:
-            block_hash: The hash value to look up.
-
-        Returns:
-            Block ID if found, None otherwise.
-        """
-        return self.hash_to_block_id.get(block_hash)
-
-    def register_block_hash(self, block_id: int, block_hash: int) -> None:
-        """Register a block in the hash-to-block mapping.
-
-        Should be called after computing a block's hash to enable prefix matching.
-
-        Args:
-            block_id: The block ID.
-            block_hash: The computed hash value.
-        """
-        self.set_block_hash(block_id, block_hash)
-        self.hash_to_block_id[block_hash] = block_id
-
-    def increment_ref_count(self, block_ids: Tensor) -> None:
-        """Increment reference count for shared blocks.
-
-        Called when a request starts using (sharing) existing cached blocks.
-
-        Args:
-            block_ids: Tensor of block IDs to increment.
-        """
-        if block_ids.numel() == 0:
-            return
-        self.block_ref_counts[block_ids] += 1
-
-    def decrement_ref_count(self, block_ids: Tensor) -> None:
-        """Decrement reference count when a request releases blocks.
-
-        Blocks with ref_count == 0 become cached (evictable but still in hash map).
-
-        Args:
-            block_ids: Tensor of block IDs to decrement.
-        """
-        if block_ids.numel() == 0:
-            return
-        self.block_ref_counts[block_ids] -= 1
-
-    def update_timestamps(self, block_ids: Tensor) -> None:
-        """Update LRU timestamps for accessed blocks.
-
-        Args:
-            block_ids: Tensor of block IDs that were accessed.
-        """
-        if block_ids.numel() == 0:
-            return
-        self.global_timestamp += 1
-        self.block_timestamps[block_ids] = self.global_timestamp
-
-    def get_evictable_block_count(self) -> int:
-        """Get count of cached blocks that can be evicted (ref_count == 0, hash set).
-
-        Returns:
-            Number of evictable cached blocks.
-        """
-        cached_mask = (self.block_ref_counts == 0) & (self.block_hashes != -1)
-        return cached_mask.sum().item()
+        # Reset prefix tree
+        self.context.prefix_tree.reset()
 
     def evict_lru_blocks(self, num_blocks_needed: int) -> bool:
         """Evict LRU cached blocks to free up space in the pool.
 
-        Evicts blocks with ref_count == 0, starting with oldest timestamps.
+        Evicts leaf nodes from the prefix tree with ref_count == 0,
+        starting with oldest timestamps.
 
         Args:
             num_blocks_needed: Number of blocks to evict.
@@ -313,32 +175,104 @@ class BlockAllocator:
         Returns:
             True if enough blocks were evicted, False otherwise.
         """
-        # Find all cached blocks (ref_count == 0, hash != -1)
-        cached_mask = (self.block_ref_counts == 0) & (self.block_hashes != -1)
-        cached_block_ids = torch.nonzero(cached_mask, as_tuple=True)[0]
+        # Delegate to prefix tree for leaf-node eviction
+        evicted_block_ids = self.context.prefix_tree.evict_leaf_nodes(num_blocks_needed)
 
-        if cached_block_ids.numel() < num_blocks_needed:
-            return False  # Not enough cached blocks to evict
+        if len(evicted_block_ids) < num_blocks_needed:
+            return False  # Not enough blocks could be evicted
 
-        # Sort by timestamp (ascending = oldest first)
-        cached_timestamps = self.block_timestamps[cached_block_ids]
-        sorted_indices = torch.argsort(cached_timestamps)
-        blocks_to_evict = cached_block_ids[sorted_indices[:num_blocks_needed]]
-
-        # Remove from hash mapping
-        for block_id in blocks_to_evict:
-            block_id_int = block_id.item()
-            block_hash = self.block_hashes[block_id_int].item()
-            if block_hash in self.hash_to_block_id:
-                del self.hash_to_block_id[block_hash]
-
-        # Reset block state
-        self.block_hashes[blocks_to_evict] = -1
-        self.block_ref_counts[blocks_to_evict] = 0
-        self.block_timestamps[blocks_to_evict] = 0
-
-        # Add back to free pool
-        self.block_bag[self.total_avail : self.total_avail + num_blocks_needed] = blocks_to_evict
-        self.total_avail += num_blocks_needed
+        # Add evicted blocks back to free pool
+        evicted_tensor = torch.tensor(
+            evicted_block_ids, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        self.block_bag[self.total_avail : self.total_avail + len(evicted_block_ids)] = evicted_tensor
+        self.total_avail += len(evicted_block_ids)
 
         return True
+
+    def lookup_block_by_hash(self, block_hash: int) -> Optional[int]:
+        """Look up a cached block by its hash.
+
+        Delegates to the prefix tree.
+
+        Args:
+            block_hash: The hash value to look up.
+
+        Returns:
+            Block ID if found, None otherwise.
+        """
+        return self.context.prefix_tree.lookup_block_by_hash(block_hash)
+
+    def get_block_hash(self, block_id: int) -> int:
+        """Get the hash for a block.
+
+        Delegates to the prefix tree.
+
+        Args:
+            block_id: The block ID to get hash for.
+
+        Returns:
+            Hash value (-1 if not found).
+        """
+        return self.context.prefix_tree.get_block_hash(block_id)
+
+    def compute_block_hash(self, parent_hash: int, token_ids: Tensor) -> int:
+        """Compute hash for a block from (parent_hash, token_ids).
+
+        Delegates to the prefix tree.
+
+        Args:
+            parent_hash: Hash of parent block (0 for first block in sequence).
+            token_ids: Token IDs in this block.
+
+        Returns:
+            Computed hash value.
+        """
+        return self.context.prefix_tree.compute_block_hash(parent_hash, token_ids)
+
+    def get_block_ref_count(self, block_id: int) -> int:
+        """Get the reference count for a block.
+
+        Delegates to the prefix tree.
+
+        Args:
+            block_id: The block ID to get ref count for.
+
+        Returns:
+            Reference count (0 if not found).
+        """
+        return self.context.prefix_tree.get_block_ref_count(block_id)
+
+    def get_evictable_block_count(self) -> int:
+        """Get the number of evictable cached blocks.
+
+        Delegates to the prefix tree.
+
+        Returns:
+            Number of blocks in evictable leaf nodes.
+        """
+        return self.context.prefix_tree.get_evictable_block_count()
+
+    @property
+    def hash_to_block_id(self):
+        """Access the hash-to-block-id mapping.
+
+        Delegates to the prefix tree.
+
+        Returns:
+            Dict mapping hash -> block_id.
+        """
+        return self.context.prefix_tree.hash_to_block_id
+
+    def get_block_timestamp(self, block_id: int) -> int:
+        """Get the timestamp for a block.
+
+        Delegates to the prefix tree.
+
+        Args:
+            block_id: The block ID to get timestamp for.
+
+        Returns:
+            Timestamp (0 if not found).
+        """
+        return self.context.prefix_tree.get_block_timestamp(block_id)

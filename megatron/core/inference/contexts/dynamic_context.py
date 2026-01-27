@@ -38,6 +38,7 @@ from .attention_context.mamba_metadata import MambaInferenceStateConfig, MambaMe
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
 from .base_context import BaseInferenceContext
 from .dynamic_block_allocator import BlockAllocator
+from .dynamic_prefix_tree import PrefixTree, PrefixNode, BlockMetadata
 
 try:
     from .fused_kv_append_kernel import triton_append_key_value_cache
@@ -455,6 +456,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 group=self.pipeline_parallel_group,
             )
             block_count = block_count_tensor.item()
+
+        # Initialize prefix tree for block metadata (must be before BlockAllocator)
+        self.prefix_tree = PrefixTree()
 
         self.block_allocator = BlockAllocator(
             context=self,
@@ -1544,11 +1548,10 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def _find_matching_prefix_blocks(
         self, prompt_tokens: Tensor
-    ) -> tuple[list[int], int]:
+    ) -> tuple[list[int], int, PrefixNode, int]:
         """Find cached blocks matching the prompt prefix.
 
-        Computes block hashes for complete blocks in the prompt and looks them up
-        in the block allocator's hash-to-block mapping. Stops at the first non-match.
+        Delegates to the prefix tree for traversal and matching.
 
         Args:
             prompt_tokens: Full prompt token IDs for this request.
@@ -1557,35 +1560,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             Tuple of:
             - List of matched block IDs (in order from block 0)
             - Parent hash for computing the next block's hash (0 if no matches)
+            - Insertion node in tree where new blocks should be added
+            - Insertion index within the node
         """
         # Early return if prefix caching is disabled
         if not self.enable_prefix_caching:
-            return [], 0
+            return [], 0, self.prefix_tree.root, 0
 
-        matched_blocks: list[int] = []
-        parent_hash = 0
+        matched_blocks, parent_hash, insertion_node, insertion_idx = (
+            self.prefix_tree.find_matching_prefix(prompt_tokens, self.block_size_tokens)
+        )
 
-        num_complete_blocks = len(prompt_tokens) // self.block_size_tokens
-
-        for block_pos in range(num_complete_blocks):
-            start = block_pos * self.block_size_tokens
-            end = start + self.block_size_tokens
-            block_tokens = prompt_tokens[start:end]
-
-            # Compute hash for this block
-            block_hash = self.block_allocator.compute_block_hash(parent_hash, block_tokens)
-
-            # Look up existing block with this hash
-            existing_block = self.block_allocator.lookup_block_by_hash(block_hash)
-
-            if existing_block is not None:
-                matched_blocks.append(existing_block)
-                parent_hash = block_hash
-            else:
-                # No match found, stop here
-                break
-
-        return matched_blocks, parent_hash
+        return matched_blocks, parent_hash, insertion_node, insertion_idx
 
     def add_request(self, req: DynamicInferenceRequest, chunk_length: Optional[int] = None) -> None:
         """Add request to context. At this stage, we assume that the request is valid and can be added, as the checks are done in the schedule function.
@@ -1625,11 +1611,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         matched_block_ids: list[int] = []
         prefix_parent_hash = 0
         num_matched_blocks = 0
+        insertion_node = self.prefix_tree.root
+        insertion_idx = 0
 
         # Only attempt prefix matching on the first chunk of a new request
         if not is_chunked_prefill:
-            matched_block_ids, prefix_parent_hash = self._find_matching_prefix_blocks(
-                req.prompt_tokens
+            matched_block_ids, prefix_parent_hash, insertion_node, insertion_idx = (
+                self._find_matching_prefix_blocks(req.prompt_tokens)
             )
             num_matched_blocks = len(matched_block_ids)
 
@@ -1655,11 +1643,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Increment ref counts and update timestamps for matched (shared) blocks
         if num_matched_blocks > 0:
-            matched_tensor = torch.tensor(
-                matched_block_ids, dtype=torch.int32, device=torch.cuda.current_device()
-            )
-            self.block_allocator.increment_ref_count(matched_tensor)
-            self.block_allocator.update_timestamps(matched_tensor)
+            self.prefix_tree.increment_ref_counts(matched_block_ids)
+            self.prefix_tree.update_timestamps(matched_block_ids)
 
         # when a request already starts chunked prefill, it is exactly the last request in the current system
         # (see dynamic_engine.py, schedule_chunked_prefill invariants)
@@ -1752,40 +1737,46 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.active_token_count : self.active_token_count + chunk_length
         ] = (token_offset_range % self.block_size_tokens)
 
-        # Compute hashes for completely filled blocks (skip matched blocks)
-        total_tokens_after = req.finished_chunk_token_count + chunk_length
-        num_complete_blocks = total_tokens_after // self.block_size_tokens
-        previously_complete = req.finished_chunk_token_count // self.block_size_tokens
+        # =========================================================================
+        # Insert new blocks into prefix tree (for prefix caching)
+        # =========================================================================
+        if self.enable_prefix_caching:
+            total_tokens_after = req.finished_chunk_token_count + chunk_length
+            num_complete_blocks = total_tokens_after // self.block_size_tokens
+            previously_complete = req.finished_chunk_token_count // self.block_size_tokens
 
-        # Start from the first non-matched block
-        first_block_to_hash = max(previously_complete, num_matched_blocks)
+            # Start from the first non-matched block
+            first_block_to_hash = max(previously_complete, num_matched_blocks)
 
-        for block_pos in range(first_block_to_hash, num_complete_blocks):
-            block_id = self.request_to_kv_block_ids[current_id][block_pos].item()
+            # Build BlockMetadata list for new blocks
+            new_block_metadatas: list[BlockMetadata] = []
+            parent_hash = prefix_parent_hash
 
-            # Get parent hash
-            if block_pos == num_matched_blocks and num_matched_blocks > 0:
-                # First new block after matched prefix - use prefix_parent_hash
-                parent_hash = prefix_parent_hash
-            elif block_pos > 0:
-                parent_block_id = self.request_to_kv_block_ids[current_id][block_pos - 1].item()
-                parent_hash = self.block_allocator.get_block_hash(parent_block_id)
-            else:
-                parent_hash = 0
+            for block_pos in range(first_block_to_hash, num_complete_blocks):
+                block_id = self.request_to_kv_block_ids[current_id][block_pos].item()
 
-            # Compute and register hash
-            if self.enable_prefix_caching:
-                # Use content-based hash from prompt tokens and register for prefix matching
+                # Compute hash for this block
                 start = block_pos * self.block_size_tokens
                 end = start + self.block_size_tokens
                 block_tokens = req.prompt_tokens[start:end]
-                block_hash = self.block_allocator.compute_block_hash(parent_hash, block_tokens)
-                self.block_allocator.register_block_hash(block_id, block_hash)
-            else:
-                # Use deterministic unique hash based on block_id to prevent matching
-                # Knuth's multiplicative hash spreads IDs across hash space
-                unique_hash = (block_id * 2654435761) % self.block_allocator.HASH_PRIME + 1
-                self.block_allocator.set_block_hash(block_id, unique_hash)
+                block_hash = self.prefix_tree.compute_block_hash(parent_hash, block_tokens)
+
+                # Create metadata with ref_count=1 (this request is using it)
+                self.prefix_tree.global_timestamp += 1
+                metadata = BlockMetadata(
+                    block_id=block_id,
+                    hash=block_hash,
+                    ref_count=1,
+                    timestamp=self.prefix_tree.global_timestamp,
+                )
+                new_block_metadatas.append(metadata)
+                parent_hash = block_hash
+
+            # Insert new blocks into tree at the found insertion point
+            if new_block_metadatas:
+                self.prefix_tree.insert_blocks(
+                    new_block_metadatas, insertion_node, insertion_idx
+                )
 
         if self.is_hybrid_model and not is_chunked_prefill:
             # Allocate a slot for Mamba states
