@@ -192,6 +192,7 @@ def get_inference_context(
         cuda_graph_mixed_prefill_count=args.inference_dynamic_batching_cuda_graph_mixed_prefill_count,
         metrics_writer=metrics_writer,
         enable_prefix_caching=args.inference_dynamic_batching_enable_prefix_caching,
+        prefix_caching_mamba_gb=getattr(args, 'inference_dynamic_batching_prefix_caching_mamba_gb', 8.0),
     )
 
     return context

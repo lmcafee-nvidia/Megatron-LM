@@ -288,6 +288,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None,
         persist_cuda_graphs: Optional[bool] = False,
         enable_prefix_caching: bool = True,
+        prefix_caching_mamba_gb: float = 8.0,
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
 
@@ -458,7 +459,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             block_count = block_count_tensor.item()
 
         # Initialize prefix tree for block metadata (must be before BlockAllocator)
-        self.prefix_tree = PrefixTree()
+        self.prefix_tree = PrefixTree(
+            mamba_state_bytes_per_node=mamba_states_memory_per_request if self.is_hybrid_model else 0
+        )
+        self.prefix_caching_mamba_limit_bytes = int(prefix_caching_mamba_gb * 1024**3)
 
         # Track pending mamba state stores: request_idx -> PrefixNode
         # These are processed in update_requests before mamba slots are freed
@@ -2156,12 +2160,28 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Store mamba states to prefix nodes for hybrid models (before any state modifications)
         if self._pending_mamba_state_stores:
+            bytes_per_store = self.prefix_tree.mamba_state_bytes_per_node
+
             for request_idx, node in self._pending_mamba_state_stores.items():
                 mamba_idx = self.mamba_metadata.request_to_mamba_state_idx[request_idx]
-                if mamba_idx >= 0:
-                    # Clone states to avoid aliasing issues when request is released
-                    node.mamba_conv_states = self.mamba_conv_states[:, mamba_idx].clone()
-                    node.mamba_ssm_states = self.mamba_ssm_states[:, mamba_idx].clone()
+                if mamba_idx < 0:
+                    continue
+
+                # Check memory limit before storing
+                if self.prefix_caching_mamba_limit_bytes > 0:
+                    projected = self.prefix_tree.mamba_state_memory_bytes + bytes_per_store
+                    if projected > self.prefix_caching_mamba_limit_bytes:
+                        # Try to evict old nodes to make room
+                        if not self.prefix_tree.evict_for_mamba_memory(
+                            bytes_per_store, self.prefix_caching_mamba_limit_bytes
+                        ):
+                            continue  # Can't make room, skip storing mamba state for this node
+
+                # Clone states to avoid aliasing issues when request is released
+                node.mamba_conv_states = self.mamba_conv_states[:, mamba_idx].clone()
+                node.mamba_ssm_states = self.mamba_ssm_states[:, mamba_idx].clone()
+                self.prefix_tree.mamba_state_memory_bytes += bytes_per_store
+
             self._pending_mamba_state_stores.clear()
 
         if self.chunked_prefill_request_id != -1:

@@ -53,6 +53,7 @@ class TestDynamicPrefixCaching:
         rounder=64,
         enable_prefix_caching=True,
         layer_type_list: Optional[list] = None,
+        prefix_caching_mamba_gb: float = 8.0,
     ):
         set_rounder(rounder)
 
@@ -83,6 +84,7 @@ class TestDynamicPrefixCaching:
             use_flashinfer_fused_rope=None,
             unified_memory_level=0,
             enable_prefix_caching=enable_prefix_caching,
+            prefix_caching_mamba_gb=prefix_caching_mamba_gb,
         )
         return dynamic_context
 
@@ -2078,3 +2080,246 @@ class TestDynamicPrefixCaching:
         assert ssm_states is not None
         assert torch.allclose(conv_states, test_conv_state)
         assert torch.allclose(ssm_states, test_ssm_state)
+
+    # =========================================================================
+    # Mamba Memory Limit Tests
+    # =========================================================================
+
+    @pytest.mark.internal
+    def test_mamba_memory_limit_basic_tracking(self):
+        """Test that mamba memory is tracked correctly when storing states."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=True,
+            rounder=64,
+            prefix_caching_mamba_gb=8.0,
+        )
+
+        block_size = dynamic_context.block_size_tokens
+        tree = dynamic_context.prefix_tree
+
+        # Verify initial state
+        assert tree.mamba_state_memory_bytes == 0
+        assert tree.mamba_state_bytes_per_node > 0
+
+        # Add a request
+        prompt = torch.arange(block_size * 2, device=torch.cuda.current_device())
+        request = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request)
+
+        # Set mamba states
+        mamba_idx = dynamic_context.mamba_metadata.request_to_mamba_state_idx[0]
+        dynamic_context.mamba_conv_states[:, mamba_idx] = 42.0
+        dynamic_context.mamba_ssm_states[:, mamba_idx] = 84.0
+
+        # Store states via update_requests
+        active_mask = torch.ones(1, dtype=torch.uint8, device=torch.cuda.current_device())
+        new_tokens = torch.zeros(1, dtype=torch.int64, device=torch.cuda.current_device())
+        dynamic_context.update_requests(active_mask, new_tokens)
+
+        # Memory should be tracked
+        assert tree.mamba_state_memory_bytes == tree.mamba_state_bytes_per_node
+
+    @pytest.mark.internal
+    def test_mamba_memory_limit_eviction_on_overflow(self):
+        """Test that mamba states are evicted when memory limit is exceeded."""
+        self._setup_model_parallel_group(1, 1)
+
+        # Use a very small memory limit to force eviction
+        # First create context to find out the bytes per node
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=True,
+            rounder=64,
+            prefix_caching_mamba_gb=8.0,
+        )
+
+        bytes_per_node = dynamic_context.prefix_tree.mamba_state_bytes_per_node
+        # Set limit to allow only 1 node's worth of mamba states
+        limit_gb = (bytes_per_node * 1.5) / (1024**3)
+
+        # Recreate context with small limit
+        Utils.destroy_model_parallel()
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=True,
+            rounder=64,
+            prefix_caching_mamba_gb=limit_gb,
+        )
+
+        block_size = dynamic_context.block_size_tokens
+        tree = dynamic_context.prefix_tree
+
+        # Add first request with different tokens
+        prompt1 = torch.arange(block_size * 2, device=torch.cuda.current_device())
+        request1 = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt1,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request1)
+
+        # Set mamba states for first request
+        mamba_idx1 = dynamic_context.mamba_metadata.request_to_mamba_state_idx[0]
+        dynamic_context.mamba_conv_states[:, mamba_idx1] = 42.0
+        dynamic_context.mamba_ssm_states[:, mamba_idx1] = 84.0
+
+        # Simulate completion to store states
+        active_mask = torch.ones(1, dtype=torch.uint8, device=torch.cuda.current_device())
+        new_tokens = torch.zeros(1, dtype=torch.int64, device=torch.cuda.current_device())
+        dynamic_context.update_requests(active_mask, new_tokens)
+
+        # First node should have mamba states stored
+        assert tree.mamba_state_memory_bytes == bytes_per_node
+
+        # Release first request so its node becomes evictable
+        active_mask[0] = 0
+        dynamic_context.update_requests(active_mask, new_tokens)
+
+        # Add second request with different tokens
+        prompt2 = torch.arange(1000, 1000 + block_size * 2, device=torch.cuda.current_device())
+        request2 = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=prompt2,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request2)
+
+        # Set mamba states for second request
+        mamba_idx2 = dynamic_context.mamba_metadata.request_to_mamba_state_idx[1]
+        dynamic_context.mamba_conv_states[:, mamba_idx2] = 100.0
+        dynamic_context.mamba_ssm_states[:, mamba_idx2] = 200.0
+
+        # Store states - this should trigger eviction of first node
+        active_mask = torch.ones(2, dtype=torch.uint8, device=torch.cuda.current_device())
+        active_mask[0] = 0  # first request already released
+        new_tokens = torch.zeros(2, dtype=torch.int64, device=torch.cuda.current_device())
+        dynamic_context.update_requests(active_mask, new_tokens)
+
+        # Memory should still be within limit (at most 1.5 nodes worth)
+        assert tree.mamba_state_memory_bytes <= dynamic_context.prefix_caching_mamba_limit_bytes
+
+    @pytest.mark.internal
+    def test_mamba_memory_limit_zero_disables_caching(self):
+        """Test that setting mamba memory limit to 0 disables mamba state caching."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=True,
+            rounder=64,
+            prefix_caching_mamba_gb=0.0,
+        )
+
+        block_size = dynamic_context.block_size_tokens
+        tree = dynamic_context.prefix_tree
+
+        # Add a request
+        prompt = torch.arange(block_size * 2, device=torch.cuda.current_device())
+        request = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request)
+
+        # Set mamba states
+        mamba_idx = dynamic_context.mamba_metadata.request_to_mamba_state_idx[0]
+        dynamic_context.mamba_conv_states[:, mamba_idx] = 42.0
+        dynamic_context.mamba_ssm_states[:, mamba_idx] = 84.0
+
+        # Attempt to store states
+        active_mask = torch.ones(1, dtype=torch.uint8, device=torch.cuda.current_device())
+        new_tokens = torch.zeros(1, dtype=torch.int64, device=torch.cuda.current_device())
+        dynamic_context.update_requests(active_mask, new_tokens)
+
+        # No mamba states should be stored since limit is 0
+        assert tree.mamba_state_memory_bytes == 0
+
+    @pytest.mark.internal
+    def test_mamba_memory_tracking_on_node_removal(self):
+        """Test that mamba memory is correctly decremented when nodes are removed."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=True,
+            rounder=64,
+            prefix_caching_mamba_gb=8.0,
+        )
+
+        block_size = dynamic_context.block_size_tokens
+        tree = dynamic_context.prefix_tree
+
+        # Add a request
+        prompt = torch.arange(block_size * 2, device=torch.cuda.current_device())
+        request = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request)
+
+        # Set mamba states
+        mamba_idx = dynamic_context.mamba_metadata.request_to_mamba_state_idx[0]
+        dynamic_context.mamba_conv_states[:, mamba_idx] = 42.0
+        dynamic_context.mamba_ssm_states[:, mamba_idx] = 84.0
+
+        # Store states
+        active_mask = torch.ones(1, dtype=torch.uint8, device=torch.cuda.current_device())
+        new_tokens = torch.zeros(1, dtype=torch.int64, device=torch.cuda.current_device())
+        dynamic_context.update_requests(active_mask, new_tokens)
+
+        assert tree.mamba_state_memory_bytes == tree.mamba_state_bytes_per_node
+
+        # Find and remove the node
+        first_block_hash = tree.get_block_hash(
+            dynamic_context.request_to_kv_block_ids[0][0].item()
+        )
+        if first_block_hash in tree.root.children:
+            node = tree.root.children[first_block_hash]
+            for block in node.blocks:
+                block.ref_count = 0
+            tree._remove_node(node)
+
+            # Memory should be decremented
+            assert tree.mamba_state_memory_bytes == 0

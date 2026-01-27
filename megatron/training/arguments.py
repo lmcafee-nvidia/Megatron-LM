@@ -1698,6 +1698,10 @@ def _add_inference_args(parser):
                        'When disabled, KV cache blocks cannot be shared between '
                        'requests with identical prompt prefixes.')
     group.set_defaults(inference_dynamic_batching_enable_prefix_caching=True)
+    group.add_argument('--inference-dynamic-batching-prefix-caching-mamba-gb',
+                       type=float, default=8.0,
+                       help='Memory limit (GB) for mamba states in prefix tree. '
+                       'Set to 0 to disable mamba state caching. Default: 8.0')
     group.add_argument('--symmetric-ar-type', type=str, default=None,
                        choices=['two_shot', "one_shot", "multimem_all_reduce", None],
                        help='What type of symmetric all reduce to use. The default is none which is no use of symetric memory')

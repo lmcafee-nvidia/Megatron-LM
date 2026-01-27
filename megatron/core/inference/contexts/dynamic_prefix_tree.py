@@ -73,11 +73,14 @@ class PrefixTree:
         global_timestamp: Counter for LRU ordering
     """
 
-    def __init__(self):
+    def __init__(self, mamba_state_bytes_per_node: int = 0):
         self.root = PrefixNode()
         self.hash_to_block_id: Dict[int, int] = {}
         self.block_id_to_metadata: Dict[int, BlockMetadata] = {}
         self.global_timestamp: int = 0
+        # Mamba state memory tracking
+        self.mamba_state_bytes_per_node = mamba_state_bytes_per_node
+        self.mamba_state_memory_bytes: int = 0
 
     def reset(self) -> None:
         """Reset tree to initial empty state."""
@@ -85,6 +88,7 @@ class PrefixTree:
         self.hash_to_block_id.clear()
         self.block_id_to_metadata.clear()
         self.global_timestamp = 0
+        self.mamba_state_memory_bytes = 0
 
     def lookup_block_by_hash(self, block_hash: int) -> Optional[int]:
         """Look up block ID by content hash.
@@ -396,6 +400,44 @@ class PrefixTree:
 
         return evicted
 
+    def evict_for_mamba_memory(self, bytes_needed: int, memory_limit_bytes: int) -> bool:
+        """Evict unused leaf nodes with mamba states until memory is under limit.
+
+        Evicts entire nodes (not just mamba states) to maintain tree consistency
+        with KV cache eviction behavior.
+
+        Args:
+            bytes_needed: Bytes about to be stored.
+            memory_limit_bytes: Maximum allowed mamba state memory.
+
+        Returns:
+            True if enough memory was freed, False if unable to evict enough.
+        """
+        target_memory = memory_limit_bytes - bytes_needed
+
+        while self.mamba_state_memory_bytes > target_memory:
+            # Find leaf nodes with mamba states that are evictable (all blocks ref_count=0)
+            evictable = [
+                n for n in self._find_leaf_nodes()
+                if n.mamba_conv_states is not None
+                and n.blocks
+                and all(b.ref_count == 0 for b in n.blocks)
+            ]
+            if not evictable:
+                return False
+
+            # Sort by LRU (oldest timestamp first)
+            evictable.sort(key=lambda n: min(b.timestamp for b in n.blocks))
+
+            # Evict oldest node entirely (removes blocks too)
+            node = evictable[0]
+            for block in node.blocks:
+                del self.hash_to_block_id[block.hash]
+                del self.block_id_to_metadata[block.block_id]
+            self._remove_node(node)
+
+        return True
+
     def _find_leaf_nodes(self) -> List[PrefixNode]:
         """Find all leaf nodes in the tree (excluding root).
 
@@ -423,6 +465,10 @@ class PrefixTree:
         """
         if not node.is_leaf() or node.is_root():
             return  # Can only remove leaf nodes, not root
+
+        # Update mamba memory tracking before clearing
+        if node.mamba_conv_states is not None:
+            self.mamba_state_memory_bytes -= self.mamba_state_bytes_per_node
 
         # Free mamba states (Python GC will reclaim memory)
         node.mamba_conv_states = None
