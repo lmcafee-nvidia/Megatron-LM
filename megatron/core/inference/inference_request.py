@@ -354,7 +354,7 @@ class DynamicInferenceRequest(InferenceRequest):
 
     # Prefix caching fields
     block_size_tokens: Optional[int] = None  # Block size for hash computation
-    enable_prefix_caching: bool = True  # Whether prefix caching is enabled
+    enable_prefix_caching: bool = False  # Whether prefix caching is enabled
 
     # Computed field - not passed by caller
     precomputed_block_hashes: Optional[List[int]] = field(default=None, init=False)
