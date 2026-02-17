@@ -1,6 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-from collections import deque
 from typing import Dict, Optional
 
 import torch
@@ -73,6 +72,20 @@ class BlockAllocator:
             self._pending_block_hashes = torch.full(
                 (self.total_count,), -1, dtype=torch.int64, device=torch.cuda.current_device()
             )
+
+            # CPU-side set of block IDs that are pending (registered but not yet computed).
+            # Mirrors the GPU _pending_block_hashes tensor for O(1) CPU-only lookups,
+            # eliminating GPU→CPU sync in _has_pending_prefix_blocks().
+            self._pending_block_ids_cpu: set[int] = set()
+
+            # CPU-side reverse mapping: block_id → hash. Enables _deregister_blocks()
+            # to find hashes to remove from hash_to_block_id without GPU tensor reads.
+            self.block_id_to_hash: Dict[int, int] = {}
+
+            # CPU counters for event tracking, avoiding GPU→CPU sync in
+            # post_process_requests(). Maintained at all ref count mutation points.
+            self._cpu_blocks_with_refs = 0  # count of blocks with ref_count > 0
+            self._cpu_total_ref_count = 0  # sum of all ref counts
 
     def __str__(self):
         return (
@@ -155,9 +168,16 @@ class BlockAllocator:
         block_ids = self.block_bag[self.total_avail : (self.total_avail + num_blocks)]
         assert num_blocks == block_ids.numel()
 
+        # Piggyback CPU list on the inevitable GPU→CPU sync (block_bag is GPU tensor).
+        # Callers use _last_allocated_cpu for hash registration and pending tracking,
+        # avoiding additional .tolist() syncs on request_to_kv_block_ids.
+        self._last_allocated_cpu = block_ids.tolist()
+
         if self.enable_prefix_caching:
             # Initialize ref counts for newly allocated blocks
             self.block_ref_counts[block_ids] = 1
+            self._cpu_blocks_with_refs += num_blocks
+            self._cpu_total_ref_count += num_blocks
             if self.block_evict_lru:
                 self.update_timestamps(block_ids)
 
@@ -180,10 +200,18 @@ class BlockAllocator:
 
         if self.enable_prefix_caching:
             self.block_ref_counts[blocks] -= 1
+            self._cpu_total_ref_count -= blocks.numel()
+
             if not self.block_evict_lru:
                 zero_mask = self.block_ref_counts[blocks] == 0
                 if zero_mask.any():
-                    self._deregister_blocks(blocks[zero_mask])
+                    zero_blocks = blocks[zero_mask]
+                    self._cpu_blocks_with_refs -= zero_blocks.numel()
+                    self._deregister_blocks(zero_blocks)
+            else:
+                # LRU: count blocks that transitioned from ref=1 to ref=0
+                num_zero = (self.block_ref_counts[blocks] == 0).sum().item()
+                self._cpu_blocks_with_refs -= num_zero
         else:
             num_blocks = blocks.numel()
             self.block_bag[self.total_avail : self.total_avail + num_blocks] = blocks
@@ -217,7 +245,11 @@ class BlockAllocator:
             # Reset prefix caching state
             self.hash_to_block_id.clear()
             self._pending_block_hashes.fill_(-1)
+            self._pending_block_ids_cpu.clear()
+            self.block_id_to_hash.clear()
             self.block_ref_counts.fill_(0)
+            self._cpu_blocks_with_refs = 0
+            self._cpu_total_ref_count = 0
             if self.block_evict_lru:
                 self.block_timestamps.fill_(0)
 
@@ -246,6 +278,32 @@ class BlockAllocator:
         )
         self._pending_block_hashes[id_tensor] = hash_tensor
         self.hash_to_block_id.update(zip(block_hashes, block_ids))
+        self._pending_block_ids_cpu.update(block_ids)
+        self.block_id_to_hash.update(zip(block_ids, block_hashes))
+
+    def increment_ref_counts(self, matched_block_ids: list[int], matched_tensor: Tensor) -> None:
+        """Increment ref counts for matched prefix blocks and update CPU counters.
+
+        Args:
+            matched_block_ids: CPU list of matched block IDs.
+            matched_tensor: GPU tensor of matched block IDs (same content).
+        """
+        num_matched = len(matched_block_ids)
+        if num_matched == 0:
+            return
+
+        # In LRU mode, some matched blocks might be cached (ref=0 → ref=1)
+        if self.block_evict_lru:
+            newly_active = int((self.block_ref_counts[matched_tensor] == 0).sum().item())
+            self._cpu_blocks_with_refs += newly_active
+        # In RZ mode, cached blocks are deregistered immediately (ref never 0 in map),
+        # so all matched blocks already have ref > 0 — no _cpu_blocks_with_refs change.
+
+        self._cpu_total_ref_count += num_matched
+        self.block_ref_counts[matched_tensor] += 1
+
+        if self.block_evict_lru:
+            self.update_timestamps(matched_tensor)
 
     def mark_blocks_computed(self, block_ids: list[int]) -> None:
         """Mark blocks as having their KV computed (batch).
@@ -264,11 +322,14 @@ class BlockAllocator:
         )
         self.block_hashes[id_tensor] = self._pending_block_hashes[id_tensor]
         self._pending_block_hashes[id_tensor] = -1
+        self._pending_block_ids_cpu.difference_update(block_ids)
 
     def _deregister_blocks(self, block_ids: Tensor) -> None:
         """Remove blocks from prefix caching state and return to free pool.
 
         Shared cleanup logic for both LRU eviction and RZ proactive eviction.
+        Uses CPU-side reverse mapping (block_id_to_hash) to find hashes to remove
+        from hash_to_block_id, avoiding GPU tensor reads for hash lookup.
 
         Args:
             block_ids: Tensor of block IDs to deregister.
@@ -277,21 +338,25 @@ class BlockAllocator:
         if num_blocks == 0:
             return
 
-        # Gather pending and computed hashes via batched tensor indexing
+        # Convert block IDs to CPU list (one sync, N*int32)
+        block_ids_list = block_ids.tolist()
+
+        # Look up hashes from CPU reverse mapping — no GPU reads needed
+        hashes_to_delete = set()
+        for bid in block_ids_list:
+            h = self.block_id_to_hash.pop(bid, None)
+            if h is not None:
+                hashes_to_delete.add(h)
+
+        # Remove from hash_to_block_id
+        for h in hashes_to_delete:
+            self.hash_to_block_id.pop(h, None)
+
+        # Remove from pending CPU set
+        self._pending_block_ids_cpu.difference_update(block_ids_list)
+
+        # Reset GPU state (batched tensor ops, no sync needed)
         block_ids_i64 = block_ids.to(torch.int64)
-        pending_hashes = self._pending_block_hashes[block_ids_i64]
-        computed_hashes = self.block_hashes[block_ids_i64]
-
-        # Single GPU→CPU transfer for all hash values
-        all_hashes = torch.stack([pending_hashes, computed_hashes]).tolist()
-        pending_list = all_hashes[0]
-        computed_list = all_hashes[1]
-
-        # Remove from hash_to_block_id dict (set ops + C-level map, no Python loop)
-        keys_to_delete = (set(pending_list) | set(computed_list)) - {-1}
-        deque(map(self.hash_to_block_id.pop, keys_to_delete & self.hash_to_block_id.keys()), maxlen=0)
-
-        # Reset block state (batched tensor ops)
         self._pending_block_hashes[block_ids_i64] = -1
         self.block_hashes[block_ids] = -1
         self.block_ref_counts[block_ids] = 0
@@ -334,10 +399,14 @@ class BlockAllocator:
         """
         # Find all cached blocks (ref_count == 0, hash != -1)
         cached_mask = (self.block_ref_counts == 0) & (self.block_hashes != -1)
-        cached_block_ids = torch.nonzero(cached_mask, as_tuple=True)[0]
 
-        if cached_block_ids.numel() < num_blocks_needed:
+        # Check count via .sum() first (single sync); only call torch.nonzero()
+        # if we know eviction will succeed — avoids a wasted sync on failure.
+        num_cached = cached_mask.sum().item()
+        if num_cached < num_blocks_needed:
             return False  # Not enough cached blocks to evict
+
+        cached_block_ids = torch.nonzero(cached_mask, as_tuple=True)[0]
 
         # Sort by timestamp (ascending = oldest first)
         cached_timestamps = self.block_timestamps[cached_block_ids]

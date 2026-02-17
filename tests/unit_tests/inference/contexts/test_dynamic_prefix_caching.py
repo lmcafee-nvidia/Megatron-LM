@@ -866,3 +866,175 @@ class TestEngineCoordination(PrefixCachingTestBase):
         engine.schedule_non_chunked_prefill()
         # Counter doesn't reset — cumulative
         assert engine.get_prefix_coordination_metrics() == {"waits": 2}
+
+
+# =========================================================================
+# Class 9: TestCPUShadowStructures (5 tests)
+# =========================================================================
+
+
+class TestCPUShadowStructures(PrefixCachingTestBase):
+    """Tests for CPU shadow structures that avoid GPU→CPU sync."""
+
+    @staticmethod
+    def _assert_cpu_shadows_consistent(alloc):
+        """Verify CPU shadow structures match GPU ground truth."""
+        # _pending_block_ids_cpu matches _pending_block_hashes
+        gpu_pending = set(
+            torch.nonzero(alloc._pending_block_hashes != -1).flatten().tolist()
+        )
+        assert alloc._pending_block_ids_cpu == gpu_pending, (
+            f"_pending_block_ids_cpu {alloc._pending_block_ids_cpu} != "
+            f"GPU pending {gpu_pending}"
+        )
+
+        # block_id_to_hash matches hash_to_block_id (reverse mapping)
+        for bid, h in alloc.block_id_to_hash.items():
+            assert alloc.hash_to_block_id.get(h) == bid, (
+                f"block_id_to_hash[{bid}]={h} not found in hash_to_block_id"
+            )
+        for h, bid in alloc.hash_to_block_id.items():
+            assert alloc.block_id_to_hash.get(bid) == h, (
+                f"hash_to_block_id[{h}]={bid} not found in block_id_to_hash"
+            )
+
+        # CPU ref count counters match GPU
+        gpu_blocks_with_refs = int((alloc.block_ref_counts > 0).sum().item())
+        gpu_total_ref_count = int(alloc.block_ref_counts.sum().item())
+        assert alloc._cpu_blocks_with_refs == gpu_blocks_with_refs, (
+            f"_cpu_blocks_with_refs {alloc._cpu_blocks_with_refs} != "
+            f"GPU {gpu_blocks_with_refs}"
+        )
+        assert alloc._cpu_total_ref_count == gpu_total_ref_count, (
+            f"_cpu_total_ref_count {alloc._cpu_total_ref_count} != "
+            f"GPU {gpu_total_ref_count}"
+        )
+
+    @pytest.mark.internal
+    def test_pending_set_tracks_two_phase(self):
+        """_pending_block_ids_cpu tracks register → mark computed transitions."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+        prompt = self._prompt(bs * 2)
+
+        # Before any requests
+        assert alloc._pending_block_ids_cpu == set()
+
+        # After add_request (phase 1): blocks are pending
+        req = self._req(ctx, prompt)
+        ctx.add_request(req)
+        b0, b1 = self._block_ids(ctx, 0, 2)
+        assert alloc._pending_block_ids_cpu == {b0, b1}
+        self._assert_cpu_shadows_consistent(alloc)
+
+        # After mark_pending_blocks_computed (phase 2): no longer pending
+        ctx.mark_pending_blocks_computed()
+        assert alloc._pending_block_ids_cpu == set()
+        self._assert_cpu_shadows_consistent(alloc)
+
+    @pytest.mark.internal
+    def test_reverse_hash_mapping(self):
+        """block_id_to_hash stays consistent through register → release → evict."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+        prompt = self._prompt(bs * 2)
+
+        # Register
+        req = self._req(ctx, prompt)
+        ctx.add_request(req)
+        b0, b1 = self._block_ids(ctx, 0, 2)
+        h0, h1 = req.precomputed_block_hashes
+        assert alloc.block_id_to_hash[b0] == h0
+        assert alloc.block_id_to_hash[b1] == h1
+        self._assert_cpu_shadows_consistent(alloc)
+
+        # Mark computed
+        ctx.mark_pending_blocks_computed()
+        assert alloc.block_id_to_hash[b0] == h0  # still there
+        self._assert_cpu_shadows_consistent(alloc)
+
+        # Release (LRU: blocks stay cached)
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+        assert alloc.block_id_to_hash[b0] == h0  # still cached
+        self._assert_cpu_shadows_consistent(alloc)
+
+    @pytest.mark.internal
+    def test_rz_deregister_cleans_reverse_mapping(self):
+        """RZ mode: release removes from block_id_to_hash."""
+        ctx = self._ctx(block_evict_lru=False)
+        bs = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+        prompt = self._prompt(bs * 2)
+
+        req = self._req(ctx, prompt)
+        ctx.add_request(req)
+        ctx.mark_pending_blocks_computed()
+        b0, b1 = self._block_ids(ctx, 0, 2)
+
+        # Release in RZ → deregister → reverse mapping cleared
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+        assert b0 not in alloc.block_id_to_hash
+        assert b1 not in alloc.block_id_to_hash
+        self._assert_cpu_shadows_consistent(alloc)
+
+    @pytest.mark.internal
+    def test_cpu_ref_count_counters(self):
+        """_cpu_blocks_with_refs and _cpu_total_ref_count stay accurate."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+        prompt = self._prompt(bs * 2)
+
+        # Initial state
+        assert alloc._cpu_blocks_with_refs == 0
+        assert alloc._cpu_total_ref_count == 0
+
+        # After first request: 2 blocks at ref=1
+        ctx.add_request(self._req(ctx, prompt.clone()))
+        ctx.mark_pending_blocks_computed()
+        assert alloc._cpu_blocks_with_refs == 2
+        assert alloc._cpu_total_ref_count == 2
+        self._assert_cpu_shadows_consistent(alloc)
+
+        # After second request sharing prefix: 2 blocks at ref=2
+        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
+        assert alloc._cpu_blocks_with_refs == 2
+        assert alloc._cpu_total_ref_count == 4
+        self._assert_cpu_shadows_consistent(alloc)
+
+        # Release first request: 2 blocks at ref=1
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+        assert alloc._cpu_blocks_with_refs == 2
+        assert alloc._cpu_total_ref_count == 2
+        self._assert_cpu_shadows_consistent(alloc)
+
+        # Release second request: 2 blocks at ref=0 (cached in LRU)
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
+        assert alloc._cpu_blocks_with_refs == 0
+        assert alloc._cpu_total_ref_count == 0
+        self._assert_cpu_shadows_consistent(alloc)
+
+    @pytest.mark.internal
+    def test_cpu_shadows_after_reset(self):
+        """All CPU shadow structures cleared after reset."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+        prompt = self._prompt(bs * 2)
+
+        ctx.add_request(self._req(ctx, prompt))
+        ctx.mark_pending_blocks_computed()
+
+        # Verify non-empty state
+        assert len(alloc.block_id_to_hash) > 0
+        assert alloc._cpu_blocks_with_refs > 0
+
+        # Reset
+        alloc.reset()
+        assert alloc._pending_block_ids_cpu == set()
+        assert alloc.block_id_to_hash == {}
+        assert alloc._cpu_blocks_with_refs == 0
+        assert alloc._cpu_total_ref_count == 0
+        self._assert_cpu_shadows_consistent(alloc)

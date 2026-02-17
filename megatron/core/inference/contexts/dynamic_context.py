@@ -1612,9 +1612,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             matched_tensor = torch.tensor(
                 matched_block_ids, dtype=torch.int32, device=torch.cuda.current_device()
             )
-            self.block_allocator.block_ref_counts[matched_tensor] += 1
-            if self.block_evict_lru:
-                self.block_allocator.update_timestamps(matched_tensor)
+            self.block_allocator.increment_ref_counts(matched_block_ids, matched_tensor)
 
         # when a request already starts chunked prefill, it is exactly the last request in the current system
         # (see dynamic_engine.py, schedule_chunked_prefill invariants)
@@ -1713,27 +1711,42 @@ class DynamicInferenceContext(BaseInferenceContext):
         #       — the partial block from a prior chunk that this chunk's tokens completed
         #   Range 2: [already_allocated_blocks + num_matched_blocks, num_complete_blocks)
         #       — newly allocated blocks that are now complete
+        #
+        # Uses CPU-side block IDs to avoid GPU→CPU sync:
+        #   Range 1 (chunked prefill only): reads from request_to_kv_block_ids (GPU)
+        #   Range 2: uses _last_allocated_cpu from allocate_memory_blocks()
         if self.enable_prefix_caching and req.precomputed_block_hashes is not None:
             total_tokens_after = req.finished_chunk_token_count + chunk_length
             num_complete_blocks = total_tokens_after // self.block_size_tokens
             previously_complete = req.finished_chunk_token_count // self.block_size_tokens
 
-            def _register_range(start: int, end: int):
-                if start >= end:
-                    return
-                block_ids_to_hash = self.request_to_kv_block_ids[current_id][
-                    start:end
-                ].tolist()
-                block_hashes_slice = req.precomputed_block_hashes[start:end]
-                self.block_allocator.register_block_hashes(
-                    block_ids_to_hash, block_hashes_slice
-                )
-                self._blocks_pending_computation.extend(block_ids_to_hash)
+            all_block_ids: list[int] = []
+            all_hashes: list[int] = []
 
             # Range 1: prior-chunk partial block that this chunk just completed
-            _register_range(previously_complete, min(already_allocated_blocks, num_complete_blocks))
+            r1_end = min(already_allocated_blocks, num_complete_blocks)
+            if previously_complete < r1_end:
+                # Chunked prefill path: block IDs from prior chunk are on GPU
+                r1_ids = self.request_to_kv_block_ids[current_id][
+                    previously_complete:r1_end
+                ].tolist()
+                all_block_ids.extend(r1_ids)
+                all_hashes.extend(req.precomputed_block_hashes[previously_complete:r1_end])
+
             # Range 2: newly allocated (non-matched) blocks that are now complete
-            _register_range(already_allocated_blocks + num_matched_blocks, num_complete_blocks)
+            r2_start = already_allocated_blocks + num_matched_blocks
+            if r2_start < num_complete_blocks:
+                # Use CPU list from allocate_memory_blocks() — zero GPU sync.
+                # _last_allocated_cpu[0] maps to position new_block_start (= r2_start)
+                # in the request's block layout, so slice from offset 0.
+                r2_count = num_complete_blocks - r2_start
+                r2_ids = self.block_allocator._last_allocated_cpu[:r2_count]
+                all_block_ids.extend(r2_ids)
+                all_hashes.extend(req.precomputed_block_hashes[r2_start:num_complete_blocks])
+
+            if all_block_ids:
+                self.block_allocator.register_block_hashes(all_block_ids, all_hashes)
+                self._blocks_pending_computation.extend(all_block_ids)
 
         if self.is_hybrid_model and not is_chunked_prefill:
             # Allocate a slot for Mamba states

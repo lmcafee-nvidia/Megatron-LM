@@ -887,10 +887,9 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.track_generated_token_events:
             blocks_allocated = block_allocator.total_count - block_allocator.total_avail
             if block_allocator.enable_prefix_caching:
-                blocks_hashed_active = int(
-                    (block_allocator.block_ref_counts > 0).sum().item()
-                )
-                blocks_ref_count = block_allocator.block_ref_counts.sum().item()
+                # Use CPU counters — no GPU→CPU sync needed
+                blocks_hashed_active = block_allocator._cpu_blocks_with_refs
+                blocks_ref_count = block_allocator._cpu_total_ref_count
             else:
                 blocks_hashed_active = blocks_allocated
                 blocks_ref_count = None
@@ -1138,6 +1137,9 @@ class DynamicInferenceEngine(AbstractEngine):
         block allocator (registered but not yet marked computed). Scheduling such
         a request before the KV is ready would produce incorrect results.
 
+        Uses CPU-only data structures (hash_to_block_id dict + _pending_block_ids_cpu
+        set) to avoid any GPU→CPU synchronization.
+
         Args:
             req: The request to check.
 
@@ -1151,21 +1153,15 @@ class DynamicInferenceEngine(AbstractEngine):
 
         block_allocator = self.context.block_allocator
         hash_to_block = block_allocator.hash_to_block_id
+        pending = block_allocator._pending_block_ids_cpu
 
-        # Phase 1: CPU-only dict lookups to find all matching block IDs
-        block_ids = list(map(hash_to_block.get, req.precomputed_block_hashes))
-        try:
-            prefix_len = block_ids.index(None)
-        except ValueError:
-            prefix_len = len(block_ids)
-        matched_ids = block_ids[:prefix_len]
-
-        if not matched_ids:
-            return False
-
-        # Phase 2: Single batched GPU read (1 sync instead of N)
-        id_tensor = torch.tensor(matched_ids, dtype=torch.int64, device=block_allocator.block_hashes.device)
-        return (block_allocator.block_hashes[id_tensor] == -1).any().item()
+        for block_hash in req.precomputed_block_hashes:
+            block_id = hash_to_block.get(block_hash)
+            if block_id is None:
+                break
+            if block_id in pending:
+                return True
+        return False
 
     def get_prefix_coordination_metrics(self) -> dict:
         """Return prefix caching coordination metrics.
