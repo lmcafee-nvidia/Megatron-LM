@@ -87,6 +87,11 @@ class BlockAllocator:
             self._cpu_blocks_with_refs = 0  # count of blocks with ref_count > 0
             self._cpu_total_ref_count = 0  # sum of all ref counts
 
+            # Lazy reconciliation flag for _cpu_blocks_with_refs.
+            # In LRU mode, release_memory_blocks() sets this instead of syncing.
+            # Must be reconciled before reading _cpu_blocks_with_refs.
+            self._cpu_blocks_with_refs_dirty = False
+
     def __str__(self):
         return (
             f"using: total {self.get_total_used()}/{self.total_count - 1}"
@@ -140,7 +145,23 @@ class BlockAllocator:
             return False
         if not self.block_evict_lru:
             return False  # RZ: no cached blocks to evict
-        # Also count evictable cached blocks
+
+        # CPU-only conservative estimate (no GPU sync).
+        # hash_to_block_id = all registered blocks (cached + active + pending).
+        # _cpu_blocks_with_refs = blocks with ref > 0 (may be stale-high → conservative).
+        # _pending_block_ids_cpu = pending blocks (ref > 0 but hash == -1, not evictable).
+        #   Pending blocks are already counted in _cpu_blocks_with_refs, but subtracting
+        #   them handles the edge case where a block is released before mark_computed
+        #   (ref == 0, still pending, not evictable).
+        estimated_evictable = max(0,
+            len(self.hash_to_block_id)
+            - self._cpu_blocks_with_refs
+            - len(self._pending_block_ids_cpu)
+        )
+        if self.total_avail + estimated_evictable >= num_blocks:
+            return True
+
+        # Fall back to exact GPU count (1 sync)
         evictable_count = self.get_evictable_block_count()
         return (self.total_avail + evictable_count) >= num_blocks
 
@@ -204,14 +225,14 @@ class BlockAllocator:
 
             if not self.block_evict_lru:
                 zero_mask = self.block_ref_counts[blocks] == 0
-                if zero_mask.any():
-                    zero_blocks = blocks[zero_mask]
+                zero_blocks = blocks[zero_mask]  # SYNC: boolean indexing
+                if zero_blocks.numel() > 0:  # Free: reads shape metadata
                     self._cpu_blocks_with_refs -= zero_blocks.numel()
                     self._deregister_blocks(zero_blocks)
             else:
-                # LRU: count blocks that transitioned from ref=1 to ref=0
-                num_zero = (self.block_ref_counts[blocks] == 0).sum().item()
-                self._cpu_blocks_with_refs -= num_zero
+                # LRU: defer _cpu_blocks_with_refs update — no GPU sync.
+                # Reconciled before next read via reconcile_blocks_with_refs().
+                self._cpu_blocks_with_refs_dirty = True
         else:
             num_blocks = blocks.numel()
             self.block_bag[self.total_avail : self.total_avail + num_blocks] = blocks
@@ -250,6 +271,7 @@ class BlockAllocator:
             self.block_ref_counts.fill_(0)
             self._cpu_blocks_with_refs = 0
             self._cpu_total_ref_count = 0
+            self._cpu_blocks_with_refs_dirty = False
             if self.block_evict_lru:
                 self.block_timestamps.fill_(0)
 
@@ -304,6 +326,16 @@ class BlockAllocator:
 
         if self.block_evict_lru:
             self.update_timestamps(matched_tensor)
+
+    def reconcile_blocks_with_refs(self) -> None:
+        """Recompute _cpu_blocks_with_refs from GPU if dirty (one sync).
+
+        Called by the engine before reading the counter for metrics.
+        """
+        if not self._cpu_blocks_with_refs_dirty:
+            return
+        self._cpu_blocks_with_refs = int((self.block_ref_counts > 0).sum().item())
+        self._cpu_blocks_with_refs_dirty = False
 
     def mark_blocks_computed(self, block_ids: list[int]) -> None:
         """Mark blocks as having their KV computed (batch).
@@ -400,13 +432,11 @@ class BlockAllocator:
         # Find all cached blocks (ref_count == 0, hash != -1)
         cached_mask = (self.block_ref_counts == 0) & (self.block_hashes != -1)
 
-        # Check count via .sum() first (single sync); only call torch.nonzero()
-        # if we know eviction will succeed — avoids a wasted sync on failure.
-        num_cached = cached_mask.sum().item()
-        if num_cached < num_blocks_needed:
-            return False  # Not enough cached blocks to evict
-
+        # nonzero() syncs to determine output size; .numel() reads shape (no sync).
+        # Combined into one sync instead of separate sum() + nonzero().
         cached_block_ids = torch.nonzero(cached_mask, as_tuple=True)[0]
+        if cached_block_ids.numel() < num_blocks_needed:
+            return False  # Not enough cached blocks to evict
 
         # Sort by timestamp (ascending = oldest first)
         cached_timestamps = self.block_timestamps[cached_block_ids]

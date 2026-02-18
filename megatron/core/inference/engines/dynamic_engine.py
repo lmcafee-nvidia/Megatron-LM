@@ -887,6 +887,8 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.track_generated_token_events:
             blocks_allocated = block_allocator.total_count - block_allocator.total_avail
             if block_allocator.enable_prefix_caching:
+                # Reconcile lazy counter before reading (at most 1 GPU sync)
+                block_allocator.reconcile_blocks_with_refs()
                 # Use CPU counters — no GPU→CPU sync needed
                 blocks_hashed_active = block_allocator._cpu_blocks_with_refs
                 blocks_ref_count = block_allocator._cpu_total_ref_count

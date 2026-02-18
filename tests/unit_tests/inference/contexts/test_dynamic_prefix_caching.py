@@ -710,6 +710,8 @@ class TestCPUShadowsAndConfig(PrefixCachingTestBase):
             assert alloc.hash_to_block_id.get(h) == bid
         for h, bid in alloc.hash_to_block_id.items():
             assert alloc.block_id_to_hash.get(bid) == h
+        # Reconcile lazy counter before comparing (matches engine flow)
+        alloc.reconcile_blocks_with_refs()
         gpu_blocks_with_refs = int((alloc.block_ref_counts > 0).sum().item())
         gpu_total_ref_count = int(alloc.block_ref_counts.sum().item())
         assert alloc._cpu_blocks_with_refs == gpu_blocks_with_refs
@@ -781,10 +783,12 @@ class TestCPUShadowsAndConfig(PrefixCachingTestBase):
         assert alloc._cpu_total_ref_count == 4
         self._assert_cpu_shadows_consistent(alloc)
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+        alloc.reconcile_blocks_with_refs()
         assert alloc._cpu_blocks_with_refs == 2
         assert alloc._cpu_total_ref_count == 2
         self._assert_cpu_shadows_consistent(alloc)
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
+        alloc.reconcile_blocks_with_refs()
         assert alloc._cpu_blocks_with_refs == 0
         assert alloc._cpu_total_ref_count == 0
         self._assert_cpu_shadows_consistent(alloc)
