@@ -887,11 +887,9 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.track_generated_token_events:
             blocks_allocated = block_allocator.total_count - block_allocator.total_avail
             if block_allocator.enable_prefix_caching:
-                # Reconcile lazy counter before reading (at most 1 GPU sync)
-                block_allocator.reconcile_blocks_with_refs()
-                # Use CPU counters — no GPU→CPU sync needed
-                blocks_hashed_active = block_allocator._cpu_blocks_with_refs
-                blocks_ref_count = block_allocator._cpu_total_ref_count
+                # Read GPU scalar counters (post-forward, sync is acceptable)
+                blocks_hashed_active = int(block_allocator._gpu_blocks_with_refs.item())
+                blocks_ref_count = int(block_allocator._gpu_total_ref_count.item())
             else:
                 blocks_hashed_active = blocks_allocated
                 blocks_ref_count = None
@@ -1139,8 +1137,7 @@ class DynamicInferenceEngine(AbstractEngine):
         block allocator (registered but not yet marked computed). Scheduling such
         a request before the KV is ready would produce incorrect results.
 
-        Uses CPU-only data structures (hash_to_block_id dict + _pending_block_ids_cpu
-        set) to avoid any GPU→CPU synchronization.
+        Uses GPU hash table lookup + pending_bitmap check.
 
         Args:
             req: The request to check.
@@ -1150,20 +1147,32 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         if not self.context.enable_prefix_caching:
             return False
-        if req.precomputed_block_hashes is None or len(req.precomputed_block_hashes) == 0:
+        if req.precomputed_block_hashes is None or req.precomputed_block_hashes.numel() == 0:
             return False
 
         block_allocator = self.context.block_allocator
-        hash_to_block = block_allocator.hash_to_block_id
-        pending = block_allocator._pending_block_ids_cpu
 
-        for block_hash in req.precomputed_block_hashes:
-            block_id = hash_to_block.get(block_hash)
-            if block_id is None:
+        # Batch GPU hash table lookup for all block hashes
+        block_ids = block_allocator.gpu_hash_table.lookup_batch_alloc(req.precomputed_block_hashes)
+
+        # Transfer to CPU for sequential prefix check
+        block_ids_cpu = block_ids.tolist()
+
+        # Walk the prefix chain, stop at first miss
+        matched_ids = []
+        for bid in block_ids_cpu:
+            if bid == -1:
                 break
-            if block_id in pending:
-                return True
-        return False
+            matched_ids.append(bid)
+
+        if not matched_ids:
+            return False
+
+        # Check pending_bitmap for matched blocks (GPU batch check)
+        matched_tensor = torch.tensor(
+            matched_ids, dtype=torch.int64, device=block_allocator.pending_bitmap.device
+        )
+        return bool(block_allocator.pending_bitmap[matched_tensor].any().item())
 
     def get_prefix_coordination_metrics(self) -> dict:
         """Return prefix caching coordination metrics.
@@ -1180,29 +1189,74 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             self.schedule_non_chunked_prefill()
 
+    def _gpu_precompute_prefix_matches(self) -> tuple:
+        """Pre-compute prefix matching for all waiting requests using GPU batch kernel.
+
+        Returns:
+            Tuple of (num_matched, has_pending, matched_block_ids) GPU tensors,
+            or None if no waiting requests or prefix caching disabled.
+        """
+        if not self.context.enable_prefix_caching:
+            return None
+        if not self.waiting_request_ids:
+            return None
+
+        # Collect hashes from all waiting requests
+        request_hashes_list = []
+        for req_id in self.waiting_request_ids:
+            req = self.get_request(req_id)
+            if (
+                req.precomputed_block_hashes is not None
+                and req.precomputed_block_hashes.numel() > 0
+            ):
+                request_hashes_list.append(req.precomputed_block_hashes)
+            else:
+                # Empty tensor placeholder
+                request_hashes_list.append(
+                    torch.empty(0, dtype=torch.int64, device=torch.cuda.current_device())
+                )
+
+        return self.context.gpu_match_prefixes_batch(request_hashes_list)
+
     def schedule_non_chunked_prefill(self):
         """
         Perform the same original scheduling logic for non-chunked runs
         """
+        # Pre-compute batch prefix matching on GPU (one kernel for all waiting requests)
+        batch_prefix_result = self._gpu_precompute_prefix_matches()
+
+        waiting_idx = 0
         while self.waiting_request_ids:
             req = self.get_request(self.waiting_request_ids[0])
 
-            # Prefix caching coordination: wait if request depends on pending blocks
-            if self._has_pending_prefix_blocks(req):
-                self._prefix_coordination_waits += 1
-                break
+            # Prefix caching coordination: use batch result instead of per-request GPU sync
+            if batch_prefix_result is not None:
+                _, has_pending, _ = batch_prefix_result
+                if has_pending[waiting_idx].item():
+                    self._prefix_coordination_waits += 1
+                    break
 
             request_can_be_added, request_tokens_can_be_added, kv_cache_available = (
                 self.context.check_availability(req)
             )
             if request_can_be_added and request_tokens_can_be_added and kv_cache_available:
-                self.context.add_request(req)
+                # Pass batch prefix results so add_request can skip per-request prefix matching
+                if batch_prefix_result is not None:
+                    num_matched, _, matched_block_ids = batch_prefix_result
+                    self.context.add_request(
+                        req,
+                        batch_num_matched=num_matched[waiting_idx],
+                        batch_matched_block_ids=matched_block_ids[waiting_idx],
+                    )
+                else:
+                    self.context.add_request(req)
                 self._loop.call_soon_threadsafe(
                     self._loop.create_task, self._notify_cond_for_new_request()
                 )
                 req.remaining_prompt_tokens = req.remaining_prompt_tokens.new_empty(0)
                 req.add_event_add_context()
                 self.waiting_request_ids.popleft()
+                waiting_idx += 1
             else:
                 break
 
@@ -1221,7 +1275,11 @@ class DynamicInferenceEngine(AbstractEngine):
                 it is during a chunked prefill
             - For each request, remaining_prompt_tokens holds the **unprefilled** prompt tokens
         """
+        # Pre-compute batch prefix matching on GPU (one kernel for all waiting requests)
+        batch_prefix_result = self._gpu_precompute_prefix_matches()
+
         can_schedule = True
+        waiting_idx = 0
         while self.waiting_request_ids and can_schedule:
             can_schedule = False
             req = self.get_request(self.waiting_request_ids[0])
@@ -1230,11 +1288,13 @@ class DynamicInferenceEngine(AbstractEngine):
             # chunk of a existing chunked prefill request
             is_continuing_chunked_prefill = self.context.chunked_prefill_request_id >= 0
 
-            # Prefix caching coordination: wait if new request depends on pending blocks
+            # Prefix caching coordination: use batch result instead of per-request GPU sync
             # (continuing chunked prefill requests must not be blocked)
-            if not is_continuing_chunked_prefill and self._has_pending_prefix_blocks(req):
-                self._prefix_coordination_waits += 1
-                break
+            if not is_continuing_chunked_prefill and batch_prefix_result is not None:
+                _, has_pending, _ = batch_prefix_result
+                if has_pending[waiting_idx].item():
+                    self._prefix_coordination_waits += 1
+                    break
 
             # Use remaining prompt tokens for scheduling decisions
             remaining_len = len(req.remaining_prompt_tokens)
@@ -1248,7 +1308,16 @@ class DynamicInferenceEngine(AbstractEngine):
             if request_can_be_added and kv_cache_available:
                 if token_fully_can_be_added:
                     self.context.chunked_prefill_request_id = -1
-                    self.context.add_request(req)
+                    # Pass batch prefix results so add_request can skip per-request prefix matching
+                    if batch_prefix_result is not None:
+                        num_matched, _, matched_block_ids = batch_prefix_result
+                        self.context.add_request(
+                            req,
+                            batch_num_matched=num_matched[waiting_idx],
+                            batch_matched_block_ids=matched_block_ids[waiting_idx],
+                        )
+                    else:
+                        self.context.add_request(req)
                     self._loop.call_soon_threadsafe(
                         self._loop.create_task, self._notify_cond_for_new_request()
                     )
@@ -1256,11 +1325,22 @@ class DynamicInferenceEngine(AbstractEngine):
                     req.add_event_add_context()
                     # Fully scheduled, so we remove from waiting pool
                     self.waiting_request_ids.popleft()
+                    waiting_idx += 1
                     # Only this case we keep checking the rest of the waiting queue
                     can_schedule = True
                 elif token_partially_can_be_added:
                     chunk_length = self.context.max_tokens - self.context.active_token_count
-                    self.context.add_request(req, chunk_length=chunk_length)
+                    # For partial chunks, pass batch prefix results too
+                    if batch_prefix_result is not None:
+                        num_matched, _, matched_block_ids = batch_prefix_result
+                        self.context.add_request(
+                            req,
+                            chunk_length=chunk_length,
+                            batch_num_matched=num_matched[waiting_idx],
+                            batch_matched_block_ids=matched_block_ids[waiting_idx],
+                        )
+                    else:
+                        self.context.add_request(req, chunk_length=chunk_length)
                     self._loop.call_soon_threadsafe(
                         self._loop.create_task, self._notify_cond_for_new_request()
                     )
@@ -1328,6 +1408,8 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             kvcache_util_stats = None
 
+        # Defer get_active_used()/get_paused_used() to the logging path below
+        # to avoid 2 GPU→CPU syncs (.sum().item()) every step.
         post_step_context_state = {
             "waiting_request_count": len(self.waiting_request_ids),
             "finished_request_count": self.finished_request_count,
@@ -1337,8 +1419,6 @@ class DynamicInferenceEngine(AbstractEngine):
             "using_cuda_graph_this_step": self.context.using_cuda_graph_this_step(),
             "total_active_block_count": self.context.block_allocator.active_count,
             "total_paused_block_count": self.context.block_allocator.paused_count,
-            "total_active_used_blocks": self.context.block_allocator.get_active_used(),
-            "total_paused_used_blocks": self.context.block_allocator.get_paused_used(),
         }
 
         context_state = {**pre_step_context_state, **post_step_context_state}
@@ -1466,6 +1546,9 @@ class DynamicInferenceEngine(AbstractEngine):
             self.logging_step_interval > 0
             and self.context.step_count % self.logging_step_interval == 0
         ):
+            # Compute used block counts only on logging steps (avoids GPU sync every step)
+            total_active_used_blocks = self.context.block_allocator.get_active_used()
+            total_paused_used_blocks = self.context.block_allocator.get_paused_used()
             mem = torch.cuda.memory_stats()
             step_type = "decode" if context_state["is_decode_only"] else "non-decode"
             output_str = (
@@ -1496,9 +1579,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     context_state["waiting_request_count"],
                     context_state["finished_request_count"],
                     context_state["evicted_request_count"],
-                    context_state["total_active_used_blocks"],
+                    total_active_used_blocks,
                     context_state["total_active_block_count"],
-                    context_state["total_paused_used_blocks"],
+                    total_paused_used_blocks,
                     context_state["total_paused_block_count"],
                     mem["allocation.all.current"],
                     mem["allocated_bytes.all.current"] / (1024**3),

@@ -249,8 +249,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Step counter (used for LRU timestamps in prefix caching)
         self.step_count = 0
 
-        # Track blocks pending computation for prefix caching coordination
-        self._blocks_pending_computation: List[int] = []
+        # Count of blocks pending computation in _pending_computation_buffer (GPU).
+        self._pending_computation_count: int = 0
 
         self.cache_mla_latent = (
             isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
@@ -639,6 +639,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         # token_to_local_position_within_kv_block is [0 , 1, 2, 3, 0, 1, 2]
         self.token_to_position_in_request = torch.empty_like(self.token_to_input_ids)
         self.token_to_local_position_within_kv_block = torch.empty_like(self.token_to_input_ids)
+
+        # GPU buffer for tracking blocks pending computation (prefix caching).
+        max_pending = self.block_allocator.total_count
+        self._pending_computation_buffer = torch.full(
+            (max_pending,), -1, dtype=torch.int32, device=torch.cuda.current_device()
+        )
 
         # Memory buffer.
         def allocate_memory_buffer():
@@ -1104,9 +1110,12 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         kv_block_view = self.request_to_kv_block_ids[request_slice]
         kv_block_view.fill_(-1)
-        block_counts_list = block_counts.tolist()
-        for row, block_count in enumerate(block_counts_list):
-            kv_block_view[row, :block_count] = dummy_block_idx
+        # Vectorized dummy block fill (avoids .tolist() GPU→CPU sync + Python loop)
+        col_indices = torch.arange(
+            kv_block_view.shape[1], device=kv_block_view.device, dtype=block_counts.dtype
+        )
+        fill_mask = col_indices.unsqueeze(0) < block_counts.unsqueeze(1)
+        kv_block_view[fill_mask] = dummy_block_idx
 
         token_start = self.active_token_count
         token_end = token_start + total_new_tokens
@@ -1414,7 +1423,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # Reset prefix caching coordination state
-        self._blocks_pending_computation.clear()
+        self._pending_computation_count = 0
 
     def current_input_and_position_ids(
         self, *, num_warmup_tokens: Optional[int] = None
@@ -1490,7 +1499,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Find cached blocks matching a range of the prompt using precomputed hashes.
 
         Looks up hashes in req.precomputed_block_hashes[start_block:end_block] against
-        the block allocator's hash-to-block mapping. Stops at the first non-match.
+        the block allocator's GPU hash table. Stops at the first non-match.
 
         Args:
             req: The inference request with precomputed_block_hashes set.
@@ -1507,33 +1516,88 @@ class DynamicInferenceContext(BaseInferenceContext):
             return [], 0
 
         # Early return if request has no precomputed hashes
-        if req.precomputed_block_hashes is None or len(req.precomputed_block_hashes) == 0:
+        if req.precomputed_block_hashes is None or req.precomputed_block_hashes.numel() == 0:
             return [], 0
 
         # Clamp end_block to the number of precomputed hashes (the trailing
         # partial block has no hash).
-        end_block = min(end_block, len(req.precomputed_block_hashes))
+        end_block = min(end_block, req.precomputed_block_hashes.shape[0])
         if start_block >= end_block:
             return [], 0
 
         hashes = req.precomputed_block_hashes[start_block:end_block]
-        hash_to_block = self.block_allocator.hash_to_block_id
 
-        # Batch dict lookups via C-level map() — faster than Python for loop
-        block_ids = list(map(hash_to_block.get, hashes))
+        # GPU hash table batch lookup
+        lookup_results = self.block_allocator.gpu_hash_table.lookup_batch_alloc(hashes)
 
-        # Find prefix length (first None = first miss)
-        try:
-            prefix_len = block_ids.index(None)
-        except ValueError:
-            prefix_len = len(block_ids)
+        # Transfer to CPU for sequential prefix-length determination
+        # (needed because we must stop at first miss for chain integrity)
+        results_cpu = lookup_results.tolist()
+
+        # Find prefix length (first -1 = first miss)
+        prefix_len = 0
+        for v in results_cpu:
+            if v == -1:
+                break
+            prefix_len += 1
 
         if prefix_len == 0:
             return [], 0
 
-        matched_blocks = block_ids[:prefix_len]
-        parent_hash = hashes[prefix_len - 1]
+        matched_blocks = results_cpu[:prefix_len]
+        parent_hash = hashes[prefix_len - 1].item()
         return matched_blocks, parent_hash
+
+    def gpu_match_prefixes_batch(
+        self, request_hashes_list: list[torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Batch prefix matching for all waiting requests on GPU.
+
+        Replaces per-request _find_matching_prefix_blocks() + _has_pending_prefix_blocks()
+        calls with a single GPU kernel invocation.
+
+        Args:
+            request_hashes_list: List of GPU int64 tensors, one per waiting request.
+                Each tensor contains that request's precomputed_block_hashes.
+
+        Returns:
+            Tuple of:
+            - num_matched: [N] int32 — matched block count per request
+            - has_pending: [N] int32 — 1 if request depends on pending block
+            - matched_block_ids: [N, max_blocks] int32 — matched block IDs
+        """
+        if not request_hashes_list:
+            device = torch.cuda.current_device()
+            return (
+                torch.empty(0, dtype=torch.int32, device=device),
+                torch.empty(0, dtype=torch.int32, device=device),
+                torch.empty((0, 1), dtype=torch.int32, device=device),
+            )
+
+        device = request_hashes_list[0].device
+
+        # Build flattened hashes and offsets
+        lengths = [h.numel() for h in request_hashes_list]
+        max_blocks_per_req = max(lengths) if lengths else 1
+        max_blocks_per_req = max(max_blocks_per_req, 1)  # Ensure at least 1
+
+        offsets = [0]
+        for l in lengths:
+            offsets.append(offsets[-1] + l)
+
+        request_hashes = (
+            torch.cat(request_hashes_list)
+            if any(l > 0 for l in lengths)
+            else torch.empty(0, dtype=torch.int64, device=device)
+        )
+        request_offsets = torch.tensor(offsets, dtype=torch.int32, device=device)
+
+        return self.block_allocator.gpu_hash_table.prefix_match_batch(
+            request_hashes=request_hashes,
+            request_offsets=request_offsets,
+            pending_bitmap=self.block_allocator.pending_bitmap,
+            max_blocks_per_req=max_blocks_per_req,
+        )
 
     def mark_pending_blocks_computed(self) -> None:
         """Mark all pending blocks as computed after prefill.
@@ -1542,15 +1606,25 @@ class DynamicInferenceContext(BaseInferenceContext):
         as having their KV computed. This enables prefix caching coordination
         where subsequent requests can safely reuse these blocks.
         """
-        self.block_allocator.mark_blocks_computed(self._blocks_pending_computation)
-        self._blocks_pending_computation.clear()
+        if self._pending_computation_count > 0:
+            ids = self._pending_computation_buffer[: self._pending_computation_count]
+            self.block_allocator.mark_blocks_computed_gpu(ids)
+            self._pending_computation_count = 0
 
-    def add_request(self, req: DynamicInferenceRequest, chunk_length: Optional[int] = None) -> None:
+    def add_request(
+        self,
+        req: DynamicInferenceRequest,
+        chunk_length: Optional[int] = None,
+        batch_num_matched: Optional[Tensor] = None,
+        batch_matched_block_ids: Optional[Tensor] = None,
+    ) -> None:
         """Add request to context. At this stage, we assume that the request is valid and can be added, as the checks are done in the schedule function.
 
         Args:
             req (DynamicInferenceRequest): Request to add.
             chunk_length (Optional[int]): Length of chunk to add. If None, the request will be fully added.
+            batch_num_matched (Optional[Tensor]): Pre-computed matched block count from batch kernel (scalar GPU tensor).
+            batch_matched_block_ids (Optional[Tensor]): Pre-computed matched block IDs from batch kernel (1-D GPU tensor).
 
         Return:
             None
@@ -1590,10 +1664,34 @@ class DynamicInferenceContext(BaseInferenceContext):
         # =========================================================================
         # Prefix caching: find matching prefix blocks (scoped to this chunk)
         # =========================================================================
-        matched_block_ids, prefix_parent_hash = self._find_matching_prefix_blocks(
-            req, already_allocated_blocks, overall_required_blocks
-        )
-        num_matched_blocks = len(matched_block_ids)
+        if batch_num_matched is not None and batch_matched_block_ids is not None:
+            # Use pre-computed batch kernel results (GPU tensors, no per-request sync)
+            num_matched_blocks = batch_num_matched.item()
+            # Clamp to the range [already_allocated_blocks, overall_required_blocks)
+            effective_matched = min(
+                num_matched_blocks - already_allocated_blocks,
+                overall_required_blocks - already_allocated_blocks,
+            )
+            effective_matched = max(0, effective_matched)
+            if effective_matched > 0:
+                matched_tensor = batch_matched_block_ids[
+                    already_allocated_blocks:already_allocated_blocks + effective_matched
+                ].to(torch.int32)
+            else:
+                matched_tensor = None
+            num_matched_blocks = effective_matched
+        else:
+            # Fallback: per-request GPU hash table lookup
+            matched_block_ids, prefix_parent_hash = self._find_matching_prefix_blocks(
+                req, already_allocated_blocks, overall_required_blocks
+            )
+            num_matched_blocks = len(matched_block_ids)
+            if num_matched_blocks > 0:
+                matched_tensor = torch.tensor(
+                    matched_block_ids, dtype=torch.int32, device=torch.cuda.current_device()
+                )
+            else:
+                matched_tensor = None
 
         # Reduce blocks needed by the number of matched (shared) blocks
         num_blocks_from_pool = (
@@ -1608,11 +1706,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 raise BlockOverflowError(req.request_id)
 
         # Increment ref counts and update timestamps for matched (shared) blocks
-        if num_matched_blocks > 0:
-            matched_tensor = torch.tensor(
-                matched_block_ids, dtype=torch.int32, device=torch.cuda.current_device()
-            )
-            self.block_allocator.increment_ref_counts(matched_block_ids, matched_tensor)
+        if matched_tensor is not None:
+            self.block_allocator.increment_ref_counts_gpu(matched_tensor)
 
         # when a request already starts chunked prefill, it is exactly the last request in the current system
         # (see dynamic_engine.py, schedule_chunked_prefill invariants)
@@ -1665,7 +1760,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # then newly allocated blocks after that.
         match_start = already_allocated_blocks
         new_block_start = already_allocated_blocks + num_matched_blocks
-        if num_matched_blocks > 0:
+        if matched_tensor is not None:
             self.request_to_kv_block_ids[current_id][
                 match_start : match_start + num_matched_blocks
             ] = matched_tensor
@@ -1714,41 +1809,53 @@ class DynamicInferenceContext(BaseInferenceContext):
         #   Range 2: [already_allocated_blocks + num_matched_blocks, num_complete_blocks)
         #       — newly allocated blocks that are now complete
         #
-        # Uses CPU-side block IDs to avoid GPU→CPU sync:
-        #   Range 1 (chunked prefill only): reads from request_to_kv_block_ids (GPU)
-        #   Range 2: uses _last_allocated_cpu from allocate_memory_blocks()
-        if self.enable_prefix_caching and req.precomputed_block_hashes is not None:
+        # All registration uses GPU tensors directly (no CPU conversion).
+        if (
+            self.enable_prefix_caching
+            and req.precomputed_block_hashes is not None
+            and req.precomputed_block_hashes.numel() > 0
+        ):
             total_tokens_after = req.finished_chunk_token_count + chunk_length
             num_complete_blocks = total_tokens_after // self.block_size_tokens
             previously_complete = req.finished_chunk_token_count // self.block_size_tokens
 
-            all_block_ids: list[int] = []
-            all_hashes: list[int] = []
+            gpu_id_parts: list[Tensor] = []
+            gpu_hash_parts: list[Tensor] = []
 
             # Range 1: prior-chunk partial block that this chunk just completed
             r1_end = min(already_allocated_blocks, num_complete_blocks)
             if previously_complete < r1_end:
                 # Chunked prefill path: block IDs from prior chunk are on GPU
-                r1_ids = self.request_to_kv_block_ids[current_id][
-                    previously_complete:r1_end
-                ].tolist()
-                all_block_ids.extend(r1_ids)
-                all_hashes.extend(req.precomputed_block_hashes[previously_complete:r1_end])
+                r1_ids = self.request_to_kv_block_ids[current_id][previously_complete:r1_end]
+                gpu_id_parts.append(r1_ids)
+                gpu_hash_parts.append(req.precomputed_block_hashes[previously_complete:r1_end])
 
             # Range 2: newly allocated (non-matched) blocks that are now complete
             r2_start = already_allocated_blocks + num_matched_blocks
             if r2_start < num_complete_blocks:
-                # Use CPU list from allocate_memory_blocks() — zero GPU sync.
-                # _last_allocated_cpu[0] maps to position new_block_start (= r2_start)
+                # Use GPU tensor from allocate_memory_blocks() directly.
+                # new_block_ids[0] maps to position new_block_start (= r2_start)
                 # in the request's block layout, so slice from offset 0.
                 r2_count = num_complete_blocks - r2_start
-                r2_ids = self.block_allocator._last_allocated_cpu[:r2_count]
-                all_block_ids.extend(r2_ids)
-                all_hashes.extend(req.precomputed_block_hashes[r2_start:num_complete_blocks])
+                gpu_id_parts.append(new_block_ids[:r2_count])
+                gpu_hash_parts.append(req.precomputed_block_hashes[r2_start:num_complete_blocks])
 
-            if all_block_ids:
-                self.block_allocator.register_block_hashes(all_block_ids, all_hashes)
-                self._blocks_pending_computation.extend(all_block_ids)
+            if gpu_id_parts:
+                all_ids_gpu = torch.cat(gpu_id_parts) if len(gpu_id_parts) > 1 else gpu_id_parts[0]
+                all_hashes_gpu = (
+                    torch.cat(gpu_hash_parts) if len(gpu_hash_parts) > 1 else gpu_hash_parts[0]
+                )
+                self.block_allocator.register_block_hashes_gpu(
+                    all_ids_gpu.to(torch.int32), all_hashes_gpu
+                )
+
+                # Populate GPU pending buffer
+                n = all_ids_gpu.numel()
+                buf_start = self._pending_computation_count
+                self._pending_computation_buffer[buf_start : buf_start + n] = all_ids_gpu.to(
+                    torch.int32
+                )
+                self._pending_computation_count += n
 
         if self.is_hybrid_model and not is_chunked_prefill:
             # Allocate a slot for Mamba states
@@ -2084,10 +2191,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
 
         active_request_count = (active_requests_mask == 1).sum().item()
-        finished_request_count = (active_requests_mask == 0).sum().item()
-        assert (
-            active_request_count + finished_request_count + self.paused_request_count
-            == self.total_request_count
+        # Derive finished count arithmetically to avoid a second GPU→CPU sync
+        finished_request_count = (
+            self.total_request_count - self.paused_request_count - active_request_count
         )
 
         # Reset attention state.

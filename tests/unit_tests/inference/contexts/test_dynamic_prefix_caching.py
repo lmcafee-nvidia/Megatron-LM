@@ -147,37 +147,40 @@ class TestHashContract(PrefixCachingTestBase):
         bs = ctx.block_size_tokens
         prompt = self._prompt(bs * 3)
         req = self._req(ctx, prompt)
-        assert len(req.precomputed_block_hashes) == 3
-        assert req.precomputed_block_hashes == compute_block_hashes_batched(prompt, bs)
+        assert req.precomputed_block_hashes.numel() == 3
+        expected = compute_block_hashes_batched(prompt, bs)
+        assert req.precomputed_block_hashes.tolist() == expected
         req2 = self._req(ctx, prompt.clone(), request_id=2)
-        assert req.precomputed_block_hashes == req2.precomputed_block_hashes
-        assert len(set(req.precomputed_block_hashes)) == 3
+        assert torch.equal(req.precomputed_block_hashes, req2.precomputed_block_hashes)
+        assert len(set(req.precomputed_block_hashes.tolist())) == 3
 
     @pytest.mark.internal
     def test_edge_cases(self):
-        """Sub-block → []; empty → []; single-token → []; all-zeros → 4 distinct; 120-block → 120 positive."""
+        """Sub-block → empty; empty → empty; single-token → empty; all-zeros → 4 distinct; 120-block → 120 positive."""
         ctx = self._ctx()
         bs = ctx.block_size_tokens
         dev = torch.cuda.current_device()
-        assert self._req(ctx, self._prompt(bs // 2)).precomputed_block_hashes == []
+        assert self._req(ctx, self._prompt(bs // 2)).precomputed_block_hashes.numel() == 0
         assert (
-            self._req(ctx, torch.tensor([], device=dev, dtype=torch.long)).precomputed_block_hashes
-            == []
+            self._req(
+                ctx, torch.tensor([], device=dev, dtype=torch.long)
+            ).precomputed_block_hashes.numel()
+            == 0
         )
         assert (
             self._req(
                 ctx, torch.tensor([42], device=dev, dtype=torch.long)
-            ).precomputed_block_hashes
-            == []
+            ).precomputed_block_hashes.numel()
+            == 0
         )
         zeros = torch.zeros(bs * 4, device=dev, dtype=torch.long)
         h_zeros = self._req(ctx, zeros).precomputed_block_hashes
-        assert len(h_zeros) == 4 and len(set(h_zeros)) == 4
+        assert h_zeros.numel() == 4 and len(set(h_zeros.tolist())) == 4
         ctx_long = self._ctx(max_sequence_length=8192)
         h_long = self._req(
             ctx_long, torch.arange(bs * 120, device=dev, dtype=torch.long)
         ).precomputed_block_hashes
-        assert len(h_long) == 120 and all(h > 0 for h in h_long)
+        assert h_long.numel() == 120 and all(h > 0 for h in h_long.tolist())
 
 
 # =========================================================================
@@ -283,10 +286,22 @@ class TestRefCountLifecycle(PrefixCachingTestBase):
         assert alloc.block_ref_counts[b1].item() == 2
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
         assert alloc.block_ref_counts[b0].item() == 1
-        assert b0_hash in alloc.hash_to_block_id
+        # Hash still discoverable via GPU hash table
+        assert (
+            alloc.gpu_hash_table.lookup_batch_alloc(
+                torch.tensor([b0_hash], dtype=torch.int64, device=torch.cuda.current_device())
+            )[0].item()
+            == b0
+        )
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
         assert alloc.block_ref_counts[b0].item() == 0
-        assert b0_hash in alloc.hash_to_block_id  # still cached in LRU
+        # Still cached in LRU (hash remains in GPU hash table)
+        assert (
+            alloc.gpu_hash_table.lookup_batch_alloc(
+                torch.tensor([b0_hash], dtype=torch.int64, device=torch.cuda.current_device())
+            )[0].item()
+            == b0
+        )
 
     @pytest.mark.internal
     def test_lru_reuse_after_release(self):
@@ -301,7 +316,14 @@ class TestRefCountLifecycle(PrefixCachingTestBase):
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
         ctx.total_request_count = 0
         assert alloc.block_ref_counts[b0].item() == 0
-        assert alloc.block_hashes[b0].item() in alloc.hash_to_block_id
+        # Hash still discoverable via GPU hash table (LRU cached)
+        b0_hash = alloc.block_hashes[b0].item()
+        assert (
+            alloc.gpu_hash_table.lookup_batch_alloc(
+                torch.tensor([b0_hash], dtype=torch.int64, device=torch.cuda.current_device())
+            )[0].item()
+            == b0
+        )
         ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
         assert self._block_ids(ctx, 0, 2) == [b0, b1]
         assert alloc.block_ref_counts[b0].item() == 1
@@ -368,8 +390,20 @@ class TestEvictionPolicy(PrefixCachingTestBase):
         avail_before = alloc.total_avail
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
         assert alloc.block_ref_counts[b0].item() == 0
-        assert b0_hash not in alloc.hash_to_block_id
-        assert b1_hash not in alloc.hash_to_block_id
+        dev = torch.cuda.current_device()
+        # Hashes removed from GPU hash table after RZ deregistration
+        assert (
+            alloc.gpu_hash_table.lookup_batch_alloc(
+                torch.tensor([b0_hash], dtype=torch.int64, device=dev)
+            )[0].item()
+            == -1
+        )
+        assert (
+            alloc.gpu_hash_table.lookup_batch_alloc(
+                torch.tensor([b1_hash], dtype=torch.int64, device=dev)
+            )[0].item()
+            == -1
+        )
         assert alloc.block_hashes[b0].item() == -1
         assert alloc.block_hashes[b1].item() == -1
         assert alloc.total_avail == avail_before + 2
@@ -386,13 +420,26 @@ class TestEvictionPolicy(PrefixCachingTestBase):
         ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
         b0, _ = self._block_ids(ctx, 0, 2)
         b0_hash = alloc.block_hashes[b0].item()
+        dev = torch.cuda.current_device()
         assert alloc.block_ref_counts[b0].item() == 2
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
         assert alloc.block_ref_counts[b0].item() == 1
-        assert b0_hash in alloc.hash_to_block_id
+        # Hash still in GPU hash table (ref > 0)
+        assert (
+            alloc.gpu_hash_table.lookup_batch_alloc(
+                torch.tensor([b0_hash], dtype=torch.int64, device=dev)
+            )[0].item()
+            == b0
+        )
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
         assert alloc.block_ref_counts[b0].item() == 0
-        assert b0_hash not in alloc.hash_to_block_id
+        # Hash removed from GPU hash table after RZ deregistration
+        assert (
+            alloc.gpu_hash_table.lookup_batch_alloc(
+                torch.tensor([b0_hash], dtype=torch.int64, device=dev)
+            )[0].item()
+            == -1
+        )
 
     @pytest.mark.internal
     def test_rz_no_reuse_after_release(self):
@@ -421,24 +468,36 @@ class TestTwoPhaseRegistration(PrefixCachingTestBase):
 
     @pytest.mark.internal
     def test_phase1_discoverable_phase2_computed(self):
-        """After add: hash_to_block_id populated, block_hashes==-1, pending!=−1. After mark: hash set, pending cleared."""
+        """After add: GPU hash table populated, block_hashes==-1, pending!=−1. After mark: hash set, pending cleared."""
         ctx = self._ctx()
         bs = ctx.block_size_tokens
         alloc = ctx.block_allocator
+        dev = torch.cuda.current_device()
         req = self._req(ctx, self._prompt(bs * 2))
         ctx.add_request(req)
         b0, b1 = self._block_ids(ctx, 0, 2)
-        h0, h1 = req.precomputed_block_hashes
-        assert alloc.hash_to_block_id.get(h0) == b0
-        assert alloc.hash_to_block_id.get(h1) == b1
+        h0, h1 = req.precomputed_block_hashes.tolist()
+        # GPU hash table should find the blocks
+        assert (
+            alloc.gpu_hash_table.lookup_batch_alloc(
+                torch.tensor([h0], dtype=torch.int64, device=dev)
+            )[0].item()
+            == b0
+        )
+        assert (
+            alloc.gpu_hash_table.lookup_batch_alloc(
+                torch.tensor([h1], dtype=torch.int64, device=dev)
+            )[0].item()
+            == b1
+        )
         assert alloc.block_hashes[b0].item() == -1
         assert alloc._pending_block_hashes[b0].item() != -1
-        assert len(ctx._blocks_pending_computation) == 2
+        assert ctx._pending_computation_count == 2
         ctx.mark_pending_blocks_computed()
         assert alloc.block_hashes[b0].item() == h0
         assert alloc.block_hashes[b1].item() == h1
         assert alloc._pending_block_hashes[b0].item() == -1
-        assert len(ctx._blocks_pending_computation) == 0
+        assert ctx._pending_computation_count == 0
 
     @pytest.mark.internal
     def test_concurrent_sharing_before_computed(self):
@@ -465,14 +524,21 @@ class TestTwoPhaseRegistration(PrefixCachingTestBase):
 
     @pytest.mark.internal
     def test_allocator_api_register_then_mark(self):
-        """Direct allocator: register → lookup finds block, hash==-1. mark → hash==hash."""
+        """Direct allocator: register → GPU lookup finds block, hash==-1. mark → hash==hash."""
         ctx = self._ctx()
         alloc = ctx.block_allocator
+        dev = torch.cuda.current_device()
         block_ids = alloc.allocate_memory_blocks(1)
         bid = block_ids[0].item()
         test_hash = 99999
         alloc.register_block_hashes([bid], [test_hash])
-        assert alloc.hash_to_block_id.get(test_hash) == bid
+        # GPU hash table should find the block
+        assert (
+            alloc.gpu_hash_table.lookup_batch_alloc(
+                torch.tensor([test_hash], dtype=torch.int64, device=dev)
+            )[0].item()
+            == bid
+        )
         assert alloc.block_hashes[bid].item() == -1
         alloc.mark_blocks_computed([bid])
         assert alloc.block_hashes[bid].item() == test_hash
@@ -493,15 +559,15 @@ class TestPrefillAndDecode(PrefixCachingTestBase):
         bs = ctx.block_size_tokens
         prompt = self._prompt(bs * 4)
         ctx.add_request(self._req(ctx, prompt.clone()))
-        assert len(ctx._blocks_pending_computation) == 4
+        assert ctx._pending_computation_count == 4
         ctx.mark_pending_blocks_computed()
-        assert len(ctx._blocks_pending_computation) == 0
+        assert ctx._pending_computation_count == 0
         ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
-        assert len(ctx._blocks_pending_computation) == 0
+        assert ctx._pending_computation_count == 0
         assert torch.equal(ctx.request_to_kv_block_ids[0][:4], ctx.request_to_kv_block_ids[1][:4])
         extended = torch.cat([prompt, self._prompt(bs, offset=1000)])
         ctx.add_request(self._req(ctx, extended, request_id=3))
-        assert len(ctx._blocks_pending_computation) == 1
+        assert ctx._pending_computation_count == 1
 
     @pytest.mark.internal
     def test_decode_does_not_register_hashes(self):
@@ -725,121 +791,138 @@ class TestEngineScheduling(PrefixCachingTestBase):
 # =========================================================================
 
 
-class TestCPUShadowsAndConfig(PrefixCachingTestBase):
-    """Pending set lifecycle, reverse mapping, ref counters, reset, disabled+RZ attrs."""
+class TestGPUStructuresAndConfig(PrefixCachingTestBase):
+    """Pending bitmap lifecycle, GPU hash table consistency, GPU ref counters, reset, disabled+RZ attrs."""
 
     @staticmethod
-    def _assert_cpu_shadows_consistent(alloc):
+    def _assert_gpu_structures_consistent(alloc):
+        """Verify GPU structures are internally consistent."""
         gpu_pending = set(torch.nonzero(alloc._pending_block_hashes != -1).flatten().tolist())
-        assert alloc._pending_block_ids_cpu == gpu_pending
-        for bid, h in alloc.block_id_to_hash.items():
-            assert alloc.hash_to_block_id.get(h) == bid
-        for h, bid in alloc.hash_to_block_id.items():
-            assert alloc.block_id_to_hash.get(bid) == h
-        # Reconcile lazy counter before comparing (matches engine flow)
-        alloc.reconcile_blocks_with_refs()
+        bitmap_pending = set(torch.nonzero(alloc.pending_bitmap).flatten().tolist())
+        assert gpu_pending == bitmap_pending, "pending_bitmap must match _pending_block_hashes"
         gpu_blocks_with_refs = int((alloc.block_ref_counts > 0).sum().item())
         gpu_total_ref_count = int(alloc.block_ref_counts.sum().item())
-        assert alloc._cpu_blocks_with_refs == gpu_blocks_with_refs
-        assert alloc._cpu_total_ref_count == gpu_total_ref_count
+        assert int(alloc._gpu_blocks_with_refs.item()) == gpu_blocks_with_refs
+        assert int(alloc._gpu_total_ref_count.item()) == gpu_total_ref_count
 
     @pytest.mark.internal
-    def test_pending_set_tracks_lifecycle(self):
-        """_pending_block_ids_cpu: empty → {b0,b1} after add → empty after mark."""
+    def test_pending_bitmap_tracks_lifecycle(self):
+        """pending_bitmap: empty → {b0,b1} after add → empty after mark."""
         ctx = self._ctx()
         bs = ctx.block_size_tokens
         alloc = ctx.block_allocator
-        assert alloc._pending_block_ids_cpu == set()
+        assert alloc.pending_bitmap.sum().item() == 0
         req = self._req(ctx, self._prompt(bs * 2))
         ctx.add_request(req)
         b0, b1 = self._block_ids(ctx, 0, 2)
-        assert alloc._pending_block_ids_cpu == {b0, b1}
-        self._assert_cpu_shadows_consistent(alloc)
+        assert alloc.pending_bitmap[b0].item() is True
+        assert alloc.pending_bitmap[b1].item() is True
+        self._assert_gpu_structures_consistent(alloc)
         ctx.mark_pending_blocks_computed()
-        assert alloc._pending_block_ids_cpu == set()
-        self._assert_cpu_shadows_consistent(alloc)
+        assert alloc.pending_bitmap[b0].item() is False
+        assert alloc.pending_bitmap[b1].item() is False
+        self._assert_gpu_structures_consistent(alloc)
 
     @pytest.mark.internal
-    def test_reverse_mapping_consistent(self):
-        """block_id_to_hash correct after register, mark, and LRU release. RZ release clears it."""
+    def test_gpu_hash_table_consistent(self):
+        """GPU hash table consistent after register, mark, and LRU release. RZ release clears it."""
         ctx = self._ctx()
         bs = ctx.block_size_tokens
         alloc = ctx.block_allocator
+        dev = torch.cuda.current_device()
         req = self._req(ctx, self._prompt(bs * 2))
         ctx.add_request(req)
         b0, b1 = self._block_ids(ctx, 0, 2)
-        h0, h1 = req.precomputed_block_hashes
-        assert alloc.block_id_to_hash[b0] == h0
-        assert alloc.block_id_to_hash[b1] == h1
-        self._assert_cpu_shadows_consistent(alloc)
+        h0, h1 = req.precomputed_block_hashes.tolist()
+        # After register: hash table finds blocks
+        assert (
+            alloc.gpu_hash_table.lookup_batch_alloc(
+                torch.tensor([h0], dtype=torch.int64, device=dev)
+            )[0].item()
+            == b0
+        )
+        assert (
+            alloc.gpu_hash_table.lookup_batch_alloc(
+                torch.tensor([h1], dtype=torch.int64, device=dev)
+            )[0].item()
+            == b1
+        )
+        self._assert_gpu_structures_consistent(alloc)
         ctx.mark_pending_blocks_computed()
-        assert alloc.block_id_to_hash[b0] == h0
-        self._assert_cpu_shadows_consistent(alloc)
+        self._assert_gpu_structures_consistent(alloc)
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
-        assert alloc.block_id_to_hash[b0] == h0  # still cached in LRU
-        self._assert_cpu_shadows_consistent(alloc)
-        # RZ mode: release clears reverse mapping
+        # LRU: still in hash table after release (cached)
+        assert (
+            alloc.gpu_hash_table.lookup_batch_alloc(
+                torch.tensor([h0], dtype=torch.int64, device=dev)
+            )[0].item()
+            == b0
+        )
+        self._assert_gpu_structures_consistent(alloc)
+        # RZ mode: release removes from hash table
         ctx_rz = self._ctx(block_evict_lru=False)
         alloc_rz = ctx_rz.block_allocator
         req_rz = self._req(ctx_rz, self._prompt(bs * 2))
         ctx_rz.add_request(req_rz)
         ctx_rz.mark_pending_blocks_computed()
         b0_rz, b1_rz = self._block_ids(ctx_rz, 0, 2)
+        h0_rz = alloc_rz.block_hashes[b0_rz].item()
         ctx_rz.release_memory_blocks_from_request_indexes(torch.tensor([0]))
-        assert b0_rz not in alloc_rz.block_id_to_hash
-        assert b1_rz not in alloc_rz.block_id_to_hash
-        self._assert_cpu_shadows_consistent(alloc_rz)
+        assert (
+            alloc_rz.gpu_hash_table.lookup_batch_alloc(
+                torch.tensor([h0_rz], dtype=torch.int64, device=dev)
+            )[0].item()
+            == -1
+        )
+        self._assert_gpu_structures_consistent(alloc_rz)
 
     @pytest.mark.internal
-    def test_cpu_ref_counters(self):
-        """_cpu_blocks_with_refs and _cpu_total_ref_count accurate through add→share→release→release."""
+    def test_gpu_ref_counters(self):
+        """_gpu_blocks_with_refs and _gpu_total_ref_count accurate through add→share→release→release."""
         ctx = self._ctx()
         bs = ctx.block_size_tokens
         alloc = ctx.block_allocator
         prompt = self._prompt(bs * 2)
-        assert alloc._cpu_blocks_with_refs == 0
-        assert alloc._cpu_total_ref_count == 0
+        assert int(alloc._gpu_blocks_with_refs.item()) == 0
+        assert int(alloc._gpu_total_ref_count.item()) == 0
         ctx.add_request(self._req(ctx, prompt.clone()))
         ctx.mark_pending_blocks_computed()
-        assert alloc._cpu_blocks_with_refs == 2
-        assert alloc._cpu_total_ref_count == 2
-        self._assert_cpu_shadows_consistent(alloc)
+        assert int(alloc._gpu_blocks_with_refs.item()) == 2
+        assert int(alloc._gpu_total_ref_count.item()) == 2
+        self._assert_gpu_structures_consistent(alloc)
         ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
-        assert alloc._cpu_blocks_with_refs == 2
-        assert alloc._cpu_total_ref_count == 4
-        self._assert_cpu_shadows_consistent(alloc)
+        assert int(alloc._gpu_blocks_with_refs.item()) == 2
+        assert int(alloc._gpu_total_ref_count.item()) == 4
+        self._assert_gpu_structures_consistent(alloc)
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
-        alloc.reconcile_blocks_with_refs()
-        assert alloc._cpu_blocks_with_refs == 2
-        assert alloc._cpu_total_ref_count == 2
-        self._assert_cpu_shadows_consistent(alloc)
+        assert int(alloc._gpu_blocks_with_refs.item()) == 2
+        assert int(alloc._gpu_total_ref_count.item()) == 2
+        self._assert_gpu_structures_consistent(alloc)
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
-        alloc.reconcile_blocks_with_refs()
-        assert alloc._cpu_blocks_with_refs == 0
-        assert alloc._cpu_total_ref_count == 0
-        self._assert_cpu_shadows_consistent(alloc)
+        assert int(alloc._gpu_blocks_with_refs.item()) == 0
+        assert int(alloc._gpu_total_ref_count.item()) == 0
+        self._assert_gpu_structures_consistent(alloc)
 
     @pytest.mark.internal
-    def test_reset_clears_all_shadows(self):
-        """After alloc.reset(), all CPU structures zeroed."""
+    def test_reset_clears_all_gpu_structures(self):
+        """After alloc.reset(), all GPU structures zeroed."""
         ctx = self._ctx()
         alloc = ctx.block_allocator
         ctx.add_request(self._req(ctx, self._prompt(ctx.block_size_tokens * 2)))
         ctx.mark_pending_blocks_computed()
-        assert len(alloc.block_id_to_hash) > 0
+        assert alloc.gpu_hash_table.size > 0
         alloc.reset()
-        assert alloc._pending_block_ids_cpu == set()
-        assert alloc.block_id_to_hash == {}
-        assert alloc._cpu_blocks_with_refs == 0
-        assert alloc._cpu_total_ref_count == 0
-        self._assert_cpu_shadows_consistent(alloc)
+        assert alloc.pending_bitmap.sum().item() == 0
+        assert int(alloc._gpu_blocks_with_refs.item()) == 0
+        assert int(alloc._gpu_total_ref_count.item()) == 0
+        self._assert_gpu_structures_consistent(alloc)
 
     @pytest.mark.internal
     def test_disabled_and_rz_attribute_absence(self):
-        """Disabled: no block_hashes, block_ref_counts, hash_to_block_id. RZ: no block_timestamps."""
+        """Disabled: no block_hashes, block_ref_counts, gpu_hash_table. RZ: no block_timestamps."""
         alloc_disabled = self._ctx(enable_prefix_caching=False).block_allocator
         assert not hasattr(alloc_disabled, 'block_hashes')
         assert not hasattr(alloc_disabled, 'block_ref_counts')
-        assert not hasattr(alloc_disabled, 'hash_to_block_id')
+        assert not hasattr(alloc_disabled, 'gpu_hash_table')
         alloc_rz = self._ctx(block_evict_lru=False).block_allocator
         assert not hasattr(alloc_rz, 'block_timestamps')
