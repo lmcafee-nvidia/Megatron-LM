@@ -5,6 +5,8 @@ from typing import Optional
 import torch
 from torch import Tensor
 
+from megatron.core.inference.config import PrefixCachingEvictPolicy
+
 from .gpu_hash_table import GPUHashTable
 
 
@@ -29,12 +31,12 @@ class BlockAllocator:
         total_count: int,
         paused_count: int,
         enable_prefix_caching: bool = False,
-        block_evict_lru: bool = False,
+        prefix_caching_evict_policy: PrefixCachingEvictPolicy = PrefixCachingEvictPolicy.REF_ZERO,
     ):
 
         self.context = context
         self.enable_prefix_caching = enable_prefix_caching
-        self.block_evict_lru = block_evict_lru
+        self.prefix_caching_evict_policy = prefix_caching_evict_policy
 
         self.total_count = total_count
         self.total_avail = total_count - 1  # -1 for dummy_block_idx (see below)
@@ -66,7 +68,7 @@ class BlockAllocator:
 
             # LRU timestamps for eviction ordering (higher = more recently used)
             # Only needed in LRU mode; RZ mode evicts immediately on ref_count==0
-            if self.block_evict_lru:
+            if self.prefix_caching_evict_policy == PrefixCachingEvictPolicy.LRU:
                 self.block_timestamps = torch.zeros(
                     (self.total_count,), dtype=torch.int64, device=device
                 )
@@ -141,7 +143,7 @@ class BlockAllocator:
             return True
         if not self.enable_prefix_caching:
             return False
-        if not self.block_evict_lru:
+        if self.prefix_caching_evict_policy == PrefixCachingEvictPolicy.REF_ZERO:
             return False  # RZ: no cached blocks to evict
 
         # Exact GPU count (1 sync via get_evictable_block_count)
@@ -161,7 +163,7 @@ class BlockAllocator:
         """
         # Try to evict cached blocks if free pool is insufficient
         if self.total_avail < num_blocks:
-            if not self.enable_prefix_caching or not self.block_evict_lru:
+            if not self.enable_prefix_caching or self.prefix_caching_evict_policy == PrefixCachingEvictPolicy.REF_ZERO:
                 return None  # RZ: no eviction path; disabled: no cached blocks
             blocks_needed_from_eviction = num_blocks - self.total_avail
             if not self.evict_lru_blocks(blocks_needed_from_eviction):
@@ -177,7 +179,7 @@ class BlockAllocator:
             self.block_ref_counts[block_ids] = 1
             self._gpu_blocks_with_refs += num_blocks
             self._gpu_total_ref_count += num_blocks
-            if self.block_evict_lru:
+            if self.prefix_caching_evict_policy == PrefixCachingEvictPolicy.LRU:
                 self.update_timestamps(block_ids)
 
         return block_ids
@@ -206,7 +208,7 @@ class BlockAllocator:
             num_zero = zero_mask.sum()
             self._gpu_blocks_with_refs -= num_zero
 
-            if not self.block_evict_lru:
+            if self.prefix_caching_evict_policy == PrefixCachingEvictPolicy.REF_ZERO:
                 # RZ: immediately deregister zero-ref blocks
                 # Use torch.where to extract block IDs at fixed size, then slice
                 # by the GPU-computed count (requires one sync for _deregister_blocks)
@@ -252,7 +254,7 @@ class BlockAllocator:
             self.block_ref_counts.fill_(0)
             self._gpu_blocks_with_refs.fill_(0)
             self._gpu_total_ref_count.fill_(0)
-            if self.block_evict_lru:
+            if self.prefix_caching_evict_policy == PrefixCachingEvictPolicy.LRU:
                 self.block_timestamps.fill_(0)
 
     # =========================================================================
@@ -287,14 +289,14 @@ class BlockAllocator:
         if num_matched == 0:
             return
 
-        if self.block_evict_lru:
+        if self.prefix_caching_evict_policy == PrefixCachingEvictPolicy.LRU:
             newly_active = (self.block_ref_counts[matched_tensor] == 0).sum()
             self._gpu_blocks_with_refs += newly_active
 
         self._gpu_total_ref_count += num_matched
         self.block_ref_counts[matched_tensor] += 1
 
-        if self.block_evict_lru:
+        if self.prefix_caching_evict_policy == PrefixCachingEvictPolicy.LRU:
             self.update_timestamps(matched_tensor)
 
     def mark_blocks_computed(self, block_ids: Tensor) -> None:
@@ -333,7 +335,7 @@ class BlockAllocator:
         self.pending_bitmap[block_ids_i64] = False
         self.block_hashes[block_ids] = -1
         self.block_ref_counts[block_ids] = 0
-        if self.block_evict_lru:
+        if self.prefix_caching_evict_policy == PrefixCachingEvictPolicy.LRU:
             self.block_timestamps[block_ids] = 0
 
         # Return blocks to free pool
@@ -361,7 +363,7 @@ class BlockAllocator:
         Args:
             block_ids: Tensor of block IDs that were accessed.
         """
-        if not self.block_evict_lru or block_ids.numel() == 0:
+        if self.prefix_caching_evict_policy != PrefixCachingEvictPolicy.LRU or block_ids.numel() == 0:
             return
         self.block_timestamps[block_ids] = self.context.step_count
 

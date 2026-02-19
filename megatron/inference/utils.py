@@ -7,7 +7,11 @@ from typing import Optional
 
 from gpt_builders import gpt_builder
 from mamba_builders import mamba_builder
-from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
+from megatron.core.inference.config import (
+    InferenceConfig,
+    MambaInferenceStateConfig,
+    PrefixCachingEvictPolicy,
+)
 from megatron.core.inference.contexts import DynamicInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
@@ -307,7 +311,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
         enable_chunked_prefill=args.enable_chunked_prefill,
         enable_prefix_caching=args.inference_dynamic_batching_enable_prefix_caching,
-        block_evict_lru=args.inference_dynamic_batching_block_evict_lru,
+        prefix_caching_evict_policy=PrefixCachingEvictPolicy(args.inference_dynamic_batching_prefix_caching_evict_policy),
         metrics_writer=metrics_writer,
         logging_step_interval=args.inference_logging_step_interval,
     )

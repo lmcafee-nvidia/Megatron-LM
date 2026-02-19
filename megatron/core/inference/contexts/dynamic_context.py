@@ -244,7 +244,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Prefix caching configuration
         self.enable_prefix_caching = inference_config.enable_prefix_caching
-        self.block_evict_lru = inference_config.block_evict_lru
 
         # Step counter (used for LRU timestamps in prefix caching)
         self.step_count = 0
@@ -431,7 +430,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             ),
             paused_count=paused_block_count,
             enable_prefix_caching=self.enable_prefix_caching,
-            block_evict_lru=self.block_evict_lru,
+            prefix_caching_evict_policy=self.config.prefix_caching_evict_policy,
         )
 
         # Track request metadata.

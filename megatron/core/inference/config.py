@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import List, Optional, Tuple
 
 import torch
@@ -49,6 +50,13 @@ class MambaInferenceStateConfig:
                 mamba_ssm_states_shape=mamba_ssm_states_shape,
             )
         return None
+
+
+class PrefixCachingEvictPolicy(Enum):
+    """Eviction policy for prefix caching blocks."""
+
+    REF_ZERO = "ref_zero"
+    LRU = "lru"
 
 
 @dataclass
@@ -170,8 +178,8 @@ class InferenceConfig:
     enable_prefix_caching: bool = False
     """Whether to enable prefix caching for KV cache block sharing."""
 
-    block_evict_lru: bool = False
-    """Use LRU eviction for prefix caching blocks. Only applies when enable_prefix_caching is True."""
+    prefix_caching_evict_policy: PrefixCachingEvictPolicy = PrefixCachingEvictPolicy.REF_ZERO
+    """Eviction policy for prefix caching blocks. Only applies when enable_prefix_caching is True."""
 
     # =================================
     # Logging config

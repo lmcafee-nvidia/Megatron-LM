@@ -6,7 +6,7 @@ from collections import deque
 import pytest
 import torch
 
-from megatron.core.inference.config import InferenceConfig
+from megatron.core.inference.config import InferenceConfig, PrefixCachingEvictPolicy
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.inference_request import (
@@ -47,7 +47,7 @@ class PrefixCachingTestBase:
         rounder=64,
         enable_prefix_caching=True,
         max_tokens=None,
-        block_evict_lru=True,
+        prefix_caching_evict_policy=PrefixCachingEvictPolicy.LRU,
     ):
         DynamicInferenceContext.ROUNDER = rounder
         DynamicInferenceContext.TOKEN_ROUNDER = rounder
@@ -72,7 +72,7 @@ class PrefixCachingTestBase:
             use_flashinfer_fused_rope=None,
             unified_memory_level=0,
             enable_prefix_caching=enable_prefix_caching,
-            block_evict_lru=block_evict_lru,
+            prefix_caching_evict_policy=prefix_caching_evict_policy,
         )
         return DynamicInferenceContext(
             model_config=transformer_config, inference_config=inference_config
@@ -378,7 +378,7 @@ class TestEvictionPolicy(PrefixCachingTestBase):
     @pytest.mark.internal
     def test_rz_deregisters_on_ref_zero(self):
         """RZ: release → ref=0 → hash removed, block_hashes reset, total_avail increases."""
-        ctx = self._ctx(block_evict_lru=False)
+        ctx = self._ctx(prefix_caching_evict_policy=PrefixCachingEvictPolicy.REF_ZERO)
         bs = ctx.block_size_tokens
         alloc = ctx.block_allocator
         prompt = self._prompt(bs * 2)
@@ -411,7 +411,7 @@ class TestEvictionPolicy(PrefixCachingTestBase):
     @pytest.mark.internal
     def test_rz_shared_persist_until_last_ref(self):
         """RZ: 2 sharers, release one → ref=1, hash stays. Release second → hash removed."""
-        ctx = self._ctx(block_evict_lru=False)
+        ctx = self._ctx(prefix_caching_evict_policy=PrefixCachingEvictPolicy.REF_ZERO)
         bs = ctx.block_size_tokens
         alloc = ctx.block_allocator
         prompt = self._prompt(bs * 2)
@@ -444,7 +444,7 @@ class TestEvictionPolicy(PrefixCachingTestBase):
     @pytest.mark.internal
     def test_rz_no_reuse_after_release(self):
         """RZ: after release, same prefix gets fresh blocks (no cache)."""
-        ctx = self._ctx(block_evict_lru=False)
+        ctx = self._ctx(prefix_caching_evict_policy=PrefixCachingEvictPolicy.REF_ZERO)
         bs = ctx.block_size_tokens
         alloc = ctx.block_allocator
         prompt = self._prompt(bs * 2)
@@ -863,7 +863,7 @@ class TestGPUStructuresAndConfig(PrefixCachingTestBase):
         )
         self._assert_gpu_structures_consistent(alloc)
         # RZ mode: release removes from hash table
-        ctx_rz = self._ctx(block_evict_lru=False)
+        ctx_rz = self._ctx(prefix_caching_evict_policy=PrefixCachingEvictPolicy.REF_ZERO)
         alloc_rz = ctx_rz.block_allocator
         req_rz = self._req(ctx_rz, self._prompt(bs * 2))
         ctx_rz.add_request(req_rz)
@@ -927,5 +927,5 @@ class TestGPUStructuresAndConfig(PrefixCachingTestBase):
         assert not hasattr(alloc_disabled, 'block_hashes')
         assert not hasattr(alloc_disabled, 'block_ref_counts')
         assert not hasattr(alloc_disabled, 'gpu_hash_table')
-        alloc_rz = self._ctx(block_evict_lru=False).block_allocator
+        alloc_rz = self._ctx(prefix_caching_evict_policy=PrefixCachingEvictPolicy.REF_ZERO).block_allocator
         assert not hasattr(alloc_rz, 'block_timestamps')
