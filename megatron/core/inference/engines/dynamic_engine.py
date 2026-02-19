@@ -1219,16 +1219,24 @@ class DynamicInferenceEngine(AbstractEngine):
         # Pre-compute batch prefix matching on GPU (one kernel for all waiting requests)
         batch_prefix_result = self._gpu_precompute_prefix_matches()
 
+        # Pre-compute schedulable limit: how many consecutive non-pending requests from front
+        # This replaces N per-iteration .item() syncs with a single GPU cumprod+sum+.item()
+        schedulable_limit = None
+        has_pending = None
+        if batch_prefix_result is not None:
+            _, has_pending, _ = batch_prefix_result
+            non_pending = (has_pending == 0).to(torch.int32)
+            schedulable_limit = non_pending.cumprod(dim=0).sum().item()  # 1 sync total
+
         waiting_idx = 0
         while self.waiting_request_ids:
-            req = self.get_request(self.waiting_request_ids[0])
-
-            # Prefix caching coordination: use batch result instead of per-request GPU sync
-            if batch_prefix_result is not None:
-                _, has_pending, _ = batch_prefix_result
-                if has_pending[waiting_idx].item():
+            # Prefix caching coordination: stop at first pending request
+            if schedulable_limit is not None and waiting_idx >= schedulable_limit:
+                if waiting_idx < has_pending.numel():
                     self._prefix_coordination_waits += 1
-                    break
+                break
+
+            req = self.get_request(self.waiting_request_ids[0])
 
             request_can_be_added, request_tokens_can_be_added, kv_cache_available = (
                 self.context.check_availability(req)
@@ -1272,6 +1280,15 @@ class DynamicInferenceEngine(AbstractEngine):
         # Pre-compute batch prefix matching on GPU (one kernel for all waiting requests)
         batch_prefix_result = self._gpu_precompute_prefix_matches()
 
+        # Pre-compute schedulable limit: how many consecutive non-pending requests from front
+        # This replaces N per-iteration .item() syncs with a single GPU cumprod+sum+.item()
+        schedulable_limit = None
+        has_pending = None
+        if batch_prefix_result is not None:
+            _, has_pending, _ = batch_prefix_result
+            non_pending = (has_pending == 0).to(torch.int32)
+            schedulable_limit = non_pending.cumprod(dim=0).sum().item()  # 1 sync total
+
         can_schedule = True
         waiting_idx = 0
         while self.waiting_request_ids and can_schedule:
@@ -1282,12 +1299,12 @@ class DynamicInferenceEngine(AbstractEngine):
             # chunk of a existing chunked prefill request
             is_continuing_chunked_prefill = self.context.chunked_prefill_request_id >= 0
 
-            # Prefix caching coordination: use batch result instead of per-request GPU sync
+            # Prefix caching coordination: stop at first pending request
             # (continuing chunked prefill requests must not be blocked)
-            if not is_continuing_chunked_prefill and batch_prefix_result is not None:
-                _, has_pending, _ = batch_prefix_result
-                if has_pending[waiting_idx].item():
-                    self._prefix_coordination_waits += 1
+            if not is_continuing_chunked_prefill:
+                if schedulable_limit is not None and waiting_idx >= schedulable_limit:
+                    if waiting_idx < has_pending.numel():
+                        self._prefix_coordination_waits += 1
                     break
 
             # Use remaining prompt tokens for scheduling decisions
