@@ -1137,7 +1137,8 @@ class DynamicInferenceEngine(AbstractEngine):
         block allocator (registered but not yet marked computed). Scheduling such
         a request before the KV is ready would produce incorrect results.
 
-        Uses GPU hash table lookup + pending_bitmap check.
+        Uses GPU hash table lookup + cumprod prefix mask + pending_bitmap check.
+        Only syncs a single bool scalar (.item()) for the return value.
 
         Args:
             req: The request to check.
@@ -1155,24 +1156,17 @@ class DynamicInferenceEngine(AbstractEngine):
         # Batch GPU hash table lookup for all block hashes
         block_ids = block_allocator.gpu_hash_table.lookup_batch_alloc(req.precomputed_block_hashes)
 
-        # Transfer to CPU for sequential prefix check
-        block_ids_cpu = block_ids.tolist()
-
-        # Walk the prefix chain, stop at first miss
-        matched_ids = []
-        for bid in block_ids_cpu:
-            if bid == -1:
-                break
-            matched_ids.append(bid)
-
-        if not matched_ids:
+        # GPU-only prefix mask: cumprod of hit mask gives consecutive-match mask
+        hit_mask = (block_ids != -1).to(torch.int32)
+        prefix_mask = hit_mask.cumprod(dim=0).bool()
+        if not prefix_mask.any().item():
             return False
 
-        # Check pending_bitmap for matched blocks (GPU batch check)
-        matched_tensor = torch.tensor(
-            matched_ids, dtype=torch.int64, device=block_allocator.pending_bitmap.device
-        )
-        return bool(block_allocator.pending_bitmap[matched_tensor].any().item())
+        # Check pending_bitmap for matched blocks using clamped IDs
+        # (clamp to 0 for miss slots; prefix_mask filters them out)
+        safe_ids = block_ids.clamp(min=0).long()
+        pending_in_prefix = block_allocator.pending_bitmap[safe_ids] & prefix_mask
+        return pending_in_prefix.any().item()
 
     def get_prefix_coordination_metrics(self) -> dict:
         """Return prefix caching coordination metrics.

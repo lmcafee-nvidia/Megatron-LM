@@ -531,7 +531,10 @@ class TestTwoPhaseRegistration(PrefixCachingTestBase):
         block_ids = alloc.allocate_memory_blocks(1)
         bid = block_ids[0].item()
         test_hash = 99999
-        alloc.register_block_hashes([bid], [test_hash])
+        alloc.register_block_hashes(
+            block_ids[:1].to(torch.int32),
+            torch.tensor([test_hash], dtype=torch.int64, device=dev),
+        )
         # GPU hash table should find the block
         assert (
             alloc.gpu_hash_table.lookup_batch_alloc(
@@ -540,7 +543,7 @@ class TestTwoPhaseRegistration(PrefixCachingTestBase):
             == bid
         )
         assert alloc.block_hashes[bid].item() == -1
-        alloc.mark_blocks_computed([bid])
+        alloc.mark_blocks_computed(block_ids[:1].to(torch.int32))
         assert alloc.block_hashes[bid].item() == test_hash
 
 

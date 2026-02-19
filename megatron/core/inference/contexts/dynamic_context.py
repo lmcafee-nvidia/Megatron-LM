@@ -1495,11 +1495,14 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def _find_matching_prefix_blocks(
         self, req: DynamicInferenceRequest, start_block: int, end_block: int
-    ) -> tuple[list[int], int]:
+    ) -> tuple[Tensor, Tensor]:
         """Find cached blocks matching a range of the prompt using precomputed hashes.
 
         Looks up hashes in req.precomputed_block_hashes[start_block:end_block] against
         the block allocator's GPU hash table. Stops at the first non-match.
+
+        All operations are GPU-resident; the only CPU sync needed is a single
+        scalar .item() by the caller to read num_matched.
 
         Args:
             req: The inference request with precomputed_block_hashes set.
@@ -1508,45 +1511,37 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         Returns:
             Tuple of:
-            - List of matched block IDs (consecutive from start_block)
-            - Parent hash of the last matched block (0 if no matches)
+            - num_matched: [1] int32 GPU scalar — consecutive matched block count
+            - lookup_results: int32 GPU tensor — raw lookup results (caller slices
+              to [:num_matched])
         """
+        device = torch.cuda.current_device()
+        _zero = torch.zeros(1, dtype=torch.int32, device=device)
+        _empty = torch.empty(0, dtype=torch.int32, device=device)
+
         # Early return if prefix caching is disabled
         if not self.enable_prefix_caching:
-            return [], 0
+            return _zero, _empty
 
         # Early return if request has no precomputed hashes
         if req.precomputed_block_hashes is None or req.precomputed_block_hashes.numel() == 0:
-            return [], 0
+            return _zero, _empty
 
         # Clamp end_block to the number of precomputed hashes (the trailing
         # partial block has no hash).
         end_block = min(end_block, req.precomputed_block_hashes.shape[0])
         if start_block >= end_block:
-            return [], 0
+            return _zero, _empty
 
         hashes = req.precomputed_block_hashes[start_block:end_block]
 
         # GPU hash table batch lookup
         lookup_results = self.block_allocator.gpu_hash_table.lookup_batch_alloc(hashes)
 
-        # Transfer to CPU for sequential prefix-length determination
-        # (needed because we must stop at first miss for chain integrity)
-        results_cpu = lookup_results.tolist()
-
-        # Find prefix length (first -1 = first miss)
-        prefix_len = 0
-        for v in results_cpu:
-            if v == -1:
-                break
-            prefix_len += 1
-
-        if prefix_len == 0:
-            return [], 0
-
-        matched_blocks = results_cpu[:prefix_len]
-        parent_hash = hashes[prefix_len - 1].item()
-        return matched_blocks, parent_hash
+        # GPU-only prefix length: cumprod of hit mask gives consecutive-match mask
+        hit_mask = (lookup_results != -1).to(torch.int32)
+        num_matched = hit_mask.cumprod(dim=0).sum().to(torch.int32).reshape(1)
+        return num_matched, lookup_results.to(torch.int32)
 
     def gpu_match_prefixes_batch(
         self, request_hashes_list: list[torch.Tensor]
@@ -1608,7 +1603,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         if self._pending_computation_count > 0:
             ids = self._pending_computation_buffer[: self._pending_computation_count]
-            self.block_allocator.mark_blocks_computed_gpu(ids)
+            self.block_allocator.mark_blocks_computed(ids)
             self._pending_computation_count = 0
 
     def add_request(
@@ -1681,15 +1676,13 @@ class DynamicInferenceContext(BaseInferenceContext):
                 matched_tensor = None
             num_matched_blocks = effective_matched
         else:
-            # Fallback: per-request GPU hash table lookup
-            matched_block_ids, prefix_parent_hash = self._find_matching_prefix_blocks(
+            # Fallback: per-request GPU hash table lookup (single scalar sync)
+            num_matched_gpu, lookup_results = self._find_matching_prefix_blocks(
                 req, already_allocated_blocks, overall_required_blocks
             )
-            num_matched_blocks = len(matched_block_ids)
+            num_matched_blocks = num_matched_gpu.item()
             if num_matched_blocks > 0:
-                matched_tensor = torch.tensor(
-                    matched_block_ids, dtype=torch.int32, device=torch.cuda.current_device()
-                )
+                matched_tensor = lookup_results[:num_matched_blocks]
             else:
                 matched_tensor = None
 
@@ -1707,7 +1700,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Increment ref counts and update timestamps for matched (shared) blocks
         if matched_tensor is not None:
-            self.block_allocator.increment_ref_counts_gpu(matched_tensor)
+            self.block_allocator.increment_ref_counts(matched_tensor)
 
         # when a request already starts chunked prefill, it is exactly the last request in the current system
         # (see dynamic_engine.py, schedule_chunked_prefill invariants)
@@ -1845,7 +1838,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 all_hashes_gpu = (
                     torch.cat(gpu_hash_parts) if len(gpu_hash_parts) > 1 else gpu_hash_parts[0]
                 )
-                self.block_allocator.register_block_hashes_gpu(
+                self.block_allocator.register_block_hashes(
                     all_ids_gpu.to(torch.int32), all_hashes_gpu
                 )
 

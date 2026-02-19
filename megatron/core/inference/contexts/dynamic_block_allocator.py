@@ -85,6 +85,11 @@ class BlockAllocator:
             self._gpu_blocks_with_refs = torch.zeros(1, dtype=torch.int32, device=device)
             self._gpu_total_ref_count = torch.zeros(1, dtype=torch.int32, device=device)
 
+            # Immutable block ID range for hash table rebuild (avoids per-call allocation)
+            self._block_id_range = torch.arange(
+                total_count, dtype=torch.int32, device=device
+            )
+
     def __str__(self):
         return (
             f"using: total {self.get_total_used()}/{self.total_count - 1}"
@@ -254,34 +259,12 @@ class BlockAllocator:
     # Prefix caching methods
     # =========================================================================
 
-    def register_block_hashes(self, block_ids: list[int], block_hashes: list[int]) -> None:
+    def register_block_hashes(self, block_ids: Tensor, block_hashes: Tensor) -> None:
         """Register blocks in the hash-to-block mapping for discovery (batch).
 
         NOTE: Does NOT mark blocks as computed. Call mark_blocks_computed() after
         KV is computed. This two-phase approach enables prefix caching coordination
         where subsequent requests wait for blocks to be computed before reusing.
-
-        Args:
-            block_ids: List of block IDs.
-            block_hashes: List of computed hash values (same length as block_ids).
-        """
-        if not block_ids:
-            return
-        device = self._pending_block_hashes.device
-        id_tensor = torch.tensor(block_ids, dtype=torch.int64, device=device)
-        hash_tensor = torch.tensor(block_hashes, dtype=torch.int64, device=device)
-        self._pending_block_hashes[id_tensor] = hash_tensor
-
-        # GPU hash table insert
-        id_tensor_i32 = torch.tensor(block_ids, dtype=torch.int32, device=device)
-        self.gpu_hash_table.insert_batch(hash_tensor, id_tensor_i32)
-        self.pending_bitmap[id_tensor] = True
-
-    def register_block_hashes_gpu(self, block_ids: Tensor, block_hashes: Tensor) -> None:
-        """Register blocks using GPU tensors directly (no CPU conversion).
-
-        GPU-resident version of register_block_hashes(). Both inputs are
-        already GPU tensors, avoiding CPU list construction.
 
         Args:
             block_ids: int32 GPU tensor of block IDs.
@@ -294,32 +277,8 @@ class BlockAllocator:
         self.gpu_hash_table.insert_batch(block_hashes, block_ids.to(torch.int32))
         self.pending_bitmap[id_tensor_i64] = True
 
-    def increment_ref_counts(self, matched_block_ids: list[int], matched_tensor: Tensor) -> None:
+    def increment_ref_counts(self, matched_tensor: Tensor) -> None:
         """Increment ref counts for matched prefix blocks.
-
-        Args:
-            matched_block_ids: CPU list of matched block IDs.
-            matched_tensor: GPU tensor of matched block IDs (same content).
-        """
-        num_matched = len(matched_block_ids)
-        if num_matched == 0:
-            return
-
-        # In LRU mode, some matched blocks might be cached (ref=0 → ref=1)
-        if self.block_evict_lru:
-            newly_active = (self.block_ref_counts[matched_tensor] == 0).sum()
-            self._gpu_blocks_with_refs += newly_active
-
-        self._gpu_total_ref_count += num_matched
-        self.block_ref_counts[matched_tensor] += 1
-
-        if self.block_evict_lru:
-            self.update_timestamps(matched_tensor)
-
-    def increment_ref_counts_gpu(self, matched_tensor: Tensor) -> None:
-        """Increment ref counts for matched prefix blocks (GPU-only version).
-
-        GPU-resident version that avoids the CPU list parameter.
 
         Args:
             matched_tensor: GPU tensor of matched block IDs.
@@ -338,29 +297,12 @@ class BlockAllocator:
         if self.block_evict_lru:
             self.update_timestamps(matched_tensor)
 
-    def mark_blocks_computed(self, block_ids: list[int]) -> None:
+    def mark_blocks_computed(self, block_ids: Tensor) -> None:
         """Mark blocks as having their KV computed (batch).
 
         Called after prefill completes for blocks that were registered.
         This sets block_hashes[block_id] to the actual hash value,
         signaling that the KV cache for these blocks is ready for reuse.
-
-        Args:
-            block_ids: List of block IDs to mark as computed.
-        """
-        if not block_ids:
-            return
-        id_tensor = torch.tensor(
-            block_ids, dtype=torch.int64, device=self._pending_block_hashes.device
-        )
-        self.block_hashes[id_tensor] = self._pending_block_hashes[id_tensor]
-        self._pending_block_hashes[id_tensor] = -1
-        self.pending_bitmap[id_tensor] = False
-
-    def mark_blocks_computed_gpu(self, block_ids: Tensor) -> None:
-        """Mark blocks as computed using a GPU tensor (no CPU conversion).
-
-        GPU-resident version of mark_blocks_computed().
 
         Args:
             block_ids: int32 GPU tensor of block IDs to mark as computed.
@@ -403,29 +345,15 @@ class BlockAllocator:
         # compared to per-element deletion with linear probing.
         # Must include both computed blocks (block_hashes != -1) and pending
         # blocks (_pending_block_hashes != -1) since both are discoverable.
-        computed_mask = self.block_hashes != -1
-        pending_mask = self._pending_block_hashes != -1
-
-        # Computed blocks: hash from block_hashes
-        computed_ids = torch.nonzero(computed_mask, as_tuple=True)[0]
-        # Pending blocks: hash from _pending_block_hashes
-        pending_ids = torch.nonzero(pending_mask, as_tuple=True)[0]
-
-        if computed_ids.numel() > 0 or pending_ids.numel() > 0:
-            all_ids_list = []
-            all_hashes_list = []
-            if computed_ids.numel() > 0:
-                all_ids_list.append(computed_ids.to(torch.int32))
-                all_hashes_list.append(self.block_hashes[computed_ids])
-            if pending_ids.numel() > 0:
-                all_ids_list.append(pending_ids.to(torch.int32))
-                all_hashes_list.append(self._pending_block_hashes[pending_ids])
-
-            all_ids = torch.cat(all_ids_list) if len(all_ids_list) > 1 else all_ids_list[0]
-            all_hashes = (
-                torch.cat(all_hashes_list) if len(all_hashes_list) > 1 else all_hashes_list[0]
-            )
-            self.gpu_hash_table.rebuild(all_hashes, all_ids)
+        # Use torch.where to merge hashes at full-tensor width (no nonzero sync).
+        # block_hashes and _pending_block_hashes are mutually exclusive, so the
+        # merge produces -1 for unused slots; the insert kernel skips -1 keys.
+        combined_hashes = torch.where(
+            self.block_hashes != -1, self.block_hashes, self._pending_block_hashes
+        )
+        has_any = (combined_hashes != -1).any()
+        if has_any:
+            self.gpu_hash_table.rebuild(combined_hashes, self._block_id_range)
         else:
             self.gpu_hash_table.clear()
 
@@ -462,17 +390,19 @@ class BlockAllocator:
         # Find all cached blocks (ref_count == 0, hash != -1)
         cached_mask = (self.block_ref_counts == 0) & (self.block_hashes != -1)
 
-        # nonzero() syncs to determine output size; .numel() reads shape (no sync).
-        # Combined into one sync instead of separate sum() + nonzero().
-        cached_block_ids = torch.nonzero(cached_mask, as_tuple=True)[0]
-        if cached_block_ids.numel() < num_blocks_needed:
+        # Single scalar sync to check availability (no variable-size output)
+        num_cached = cached_mask.sum().item()
+        if num_cached < num_blocks_needed:
             return False  # Not enough cached blocks to evict
 
-        # Sort by timestamp (ascending = oldest first)
-        cached_timestamps = self.block_timestamps[cached_block_ids]
-        sorted_indices = torch.argsort(cached_timestamps)
-        blocks_to_evict = cached_block_ids[sorted_indices[:num_blocks_needed]]
+        # Use topk to find oldest timestamps. Mask non-cached blocks with MAX_TS
+        # so they sort to the end. topk output size is known at call time (no sync).
+        MAX_TS = torch.iinfo(torch.int64).max
+        masked_timestamps = torch.where(cached_mask, self.block_timestamps, MAX_TS)
+        _, evict_indices = torch.topk(
+            masked_timestamps, num_blocks_needed, largest=False, sorted=False
+        )
 
-        self._deregister_blocks(blocks_to_evict)
+        self._deregister_blocks(evict_indices.to(torch.int32))
 
         return True
