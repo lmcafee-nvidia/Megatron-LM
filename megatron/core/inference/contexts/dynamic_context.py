@@ -1571,21 +1571,26 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         device = request_hashes_list[0].device
 
-        # Build flattened hashes and offsets
-        lengths = [h.numel() for h in request_hashes_list]
-        max_blocks_per_req = max(lengths) if lengths else 1
-        max_blocks_per_req = max(max_blocks_per_req, 1)  # Ensure at least 1
+        # Build flattened hashes and offsets (GPU cumsum replaces Python loop)
+        lengths_tensor = torch.tensor(
+            [h.numel() for h in request_hashes_list],
+            dtype=torch.int32,
+            device=device,
+        )
+        max_blocks_per_req = (
+            max(lengths_tensor.max().item(), 1) if lengths_tensor.numel() > 0 else 1
+        )
 
-        offsets = [0]
-        for l in lengths:
-            offsets.append(offsets[-1] + l)
+        request_offsets = torch.cat([
+            torch.zeros(1, dtype=torch.int32, device=device),
+            lengths_tensor.cumsum(dim=0),
+        ])
 
         request_hashes = (
             torch.cat(request_hashes_list)
-            if any(l > 0 for l in lengths)
+            if lengths_tensor.any()
             else torch.empty(0, dtype=torch.int64, device=device)
         )
-        request_offsets = torch.tensor(offsets, dtype=torch.int32, device=device)
 
         return self.block_allocator.gpu_hash_table.prefix_match_batch(
             request_hashes=request_hashes,
@@ -1660,14 +1665,20 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Prefix caching: find matching prefix blocks (scoped to this chunk)
         # =========================================================================
         if batch_num_matched is not None and batch_matched_block_ids is not None:
-            # Use pre-computed batch kernel results (GPU tensors, no per-request sync)
-            num_matched_blocks = batch_num_matched.item()
-            # Clamp to the range [already_allocated_blocks, overall_required_blocks)
-            effective_matched = min(
-                num_matched_blocks - already_allocated_blocks,
-                overall_required_blocks - already_allocated_blocks,
+            # Use pre-computed batch kernel results (GPU tensors)
+            # Clamp on GPU — launches async, reducing stall when .item() is called
+            effective_matched_gpu = torch.clamp(
+                torch.minimum(
+                    batch_num_matched - already_allocated_blocks,
+                    torch.tensor(
+                        overall_required_blocks - already_allocated_blocks,
+                        device=batch_num_matched.device,
+                    ),
+                ),
+                min=0,
             )
-            effective_matched = max(0, effective_matched)
+            # Single deferred sync — GPU clamp may already be complete
+            effective_matched = effective_matched_gpu.item()
             if effective_matched > 0:
                 matched_tensor = batch_matched_block_ids[
                     already_allocated_blocks:already_allocated_blocks + effective_matched

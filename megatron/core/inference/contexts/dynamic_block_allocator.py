@@ -351,11 +351,9 @@ class BlockAllocator:
         combined_hashes = torch.where(
             self.block_hashes != -1, self.block_hashes, self._pending_block_hashes
         )
-        has_any = (combined_hashes != -1).any()
-        if has_any:
-            self.gpu_hash_table.rebuild(combined_hashes, self._block_id_range)
-        else:
-            self.gpu_hash_table.clear()
+        # rebuild() clears then inserts; insert kernel skips -1 keys.
+        # Unconditional call avoids the .any() GPU→CPU sync.
+        self.gpu_hash_table.rebuild(combined_hashes, self._block_id_range)
 
     def update_timestamps(self, block_ids: Tensor) -> None:
         """Update LRU timestamps for accessed blocks. No-op in RZ mode.
