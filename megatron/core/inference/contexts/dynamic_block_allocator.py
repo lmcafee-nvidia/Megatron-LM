@@ -166,7 +166,7 @@ class BlockAllocator:
             if not self.enable_prefix_caching or self.prefix_caching_evict_policy == PrefixCachingEvictPolicy.REF_ZERO:
                 return None  # RZ: no eviction path; disabled: no cached blocks
             blocks_needed_from_eviction = num_blocks - self.total_avail
-            if not self.evict_lru_blocks(blocks_needed_from_eviction):
+            if not self.try_evict_lru_blocks(blocks_needed_from_eviction):
                 return None  # Not enough blocks even after eviction
 
         # Now allocate from the free pool
@@ -376,7 +376,7 @@ class BlockAllocator:
         cached_mask = (self.block_ref_counts == 0) & (self.block_hashes != -1)
         return cached_mask.sum()
 
-    def evict_lru_blocks(self, num_blocks_needed: int) -> bool:
+    def try_evict_lru_blocks(self, num_blocks_needed: int) -> bool:
         """Evict LRU cached blocks to free up space in the pool.
 
         Evicts blocks with ref_count == 0, starting with oldest timestamps.
@@ -401,6 +401,10 @@ class BlockAllocator:
         masked_timestamps = torch.where(cached_mask, self.block_timestamps, MAX_TS)
         _, evict_indices = torch.topk(
             masked_timestamps, num_blocks_needed, largest=False, sorted=False
+        )
+
+        assert (self.block_ref_counts[evict_indices] == 0).all(), (
+            "Attempted to evict active blocks with ref_count > 0"
         )
 
         self._deregister_blocks(evict_indices.to(torch.int32))

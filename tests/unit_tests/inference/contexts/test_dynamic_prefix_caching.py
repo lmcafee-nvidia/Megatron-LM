@@ -15,6 +15,7 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceRequestRecord,
     Status,
     compute_block_hashes_batched,
+    compute_block_hashes_gpu,
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -181,6 +182,21 @@ class TestHashContract(PrefixCachingTestBase):
             ctx_long, torch.arange(bs * 120, device=dev, dtype=torch.long)
         ).precomputed_block_hashes
         assert h_long.numel() == 120 and all(h > 0 for h in h_long.tolist())
+
+    @pytest.mark.internal
+    def test_gpu_cpu_hash_cross_validation(self):
+        """GPU Triton kernel produces identical hashes to CPU batched implementation."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        dev = torch.cuda.current_device()
+        for num_blocks in [1, 3, 16, 64]:
+            tokens = torch.randint(0, 50000, (bs * num_blocks,), device=dev, dtype=torch.long)
+            cpu_hashes = compute_block_hashes_batched(tokens, bs)
+            gpu_hashes = compute_block_hashes_gpu(tokens, bs)
+            assert gpu_hashes is not None, f"GPU hash returned None for {num_blocks} blocks"
+            assert gpu_hashes.tolist() == cpu_hashes, (
+                f"GPU/CPU hash mismatch for {num_blocks} blocks"
+            )
 
 
 # =========================================================================

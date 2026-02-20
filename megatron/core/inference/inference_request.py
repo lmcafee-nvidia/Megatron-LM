@@ -87,7 +87,11 @@ if HAVE_TRITON:
         HASH_PRIME: tl.constexpr,
         HASH_BASE: tl.constexpr,
     ):
-        """Sequential prefix scan for parent-chained hashes.
+        """Sequential prefix scan for parent-chained polynomial rolling hashes.
+
+        Polynomial rolling hash with parent chaining, based on the Rabin
+        fingerprint family (Karp & Rabin, 1987). Each block's hash encodes
+        both its own tokens and the entire prefix before it:
 
         output[0] = (0 * BASE + token_hashes[0]) % PRIME + 1
         output[i] = (output[i-1] * BASE + token_hashes[i]) % PRIME + 1
@@ -465,6 +469,10 @@ class DynamicInferenceRequest(InferenceRequest):
             self.remaining_prompt_tokens = copy.deepcopy(self.prompt_tokens)
 
         # Compute block hashes for prefix matching
+        if self.enable_prefix_caching:
+            assert self.block_size_tokens is not None, (
+                "block_size_tokens is required when enable_prefix_caching=True"
+            )
         if (
             self.enable_prefix_caching
             and self.block_size_tokens is not None

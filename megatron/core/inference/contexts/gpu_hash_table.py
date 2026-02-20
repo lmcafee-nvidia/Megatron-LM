@@ -15,6 +15,11 @@ def next_power_of_2(n: int) -> int:
     return 1 << (n - 1).bit_length()
 
 
+# Maximum linear probe distance for hash table operations. At 50% load factor,
+# expected probe length is ~2; 256 is far beyond any realistic collision chain.
+MAX_PROBE_DISTANCE = tl.constexpr(256)
+
+
 # =========================================================================
 # Triton kernels
 # =========================================================================
@@ -32,12 +37,13 @@ def _hash_table_insert_kernel(
     """Insert N key-value pairs with linear probing.
 
     Each program handles one key-value pair. Collisions are resolved via
-    linear probing with atomic CAS on keys.
+    linear probing with non-atomic stores. A Python-level retry loop in
+    insert_batch() re-inserts any keys lost to races between threads.
     """
     pid = tl.program_id(0)
     key = tl.load(INSERT_KEYS + pid)
     val = tl.load(INSERT_VALUES + pid)
-    # Cast EMPTY to int64 to match TABLE_KEYS pointer type for atomic_cas
+    # Cast EMPTY to int64 to match TABLE_KEYS pointer type
     empty_i64 = tl.full([], EMPTY, dtype=tl.int64)
 
     # Skip empty sentinel keys
@@ -46,7 +52,7 @@ def _hash_table_insert_kernel(
         done: tl.int32 = 0
 
         # Linear probing with bounded search
-        for _ in range(256):
+        for _ in range(MAX_PROBE_DISTANCE):
             if done == 0:
                 existing = tl.load(TABLE_KEYS + slot)
                 if existing == empty_i64 or existing == key:
@@ -79,7 +85,7 @@ def _hash_table_lookup_kernel(
     result: tl.int32 = -1
     done = 0
 
-    for _ in range(256):
+    for _ in range(MAX_PROBE_DISTANCE):
         if done == 0:
             existing_key = tl.load(TABLE_KEYS + slot)
             if existing_key == key:
@@ -154,7 +160,7 @@ def _prefix_match_kernel(
             # Hash table lookup (inline linear probe)
             slot = (hash_key & CAPACITY_MASK).to(tl.int64)
             probe_done = 0
-            for _ in range(256):
+            for _ in range(MAX_PROBE_DISTANCE):
                 if probe_done == 0:
                     existing = tl.load(TABLE_KEYS + slot)
                     if existing == hash_key:
@@ -259,7 +265,10 @@ class GPUHashTable:
                 EMPTY=self.EMPTY,
             )
 
-            # Verify all non-sentinel keys were inserted
+            # Verify all non-sentinel keys were inserted with correct values.
+            # Non-atomic stores can cause key-value tears: two threads racing on
+            # the same slot may leave one key with the other's value. Check both
+            # presence (results >= 0) and value correctness (results == expected).
             valid = remaining_keys != self.EMPTY
             if not valid.any():
                 break
@@ -272,11 +281,11 @@ class GPUHashTable:
                 CAPACITY_MASK=self.capacity_mask,
                 EMPTY=self.EMPTY,
             )
-            missing = valid & (results < 0)
-            if not missing.any():
+            wrong = valid & (results != remaining_values)
+            if not wrong.any():
                 break
-            remaining_keys = remaining_keys[missing]
-            remaining_values = remaining_values[missing]
+            remaining_keys = remaining_keys[wrong]
+            remaining_values = remaining_values[wrong]
 
         self.size += n  # Approximate; may overcount on duplicate inserts
 

@@ -312,6 +312,41 @@ class TestGPUHashTablePrefixMatch:
         assert has_pending.tolist() == [0]
 
 
+class TestGPUHashTableDictEquivalence:
+    """Validate GPU hash table matches Python dict for random inputs."""
+
+    @pytest.mark.internal
+    def test_random_insert_lookup_matches_dict(self):
+        """Insert random key-value pairs and verify all lookups match a reference dict."""
+        torch.manual_seed(42)
+        n = 500
+        ht = GPUHashTable(max_entries=n, device=DEVICE)
+        ref = {}
+
+        # Generate unique random keys in realistic hash range (avoid -1 sentinel)
+        keys = torch.randint(1, 10**18, (n,), dtype=torch.int64, device=DEVICE)
+        keys = torch.unique(keys)[:n]  # Ensure uniqueness
+        assert keys.numel() == n, "Not enough unique keys generated"
+        vals = torch.randint(0, 10000, (keys.numel(),), dtype=torch.int32, device=DEVICE)
+
+        # Build reference dict
+        for k, v in zip(keys.tolist(), vals.tolist()):
+            ref[k] = v
+
+        ht.insert_batch(keys, vals)
+
+        # Look up all keys
+        lookup_keys = torch.tensor(list(ref.keys()), dtype=torch.int64, device=DEVICE)
+        results = ht.lookup_batch_alloc(lookup_keys)
+        for i, k in enumerate(ref.keys()):
+            assert results[i].item() == ref[k], f"Mismatch for key {k}"
+
+        # Look up keys not in the table
+        missing_keys = torch.tensor([-(i + 2) for i in range(50)], dtype=torch.int64, device=DEVICE)
+        missing_results = ht.lookup_batch_alloc(missing_keys)
+        assert (missing_results == -1).all(), "Missing keys should return -1"
+
+
 class TestGPUHashTableLargeScale:
     """Larger-scale correctness tests."""
 
