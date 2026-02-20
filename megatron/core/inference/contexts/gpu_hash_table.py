@@ -206,8 +206,11 @@ class GPUHashTable:
     backward-shift deletion in Triton, we use a "rebuild after eviction"
     approach. Inserts happen individually via the insert kernel, but
     deletions trigger a full rebuild from the source-of-truth tensors
-    (block_hashes in BlockAllocator). This is acceptable because eviction
-    is infrequent and batched.
+    (block_hashes in BlockAllocator). Rebuild cost is O(num_blocks):
+    sub-millisecond for up to ~100K blocks on H100, approaching ~1ms
+    near 1M blocks. In LRU mode, rebuilds only occur under memory
+    pressure (free pool exhausted). In REF_ZERO mode, rebuilds occur
+    on every release but remain cheap at typical block counts (1K-100K).
 
     Args:
         max_entries: Maximum number of entries the table can hold.
