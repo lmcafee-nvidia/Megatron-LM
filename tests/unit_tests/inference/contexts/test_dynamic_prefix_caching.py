@@ -1,7 +1,9 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import json
 from collections import deque
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -979,6 +981,41 @@ class TestGPUStructuresAndConfig(PrefixCachingTestBase):
         assert not hasattr(alloc_disabled, 'gpu_hash_table')
         alloc_rz = self._ctx(prefix_caching_evict_policy=PrefixCachingEvictPolicy.REF_ZERO).block_allocator
         assert not hasattr(alloc_rz, 'block_timestamps')
+
+    @pytest.mark.internal
+    def test_serialize_deserialize_round_trip(self):
+        """serialize() -> deserialize() preserves precomputed_block_hashes without recomputation."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        prompt = self._prompt(bs * 3)  # 3 complete blocks
+
+        req = self._req(ctx, prompt)
+        assert req.precomputed_block_hashes is not None
+        assert req.precomputed_block_hashes.numel() == 3
+
+        # Serialize, then JSON round-trip to convert tuples to lists (as in production).
+        serialized = json.loads(json.dumps(req.serialize()))
+        assert "precomputed_block_hashes" in serialized
+        ser_val = serialized["precomputed_block_hashes"]
+        assert isinstance(ser_val, list) and ser_val[0] == "tensor"
+
+        # Deserialize with compute_block_hashes_gpu patched to detect recomputation.
+        with patch(
+            "megatron.core.inference.inference_request.compute_block_hashes_gpu",
+            side_effect=AssertionError("compute_block_hashes_gpu should not be called"),
+        ):
+            restored = DynamicInferenceRequest.deserialize(serialized)
+
+        # Hash values match (deserialize_tensor returns CPU tensors).
+        assert torch.equal(
+            req.precomputed_block_hashes.cpu(), restored.precomputed_block_hashes.cpu()
+        )
+
+        # Key fields survived the round-trip.
+        assert restored.request_id == req.request_id
+        assert torch.equal(restored.prompt_tokens.cpu(), req.prompt_tokens.cpu())
+        assert restored.block_size_tokens == req.block_size_tokens
+        assert restored.enable_prefix_caching == req.enable_prefix_caching
 
 
 # =========================================================================
