@@ -459,31 +459,33 @@ class DynamicInferenceRequest(InferenceRequest):
     block_size_tokens: Optional[int] = None  # Block size for hash computation
     enable_prefix_caching: bool = False  # Whether prefix caching is enabled
 
-    # Computed field - not passed by caller
-    # GPU tensor of shape [num_complete_blocks], dtype=int64, device=cuda
-    precomputed_block_hashes: Optional[torch.Tensor] = field(default=None, init=False)
+    # GPU tensor of shape [num_complete_blocks], dtype=int64, device=cuda.
+    # Computed automatically in __post_init__ when None; passed through during deserialization.
+    precomputed_block_hashes: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         self.sampling_params = copy.deepcopy(self.sampling_params)
         if self.prompt_tokens is not None:
             self.remaining_prompt_tokens = copy.deepcopy(self.prompt_tokens)
 
-        # Compute block hashes for prefix matching
+        # Compute block hashes for prefix matching.
+        # Skip if already provided (e.g., during deserialization).
         if self.enable_prefix_caching:
             assert self.block_size_tokens is not None, (
                 "block_size_tokens is required when enable_prefix_caching=True"
             )
-        if (
-            self.enable_prefix_caching
-            and self.block_size_tokens is not None
-            and self.prompt_tokens is not None
-        ):
-            self._compute_block_hashes()
-        elif self.block_size_tokens is not None:
-            # No prompt yet or prefix caching disabled - set empty tensor
-            self.precomputed_block_hashes = torch.empty(
-                0, dtype=torch.int64, device=torch.cuda.current_device()
-            )
+        if self.precomputed_block_hashes is None:
+            if (
+                self.enable_prefix_caching
+                and self.block_size_tokens is not None
+                and self.prompt_tokens is not None
+            ):
+                self._compute_block_hashes()
+            elif self.block_size_tokens is not None:
+                # No prompt yet or prefix caching disabled - set empty tensor
+                self.precomputed_block_hashes = torch.empty(
+                    0, dtype=torch.int64, device=torch.cuda.current_device()
+                )
 
     def _compute_block_hashes(self) -> None:
         """Compute hashes for all complete blocks in the prompt.
