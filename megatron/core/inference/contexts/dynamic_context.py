@@ -1698,7 +1698,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         assert (
             chunk_length <= req.remaining_prompt_length
         ), "Chunk length is greater than remaining prompt length"
-        if self.active_token_count + chunk_length > self.max_tokens:
+        # When prefix caching is enabled, matched prefix blocks skip KV computation,
+        # so the true token cost is effective_chunk_length (= chunk_length - prefix_skip_tokens),
+        # which is only known after prefix matching below. The accurate check happens later
+        # using effective_chunk_length; this early check would be overly conservative because
+        # it uses the full chunk_length.
+        if not self.enable_prefix_caching and self.active_token_count + chunk_length > self.max_tokens:
             raise TokenOverflowError(req.request_id)
 
         # =========================================================================
