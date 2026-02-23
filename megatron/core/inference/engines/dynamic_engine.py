@@ -1382,12 +1382,24 @@ class DynamicInferenceEngine(AbstractEngine):
         self._prefix_coordination_skips += pending_count
 
         # Minimal CPU loop: only iterates requests we KNOW should be scheduled.
-        # All GPU data already transferred — zero syncs in this loop.
+        # All GPU data already transferred — zero syncs in this loop (unless
+        # new pending blocks trigger re-checks for co-scheduling prevention).
         scheduled_ids = []
+        new_pending_registered = False
         for i, orig_idx in enumerate(schedulable_indices):
             req = self.get_request(self.waiting_request_ids[orig_idx])
+
+            # After a prior add_request registered new pending blocks, re-check
+            # subsequent requests for stale batch results. Pass None for batch
+            # results so add_request falls back to per-request lookup.
+            if new_pending_registered and self.context.enable_prefix_caching:
+                if self._has_pending_prefix_blocks(req):
+                    self._prefix_coordination_skips += 1
+                    continue
+
+            pending_before = self.context._pending_computation_count
             try:
-                if batch_prefix_result is not None:
+                if batch_prefix_result is not None and not new_pending_registered:
                     num_matched, _, matched_block_ids = batch_prefix_result
                     self.context.add_request(
                         req,
@@ -1399,6 +1411,11 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.context.add_request(req)
             except BlockOverflowError:
                 break  # Evictable estimate slightly off; stop safely
+
+            # Detect if this add_request registered new pending blocks
+            if self.context._pending_computation_count > pending_before:
+                new_pending_registered = True
+
             self._loop.call_soon_threadsafe(
                 self._loop.create_task, self._notify_cond_for_new_request()
             )
@@ -1537,12 +1554,25 @@ class DynamicInferenceEngine(AbstractEngine):
         # Track pending skips
         self._prefix_coordination_skips += pending_count
 
+        # Check if Phase 1 registered new pending blocks that affect Phase 2
+        new_pending_registered = (
+            self.context.enable_prefix_caching
+            and self.context._pending_computation_count > 0
+        )
+
         for i, orig_idx in enumerate(schedulable_indices):
             req = self.get_request(self.waiting_request_ids[orig_idx])
             remaining_len = len(req.remaining_prompt_tokens)
 
+            # After a prior add_request registered new pending blocks, re-check
+            # subsequent requests for stale batch results.
+            if new_pending_registered and self.context.enable_prefix_caching:
+                if self._has_pending_prefix_blocks(req):
+                    self._prefix_coordination_skips += 1
+                    continue
+
             # Phase 2 requests are new (finished=0, block-aligned), prefix skip applies
-            if batch_prefix_result is not None:
+            if batch_prefix_result is not None and not new_pending_registered:
                 eff_len = max(
                     1,
                     remaining_len
@@ -1561,9 +1591,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 # to maintain the invariant that chunked prefill is at the head.
                 break
 
+            pending_before = self.context._pending_computation_count
             try:
                 self.context.chunked_prefill_request_id = -1
-                if batch_prefix_result is not None:
+                if batch_prefix_result is not None and not new_pending_registered:
                     num_matched, _, matched_block_ids = batch_prefix_result
                     self.context.add_request(
                         req,
@@ -1575,6 +1606,11 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.context.add_request(req)
             except BlockOverflowError:
                 break
+
+            # Detect if this add_request registered new pending blocks
+            if self.context._pending_computation_count > pending_before:
+                new_pending_registered = True
+
             self._loop.call_soon_threadsafe(
                 self._loop.create_task, self._notify_cond_for_new_request()
             )

@@ -275,9 +275,32 @@ class BlockAllocator:
         if block_ids.numel() == 0:
             return
         id_tensor_i64 = block_ids.to(torch.int64)
+
+        # Assert A: pre-insert consistency — if a hash already exists in the table,
+        # it must map to the same block ID we're registering (e.g., chunked prefill
+        # re-registering a matched block). A hash mapping to a *different* block ID
+        # indicates a co-scheduling bug where a second request tries to overwrite
+        # a prior request's hash→block mapping.
+        existing = self.gpu_hash_table.lookup_batch_alloc(block_hashes)
+        already_present = existing >= 0
+        if already_present.any().item():
+            mismatched = already_present & (existing != block_ids.to(torch.int32))
+            assert not mismatched.any().item(), (
+                f"register_block_hashes: {mismatched.sum().item()} hash(es) map to different "
+                f"block_ids — scheduling should have deferred this request"
+            )
+
         self._pending_block_hashes[id_tensor_i64] = block_hashes
         self.gpu_hash_table.insert_batch(block_hashes, block_ids.to(torch.int32))
         self.pending_bitmap[id_tensor_i64] = True
+
+        # Assert B: post-insert verification — hash table maps each hash to the
+        # block ID we intended. Catches kernel-level bugs.
+        verify = self.gpu_hash_table.lookup_batch_alloc(block_hashes)
+        assert (verify == block_ids.to(torch.int32)).all().item(), (
+            "register_block_hashes: post-insert lookup mismatch — "
+            "hash table contains different block_id for registered hash"
+        )
 
     def increment_ref_counts(self, matched_tensor: Tensor) -> None:
         """Increment ref counts for matched prefix blocks.

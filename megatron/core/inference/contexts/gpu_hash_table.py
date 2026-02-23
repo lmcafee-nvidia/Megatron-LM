@@ -272,6 +272,9 @@ class GPUHashTable:
             # Non-atomic stores can cause key-value tears: two threads racing on
             # the same slot may leave one key with the other's value. Check both
             # presence (results >= 0) and value correctness (results == expected).
+            # The no-overwrite kernel preserves existing keys, so re-inserting a
+            # key with the same value (e.g., chunked prefill re-registration) is
+            # a no-op that passes this check since results == remaining_values.
             valid = remaining_keys != self.EMPTY
             if not valid.any():
                 break

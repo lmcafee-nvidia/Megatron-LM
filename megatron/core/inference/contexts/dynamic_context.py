@@ -1760,6 +1760,21 @@ class DynamicInferenceContext(BaseInferenceContext):
             else:
                 matched_tensor = None
 
+        # Assert C: matched block hash consistency — verify each matched block's
+        # hash (live or pending) matches the request's precomputed hash.
+        if matched_tensor is not None and num_matched_blocks > 0:
+            matched_ids_i64 = matched_tensor.long()
+            live = self.block_allocator.block_hashes[matched_ids_i64]
+            pending = self.block_allocator._pending_block_hashes[matched_ids_i64]
+            actual = torch.where(live > 0, live, pending)
+            expected = req.precomputed_block_hashes[
+                already_allocated_blocks:already_allocated_blocks + num_matched_blocks
+            ]
+            assert (actual == expected).all().item(), (
+                "add_request: matched block hash mismatch — "
+                "hash table returned block_ids whose hashes don't match request"
+            )
+
         # --- Prefix skip: only send unmatched suffix through the model ---
         block_aligned = (req.finished_chunk_token_count % self.block_size_tokens == 0)
         if self.enable_prefix_caching and num_matched_blocks > 0 and block_aligned:

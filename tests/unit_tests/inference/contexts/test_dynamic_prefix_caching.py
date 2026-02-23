@@ -279,6 +279,38 @@ class TestPrefixMatchingContract(PrefixCachingTestBase):
         for bid in r1 | r2:
             assert alloc.block_ref_counts[bid].item() == 1
 
+    @pytest.mark.internal
+    def test_matched_block_hash_consistency(self):
+        """Assert C passes for correct matches, catches tampered hashes."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+        prompt = self._prompt(bs * 2)
+
+        # Req A establishes cached blocks
+        req_a = self._req(ctx, prompt.clone())
+        ctx.add_request(req_a)
+        ctx.mark_pending_blocks_computed()
+
+        # Req B with same prompt: assert C should pass (hashes match)
+        req_b = self._req(ctx, prompt.clone(), request_id=2)
+        ctx.add_request(req_b)  # Should not raise
+
+        # Verify blocks are shared
+        assert self._block_ids(ctx, 0, 2) == self._block_ids(ctx, 1, 2)
+
+        # Now tamper with a block's hash to verify assert C would catch mismatch
+        b0 = self._block_ids(ctx, 0, 1)[0]
+        original_hash = alloc.block_hashes[b0].item()
+        alloc.block_hashes[b0] = 99999  # Tamper
+
+        req_c = self._req(ctx, prompt.clone(), request_id=3)
+        with pytest.raises(AssertionError, match="matched block hash mismatch"):
+            ctx.add_request(req_c)
+
+        # Restore to avoid corrupting other state
+        alloc.block_hashes[b0] = original_hash
+
 
 # =========================================================================
 # Class 3: TestRefCountLifecycle
@@ -564,6 +596,26 @@ class TestTwoPhaseRegistration(PrefixCachingTestBase):
         alloc.mark_blocks_computed(block_ids[:1].to(torch.int32))
         assert alloc.block_hashes[bid].item() == test_hash
 
+    @pytest.mark.internal
+    def test_register_block_hashes_assert_no_duplicates(self):
+        """Assert A fires when trying to register a hash with a different block ID."""
+        ctx = self._ctx()
+        alloc = ctx.block_allocator
+        dev = torch.cuda.current_device()
+
+        # Register a block with a hash
+        block_ids_1 = alloc.allocate_memory_blocks(1)
+        test_hash = torch.tensor([77777], dtype=torch.int64, device=dev)
+        alloc.register_block_hashes(block_ids_1[:1].to(torch.int32), test_hash)
+
+        # Same hash, same block ID — should succeed (no-op is fine)
+        alloc.register_block_hashes(block_ids_1[:1].to(torch.int32), test_hash)
+
+        # Try to register a DIFFERENT block with the SAME hash — should assert
+        block_ids_2 = alloc.allocate_memory_blocks(1)
+        with pytest.raises(AssertionError, match="map to different"):
+            alloc.register_block_hashes(block_ids_2[:1].to(torch.int32), test_hash)
+
 
 # =========================================================================
 # Class 6: TestPrefillAndDecode
@@ -840,6 +892,44 @@ class TestEngineScheduling(PrefixCachingTestBase):
         assert ctx.total_request_count == 3  # req1 + req3 + req4
         assert engine._prefix_coordination_skips == 1
 
+    @pytest.mark.internal
+    def test_co_scheduled_identical_requests_deferred(self):
+        """3 identical requests submitted simultaneously: only 1 scheduled in step 1,
+        remaining deferred until blocks are computed, then all scheduled in step 2."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        engine = self._engine(ctx)
+        prompt = self._prompt(bs * 2)
+
+        # All 3 identical requests go into the waiting queue
+        req1 = self._req(ctx, prompt.clone(), request_id=1)
+        req2 = self._req(ctx, prompt.clone(), request_id=2)
+        req3 = self._req(ctx, prompt.clone(), request_id=3)
+        self._add_to_waiting(engine, ctx, req1)
+        self._add_to_waiting(engine, ctx, req2)
+        self._add_to_waiting(engine, ctx, req3)
+
+        # Step 1: only req1 should be scheduled (req2, req3 deferred due to
+        # new pending blocks registered by req1's add_request)
+        engine.schedule_non_chunked_prefill()
+        assert ctx.total_request_count == 1
+        assert len(engine.waiting_request_ids) == 2
+        skips_after_step1 = engine._prefix_coordination_skips
+        assert skips_after_step1 >= 2  # req2 and req3 both skipped
+
+        # Mark req1's blocks as computed
+        ctx.mark_pending_blocks_computed()
+
+        # Step 2: req2 and req3 can now safely share computed blocks
+        engine.schedule_non_chunked_prefill()
+        assert ctx.total_request_count == 3
+        assert len(engine.waiting_request_ids) == 0
+
+        # All 3 requests should share the same block IDs
+        first_blocks = self._block_ids(ctx, 0, 2)
+        for req_idx in range(1, 3):
+            assert self._block_ids(ctx, req_idx, 2) == first_blocks
+
 
 # =========================================================================
 # Class 9: TestCPUShadowsAndConfig
@@ -1016,6 +1106,24 @@ class TestGPUStructuresAndConfig(PrefixCachingTestBase):
         assert torch.equal(restored.prompt_tokens.cpu(), req.prompt_tokens.cpu())
         assert restored.block_size_tokens == req.block_size_tokens
         assert restored.enable_prefix_caching == req.enable_prefix_caching
+
+    @pytest.mark.internal
+    def test_assert_a_prevents_hash_overwrite(self):
+        """Assert A in register_block_hashes prevents a different block from overwriting
+        an existing hash→block mapping, which is the defense-in-depth for the co-scheduling fix."""
+        ctx = self._ctx()
+        alloc = ctx.block_allocator
+        dev = torch.cuda.current_device()
+
+        # Register block 1 with hash 42
+        block_ids_1 = alloc.allocate_memory_blocks(1)
+        h = torch.tensor([42], dtype=torch.int64, device=dev)
+        alloc.register_block_hashes(block_ids_1[:1].to(torch.int32), h)
+
+        # Attempting to register block 2 with the same hash should fail
+        block_ids_2 = alloc.allocate_memory_blocks(1)
+        with pytest.raises(AssertionError, match="map to different"):
+            alloc.register_block_hashes(block_ids_2[:1].to(torch.int32), h)
 
 
 # =========================================================================
