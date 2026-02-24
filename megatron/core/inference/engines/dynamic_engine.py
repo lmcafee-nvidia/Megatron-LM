@@ -895,7 +895,12 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Pre-compute step-level block stats (before the per-request loop)
         if self.track_generated_token_events:
-            blocks_allocated = block_allocator.total_count - block_allocator.total_avail
+            # Exclude the reserved dummy block so the metric is consistent
+            # between prefix-caching enabled (_gpu_blocks_with_refs already
+            # excludes it since dummy has ref_count=0) and disabled modes.
+            blocks_allocated = (
+                block_allocator.total_count - block_allocator.total_avail - 1
+            )
             if block_allocator.enable_prefix_caching:
                 # Read GPU scalar counters (post-forward, sync is acceptable)
                 blocks_hashed_active = int(block_allocator._gpu_blocks_with_refs.item())
