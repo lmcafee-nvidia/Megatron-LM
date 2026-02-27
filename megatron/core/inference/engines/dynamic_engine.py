@@ -3,6 +3,7 @@
 import asyncio
 import concurrent.futures
 import logging
+import math
 import multiprocessing
 import socket
 import struct
@@ -1144,6 +1145,112 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         return {"waits": self._prefix_coordination_waits}
 
+    def _compute_mamba_prefill_boundaries(
+        self,
+        req: DynamicInferenceRequest,
+        num_matched_blocks: int,
+    ) -> tuple:
+        """Compute token boundaries for three-part Mamba prefill.
+
+        Args:
+            req: The inference request
+            num_matched_blocks: Number of prefix blocks with cached Mamba state
+
+        Returns:
+            Tuple of (divergence_token, last_aligned_token, prompt_length)
+        """
+        block_size = self.context.block_size_tokens
+        prompt_length = len(req.prompt_tokens)
+        divergence_token = num_matched_blocks * block_size
+        last_aligned_token = (prompt_length // block_size) * block_size
+        return divergence_token, last_aligned_token, prompt_length
+
+    def _find_mamba_divergence_block(self, matched_kv_blocks: list) -> int:
+        """Find the last KV block that also has cached Mamba state.
+
+        Args:
+            matched_kv_blocks: List of KV block IDs that matched the prefix
+
+        Returns:
+            Number of blocks with valid Mamba state (0 if none)
+        """
+        for i in range(len(matched_kv_blocks) - 1, -1, -1):
+            if self.context.has_mamba_state_for_block(matched_kv_blocks[i]):
+                return i + 1
+        return 0  # No Mamba state cached for any matched block
+
+    def _store_mamba_states_for_completed_prefill(self):
+        """Store Mamba state at block boundaries after prefill.
+
+        Called after prefill forward pass completes. For each request that
+        was part of this prefill, stores Mamba state at meaningful boundaries:
+        the KV divergence block and the last-aligned block.
+
+        Only stores state if:
+        - The chunk ends at a mamba-meaningful boundary (KV divergence or last-aligned)
+        - The request has at least one complete block
+        - The block doesn't already have cached Mamba state
+        """
+        block_size = self.context.block_size_tokens
+
+        for req_idx in range(self.context.paused_request_count,
+                             self.context.total_request_count):
+            request_id = self.context.request_ids[req_idx].item()
+            req = self.get_request(request_id)
+
+            # Calculate total tokens actually in context (processed through forward).
+            # For continuing chunks, remaining_prompt_tokens still holds unprocessed
+            # tokens, so subtract from total prompt length.
+            total_prefilled = len(req.prompt_tokens) - len(req.remaining_prompt_tokens)
+
+            # For hybrid mamba: only store when chunk ends at a meaningful boundary
+            kv_divergence = getattr(req, '_kv_divergence_token', 0)
+            last_aligned = getattr(req, '_mamba_last_aligned_token', 0)
+            is_kv_divergence = (kv_divergence > 0 and total_prefilled == kv_divergence)
+            is_last_aligned = (last_aligned > 0 and total_prefilled == last_aligned)
+            if not (is_kv_divergence or is_last_aligned):
+                continue
+
+            # Find the last complete block index
+            num_complete_blocks = total_prefilled // block_size
+            if num_complete_blocks == 0:
+                continue  # No complete blocks to store
+
+            # Get the block ID of the last complete block
+            last_complete_block_idx = num_complete_blocks - 1
+            if last_complete_block_idx >= self.context.request_kv_block_counts[req_idx].item():
+                continue  # Safety check
+
+            block_id = self.context.request_to_kv_block_ids[req_idx, last_complete_block_idx].item()
+            if block_id < 0:
+                continue  # Invalid block ID
+
+            # Store mamba state and register in mamba hash map
+            if not self.context.has_mamba_state_for_block(block_id):
+                self.context.store_mamba_state_for_block(block_id, req_idx)
+                if req.precomputed_block_hashes and last_complete_block_idx < len(req.precomputed_block_hashes):
+                    block_hash = req.precomputed_block_hashes[last_complete_block_idx]
+                    self.context.block_allocator.register_mamba_block_hash(block_id, block_hash)
+
+    def _get_mamba_chunk_limit(self, req) -> Optional[int]:
+        """Return max chunk_length based on next mamba boundary, or None.
+
+        Two boundaries matter for mamba state storage: KV divergence (where
+        KV match ends) and last-aligned (last complete block in prompt).
+        The engine must break chunks at these points so _store_mamba_states
+        can detect and store state at the correct boundaries.
+        """
+        finished = req.finished_chunk_token_count
+        kv_divergence = getattr(req, '_kv_divergence_token', 0)
+        last_aligned = getattr(req, '_mamba_last_aligned_token', 0)
+
+        if kv_divergence > 0 and finished < kv_divergence:
+            return kv_divergence - finished
+        elif last_aligned > 0 and finished < last_aligned:
+            return last_aligned - finished
+        else:
+            return None
+
     def schedule_waiting_requests(self):
         """Tries to schedule any requests in the waiting pool."""
         if self.enable_chunked_prefill:
@@ -1155,6 +1262,10 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         Perform the same original scheduling logic for non-chunked runs
         """
+        # Mamba prefix caching requires chunked prefill for breaking at block boundaries
+        assert not (self.context.is_hybrid_model and self.context.max_mamba_cache_slots > 0), \
+            "Mamba prefix caching requires chunked prefill. Use schedule_chunked_prefill() instead."
+
         prefix_caching_enabled = self.context.enable_prefix_caching
         if prefix_caching_enabled:
             pending_block_hashes = set()
@@ -1181,7 +1292,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Add these hashes to pending.
                 if prefix_caching_enabled:
                     for block_hash in req.precomputed_block_hashes:
-                        if block_hash not in self.context.block_allocator.hash_to_block_id:
+                        if block_hash not in self.context.block_allocator.kv_hash_to_block_id:
                             pending_block_hashes.add(block_hash)
                 self.context.add_request(req)
                 self._loop.call_soon_threadsafe(
@@ -1196,6 +1307,52 @@ class DynamicInferenceEngine(AbstractEngine):
         # Prepend pending request ids to waiting queue.
         if prefix_caching_enabled and pending_request_ids:
             self.waiting_request_ids.extendleft(reversed(pending_request_ids))
+
+    def _reorder_waiting_for_mamba_priority(self):
+        """Reorder waiting requests so those with restored Mamba states come first.
+
+        This ensures the token layout groups batch-kernel requests before varlen
+        requests in the prefill portion, which is required for correct Mamba state
+        handling when multiple prefill requests have initial states.
+
+        Skips the head of the queue if it's a continuing chunked prefill request.
+        """
+        is_continuing = self.context.chunked_prefill_request_id >= 0
+        start_idx = 1 if is_continuing else 0
+
+        if len(self.waiting_request_ids) - start_idx <= 1:
+            return  # Nothing to reorder
+
+        block_size = self.context.block_size_tokens
+        with_mamba = []
+        without_mamba = []
+
+        for i in range(start_idx, len(self.waiting_request_ids)):
+            req_id = self.waiting_request_ids[i]
+            req = self.get_request(req_id)
+
+            # Check if this request will have restored Mamba states
+            num_blocks = math.ceil(len(req.prompt_tokens) / block_size)
+            matched_blocks, _ = self.context._find_matching_prefix_blocks(req, 0, num_blocks)
+
+            has_mamba = False
+            if len(matched_blocks) > 0:
+                num_mamba_matched = self._find_mamba_divergence_block(matched_blocks)
+                if num_mamba_matched > 0:
+                    has_mamba = True
+
+            if has_mamba:
+                with_mamba.append(req_id)
+            else:
+                without_mamba.append(req_id)
+
+        # Rebuild the deque with reordered requests
+        new_queue = deque()
+        if is_continuing:
+            new_queue.append(self.waiting_request_ids[0])
+        new_queue.extend(with_mamba)
+        new_queue.extend(without_mamba)
+        self.waiting_request_ids = new_queue
 
     def schedule_chunked_prefill(self):
         """
@@ -1212,6 +1369,11 @@ class DynamicInferenceEngine(AbstractEngine):
                 it is during a chunked prefill
             - For each request, remaining_prompt_tokens holds the **unprefilled** prompt tokens
         """
+        # Reorder new requests so those with restored Mamba states are scheduled
+        # first, ensuring the batch-kernel token layout precedes varlen tokens.
+        if self.context.is_hybrid_model and self.context.max_mamba_cache_slots > 0:
+            self._reorder_waiting_for_mamba_priority()
+
         prefix_caching_enabled = self.context.enable_prefix_caching
         if prefix_caching_enabled:
             pending_block_hashes = set()
@@ -1240,6 +1402,33 @@ class DynamicInferenceEngine(AbstractEngine):
                     )
                     continue
 
+            # For hybrid models with Mamba prefix caching: compute Mamba-aware boundaries
+            if (self.context.is_hybrid_model and
+                self.context.max_mamba_cache_slots > 0 and
+                not is_continuing_chunked_prefill):
+                # Find matching KV blocks
+                num_hashes = len(req.precomputed_block_hashes) if req.precomputed_block_hashes else 0
+                matched_blocks, _ = self.context._find_matching_prefix_blocks(req, 0, num_hashes)
+                num_kv_matched = len(matched_blocks)
+
+                # Find how many of those also have cached Mamba state
+                if num_kv_matched > 0:
+                    num_mamba_matched = self._find_mamba_divergence_block(matched_blocks)
+                else:
+                    num_mamba_matched = 0
+
+                # Store for use in add_request() and chunk break enforcement
+                req._mamba_num_matched_blocks = num_mamba_matched
+                req._mamba_divergence_token, req._mamba_last_aligned_token, _ = \
+                    self._compute_mamba_prefill_boundaries(req, num_mamba_matched)
+                # KV divergence is only meaningful when mamba match is active and KV
+                # match extends beyond it. Otherwise, add_request truncates the KV
+                # match to 0, making the divergence point meaningless.
+                if num_mamba_matched > 0 and num_kv_matched > num_mamba_matched:
+                    req._kv_divergence_token = num_kv_matched * self.context.block_size_tokens
+                else:
+                    req._kv_divergence_token = 0
+
             # Use remaining prompt tokens for scheduling decisions
             remaining_len = len(req.remaining_prompt_tokens)
             token_fully_can_be_added = (
@@ -1250,11 +1439,19 @@ class DynamicInferenceEngine(AbstractEngine):
             request_can_be_added = is_continuing_chunked_prefill or request_can_be_added
 
             if request_can_be_added and kv_cache_available:
-                if token_fully_can_be_added:
+                # Compute mamba chunk limit for hybrid models
+                mamba_limit = None
+                if self.context.is_hybrid_model and self.context.max_mamba_cache_slots > 0:
+                    mamba_limit = self._get_mamba_chunk_limit(req)
+
+                # Check if mamba boundary requires a chunk break even when tokens fully fit
+                mamba_forces_chunk = (mamba_limit is not None and remaining_len > mamba_limit)
+
+                if token_fully_can_be_added and not mamba_forces_chunk:
                     # Add these hashes to pending.
                     if prefix_caching_enabled:
                         for block_hash in req.precomputed_block_hashes:
-                            if block_hash not in self.context.block_allocator.hash_to_block_id:
+                            if block_hash not in self.context.block_allocator.kv_hash_to_block_id:
                                 pending_block_hashes.add(block_hash)
                     self.context.chunked_prefill_request_id = -1
                     self.context.add_request(req)
@@ -1267,13 +1464,15 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.waiting_request_ids.popleft()
                     # Only this case we keep checking the rest of the waiting queue
                     can_schedule = True
-                elif token_partially_can_be_added:
+                elif token_partially_can_be_added or mamba_forces_chunk:
                     # Add these hashes to pending.
                     if prefix_caching_enabled:
                         for block_hash in req.precomputed_block_hashes:
-                            if block_hash not in self.context.block_allocator.hash_to_block_id:
+                            if block_hash not in self.context.block_allocator.kv_hash_to_block_id:
                                 pending_block_hashes.add(block_hash)
-                    chunk_length = self.context.max_tokens - self.context.active_token_count
+                    chunk_length = min(remaining_len, self.context.max_tokens - self.context.active_token_count)
+                    if mamba_limit is not None:
+                        chunk_length = min(chunk_length, mamba_limit)
 
                     # If this chunk would leave exactly 1 token for the final chunk, reduce this
                     # chunk by 1 so the final chunk has 2 tokens. This avoids the edge case where
@@ -1343,6 +1542,12 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_end_event.synchronize()
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
         self.context.step_count += 1
+
+        # Store Mamba state for blocks that completed during this prefill
+        if (not is_decode_only and self.context.enable_prefix_caching
+                and self.context.is_hybrid_model and self.context.max_mamba_cache_slots > 0):
+            self._store_mamba_states_for_completed_prefill()
+
 
         range_pop()
 
