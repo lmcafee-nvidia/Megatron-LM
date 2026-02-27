@@ -455,7 +455,7 @@ class TestDynamicInferenceEngine:
         # Suspend + resume.
         if (
             env.config.suspend_resume_interval is not None
-            and env.engine.step_count % env.config.suspend_resume_interval == 0
+            and env.engine.context.step_count % env.config.suspend_resume_interval == 0
         ):
             suspend_resume_mems = {}
             suspend_resume_mems["start"] = torch.cuda.memory_stats()
@@ -463,7 +463,7 @@ class TestDynamicInferenceEngine:
             suspend_resume_mems["mid"] = torch.cuda.memory_stats()
             env.engine.resume()  # resume.
             suspend_resume_mems["end"] = torch.cuda.memory_stats()
-            env.mem_usage["suspend_resume"][env.engine.step_count] = suspend_resume_mems
+            env.mem_usage["suspend_resume"][env.engine.context.step_count] = suspend_resume_mems
 
         # Nothing done?
         finished_request_records = result["finished_request_records"]
@@ -543,7 +543,7 @@ class TestDynamicInferenceEngine:
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
-    @pytest.mark.parametrize("num_cuda_graphs", [None, 1, 4])
+    @pytest.mark.parametrize("num_cuda_graphs", [None, 1, 4, -1])
     @pytest.mark.parametrize("cuda_graph_scope", [[], [CudaGraphScope.full_iteration_inference]])
     def test_simple(self, model_provider, num_cuda_graphs, cuda_graph_scope) -> None:
         """Simple test that runs without errors, and validates output."""
@@ -557,6 +557,7 @@ class TestDynamicInferenceEngine:
             num_cuda_graphs=num_cuda_graphs,
             cuda_graph_scope=cuda_graph_scope,
             force_build_cuda_graphs=True,
+            context_max_requests=128,
         )
 
         # Validate max_requests, max_tokens.
@@ -1732,7 +1733,7 @@ class TestDynamicInferenceEngine:
         env = self._run_test(
             context_max_requests=max_requests, num_tokens_to_generate=16, num_gap_steps=1
         )
-        step_count = env.engine.step_count
+        step_count = env.engine.context.step_count
         context = env.engine.context
         if max_requests is None:
             assert context.max_requests == 816
