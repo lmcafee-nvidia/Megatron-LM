@@ -1071,6 +1071,7 @@ class DynamicInferenceEngine(AbstractEngine):
         active_request_ids: list[int] = []
         finished_request_ids = set(finished_request_ids.tolist())
         finished_request_records: list[DynamicInferenceRequestRecord] = []
+        _routing_reconstruct_time = 0.0
         self.finished_request_count += len(finished_request_ids)
         if evict_request_ids is not None:
             self.evicted_request_count += evict_request_ids.numel()
@@ -1197,9 +1198,12 @@ class DynamicInferenceEngine(AbstractEngine):
                         total_tokens = len(request.prompt_tokens) + len(
                             request.generated_tokens
                         )
+                        import time as _time
+                        _t_recon = _time.perf_counter()
                         request.routing_indices = self.context.kv_block_allocator.reconstruct_routing_from_blocks(
                             block_ids, total_tokens - 1
                         )
+                        _routing_reconstruct_time += _time.perf_counter() - _t_recon
 
                     # Request finished by normal means (termination_id, max_length, or stop word from previous step)
                     request.generated_length = len(request.generated_tokens)
@@ -1330,7 +1334,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Clear the stop word being finished set after processing
         self.stop_word_being_finished_ids.clear()
 
-        return active_request_ids, finished_request_records
+        return active_request_ids, finished_request_records, _routing_reconstruct_time
 
     def _get_and_clear_stop_word_finished_ids(self, active_request_ids: list[int]) -> set[int]:
         """Get and clear the set of request IDs that should be finished due to stop words.
@@ -1648,6 +1652,12 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Saving pre-step state, for printing output below.
         is_decode_only = self.context.is_decode_only()
+        active_count = self.context.total_request_count - self.context.paused_request_count
+        prefill_status = self.context.request_in_prefill_status_tensor[
+            self.context.paused_request_count:self.context.total_request_count
+        ]
+        prefill_count = int(prefill_status.sum().item()) if active_count > 0 else 0
+        decode_count = active_count - prefill_count
         pre_step_context_state = {
             "is_decode_only": is_decode_only,
             "max_requests": self.context.max_requests,
@@ -1655,6 +1665,8 @@ class DynamicInferenceEngine(AbstractEngine):
             "paused_request_count": self.context.paused_request_count,
             "active_token_count": self.context.active_token_count,
             "step_count": self.context.step_count,
+            "prefill_count": prefill_count,
+            "decode_count": decode_count,
         }
 
         # Generate tokens.
@@ -1739,7 +1751,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 [self.get_request(i).add_event_pause() for i in newly_paused_request_ids]
 
             # Process finished requests (adds FINISH events and returns records).
-            (active_request_ids, finished_request_records) = self.post_process_requests(
+            (active_request_ids, finished_request_records, routing_reconstruct_time) = self.post_process_requests(
                 active_request_ids,
                 finished_request_ids,
                 evict_request_ids,
@@ -1757,6 +1769,7 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             active_request_ids: list[int] = []
             finished_request_records: list[DynamicInferenceRequestRecord] = []
+            routing_reconstruct_time = 0.0
 
         # Failed requests. Status and events were already set in _handle_failed_request;
         # here we just clean up the entry and include it in finished_request_records.
@@ -1791,10 +1804,14 @@ class DynamicInferenceEngine(AbstractEngine):
             range_pop()
 
         # Finalize routing chunks on all sub-requests before block store dump or merge/serialize.
+        import time as _time
+        routing_finalize_time = 0.0
         if self._routing_replay_enabled and finished_request_records:
+            _t_fin = _time.perf_counter()
             for record in finished_request_records:
                 for req in record.requests:
                     req.finalize_routing_chunks()
+            routing_finalize_time = _time.perf_counter() - _t_fin
 
         # Dump routing indices to block store before coordinator communication.
         if getattr(self, 'block_store_instance', None) is not None and finished_request_records:
@@ -1941,11 +1958,23 @@ class DynamicInferenceEngine(AbstractEngine):
                 self._prefix_cache_hits = 0
                 self._prefix_cache_blocks_matched = 0
 
+        step_detail = {
+            "step": context_state["step_count"],
+            "prefill_request_count": context_state.get("prefill_count", 0),
+            "decode_request_count": context_state.get("decode_count", 0),
+            "step_time": step_time,
+            "routing_gather_time": step_result.get("routing_gather_time", 0.0) if step_result else 0.0,
+            "routing_store_time": step_result.get("routing_store_time", 0.0) if step_result else 0.0,
+            "routing_reconstruct_time": routing_reconstruct_time,
+            "routing_finalize_time": routing_finalize_time,
+        }
+
         return {
             "active_request_ids": active_request_ids,
             "finished_request_records": finished_request_records,
             "step_time": step_time,
             "cuda_graph_request_count": cuda_graph_request_count,
+            "step_detail": step_detail,
         }
 
     async def async_step(

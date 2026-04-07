@@ -100,6 +100,7 @@ def run_inference(
     num_requests_added = 0
     num_requests_finished = 0
     step_times = {"prefill": [], "decode": []}
+    step_details = []
     add_times = []
     output_times = []
     tbar = tqdm(total=num_requests_total)
@@ -140,6 +141,10 @@ def run_inference(
         active_request_ids = result["active_request_ids"]
         finished_request_records = result["finished_request_records"]
         step_time = result["step_time"]
+        step_detail = result.get("step_detail")
+        if step_detail is not None:
+            step_details.append(step_detail)
+
         if len(active_request_ids) > 0 or len(finished_request_records) > 0:
             if is_decode_only:
                 step_times["decode"].append(step_time)
@@ -268,6 +273,7 @@ def run_inference(
 
     return {
         "step_times": step_times,
+        "step_details": step_details,
         "add_times": add_times,
         "output_times": output_times,
         "total_output_tokens": total_output_tokens,
@@ -363,6 +369,7 @@ def main():
         t = get_curr_time()
         result = run_inference(requests, engine)
         step_times = result["step_times"]
+        step_details = result["step_details"]
         add_times = result["add_times"]
         output_times = result["output_times"]
         total_output_tokens = result["total_output_tokens"]
@@ -470,6 +477,8 @@ def main():
             # if the fields exist in the golden values.
             json_results.update(peak_mem_stats)
             json_results["lifetime_prefill_token_count"] = engine.context.lifetime_prefill_token_count
+            if step_details:
+                json_results["step_details"] = step_details
 
             print(f' Saving results to {args.output_path}')
             with open(args.output_path, "w") as fp:

@@ -1795,12 +1795,18 @@ class TextGenerationController:
             context.mamba_slot_allocator.commit_intermediate_states()
 
         # Collect routing indices per request (must be done before context transitions)
+        import time as _time
+        _t0 = _time.perf_counter()
         routing_indices_per_request = self._router_record_bookkeeping()
+        _t1 = _time.perf_counter()
 
         # Store routing per-block for MoE routing replay reconstruction.
         # Must be done while token-to-block mappings are still valid (before update_requests).
         context = self.inference_wrapped_model.inference_context
         context.kv_block_allocator.store_routing_per_block(routing_indices_per_request)
+        _t2 = _time.perf_counter()
+        routing_gather_time = _t1 - _t0
+        routing_store_time = _t2 - _t1
         # Per-step routing is no longer needed; reconstruction happens from blocks at completion.
         routing_indices_per_request = None
 
@@ -1867,6 +1873,8 @@ class TextGenerationController:
             "log_probs": log_probs,
             "top_n_logprobs": top_n_logprobs,
             "routing_indices_per_request": routing_indices_per_request,
+            "routing_gather_time": routing_gather_time,
+            "routing_store_time": routing_store_time,
             "cuda_graph_request_count": cuda_graph_request_count,
         }
         if self.num_speculative_tokens > 0:
