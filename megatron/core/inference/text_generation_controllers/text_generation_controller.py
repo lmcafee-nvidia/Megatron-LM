@@ -4,6 +4,7 @@ import asyncio
 import concurrent
 import copy
 import functools
+import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
 
@@ -102,6 +103,10 @@ class TextGenerationController:
                 "CUDA graphs with expert parallelism"
             )
 
+        # Per-stage timing for the inference loop (always on).
+        self._stage_timing_enabled = True
+        self._stage_times: Dict[str, list] = {name: [] for name in self._STAGE_NAMES}
+
         if self.inference_wrapped_model.inference_context.is_dynamic_batching():
             self._init_dynamic_sampling_tensors()
 
@@ -174,6 +179,26 @@ class TextGenerationController:
                 )
                 * -1
             )
+
+    # ------------------------------------------------------------------
+    # Stage timing helpers
+    # ------------------------------------------------------------------
+
+    _STAGE_NAMES = [
+        "initialize_attention_state",
+        "transfer_bookkeeping_to_gpu",
+        "forward_pass",
+        "sampling",
+        "transfer_samples_to_cpu",
+        "active_request_mask",
+        "update_requests",
+    ]
+
+    def get_stage_timing_summary(self) -> dict:
+        """Return {stage_name: total_ms} for all recorded stages."""
+        return {
+            name: sum(times) * 1000.0 for name, times in self._stage_times.items()
+        }
 
     @staticmethod
     def tokenize_prompt(tokenizer, prompt: str, add_BOS: bool = False) -> List[int]:
@@ -576,13 +601,23 @@ class TextGenerationController:
         model_config = get_model_config(unwrapped_model)
 
         # Initialize attention state (100% CPU computation).
+        if self._stage_timing_enabled:
+            torch.cuda.synchronize()
+            _t0 = time.perf_counter()
         context.initialize_attention_state(
             construct_graph_dimensions=construct_graph_dimensions,
             is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
         )
+        if self._stage_timing_enabled:
+            _t1 = time.perf_counter()
+            self._stage_times["initialize_attention_state"].append(_t1 - _t0)
 
         # Single batch CPU-to-GPU transfer of bookkeeping state.
         context.transfer_bookkeeping_to_gpu()
+        if self._stage_timing_enabled:
+            torch.cuda.synchronize()
+            _t2 = time.perf_counter()
+            self._stage_times["transfer_bookkeeping_to_gpu"].append(_t2 - _t1)
 
         # If using symmetric kernels and we are using using nccl
         # for prefill turn off symmetric kernels
@@ -1783,9 +1818,16 @@ class TextGenerationController:
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
         # Batch GPU-to-CPU transfer of all sampled tokens.
+        if self._stage_timing_enabled:
+            torch.cuda.synchronize()
+            _t_d2h0 = time.perf_counter()
         sampled_tokens_cpu, sampled_mtp_tokens_cpu = self._transfer_samples_to_cpu(
             active_request_count,
         )
+        if self._stage_timing_enabled:
+            torch.cuda.synchronize()
+            _t_d2h1 = time.perf_counter()
+            self._stage_times["transfer_samples_to_cpu"].append(_t_d2h1 - _t_d2h0)
 
         # Everything below is 100% CPU.
         active_request_ids = context.request_ids[active_request_slice].long()
@@ -1817,13 +1859,22 @@ class TextGenerationController:
         )
         finished_request_ids = context.request_ids[finished_idxs]
 
+        if self._stage_timing_enabled:
+            _t_mask1 = time.perf_counter()
+            self._stage_times["active_request_mask"].append(_t_mask1 - _t_d2h1)
+
         # Clone needed: update_requests mutates next_tokens in-place via tensor_swap,
         # which would corrupt the reused buffer.
         new_sample_copy = sampled_tokens_cpu.clone()
 
+        if self._stage_timing_enabled:
+            _t_ur0 = time.perf_counter()
         update_result = context.update_requests(
             active_request_mask, new_sample_copy, sampled_mtp_tokens_cpu
         )
+        if self._stage_timing_enabled:
+            _t_ur1 = time.perf_counter()
+            self._stage_times["update_requests"].append(_t_ur1 - _t_ur0)
 
         return {
             "active_request_ids": active_request_ids,
@@ -1871,6 +1922,9 @@ class TextGenerationController:
 
             # Forward pass produces only base logits. When speculative decoding is
             # active, MTP logits are computed serially after verification.
+            if self._stage_timing_enabled:
+                torch.cuda.synchronize()
+                _t_fw0 = time.perf_counter()
             logits = self._dynamic_step_forward_logits(input_ids, position_ids)
 
             # Commit Mamba intermediate states before update_requests, which
@@ -1883,16 +1937,19 @@ class TextGenerationController:
             # Collect routing indices per request (must be done before context transitions)
             routing_indices_per_request = self._router_record_bookkeeping()
 
+            if self._stage_timing_enabled:
+                torch.cuda.synchronize()
+                _t_fw1 = time.perf_counter()
+                self._stage_times["forward_pass"].append(_t_fw1 - _t_fw0)
+
         # This is the best place to yield control back to event loop.
-        # At this point we have enqueued FW pass GPU kernels asynchronously.
-        # While they are running, we can do other useful CPU work.
-        # Note: This can be moved further ahead if sampling can be made
-        # asynchronous.
-        # Todo [Siddharth]: Can we condition the sleep on a cuda event?
-        # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
         await asyncio.sleep(0)
 
         with torch.inference_mode():
+            if self._stage_timing_enabled:
+                torch.cuda.synchronize()
+                _t_samp0 = time.perf_counter()
+
             return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
 
             self._dynamic_step_sample_bookkeeping()
@@ -1930,6 +1987,11 @@ class TextGenerationController:
                         top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(
                             logits, log_probs_tensor
                         )
+
+            if self._stage_timing_enabled:
+                torch.cuda.synchronize()
+                _t_samp1 = time.perf_counter()
+                self._stage_times["sampling"].append(_t_samp1 - _t_samp0)
 
             if skip_bookkeeping:
                 request_bookkeeping = {}
