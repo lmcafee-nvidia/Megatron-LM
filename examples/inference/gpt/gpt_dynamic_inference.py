@@ -471,6 +471,13 @@ def main():
             json_results.update(peak_mem_stats)
             json_results["lifetime_prefill_token_count"] = engine.context.lifetime_prefill_token_count
 
+            # Per-stage timing of the inference loop.
+            stage_summary = controller.get_stage_timing_summary()
+            stage_summary["total"] = sum(stage_summary.values())
+            n_calls = len(controller._stage_times.get("forward_pass", [])) or 1
+            stage_summary["num_calls"] = n_calls
+            json_results["stage_timing"] = stage_summary
+
             print(f' Saving results to {args.output_path}')
             with open(args.output_path, "w") as fp:
                 json.dump(json_results, fp, indent=1)
