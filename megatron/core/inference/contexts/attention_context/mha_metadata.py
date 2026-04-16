@@ -165,68 +165,6 @@ class MHAMetadata(MetadataBase):
             "max_seqlen_k": self._max_seqlen_k,
         }
 
-    def compute_from_gpu_view(self, gpu_view, n_active, padded_bs, max_seqlen_q, max_seqlen_k):
-        """Compute MHA metadata on GPU from gpu_view tensors.
-
-        Instead of copying pre-computed CPU metadata, this derives all metadata
-        directly on GPU from the gpu_view snapshot (~7 kernel launches, 0 syncs).
-
-        Args:
-            gpu_view: ContextGPUView with request_query_lengths, request_kv_length_offsets,
-                      and request_to_kv_block_ids already populated.
-            n_active: Number of real active requests.
-            padded_bs: Padded batch size (for CUDA graph alignment).
-            max_seqlen_q: Maximum query sequence length (pre-computed on CPU).
-            max_seqlen_k: Maximum KV sequence length (pre-computed on CPU).
-        """
-        # query_lengths: copy from gpu_view, zero padding slots.
-        self._query_lengths_buf[:n_active].copy_(gpu_view.request_query_lengths[:n_active])
-        if padded_bs > n_active:
-            self._query_lengths_buf[n_active:padded_bs].zero_()
-
-        # cu_query_seq_lengths: prefix-sum on GPU.
-        self._cu_query_seq_lengths_buf[0] = 0
-        torch.cumsum(
-            self._query_lengths_buf[:padded_bs],
-            dim=0,
-            out=self._cu_query_seq_lengths_buf[1 : padded_bs + 1],
-        )
-
-        # kv_seq_lengths: element-wise add on GPU.
-        self._kv_seq_lengths_buf[:n_active] = (
-            gpu_view.request_kv_length_offsets[:n_active]
-            + gpu_view.request_query_lengths[:n_active]
-        )
-        if padded_bs > n_active:
-            self._kv_seq_lengths_buf[n_active:padded_bs].zero_()
-
-        # cu_kv_seq_lengths: prefix-sum on GPU.
-        self._cu_kv_seq_lengths_buf[0] = 0
-        torch.cumsum(
-            self._kv_seq_lengths_buf[:padded_bs],
-            dim=0,
-            out=self._cu_kv_seq_lengths_buf[1 : padded_bs + 1],
-        )
-
-        # block_table: copy from gpu_view, fill padding with -1.
-        self._block_table_buf[:n_active].copy_(gpu_view.request_to_kv_block_ids[:n_active])
-        if padded_bs > n_active:
-            self._block_table_buf[n_active:padded_bs].fill_(-1)
-
-        self._max_seqlen_q = max_seqlen_q
-        self._max_seqlen_k = max_seqlen_k
-
-        n = padded_bs
-        self.state_data = {
-            "query_lengths": self._query_lengths_buf[:n],
-            "cu_query_seq_lengths": self._cu_query_seq_lengths_buf[: n + 1],
-            "cu_kv_seq_lengths": self._cu_kv_seq_lengths_buf[: n + 1],
-            "kv_seq_lengths": self._kv_seq_lengths_buf[:n],
-            "block_table": self._block_table_buf[:n, :],
-            "max_seqlen_q": self._max_seqlen_q,
-            "max_seqlen_k": self._max_seqlen_k,
-        }
-
     def reset(self):
         """
         Reset the metadata for the next batch.

@@ -885,7 +885,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.gpu_view = ContextGPUView(
             max_requests=self.max_requests,
             max_tokens=self.max_tokens,
-            max_kv_block_count=self.max_kv_block_count,
             device=torch.cuda.current_device(),
         )
 
@@ -1773,28 +1772,64 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         assert self.active_attn_metadata is not None
 
-        # Compute only scalar MHA metadata on CPU.  Tensor metadata (cumsum, block_table)
-        # is computed on GPU from gpu_view in transfer_bookkeeping_to_gpu().
+        # Compute MHA metadata on CPU (ephemeral locals, not persistent attributes).
         real_bs = attn_dimensions.req_count
         padded_bs = self.padded_batch_dimensions.req_count
         mha = self.active_attn_metadata["mha_metadata"]
 
+        # Query lengths (padded).
+        cpu_query_lengths = torch.zeros(padded_bs, dtype=torch.int32)
+        cpu_query_lengths[:real_bs] = query_lengths_view[:real_bs]
+
+        # Cumulative query lengths (padded).
+        cpu_cu_query = torch.zeros(padded_bs + 1, dtype=torch.int32)
+        if real_bs > 0:
+            cpu_cu_query[1 : real_bs + 1] = torch.cumsum(query_lengths_view[:real_bs], dim=0)
+        if real_bs < padded_bs:
+            cpu_cu_query[real_bs + 1 : padded_bs + 1] = cpu_cu_query[real_bs]
+
+        # KV sequence lengths (padded).
+        cpu_kv_lengths = torch.zeros(padded_bs, dtype=torch.int32)
+        cpu_kv_lengths[:real_bs] = (
+            request_kv_length_offsets_view[:real_bs] + query_lengths_view[:real_bs]
+        )
+
+        # Cumulative KV lengths (padded).
+        cpu_cu_kv = torch.zeros(padded_bs + 1, dtype=torch.int32)
+        if real_bs > 0:
+            cpu_cu_kv[1 : real_bs + 1] = torch.cumsum(cpu_kv_lengths[:real_bs], dim=0)
+        if real_bs < padded_bs:
+            cpu_cu_kv[real_bs + 1 : padded_bs + 1] = cpu_cu_kv[real_bs]
+
+        # Block table (padded).
+        cpu_block_table = torch.full(
+            (padded_bs, mha.max_kv_blocks), -1, dtype=torch.int32,
+        )
+        cpu_block_table[:real_bs] = request_to_kv_block_ids_view[:real_bs]
+
+        # Max sequence lengths.
         if not self.using_cuda_graph_this_step() and real_bs > 0:
-            max_seqlen_q = query_lengths_view[:real_bs].max().item()
-            max_seqlen_k = (
-                request_kv_length_offsets_view[:real_bs] + query_lengths_view[:real_bs]
-            ).max().item()
-        elif not self.using_cuda_graph_this_step() and real_bs == 0:
-            max_seqlen_q = self.num_speculative_tokens + 1
-            max_seqlen_k = 1
+            # NonGraphedMHAMetadata: use actual max values.
+            max_seqlen_q = cpu_query_lengths[:real_bs].max().item()
+            max_seqlen_k = cpu_kv_lengths[:real_bs].max().item()
         else:
+            # GraphedMHAMetadata: use conservative bounds.
             if self.padded_batch_dimensions.prefill_req_count == 0:
                 max_seqlen_q = self.num_speculative_tokens + 1
             else:
                 max_seqlen_q = max(2, self.padded_batch_dimensions.token_count)
             max_seqlen_k = mha.max_seqlen
+        if not self.using_cuda_graph_this_step() and real_bs == 0:
+            max_seqlen_q = self.num_speculative_tokens + 1
+            max_seqlen_k = 1
 
-        self._pending_mha_metadata = {
+        # Store for transfer_bookkeeping_to_gpu().
+        self._pending_mha_transfer = {
+            "query_lengths": cpu_query_lengths,
+            "cu_query_seq_lengths": cpu_cu_query,
+            "kv_seq_lengths": cpu_kv_lengths,
+            "cu_kv_seq_lengths": cpu_cu_kv,
+            "block_table": cpu_block_table,
             "max_seqlen_q": max_seqlen_q,
             "max_seqlen_k": max_seqlen_k,
             "padded_active_request_count": padded_bs,
@@ -1811,6 +1846,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 )
             self._pending_mamba_transfer = {
                 "active_mamba_indices": self.mamba_metadata.request_to_mamba_state_idx[active_slice],
+                "token_to_request_idx": self.token_to_request_idx[: self.active_token_count],
+                "cu_seqlens": cpu_cu_query,
                 "batch_dimensions": attn_dimensions,
                 "padded_batch_dimensions": self.padded_batch_dimensions,
                 "enable_chunked_prefill": self.is_chunked_prefill_enabled(),
@@ -1906,30 +1943,30 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.gpu_view.request_kv_length_offsets[:n_active].copy_(
             self.request_kv_length_offsets[active_slice], non_blocking=True,
         )
-        self.gpu_view.request_to_kv_block_ids[:n_active].copy_(
-            self.request_to_kv_block_ids[active_slice], non_blocking=True,
-        )
         if _do_time:
             torch.cuda.synchronize()
             _sub["h2d_copies"] = _time.perf_counter() - _t
 
-        # Sub-stage C: MHA metadata computation on GPU.
+        # Sub-stage C: MHA metadata H2D transfer.
         if _do_time:
             _t = _time.perf_counter()
-        if hasattr(self, '_pending_mha_metadata') and self._pending_mha_metadata is not None:
+        if hasattr(self, '_pending_mha_transfer') and self._pending_mha_transfer is not None:
             mha = self.active_attn_metadata["mha_metadata"]
-            d = self._pending_mha_metadata
-            mha.compute_from_gpu_view(
-                gpu_view=self.gpu_view,
-                n_active=n_active,
-                padded_bs=d["padded_active_request_count"],
+            d = self._pending_mha_transfer
+            mha.load_from_cpu(
+                query_lengths=d["query_lengths"],
+                cu_query_seq_lengths=d["cu_query_seq_lengths"],
+                kv_seq_lengths=d["kv_seq_lengths"],
+                cu_kv_seq_lengths=d["cu_kv_seq_lengths"],
+                block_table=d["block_table"],
                 max_seqlen_q=d["max_seqlen_q"],
                 max_seqlen_k=d["max_seqlen_k"],
+                padded_active_request_count=d["padded_active_request_count"],
             )
-            self._pending_mha_metadata = None
+            self._pending_mha_transfer = None
         if _do_time:
             torch.cuda.synchronize()
-            _sub["mha_compute"] = _time.perf_counter() - _t
+            _sub["mha_transfer"] = _time.perf_counter() - _t
 
         # Sub-stage D: Mamba metadata update.
         if _do_time:
@@ -1941,7 +1978,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             ]
             self.mamba_metadata.update(
                 d["active_mamba_indices"],
-                self.gpu_view.token_to_request_idx[: self.active_token_count],
+                d["token_to_request_idx"],
                 cu_seqlens_gpu,
                 batch_dimensions=d["batch_dimensions"],
                 padded_batch_dimensions=d["padded_batch_dimensions"],

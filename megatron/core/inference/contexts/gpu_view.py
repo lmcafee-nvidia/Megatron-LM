@@ -18,9 +18,7 @@ class ContextGPUView:
         ``context.gpu_view.foo`` -> GPU (snapshot, used by forward pass)
     """
 
-    def __init__(
-        self, max_requests: int, max_tokens: int, max_kv_block_count: int, device: torch.device,
-    ):
+    def __init__(self, max_requests: int, max_tokens: int, device: torch.device):
         # Token-level tensors (consumed by embedding, RoPE, KV append, Mamba).
         self.token_to_input_ids = torch.zeros(max_tokens, dtype=torch.long, device=device)
         self.token_to_pos_ids = torch.zeros(max_tokens, dtype=torch.long, device=device)
@@ -42,7 +40,4 @@ class ContextGPUView:
         )
         self.request_kv_length_offsets = torch.zeros(
             max_requests, dtype=torch.int32, device=device,
-        )
-        self.request_to_kv_block_ids = torch.full(
-            (max_requests, max_kv_block_count), -1, dtype=torch.int32, device=device,
         )
