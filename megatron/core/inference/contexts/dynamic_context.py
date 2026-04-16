@@ -1857,12 +1857,25 @@ class DynamicInferenceContext(BaseInferenceContext):
         All copies use non_blocking=True with pinned CPU memory. CUDA stream
         ordering guarantees the forward pass sees completed transfers.
         """
-        # Execute deferred Mamba GPU operations first (state zeroing, restore, offsets).
+        import time as _time
+
+        _sub = {}
+        _do_time = getattr(self, '_transfer_sub_timing', False)
+
+        # Sub-stage A: deferred Mamba GPU ops (state zeroing, restore).
+        if _do_time:
+            torch.cuda.synchronize()
+            _t = _time.perf_counter()
         self._execute_pending_mamba_ops()
+        if _do_time:
+            torch.cuda.synchronize()
+            _sub["mamba_deferred"] = _time.perf_counter() - _t
 
         n_tok = self.padded_active_token_count
 
-        # Token-level transfers.
+        # Sub-stage B: H2D token-level + request-level copies.
+        if _do_time:
+            _t = _time.perf_counter()
         self.gpu_view.token_to_input_ids[:n_tok].copy_(
             self.token_to_input_ids[:n_tok], non_blocking=True,
         )
@@ -1882,7 +1895,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.token_to_position_in_request[:n_tok], non_blocking=True,
         )
 
-        # Request-level transfers (consumed by sampling, log-probs, speculative verification).
         active_slice = slice(self.paused_request_count, self.total_request_count)
         n_active = self.total_request_count - self.paused_request_count
         self.gpu_view.request_in_prefill_status[:n_active].copy_(
@@ -1897,8 +1909,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.gpu_view.request_to_kv_block_ids[:n_active].copy_(
             self.request_to_kv_block_ids[active_slice], non_blocking=True,
         )
+        if _do_time:
+            torch.cuda.synchronize()
+            _sub["h2d_copies"] = _time.perf_counter() - _t
 
-        # MHA metadata: compute on GPU from gpu_view (replaces CPU copy path).
+        # Sub-stage C: MHA metadata computation on GPU.
+        if _do_time:
+            _t = _time.perf_counter()
         if hasattr(self, '_pending_mha_metadata') and self._pending_mha_metadata is not None:
             mha = self.active_attn_metadata["mha_metadata"]
             d = self._pending_mha_metadata
@@ -1910,11 +1927,15 @@ class DynamicInferenceContext(BaseInferenceContext):
                 max_seqlen_k=d["max_seqlen_k"],
             )
             self._pending_mha_metadata = None
+        if _do_time:
+            torch.cuda.synchronize()
+            _sub["mha_compute"] = _time.perf_counter() - _t
 
-        # Mamba metadata transfer (update writes to GPU buffers).
+        # Sub-stage D: Mamba metadata update.
+        if _do_time:
+            _t = _time.perf_counter()
         if hasattr(self, '_pending_mamba_transfer') and self._pending_mamba_transfer is not None:
             d = self._pending_mamba_transfer
-            # cu_seqlens needs to be on GPU for the Mamba metadata update.
             cu_seqlens_gpu = self.active_attn_metadata["mha_metadata"].state_data[
                 "cu_query_seq_lengths"
             ]
@@ -1929,6 +1950,14 @@ class DynamicInferenceContext(BaseInferenceContext):
                 intermediate_counts_gpu=d["intermediate_counts_gpu"],
             )
             self._pending_mamba_transfer = None
+        if _do_time:
+            torch.cuda.synchronize()
+            _sub["mamba_update"] = _time.perf_counter() - _t
+
+        if _do_time:
+            if not hasattr(self, '_transfer_sub_times'):
+                self._transfer_sub_times = []
+            self._transfer_sub_times.append(_sub)
 
     def reset_tensors(self) -> None:
         """Fill all bookkeeping tensors with sentinel values."""

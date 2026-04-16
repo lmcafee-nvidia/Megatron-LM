@@ -345,6 +345,9 @@ def main():
     # Inference engine.
     engine = DynamicInferenceEngine(controller, context)
 
+    # Enable transfer sub-stage timing.
+    context._transfer_sub_timing = True
+
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
     print("~~~")
     print(setup_prefix)
@@ -477,6 +480,15 @@ def main():
             n_calls = len(controller._stage_times.get("forward_pass", [])) or 1
             stage_summary["num_calls"] = n_calls
             json_results["stage_timing"] = stage_summary
+
+            # Transfer sub-stage breakdown (if enabled).
+            if hasattr(context, '_transfer_sub_times') and context._transfer_sub_times:
+                sub_totals = {}
+                for entry in context._transfer_sub_times:
+                    for k, v in entry.items():
+                        sub_totals[k] = sub_totals.get(k, 0) + v * 1000.0
+                sub_totals["num_calls"] = len(context._transfer_sub_times)
+                json_results["transfer_sub_timing"] = sub_totals
 
             print(f' Saving results to {args.output_path}')
             with open(args.output_path, "w") as fp:
