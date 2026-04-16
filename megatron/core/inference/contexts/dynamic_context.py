@@ -1644,6 +1644,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             None.
         """
+        # Launch deferred Mamba GPU ops first (state zeroing/restore) so they
+        # overlap with the CPU work below.  These are non-blocking GPU kernels.
+        self._execute_pending_mamba_ops()
+
         self.is_creating_cuda_graphs = construct_graph_dimensions is not None
         assert not (
             self.is_creating_cuda_graphs and is_expert_parallel_dummy_cuda_graph_step
@@ -1898,15 +1902,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         _sub = {}
         _do_time = getattr(self, '_transfer_sub_timing', False)
-
-        # Sub-stage A: deferred Mamba GPU ops (state zeroing, restore).
-        if _do_time:
-            torch.cuda.synchronize()
-            _t = _time.perf_counter()
-        self._execute_pending_mamba_ops()
-        if _do_time:
-            torch.cuda.synchronize()
-            _sub["mamba_deferred"] = _time.perf_counter() - _t
 
         n_tok = self.padded_active_token_count
 
