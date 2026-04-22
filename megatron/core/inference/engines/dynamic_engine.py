@@ -1090,14 +1090,6 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.num_speculative_tokens > 0 and accepted_tokens is not None:
             self._spec_steps += 1
 
-        # Hoist loop-invariant attribute reads to locals. Each attribute-chain
-        # read is ~300ns; with ~64 iterations this saves tens of µs per step.
-        num_spec = self.num_speculative_tokens
-        track_events = self.track_generated_token_events
-        stop_finished_ids = self.stop_word_being_finished_ids
-        chunked_id = self.context.chunked_prefill_request_id
-        requests = self.requests  # inline get_request()
-
         for req_idx, (request_id, tokens, accepted_tokens_list, request_log_probs) in enumerate(
             zip(request_ids.tolist(), sample.tolist(), accepted_tokens_iter, log_probs_iter)
         ):
@@ -1106,10 +1098,9 @@ class DynamicInferenceEngine(AbstractEngine):
             if not isinstance(tokens, list):
                 tokens = [tokens]
 
-            # Inline self.get_request(request_id) to avoid a Python frame per iter.
-            request: DynamicInferenceRequest = requests[request_id].record[-1]
+            request: DynamicInferenceRequest = self.get_request(request_id)
 
-            if num_spec > 0:
+            if self.num_speculative_tokens > 0:
                 accepted_tokens = list(filter(lambda tok: tok != -1, accepted_tokens_list))
 
                 # The order `accepted_tokens + tokens` is correct here.
@@ -1120,7 +1111,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 tokens = accepted_tokens + tokens
 
             num_stop_word_trim = 0
-            if request_id != chunked_id:
+            if request_id != self.context.chunked_prefill_request_id:
                 # Skip appending token for requests being finished due to stop words
                 # (they already have their final token from the previous step)
                 # If the request already has more tokens, then we only append as much as is necessary
@@ -1137,11 +1128,11 @@ class DynamicInferenceEngine(AbstractEngine):
                         request_log_probs = request_log_probs[:keep]
                     if top_n_logprobs is not None and req_idx in top_n_logprobs:
                         top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:keep]
-                if request_id not in stop_finished_ids:
+                if request_id not in self.stop_word_being_finished_ids:
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens += tokens
                     first_token_event = None
-                    if track_events:
+                    if self.track_generated_token_events:
                         for token in tokens:
                             if block_allocator.enable_prefix_caching:
                                 event = request.add_event_generated_token(
@@ -1165,7 +1156,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             if first_token_event is None:
                                 first_token_event = event
                     if is_first_token:
-                        if not track_events:
+                        if not self.track_generated_token_events:
                             first_token_event = DynamicInferenceEvent(
                                 type=DynamicInferenceEventType.GENERATED_TOKEN,
                                 payload={"token_id": tokens[0]},
@@ -1188,19 +1179,13 @@ class DynamicInferenceEngine(AbstractEngine):
                 # appended token. The check truncates generated_tokens in-place and
                 # returns how many trailing tokens were removed so we can also trim
                 # the corresponding log probs below.
-                # Inline the stop_word_ids truthiness test that _check_stop_words
-                # does internally, to avoid a function frame per iter when no
-                # request has stop words configured (the common benchmark case).
-                if request.stop_word_ids:
-                    stop_word_hit, num_stop_word_trim = (
-                        self._check_stop_words_for_request_post_append(request)
-                    )
-                else:
-                    stop_word_hit, num_stop_word_trim = False, 0
+                stop_word_hit, num_stop_word_trim = self._check_stop_words_for_request_post_append(
+                    request
+                )
 
                 # Track acceptance statistics for logging.
-                if len(request.generated_tokens) > 0 and num_spec > 0:
-                    actual_proposed = max(0, num_spec - num_stop_word_trim)
+                if len(request.generated_tokens) > 0 and self.num_speculative_tokens > 0:
+                    actual_proposed = max(0, self.num_speculative_tokens - num_stop_word_trim)
                     actual_accepted = max(0, len(accepted_tokens) - num_stop_word_trim)
 
                     self._spec_tokens_proposed += actual_proposed
@@ -1243,7 +1228,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # the two lists in sync.
             if (
                 request_log_probs is not None
-                and request_id not in stop_finished_ids
+                and request_id not in self.stop_word_being_finished_ids
             ):
                 # Initialize lists if they don't exist
                 if not request.prompt_log_probs:
@@ -1251,7 +1236,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 if not request.generated_log_probs:
                     request.generated_log_probs = []
 
-                is_chunked_prefill = request_id == chunked_id
+                is_chunked_prefill = request_id == self.context.chunked_prefill_request_id
                 is_prefill = len(request.generated_log_probs) == 0
 
                 if request.sampling_params.skip_prompt_log_probs:
@@ -1281,7 +1266,7 @@ class DynamicInferenceEngine(AbstractEngine):
             if (
                 top_n_logprobs is not None
                 and req_idx in top_n_logprobs
-                and request_id not in stop_finished_ids
+                and request_id not in self.stop_word_being_finished_ids
             ):
                 # Initialize lists if they don't exist
                 if request.prompt_top_n_logprobs is None:
