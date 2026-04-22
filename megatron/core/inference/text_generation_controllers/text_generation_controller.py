@@ -84,6 +84,9 @@ class TextGenerationController:
         # Use padded vocab size because tokenizer vocab size might pad to nearest power of 2.
         # TODO(ksanthanam): Consider deprecating this check if LLaVAModel is no longer used
         unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+        # Cache the unwrapped model so _dynamic_step_context_init doesn't have to
+        # re-walk the wrapper chain on every inference step.
+        self._cached_unwrapped_model = unwrapped_model
         if isinstance(unwrapped_model, LLaVAModel):
             self.vocab_size = unwrapped_model.language_model.vocab_size
         else:
@@ -572,8 +575,9 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
-        # Remove Float16Module wrapper if it exists
-        unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+        # Use the cached unwrapped model (set in __init__) to avoid re-walking
+        # the DDP/FSDP/Float16Module wrapper chain every inference step.
+        unwrapped_model = self._cached_unwrapped_model
         model_config = get_model_config(unwrapped_model)
 
         # Initialize attention state (100% CPU computation).
