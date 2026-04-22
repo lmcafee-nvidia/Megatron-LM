@@ -1437,6 +1437,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
     def schedule_waiting_requests(self):
         """Tries to schedule any requests in the waiting pool."""
+        nvtx_range_push("schedule_waiting_requests")
         # Keep track of which requests get scheduled.
         waiting_before = set(self.waiting_request_ids)
         if self.enable_chunked_prefill:
@@ -1451,6 +1452,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 req = self.get_request(request_id)
                 if req.kv_cache_epoch is None:
                     req.kv_cache_epoch = [(0, self._generation_epoch)]
+        nvtx_range_pop("schedule_waiting_requests")
 
     def schedule_non_chunked_prefill(self):
         """
@@ -1651,6 +1653,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             raise EngineSuspendedError(self.context.step_count)
 
+        nvtx_range_push("async_forward")
         # schedule requests
         self.schedule_waiting_requests()
 
@@ -1723,6 +1726,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # (`if context_state["kv_stats"] is not None`) remains well-typed.
             context_state = {**pre_step_context_state, "kv_stats": None}
 
+        nvtx_range_pop("async_forward")
         return result, context_state, step_time
 
     async def async_bookkeep(
@@ -1742,6 +1746,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 step_time (float): The step time in seconds.
                 cuda_graph_request_count (int): The CUDA graph batch size matching this step.
         """
+        nvtx_range_push("async_bookkeep")
         # Increment finished_request_count.
         nvtx_range_push("bookkeeping")
         cuda_graph_request_count = None
@@ -1950,12 +1955,14 @@ class DynamicInferenceEngine(AbstractEngine):
                 self._prefix_cache_hits = 0
                 self._prefix_cache_blocks_matched = 0
 
-        return {
+        ret = {
             "active_request_ids": active_request_ids,
             "finished_request_records": finished_request_records,
             "step_time": step_time,
             "cuda_graph_request_count": cuda_graph_request_count,
         }
+        nvtx_range_pop("async_bookkeep")
+        return ret
 
     async def async_step(
         self,
@@ -1971,8 +1978,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 2. Requests that ran in the last step and have now finished.
                 3. The step time in seconds.
         """
+        nvtx_range_push("async_step")
         last_step_data = await self.async_forward()
         ret = await self.async_bookkeep(*last_step_data)
+        nvtx_range_pop("async_step")
         # Keep for compatibility with current test suite.
         return ret
 
@@ -2068,6 +2077,7 @@ class DynamicInferenceEngine(AbstractEngine):
             int: The number of messages that were received and processed in this batch.
         """
 
+        nvtx_range_push("schedule_requests")
         nvtx_range_push("drain_zmq_socket")
         all_messages = []
         if self.is_mp_coordinator:
@@ -2180,6 +2190,7 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 raise UnknownHeaderError(header)
 
+        nvtx_range_pop("schedule_requests")
         return len(all_messages)
 
     async def shutdown(self):
@@ -2320,6 +2331,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         try:
             while True:
+                nvtx_range_push("run_engine_iter")
                 self.schedule_requests()
 
                 if self.state in (EngineState.RUNNING, EngineState.PAUSING):
@@ -2377,7 +2389,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     await self._world_barrier()
                     if self.rank == 0:
                         logging.info("Stopping engine.")
+                    nvtx_range_pop("run_engine_iter")
                     break
+
+                nvtx_range_pop("run_engine_iter")
 
         finally:
             await self.shutdown()
