@@ -1729,10 +1729,11 @@ class DynamicInferenceEngine(AbstractEngine):
         nvtx_range_pop("async_forward")
         return result, context_state, step_time
 
-    async def async_bookkeep(
+    def async_bookkeep(
         self, step_result: Optional[Dict], context_state: Dict, step_time: float
     ):
-        """Uses `asyncio` for continuous bookkeeping.
+        """Continuous bookkeeping. Not a coroutine — contains no awaits; the
+        `async_` prefix is retained for call-site compatibility.
 
         Args:
             step_result (Optional[Dict]): The result of the step.
@@ -1980,7 +1981,7 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         nvtx_range_push("async_step")
         last_step_data = await self.async_forward()
-        ret = await self.async_bookkeep(*last_step_data)
+        ret = self.async_bookkeep(*last_step_data)
         nvtx_range_pop("async_step")
         # Keep for compatibility with current test suite.
         return ret
