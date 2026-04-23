@@ -1987,6 +1987,8 @@ def _add_inference_args(parser):
                        help='Dtype for the Mamba inference SSM states tensor')
     group.add_argument('--inference-use-synchronous-zmq-collectives', action=argparse.BooleanOptionalAction,
                        required=False, default=False, help='Use synchronous ZMQ collectives for inference. Helps in reducing performance variability for MoEs.')
+    group.add_argument('--inference-ep-consensus-period', type=int, default=16,
+                       help='Run the full EP all-reduce-max consensus every N iterations; fast-path-skip on the others. 1 = always run real consensus. Default 16 (~0.5 s worst-case signal-propagation latency at 30 ms/step).')
     return parser
 
 

@@ -309,6 +309,14 @@ class InferenceConfig:
     performance variability for MoEs.
     """
 
+    ep_consensus_period: int = 16
+    """Run the full EP all-reduce-max consensus every Nth iteration of
+    run_engine_with_coordinator; fast-path-skip it on the other iterations
+    when the engine is in RUNNING state with local work and no queued signals.
+    Lower = faster response to state-transition signals, higher = lower
+    per-step gap cost. Set to 1 to always run real consensus (old behavior).
+    """
+
     verbose: InitVar[bool] = False
     """Whether to log detailed context configuration at initialization.
     This is an InitVar and is not stored as a field on the config."""

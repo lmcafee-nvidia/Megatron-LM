@@ -225,6 +225,10 @@ class DynamicInferenceEngine(AbstractEngine):
         self.logging_step_interval = inference_config.logging_step_interval
         self.unified_memory_level = inference_config.unified_memory_level
         self.use_synchronous_zmq_collectives = inference_config.use_synchronous_zmq_collectives
+        # EP-consensus fast-path: skip the 3-way all_reduce_max most iterations.
+        self._ep_consensus_period_k: int = inference_config.ep_consensus_period
+        self._ep_last_global_work: int = 0
+        self._ep_last_all_pausing: bool = False
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.cuda_graph_scope = model_config.cuda_graph_scope
         # Initialize engine.
@@ -2252,6 +2256,27 @@ class DynamicInferenceEngine(AbstractEngine):
         except asyncio.CancelledError:
             pass
 
+    def _can_skip_ep_consensus(self) -> bool:
+        """Return True iff this iteration skips the EP all-reduce and reuses
+        the cached `(global_work, all_pausing)` answer.
+
+        **Correctness requires all EP peers to reach the same decision this
+        iteration.** The only rank-synchronized input available here is
+        `self.context.step_count`, which every peer increments by exactly 1
+        per completed step (real via async_step, or dummy via dummy_forward).
+        Ranks in states that don't step (PAUSED / UNPAUSING / ...) don't
+        enter the branch that calls this helper, so whenever this runs on
+        any rank it runs on all of them with the same step_count.
+
+        Don't add rank-local predicates (state, local_pending, pending
+        signals, etc.) — they can differ across peers and cause desync:
+        some ranks fast-path while others run real consensus, leaving
+        orphan sends on the leader's gather socket.
+        """
+        if self._ep_consensus_period_k <= 1:
+            return False
+        return self.context.step_count % self._ep_consensus_period_k != 0
+
     async def _ep_establish_consensus(
         self, local_work: int, signal_consensus: bool
     ) -> tuple[int, bool]:
@@ -2342,9 +2367,17 @@ class DynamicInferenceEngine(AbstractEngine):
                     local_pending = self.context.get_active_request_count() + len(
                         self.waiting_request_ids
                     )
-                    global_work, all_pausing = await self._ep_establish_consensus(
-                        local_pending, signal_consensus=(self.state == EngineState.PAUSING)
-                    )
+                    if self._can_skip_ep_consensus():
+                        # Reuse last real consensus. Cache is primed on the first
+                        # iteration (step_count=0 always takes the slow path).
+                        global_work = self._ep_last_global_work
+                        all_pausing = self._ep_last_all_pausing
+                    else:
+                        global_work, all_pausing = await self._ep_establish_consensus(
+                            local_pending, signal_consensus=(self.state == EngineState.PAUSING)
+                        )
+                        self._ep_last_global_work = global_work
+                        self._ep_last_all_pausing = all_pausing
 
                     if all_pausing:
                         # All EP peers are PAUSING: pause immediately.
