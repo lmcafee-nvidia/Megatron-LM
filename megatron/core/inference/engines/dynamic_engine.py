@@ -1438,6 +1438,9 @@ class DynamicInferenceEngine(AbstractEngine):
     def schedule_waiting_requests(self):
         """Tries to schedule any requests in the waiting pool."""
         nvtx_range_push("schedule_waiting_requests")
+        if not self.waiting_request_ids:
+            nvtx_range_pop("schedule_waiting_requests")
+            return
         # Keep track of which requests get scheduled.
         waiting_before = set(self.waiting_request_ids)
         if self.enable_chunked_prefill:
