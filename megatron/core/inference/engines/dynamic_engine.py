@@ -2089,13 +2089,10 @@ class DynamicInferenceEngine(AbstractEngine):
         nvtx_range_push("drain_zmq_socket")
         all_messages = []
         if self.is_mp_coordinator:
-            while True:
-                try:
-                    # Receive messages in a non-blocking way.
-                    all_messages.append(self.socket_for_receiving_requests.recv(flags=zmq.NOBLOCK))
-                except zmq.Again:
-                    # This exception is hit as soon as the socket is empty.
-                    break
+            # Poll-before-recv: returns 0 immediately when the socket is empty,
+            # avoiding the per-drain zmq.Again exception construction/catch.
+            while self.socket_for_receiving_requests.poll(timeout=0):
+                all_messages.append(self.socket_for_receiving_requests.recv())
             messages_to_dequeue = len(all_messages)
             # First publish the number of messages to dequeue.
             # This is important because we want all tensor parallel ranks
