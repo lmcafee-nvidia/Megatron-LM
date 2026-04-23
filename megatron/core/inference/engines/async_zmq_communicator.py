@@ -1,8 +1,11 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+import logging
+import os
 import socket
 import struct
+import uuid
 
 import torch.distributed as dist
 
@@ -15,6 +18,36 @@ except ImportError:
 
     zmq = MagicMock()
     HAVE_ZMQ = False
+
+
+logger = logging.getLogger(__name__)
+
+
+def _pick_transport(process_group: dist.ProcessGroup) -> str:
+    """Return "ipc" when all ranks in the group share a host, else "tcp".
+
+    Overridden by env MCORE_EP_ZMQ_TRANSPORT in {tcp, ipc, auto}.
+    """
+    override = os.environ.get("MCORE_EP_ZMQ_TRANSPORT", "auto").lower()
+    if override == "tcp" or override == "ipc":
+        return override
+    if override not in ("auto", ""):
+        logger.warning(
+            "Unknown MCORE_EP_ZMQ_TRANSPORT=%r, falling back to auto", override
+        )
+
+    if process_group is None:
+        world_size = dist.get_world_size()
+    else:
+        world_size = dist.get_world_size(process_group)
+    if world_size <= 1:
+        # Single-rank group never talks over the socket; transport is moot.
+        return "ipc"
+
+    my_hostname = socket.gethostname()
+    hostnames = [None] * world_size
+    dist.all_gather_object(hostnames, my_hostname, group=process_group)
+    return "ipc" if all(h == my_hostname for h in hostnames) else "tcp"
 
 
 class AsyncZMQCommunicator:
@@ -47,15 +80,14 @@ class AsyncZMQCommunicator:
         # Get the global rank of the leader (first rank in the process group)
         src_rank = dist.get_process_group_ranks(process_group)[0]
 
-        if self.is_leader:
-            local_ip = hostname or socket.gethostname()
-            self.gather_sock = zmq_context.socket(zmq.PULL)
-            self.gather_sock.bind_to_random_port(f"tcp://{local_ip}")
-            gather_socket_addr = self.gather_sock.getsockopt_string(zmq.LAST_ENDPOINT)
+        transport = _pick_transport(process_group)
+        # Track IPC file paths so we can unlink them on close.
+        self._ipc_paths: list[str] = []
 
-            self.bcast_sock = zmq_context.socket(zmq.PUB)
-            self.bcast_sock.bind_to_random_port(f"tcp://{local_ip}")
-            bcast_socket_addr = self.bcast_sock.getsockopt_string(zmq.LAST_ENDPOINT)
+        if self.is_leader:
+            gather_socket_addr, bcast_socket_addr = self._leader_bind(
+                zmq_context, transport, hostname
+            )
 
             # Share the socket addresses with all peers
             dist.broadcast_object_list(
@@ -71,6 +103,49 @@ class AsyncZMQCommunicator:
             self.bcast_sock = zmq_context.socket(zmq.SUB)
             self.bcast_sock.connect(bcast_socket_addr)
             self.bcast_sock.setsockopt_string(zmq.SUBSCRIBE, "")
+
+    def _leader_bind(
+        self, zmq_context: "zmq.Context", transport: str, hostname: str | None
+    ) -> tuple[str, str]:
+        """Bind the leader's gather/bcast sockets; return their endpoint URIs.
+
+        Tries ipc:// when transport=="ipc"; falls back to tcp:// on bind failure.
+        """
+        self.gather_sock = zmq_context.socket(zmq.PULL)
+        self.bcast_sock = zmq_context.socket(zmq.PUB)
+
+        if transport == "ipc":
+            suffix = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+            gather_path = f"/tmp/mcore-ep-{suffix}-gather.ipc"
+            bcast_path = f"/tmp/mcore-ep-{suffix}-bcast.ipc"
+            try:
+                self.gather_sock.bind(f"ipc://{gather_path}")
+                self.bcast_sock.bind(f"ipc://{bcast_path}")
+                self._ipc_paths = [gather_path, bcast_path]
+                return (
+                    self.gather_sock.getsockopt_string(zmq.LAST_ENDPOINT),
+                    self.bcast_sock.getsockopt_string(zmq.LAST_ENDPOINT),
+                )
+            except zmq.ZMQError as e:
+                logger.warning(
+                    "IPC bind failed (%s); falling back to TCP transport", e
+                )
+                # Fall through to TCP below. Recreate sockets since the failed
+                # bind left them in an inconsistent state.
+                self.gather_sock.close(linger=0)
+                self.bcast_sock.close(linger=0)
+                self.gather_sock = zmq_context.socket(zmq.PULL)
+                self.bcast_sock = zmq_context.socket(zmq.PUB)
+                self._ipc_paths = []
+
+        # TCP bind (default / fallback).
+        local_ip = hostname or socket.gethostname()
+        self.gather_sock.bind_to_random_port(f"tcp://{local_ip}")
+        self.bcast_sock.bind_to_random_port(f"tcp://{local_ip}")
+        return (
+            self.gather_sock.getsockopt_string(zmq.LAST_ENDPOINT),
+            self.bcast_sock.getsockopt_string(zmq.LAST_ENDPOINT),
+        )
 
     async def all_reduce_max(self, *local_vals: int, async_op=True) -> int | tuple[int, ...]:
         """Element-wise all-reduce max of one or more integers.
@@ -99,7 +174,19 @@ class AsyncZMQCommunicator:
                         msg = self.gather_sock.recv(flags=zmq.NOBLOCK)
                     else:
                         msg = self.gather_sock.recv()
-                    rows.append(struct.unpack(fmt, msg))
+                    try:
+                        rows.append(struct.unpack(fmt, msg))
+                    except struct.error:
+                        # Diagnostic: size mismatch means a peer sent a message
+                        # from a different collective phase than the leader expected.
+                        logger.error(
+                            "all_reduce_max leader size mismatch: "
+                            "my_rank=%d, world_size=%d, fmt=%r (expect %d bytes), "
+                            "got %d bytes, rows_collected=%d/%d",
+                            self.rank, self.world_size, fmt, struct.calcsize(fmt),
+                            len(msg), len(rows), self.world_size,
+                        )
+                        raise
                 except zmq.Again:
                     await asyncio.sleep(0.001)
 
@@ -178,3 +265,9 @@ class AsyncZMQCommunicator:
         # The ZMQ default is to not allow `close` until all messages have been successfully sent.
         self.gather_sock.close(linger=0)
         self.bcast_sock.close(linger=0)
+        for path in self._ipc_paths:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+        self._ipc_paths = []
