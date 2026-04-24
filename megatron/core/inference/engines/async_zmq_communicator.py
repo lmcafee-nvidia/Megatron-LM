@@ -5,6 +5,7 @@ import socket
 import struct
 
 import torch.distributed as dist
+from torch.cuda.nvtx import range_pop, range_push
 
 try:
     import zmq
@@ -93,6 +94,7 @@ class AsyncZMQCommunicator:
         if self.is_leader:
             rows = [local_vals]
 
+            range_push("ep_allreduce_gather_wait")
             while len(rows) < self.world_size:
                 try:
                     if async_op:
@@ -102,6 +104,7 @@ class AsyncZMQCommunicator:
                     rows.append(struct.unpack(fmt, msg))
                 except zmq.Again:
                     await asyncio.sleep(0.001)
+            range_pop()
 
             maxes = tuple(max(row[i] for row in rows) for i in range(n))
             self.bcast_sock.send(struct.pack(fmt, *maxes))
@@ -115,6 +118,7 @@ class AsyncZMQCommunicator:
         else:
             self.gather_sock.send(payload)
 
+            range_push("ep_allreduce_bcast_wait")
             while True:
                 try:
                     if async_op:
@@ -127,6 +131,7 @@ class AsyncZMQCommunicator:
                             0
                         )  # Yield control once to ensure that other coroutines can run.
                         # This might be needed for colocated RL.
+                    range_pop()
                     return result[0] if n == 1 else result
                 except zmq.Again:
                     await asyncio.sleep(0.001)
@@ -158,15 +163,19 @@ class AsyncZMQCommunicator:
 
         if self.is_leader:
             rows = [local_vals]
+            range_push("ep_sync_gather_wait")
             while len(rows) < self.world_size:
                 msg = self.gather_sock.recv()
                 rows.append(struct.unpack(fmt, msg))
+            range_pop()
             maxes = tuple(max(row[i] for row in rows) for i in range(n))
             self.bcast_sock.send(struct.pack(fmt, *maxes))
             return maxes[0] if n == 1 else maxes
         else:
             self.gather_sock.send(payload)
+            range_push("ep_sync_bcast_wait")
             msg = self.bcast_sock.recv()
+            range_pop()
             result = struct.unpack(fmt, msg)
             return result[0] if n == 1 else result
 

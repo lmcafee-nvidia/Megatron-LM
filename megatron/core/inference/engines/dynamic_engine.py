@@ -2100,14 +2100,18 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.model_parallel_publisher_socket.send_multipart(all_messages)
         else:
             # First, receive the number of messages to dequeue from mp-rank 0
+            nvtx_range_push("mp_count_recv")
             messages_to_dequeue = struct.unpack(
                 '!i', self.model_parallel_num_msgs_subscriber_socket.recv()
             )[0]
+            nvtx_range_pop("mp_count_recv")
             # Now, dequeue the same number of messages from the subscriber socket.
             # Note that these receives are blocking, because the messages
             # are guaranteed to be available after the tp-rank 0 has sent them.
             if messages_to_dequeue > 0:
+                nvtx_range_push("mp_msgs_recv")
                 all_messages = self.model_parallel_subscriber_socket.recv_multipart()
+                nvtx_range_pop("mp_msgs_recv")
             else:
                 all_messages = []
 
