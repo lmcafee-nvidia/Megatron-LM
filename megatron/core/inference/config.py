@@ -272,6 +272,14 @@ class InferenceConfig:
     at a single block boundary. When set, Mamba states at KV divergence and last-aligned
     block boundaries are cached and reused across requests with matching prefixes."""
 
+    enable_async_scheduling: bool = False
+    """If True, allow forward[N+1] to launch in parallel with bookkeeping[N] on
+    decode-only steps. Active-set decisions (admit/pause/finish/evict) made by
+    bookkeeping[N] are deferred to the start of step N+2 so forward[N+1]'s state
+    mutations are always valid; no rollback machinery needed. A request that is
+    paused/finished/evicted at step N produces one extra speculative sample at
+    step N+1, which is filtered at output assembly."""
+
     # =================================
     # Logging config
     # =================================

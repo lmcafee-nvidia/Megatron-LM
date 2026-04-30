@@ -1992,6 +1992,14 @@ def _add_inference_args(parser):
     group.add_argument('--inference-dynamic-batching-cuda-graph-mixed-prefill-count',
                        type=int, default=16,
                        help='Number of mixed prefill requests to capture in a cuda graph.')
+    group.add_argument('--enable-async-scheduling',
+                       dest='enable_async_scheduling',
+                       action='store_true', default=False,
+                       help='Allow forward[N+1] to launch in parallel with '
+                            'bookkeeping[N] on decode-only steps. Active-set '
+                            'decisions made by bookkeeping[N] are deferred to '
+                            'step N+2 so forward[N+1] mutations are always '
+                            'valid; no rollback needed.')
     group.add_argument('--inference-logging-step-interval', type=int, default=0,
                        help='Step interval for logging inference metrics. '
                             'Default to 0 to disable inference logging.')
