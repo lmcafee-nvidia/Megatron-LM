@@ -1863,22 +1863,13 @@ class TextGenerationController:
             **(update_result or {}),
         }
 
-    async def async_generate_output_tokens_dynamic_batch(
-        self, skip_bookkeeping: Optional[bool] = False
-    ) -> Optional[Dict]:
-        """Forward step the model and update the inference context.
+    def _launch_decode_step(self) -> Optional[Dict]:
+        """Run forward + sample for one decode step.
 
-        Args:
-            skip_bookkeeping (Optional[bool]): If true, skip the context bookkeeping step.
-
-        Return:
-            (Optional[Dict]): A dictionary containing:
-                active_request_ids (Tensor): Current active request IDs.
-                newly_paused_request_ids (Tensor): Newly paused request IDs.
-                finished_request_ids (Tensor): Finished request IDs.
-                sample (Tensor): New sample.
-                log_probs (Optional[Tensor]): Log probabilities of the new sample, if requested.
-                cuda_graph_request_count (Optional[int]): Size of cuda graph used for this step.
+        Synchronously enqueues GPU work (forward pass, MTP verify/rewind/serial-MTP
+        if speculative, sampling, optional log-probs computation). Does not D2H the
+        sample. Returns a `step_state` dict that `_bookkeep_decode_step` consumes,
+        or None if there is no active work.
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
@@ -1919,16 +1910,6 @@ class TextGenerationController:
             context.kv_block_allocator.store_routing_per_block(self._router_record_bookkeeping())
             range_pop()
 
-        # This is the best place to yield control back to event loop.
-        # At this point we have enqueued FW pass GPU kernels asynchronously.
-        # While they are running, we can do other useful CPU work.
-        # Note: This can be moved further ahead if sampling can be made
-        # asynchronous.
-        # Todo [Siddharth]: Can we condition the sleep on a cuda event?
-        # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
-        await asyncio.sleep(0)
-
-        with torch.inference_mode():
             range_push("sampling")
             return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
 
@@ -1980,6 +1961,24 @@ class TextGenerationController:
                         )
             range_pop()
 
+        return {
+            "active_request_count": active_request_count,
+            "cuda_graph_request_count": cuda_graph_request_count,
+            "log_probs": log_probs,
+            "top_n_logprobs": top_n_logprobs,
+        }
+
+    def _bookkeep_decode_step(
+        self, step_state: Dict, skip_bookkeeping: bool = False
+    ) -> Dict:
+        """CPU bookkeeping after `_launch_decode_step`.
+
+        Drains the sample (D2H if not already prefetched) and runs context
+        bookkeeping. Returns the final result dict.
+        """
+        active_request_count = step_state["active_request_count"]
+
+        with torch.inference_mode():
             if skip_bookkeeping:
                 # _transfer_samples_to_cpu wasn't invoked on this path, so do
                 # a one-shot D2H here to keep "sample" as a CPU tensor for
@@ -1994,20 +1993,48 @@ class TextGenerationController:
 
             ret = {
                 "accepted_tokens": (
-                    # Clone needed: .fill_(-1) on line 1480 would corrupt the returned value.
+                    # Clone needed: .fill_(-1) below would corrupt the returned value.
                     self._accepted_tokens_per_request.clone()
                     if self.num_speculative_tokens > 0
                     else None
                 ),
-                "log_probs": log_probs,
-                "top_n_logprobs": top_n_logprobs,
-                "cuda_graph_request_count": cuda_graph_request_count,
+                "log_probs": step_state["log_probs"],
+                "top_n_logprobs": step_state["top_n_logprobs"],
+                "cuda_graph_request_count": step_state["cuda_graph_request_count"],
             }
             if self.num_speculative_tokens > 0:
                 self._accepted_tokens_per_request.fill_(-1)
                 self._accepted_token_counts_per_request.fill_(0)
             ret.update(request_bookkeeping)
             return ret
+
+    async def async_generate_output_tokens_dynamic_batch(
+        self, skip_bookkeeping: Optional[bool] = False
+    ) -> Optional[Dict]:
+        """Forward step the model and update the inference context.
+
+        Args:
+            skip_bookkeeping (Optional[bool]): If true, skip the context bookkeeping step.
+
+        Return:
+            (Optional[Dict]): A dictionary containing:
+                active_request_ids (Tensor): Current active request IDs.
+                newly_paused_request_ids (Tensor): Newly paused request IDs.
+                finished_request_ids (Tensor): Finished request IDs.
+                sample (Tensor): New sample.
+                log_probs (Optional[Tensor]): Log probabilities of the new sample, if requested.
+                cuda_graph_request_count (Optional[int]): Size of cuda graph used for this step.
+        """
+        step_state = self._launch_decode_step()
+        if step_state is None:
+            return None
+
+        # Yield to the asyncio event loop so other CPU work can overlap with
+        # the sample-kernel GPU execution. (The async-scheduling engine driver
+        # uses a different overlap point and bypasses this method.)
+        await asyncio.sleep(0)
+
+        return self._bookkeep_decode_step(step_state, skip_bookkeeping=skip_bookkeeping)
 
     @torch.inference_mode()
     def generate_output_tokens_dynamic_batch(
