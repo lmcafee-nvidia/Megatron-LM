@@ -275,6 +275,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Engine step counter (used for logging, metrics, and event tracking)
         self.step_count = 0
 
+        # Async-scheduling deferred decisions queue. When async scheduling is
+        # enabled, bookkeeping[N]'s active-set decisions (admit/pause/finish/
+        # evict) are recorded here as (mask, sample, mtp_tokens) tuples and
+        # applied at the start of step N+2's prologue via
+        # `apply_pending_active_set_changes()`. Forward[N+1] therefore always
+        # runs on a stable active-set, eliminating the need for state
+        # rollback. In serial mode this queue stays empty.
+        self.pending_active_set_changes: List[
+            Tuple[Tensor, Tensor, Optional[Tensor]]
+        ] = []
+
         self.cache_mla_latent = (
             isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
         )
@@ -2287,6 +2298,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.mamba_slot_allocator is not None:
             self.mamba_slot_allocator.reset()
 
+        # Drop any deferred async-scheduling decisions from prior runs.
+        self.pending_active_set_changes.clear()
+
     def current_input_and_position_ids(
         self, *, num_warmup_tokens: Optional[int] = None
     ) -> Tuple[Tensor, Tensor]:
@@ -3060,6 +3074,45 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_metadata.request_to_mamba_state_idx[evict_slice] = -1
 
         return evict_request_ids
+
+    def enqueue_active_set_changes(
+        self,
+        active_requests_mask: Tensor,
+        new_tokens: Tensor,
+        new_speculative_tokens: Optional[Tensor] = None,
+    ) -> None:
+        """Defer an `update_requests` call to the next step's prologue.
+
+        Used by the async-scheduling engine driver. While forward[N+1] runs
+        on GPU, bookkeeping[N] enqueues its (mask, sample, mtp_tokens) tuple
+        here instead of mutating the active-set immediately. The tuple is
+        applied at the start of step N+2 via
+        `apply_pending_active_set_changes()`, so forward[N+1] never sees a
+        slot reassignment and no state rollback is needed.
+        """
+        self.pending_active_set_changes.append(
+            (active_requests_mask, new_tokens, new_speculative_tokens)
+        )
+
+    def apply_pending_active_set_changes(self) -> List[Optional[dict]]:
+        """Drain the queue and apply each deferred `update_requests` call.
+
+        Called at the start of a step's prologue, before
+        `transfer_bookkeeping_to_gpu()`. Returns the list of `update_requests`
+        result dicts in queue order so the engine driver can surface the
+        deferred bookkeeping result back to the user-visible output of the
+        step that originally enqueued it. Returns an empty list when the
+        queue is empty (the common serial-mode case).
+        """
+        if not self.pending_active_set_changes:
+            return []
+        results: List[Optional[dict]] = []
+        for mask, new_tokens, new_speculative_tokens in self.pending_active_set_changes:
+            results.append(
+                self.update_requests(mask, new_tokens, new_speculative_tokens)
+            )
+        self.pending_active_set_changes.clear()
+        return results
 
     def update_requests(
         self,
