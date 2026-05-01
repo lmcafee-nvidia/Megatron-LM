@@ -1903,6 +1903,13 @@ class TextGenerationController:
         if speculative, sampling, optional log-probs computation). Does not D2H the
         sample. Returns a `step_state` dict that `_bookkeep_decode_step` consumes,
         or None if there is no active work.
+
+        The returned `step_state` includes an `active_set_snapshot` capturing the
+        active-set tensors at launch time. The async-scheduling driver passes
+        this snapshot to `_bookkeep_decode_step`'s deferred path so that
+        bookkeep[k-1] can map sample[k-1] back to the active set forward[k-1]
+        actually saw, even after a subsequent iter's drain has reordered live
+        context state.
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
@@ -1910,6 +1917,34 @@ class TextGenerationController:
         # No tokens and no active requests?
         if context.active_token_count == 0 and active_request_count == 0:
             return None
+
+        # Capture the active-set snapshot before any forward kernels run. The
+        # snapshot is a shallow CPU clone of the slices `_dynamic_step_context_
+        # bookkeeping` reads from context. Sized O(active_request_count); cheap.
+        paused_request_count = context.paused_request_count
+        total_request_count = context.total_request_count
+        active_request_slice = slice(paused_request_count, total_request_count)
+        active_set_snapshot = {
+            "paused_request_count": paused_request_count,
+            "total_request_count": total_request_count,
+            "active_request_count": active_request_count,
+            "request_ids": context.request_ids[active_request_slice].clone(),
+            "request_query_lengths": context.request_query_lengths[
+                active_request_slice
+            ].clone(),
+            "request_kv_length_offsets": context.request_kv_length_offsets[
+                active_request_slice
+            ].clone(),
+            "request_output_lengths": context.request_output_lengths[
+                active_request_slice
+            ].clone(),
+            "termination_id": context.active_request_metadata["termination_id"][
+                :active_request_count
+            ].clone(),
+            "request_to_kv_block_ids": context.request_to_kv_block_ids[
+                active_request_slice
+            ].clone(),
+        }
 
         with torch.inference_mode():
             input_ids, position_ids = self._dynamic_step_context_init()
@@ -1999,6 +2034,7 @@ class TextGenerationController:
             "cuda_graph_request_count": cuda_graph_request_count,
             "log_probs": log_probs,
             "top_n_logprobs": top_n_logprobs,
+            "active_set_snapshot": active_set_snapshot,
         }
 
     def _bookkeep_decode_step(
