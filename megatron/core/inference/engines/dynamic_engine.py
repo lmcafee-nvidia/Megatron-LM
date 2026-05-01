@@ -313,6 +313,16 @@ class DynamicInferenceEngine(AbstractEngine):
         # Coordinator state.
         self.use_coordinator = False
 
+        # Async-scheduling pipeline state. When `_async_scheduling_active()` is
+        # True, `_async_step()` keeps a one-iteration-deep pipeline: this
+        # iteration's bookkeeping runs in parallel with the next iteration's
+        # forward+sample GPU work. The pending state holds the prior step's
+        # launched output until its bookkeeping runs.
+        self._async_pending_step_state: Optional[Dict] = None
+        self._async_pending_sample_cpu: Optional[torch.Tensor] = None
+        self._async_pending_context_state: Optional[Dict] = None
+        self._async_pending_step_time: float = 0.0
+
     async def wait_until(self, state: EngineState):
         """Wait until the engine reaches the given state.
 
@@ -1677,6 +1687,25 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 self.waiting_request_ids.extendleft(reversed(pending_request_ids))
 
+    def _async_scheduling_active(self) -> bool:
+        """Predicate: should this step use the async-scheduling deferred path?
+
+        Async scheduling lets bookkeeping[N-1]'s active-set decisions be
+        deferred and applied at the start of step N's prologue, with
+        forward[N] launching using the post-bookkeeping[N-2] active set.
+        Eligibility:
+        - User opted in via `enable_async_scheduling` config.
+        - Step is decode-only (prefill steps require synchronous admission).
+        - Initial implementation excludes MTP speculative decoding; the
+          intra-step verify/rewind path interferes with the deferral
+          invariant. To be relaxed in a follow-up.
+        """
+        return (
+            getattr(self.context.config, "enable_async_scheduling", False)
+            and self.context.is_decode_only()
+            and self.num_speculative_tokens == 0
+        )
+
     async def async_forward(self) -> Tuple[Dict, Dict, float]:
         """Uses `asyncio` for continuous generation.
         Sleeps when no requests are available, until new requests have been added.
@@ -1692,6 +1721,15 @@ class DynamicInferenceEngine(AbstractEngine):
         # If suspended, no stepping.
         if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             raise EngineSuspendedError(self.context.step_count)
+
+        # Async scheduling: apply the prior step's deferred active-set
+        # decisions before any new scheduling or forward kernel launches.
+        # Drains `pending_active_set_changes` so forward[N] sees the
+        # post-bookkeeping[N-1] state. In serial mode the queue is empty
+        # and this is a no-op.
+        async_scheduling_active = self._async_scheduling_active()
+        if async_scheduling_active:
+            self.context.apply_pending_active_set_changes()
 
         # schedule requests
         self.schedule_waiting_requests()
@@ -1731,7 +1769,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if will_log_this_step:
             self.step_start_event.record()
-        result = await self.controller.async_generate_output_tokens_dynamic_batch()
+        result = await self.controller.async_generate_output_tokens_dynamic_batch(
+            defer_active_set_changes=async_scheduling_active,
+        )
         if will_log_this_step:
             self.step_end_event.record()
             self.step_end_event.synchronize()

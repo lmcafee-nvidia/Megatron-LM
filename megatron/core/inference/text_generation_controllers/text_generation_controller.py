@@ -1768,30 +1768,51 @@ class TextGenerationController:
             sampled_mtp_tokens_cpu = None
         return sampled_tokens_cpu, sampled_mtp_tokens_cpu
 
-    def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
+    def _dynamic_step_context_bookkeeping(
+        self,
+        prefetched_sample_cpu: Optional[Tensor] = None,
+        defer_active_set_changes: bool = False,
+    ) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
 
         Args:
-            new_sample (Tensor): The newly sampled tokens.
-            request_metadata (Optional[Dict[str, Tensor]]): An override for the tensors
-                that manage request metadata, such as sampling parameters. By default, this
-                metadata is retrieved from the context.
+            prefetched_sample_cpu (Optional[Tensor]): If provided, use this CPU
+                tensor as the D2H'd sample instead of running a fresh D2H. Used
+                by the async-scheduling driver, which D2Hs the sample upstream
+                so bookkeeping can run in parallel with the next step's forward.
+            defer_active_set_changes (bool): If True, enqueue the
+                `update_requests` call onto `context.pending_active_set_changes`
+                instead of applying it synchronously. The actual mutation runs
+                at the start of the next step's prologue. Used by the
+                async-scheduling driver.
 
         Return:
             Dict [str, Tensor]: A dictionary containing:
                 active_request_ids (Tensor): Current active request IDs.
-                newly_paused_request_ids (Tensor): Newly paused request IDs.
+                newly_paused_request_ids (Tensor): Newly paused request IDs
+                    (omitted when `defer_active_set_changes` is True; the
+                    deferred apply at the next step's prologue will surface
+                    them via `apply_pending_active_set_changes()`).
                 finished_request_ids (Tensor): Finished request IDs.
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
-        # Batch GPU-to-CPU transfer of all sampled tokens.
+        # Batch GPU-to-CPU transfer of all sampled tokens (or use the prefetched
+        # copy supplied by the async-scheduling driver).
         range_push("transfer_samples_to_cpu")
-        sampled_tokens_cpu, sampled_mtp_tokens_cpu = self._transfer_samples_to_cpu(
-            active_request_count
-        )
+        if prefetched_sample_cpu is not None:
+            sampled_tokens_cpu = prefetched_sample_cpu
+            sampled_mtp_tokens_cpu = (
+                self._sampled_mtp_tokens_cuda[:, :active_request_count].cpu()
+                if self.num_speculative_tokens > 0
+                else None
+            )
+        else:
+            sampled_tokens_cpu, sampled_mtp_tokens_cpu = self._transfer_samples_to_cpu(
+                active_request_count
+            )
         range_pop()
 
         range_push("active_request_mask")
@@ -1845,11 +1866,23 @@ class TextGenerationController:
         new_sample_copy = sampled_tokens_cpu.clone()
         range_pop()
 
-        range_push("update_requests")
-        update_result = context.update_requests(
-            active_request_mask, new_sample_copy, sampled_mtp_tokens_cpu
-        )
-        range_pop()
+        if defer_active_set_changes:
+            # Async-scheduling: queue the mutation for the next step's prologue.
+            # The deferred update_result is surfaced by the engine driver via
+            # `apply_pending_active_set_changes()` and merged into the next
+            # step's bookkeeping output.
+            range_push("enqueue_active_set_changes")
+            context.enqueue_active_set_changes(
+                active_request_mask, new_sample_copy, sampled_mtp_tokens_cpu
+            )
+            range_pop()
+            update_result: Optional[dict] = None
+        else:
+            range_push("update_requests")
+            update_result = context.update_requests(
+                active_request_mask, new_sample_copy, sampled_mtp_tokens_cpu
+            )
+            range_pop()
 
         return {
             "active_request_ids": active_request_ids,
@@ -1969,12 +2002,27 @@ class TextGenerationController:
         }
 
     def _bookkeep_decode_step(
-        self, step_state: Dict, skip_bookkeeping: bool = False
+        self,
+        step_state: Dict,
+        skip_bookkeeping: bool = False,
+        prefetched_sample_cpu: Optional[Tensor] = None,
+        defer_active_set_changes: bool = False,
     ) -> Dict:
         """CPU bookkeeping after `_launch_decode_step`.
 
         Drains the sample (D2H if not already prefetched) and runs context
         bookkeeping. Returns the final result dict.
+
+        Args:
+            step_state (Dict): The state returned by `_launch_decode_step`.
+            skip_bookkeeping (bool): If True, skip context bookkeeping; only
+                D2H the sample for downstream consumers.
+            prefetched_sample_cpu (Optional[Tensor]): If provided, use this CPU
+                tensor instead of D2H'ing again. Used by async-scheduling.
+            defer_active_set_changes (bool): If True, enqueue the
+                `update_requests` call instead of applying. Used by
+                async-scheduling. The deferred work is applied at the next
+                step's prologue via `apply_pending_active_set_changes()`.
         """
         active_request_count = step_state["active_request_count"]
 
@@ -1984,12 +2032,20 @@ class TextGenerationController:
                 # a one-shot D2H here to keep "sample" as a CPU tensor for
                 # downstream consumers.
                 request_bookkeeping = {
-                    "sample": self._sampled_tokens_cuda[:active_request_count].cpu()
+                    "sample": (
+                        prefetched_sample_cpu
+                        if prefetched_sample_cpu is not None
+                        else self._sampled_tokens_cuda[:active_request_count].cpu()
+                    )
                 }
             else:
                 # request_bookkeeping supplies "sample" as the already-CPU
-                # tensor produced by _transfer_samples_to_cpu.
-                request_bookkeeping = self._dynamic_step_context_bookkeeping()
+                # tensor produced by _transfer_samples_to_cpu (or supplied via
+                # prefetched_sample_cpu).
+                request_bookkeeping = self._dynamic_step_context_bookkeeping(
+                    prefetched_sample_cpu=prefetched_sample_cpu,
+                    defer_active_set_changes=defer_active_set_changes,
+                )
 
             ret = {
                 "accepted_tokens": (
@@ -2009,12 +2065,18 @@ class TextGenerationController:
             return ret
 
     async def async_generate_output_tokens_dynamic_batch(
-        self, skip_bookkeeping: Optional[bool] = False
+        self,
+        skip_bookkeeping: Optional[bool] = False,
+        defer_active_set_changes: bool = False,
     ) -> Optional[Dict]:
         """Forward step the model and update the inference context.
 
         Args:
             skip_bookkeeping (Optional[bool]): If true, skip the context bookkeeping step.
+            defer_active_set_changes (bool): If True, the bookkeep step enqueues
+                active-set decisions onto `context.pending_active_set_changes`
+                instead of applying them. The async-scheduling engine driver
+                uses this flag and applies the queue at the next step's prologue.
 
         Return:
             (Optional[Dict]): A dictionary containing:
@@ -2034,7 +2096,11 @@ class TextGenerationController:
         # uses a different overlap point and bypasses this method.)
         await asyncio.sleep(0)
 
-        return self._bookkeep_decode_step(step_state, skip_bookkeeping=skip_bookkeeping)
+        return self._bookkeep_decode_step(
+            step_state,
+            skip_bookkeeping=skip_bookkeeping,
+            defer_active_set_changes=defer_active_set_changes,
+        )
 
     @torch.inference_mode()
     def generate_output_tokens_dynamic_batch(
