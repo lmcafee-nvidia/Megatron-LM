@@ -1687,43 +1687,17 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 self.waiting_request_ids.extendleft(reversed(pending_request_ids))
 
-    @staticmethod
-    def _merge_deferred_update_results_into_result(
-        result: Dict, deferred_update_results: List[Optional[dict]]
-    ) -> None:
-        """Merge prior-step deferred `update_result` fields into this step's
-        bookkeeping result so engine-level tracking sees them.
-
-        Concatenates `newly_paused_request_ids` and `evict_request_ids` from
-        every queued `update_result` onto the current step's result. The
-        resulting tensor is what `async_bookkeep` already consumes; pause/evict
-        events are reported one step late.
-        """
-        for deferred in deferred_update_results:
-            if deferred is None:
-                continue
-            for key in ("newly_paused_request_ids", "evict_request_ids"):
-                deferred_val = deferred.get(key)
-                if deferred_val is None or deferred_val.numel() == 0:
-                    continue
-                cur_val = result.get(key)
-                if cur_val is None or cur_val.numel() == 0:
-                    result[key] = deferred_val
-                else:
-                    result[key] = torch.cat([cur_val, deferred_val])
-
     def _async_scheduling_active(self) -> bool:
-        """Predicate: should this step use the async-scheduling deferred path?
+        """Predicate: should this step use the async-scheduling overlap path?
 
-        Async scheduling lets bookkeeping[N-1]'s active-set decisions be
-        deferred and applied at the start of step N's prologue, with
-        forward[N] launching using the post-bookkeeping[N-2] active set.
+        Async scheduling overlaps GPU forward[N] kernels with CPU bookkeep[N-1]
+        work via a side CUDA stream for the sample D2H (see Commit B).
         Eligibility:
         - User opted in via `enable_async_scheduling` config.
         - Step is decode-only (prefill steps require synchronous admission).
         - Initial implementation excludes MTP speculative decoding; the
-          intra-step verify/rewind path interferes with the deferral
-          invariant. To be relaxed in a follow-up.
+          intra-step verify/rewind path interferes with the overlap design.
+          To be relaxed in a follow-up.
         """
         return (
             getattr(self.context.config, "enable_async_scheduling", False)
@@ -1746,16 +1720,6 @@ class DynamicInferenceEngine(AbstractEngine):
         # If suspended, no stepping.
         if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             raise EngineSuspendedError(self.context.step_count)
-
-        # Async scheduling: apply the prior step's deferred active-set
-        # decisions before any new scheduling or forward kernel launches.
-        # Drains `pending_active_set_changes` so forward[N] sees the
-        # post-bookkeeping[N-1] state. In serial mode the queue is empty
-        # and this is a no-op.
-        async_scheduling_active = self._async_scheduling_active()
-        deferred_update_results: List[Optional[dict]] = []
-        if async_scheduling_active:
-            deferred_update_results = self.context.apply_pending_active_set_changes()
 
         # schedule requests
         self.schedule_waiting_requests()
@@ -1795,9 +1759,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if will_log_this_step:
             self.step_start_event.record()
-        result = await self.controller.async_generate_output_tokens_dynamic_batch(
-            defer_active_set_changes=async_scheduling_active,
-        )
+        result = await self.controller.async_generate_output_tokens_dynamic_batch()
         if will_log_this_step:
             self.step_end_event.record()
             self.step_end_event.synchronize()
@@ -1806,22 +1768,6 @@ class DynamicInferenceEngine(AbstractEngine):
             step_time = 0.0
         self.context.step_count += 1
         self.context.prefix_cache_lru_clock += 1
-
-        # Async scheduling: surface the prior step's deferred update_result
-        # (newly_paused_request_ids, evict_request_ids) into this step's
-        # step_result so engine-level tracking (post_process_requests, pause
-        # event tracking, eviction-restoration to waiting queue) still runs.
-        # Pause/evict events are reported one step late — acceptable per the
-        # deferred-decisions invariant. In serial mode `deferred_update_results`
-        # is empty and this is a no-op.
-        if (
-            async_scheduling_active
-            and result is not None
-            and deferred_update_results
-        ):
-            self._merge_deferred_update_results_into_result(
-                result, deferred_update_results
-            )
 
         nvtx_range_pop("Prefill" if not is_decode_only else "Decode")
 
