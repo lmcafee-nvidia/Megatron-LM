@@ -1687,6 +1687,31 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 self.waiting_request_ids.extendleft(reversed(pending_request_ids))
 
+    @staticmethod
+    def _merge_deferred_update_results_into_result(
+        result: Dict, deferred_update_results: List[Optional[dict]]
+    ) -> None:
+        """Merge prior-step deferred `update_result` fields into this step's
+        bookkeeping result so engine-level tracking sees them.
+
+        Concatenates `newly_paused_request_ids` and `evict_request_ids` from
+        every queued `update_result` onto the current step's result. The
+        resulting tensor is what `async_bookkeep` already consumes; pause/evict
+        events are reported one step late.
+        """
+        for deferred in deferred_update_results:
+            if deferred is None:
+                continue
+            for key in ("newly_paused_request_ids", "evict_request_ids"):
+                deferred_val = deferred.get(key)
+                if deferred_val is None or deferred_val.numel() == 0:
+                    continue
+                cur_val = result.get(key)
+                if cur_val is None or cur_val.numel() == 0:
+                    result[key] = deferred_val
+                else:
+                    result[key] = torch.cat([cur_val, deferred_val])
+
     def _async_scheduling_active(self) -> bool:
         """Predicate: should this step use the async-scheduling deferred path?
 
@@ -1728,8 +1753,9 @@ class DynamicInferenceEngine(AbstractEngine):
         # post-bookkeeping[N-1] state. In serial mode the queue is empty
         # and this is a no-op.
         async_scheduling_active = self._async_scheduling_active()
+        deferred_update_results: List[Optional[dict]] = []
         if async_scheduling_active:
-            self.context.apply_pending_active_set_changes()
+            deferred_update_results = self.context.apply_pending_active_set_changes()
 
         # schedule requests
         self.schedule_waiting_requests()
@@ -1780,6 +1806,22 @@ class DynamicInferenceEngine(AbstractEngine):
             step_time = 0.0
         self.context.step_count += 1
         self.context.prefix_cache_lru_clock += 1
+
+        # Async scheduling: surface the prior step's deferred update_result
+        # (newly_paused_request_ids, evict_request_ids) into this step's
+        # step_result so engine-level tracking (post_process_requests, pause
+        # event tracking, eviction-restoration to waiting queue) still runs.
+        # Pause/evict events are reported one step late — acceptable per the
+        # deferred-decisions invariant. In serial mode `deferred_update_results`
+        # is empty and this is a no-op.
+        if (
+            async_scheduling_active
+            and result is not None
+            and deferred_update_results
+        ):
+            self._merge_deferred_update_results_into_result(
+                result, deferred_update_results
+            )
 
         nvtx_range_pop("Prefill" if not is_decode_only else "Decode")
 
