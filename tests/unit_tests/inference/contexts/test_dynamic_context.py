@@ -810,6 +810,127 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    def test_pending_active_set_changes_queue_basics(self):
+        """Verify the deferred-decisions queue starts empty, accepts enqueue,
+        and is drained by apply (returning a list of update_result dicts)."""
+        ctx = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+        )
+        # Empty queue at startup.
+        assert ctx.pending_active_set_changes == []
+        # Apply on empty queue is a no-op returning [].
+        assert ctx.apply_pending_active_set_changes() == []
+
+        # Set up two finished requests (mask all-zero) so update_requests has
+        # something simple and well-defined to do.
+        ctx.paused_request_count = 0
+        ctx.total_request_count = 3
+        ctx.request_kv_block_counts[0:3] = 1
+        new_block_ids = ctx.kv_block_allocator.allocate_memory_blocks(3)
+        ctx.request_to_kv_block_ids[0:3, 0] = new_block_ids
+        active_requests_mask = torch.tensor([0, 0, 0]).int()
+        new_tokens = torch.tensor([0, 1, 2])
+
+        # Enqueue once; the queue should have a single tuple and the active
+        # state should NOT yet be mutated (deferral invariant).
+        ctx.enqueue_active_set_changes(active_requests_mask, new_tokens)
+        assert len(ctx.pending_active_set_changes) == 1
+        assert ctx.total_request_count == 3, (
+            "enqueue must not mutate active-set; mutation is deferred to apply"
+        )
+
+        # Apply drains the queue and produces a list of one update_result.
+        results = ctx.apply_pending_active_set_changes()
+        assert ctx.pending_active_set_changes == []
+        assert len(results) == 1
+        # All three requests were "finished" (mask=0), so update_requests
+        # should have moved them out of the active set.
+        assert ctx.total_request_count == 0
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_pending_active_set_changes_apply_matches_direct_update(self):
+        """Enqueue+apply of a single update_requests call must produce the same
+        end state as calling update_requests synchronously on a fresh context."""
+        # Reference path: call update_requests directly.
+        ref = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+        )
+        ref.paused_request_count = 0
+        ref.total_request_count = 3
+        ref.request_kv_block_counts[0:3] = 1
+        ref_block_ids = ref.kv_block_allocator.allocate_memory_blocks(3)
+        ref.request_to_kv_block_ids[0:3, 0] = ref_block_ids
+        ref.update_requests(
+            active_requests_mask=torch.tensor([0, 0, 0]).int(),
+            new_tokens=torch.tensor([0, 1, 2]),
+        )
+
+        # Deferred path: enqueue then apply on an identically-set-up context.
+        deferred = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+        )
+        deferred.paused_request_count = 0
+        deferred.total_request_count = 3
+        deferred.request_kv_block_counts[0:3] = 1
+        d_block_ids = deferred.kv_block_allocator.allocate_memory_blocks(3)
+        deferred.request_to_kv_block_ids[0:3, 0] = d_block_ids
+        deferred.enqueue_active_set_changes(
+            torch.tensor([0, 0, 0]).int(), torch.tensor([0, 1, 2])
+        )
+        deferred.apply_pending_active_set_changes()
+
+        # End state must match.
+        assert ref.total_request_count == deferred.total_request_count
+        assert ref.paused_request_count == deferred.paused_request_count
+        assert ref.active_token_count == deferred.active_token_count
+        assert torch.equal(ref.request_ids, deferred.request_ids)
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_pending_active_set_changes_cleared_on_reset(self):
+        """`context.reset()` must drain the deferred-decisions queue so a
+        prior run's pending entries can't leak into the next run."""
+        ctx = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+        )
+        ctx.pending_active_set_changes.append(
+            (torch.tensor([0]).int(), torch.tensor([0]), None)
+        )
+        assert len(ctx.pending_active_set_changes) == 1
+        ctx.reset()
+        assert ctx.pending_active_set_changes == []
+
+    @pytest.mark.internal
+    @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_release_memory_blocks_for_finished_requests(self, is_hybrid_model):
         """Test that memory blocks are correctly released for finished requests."""
