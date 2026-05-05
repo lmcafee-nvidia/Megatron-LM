@@ -5,7 +5,7 @@ import concurrent
 import copy
 import functools
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
 
 import numpy as np
@@ -86,6 +86,31 @@ class _AsyncForwardGraph:
     batch_dimensions: InferenceBatchDimensions
     graph: torch.cuda.CUDAGraph
     h2d_done_event: torch.cuda.Event
+
+
+@dataclass
+class _AsyncGpuRunnerRetirement:
+    """Bookkeeping record for a future delayed CPU retirement."""
+
+    epoch: int
+    sample_slot: int
+    active_request_count: int
+
+
+@dataclass
+class _AsyncGpuRunnerState:
+    """Passive state for the GPU-resident async decode runner."""
+
+    enabled: bool
+    epoch: int = 0
+    current_sample_slot: int = 0
+    next_sample_slot: int = 0
+    launch_count: int = 0
+    reset_count: int = 0
+    repair_count: int = 0
+    retirement_count: int = 0
+    last_disable_reason: Optional[str] = None
+    pending_retirements: List[_AsyncGpuRunnerRetirement] = field(default_factory=list)
 
 
 # pylint: disable=line-too-long
@@ -214,6 +239,7 @@ class TextGenerationController:
         self._async_sample_slot_launch_counts = [0] * self._async_sample_slot_count
         self._async_sample_slot_copy_counts = [0] * self._async_sample_slot_count
         self._async_sample_slot_wait_count = 0
+        self._init_async_gpu_runner_state(max_requests, device)
 
         # Initialize bookkeeping tensors.
         if self._enable_cuda_graph:
@@ -261,6 +287,52 @@ class TextGenerationController:
 
         self._init_mtp_sampling_tensors()
         self._select_async_sample_slot(0)
+
+    def _init_async_gpu_runner_state(self, max_requests: int, device) -> None:
+        """Initialize passive state for the future F->S->F GPU runner."""
+        self._async_gpu_runner_state = _AsyncGpuRunnerState(
+            enabled=self._async_scheduling_enabled and self._enable_cuda_graph,
+            current_sample_slot=self._async_current_sample_slot,
+            next_sample_slot=self._async_next_sample_slot,
+        )
+        self._async_gpu_runner_request_ids_cpu_slots = torch.empty(
+            (self._async_sample_slot_count, max_requests),
+            dtype=torch.int64,
+            device='cpu',
+            pin_memory=True,
+        )
+        self._async_gpu_runner_row_indices_cuda_slots = torch.empty(
+            (self._async_sample_slot_count, max_requests), dtype=torch.int64, device=device
+        )
+        self._async_gpu_runner_slot_epochs = [-1] * self._async_sample_slot_count
+        self._async_gpu_runner_slot_active_counts = [0] * self._async_sample_slot_count
+
+    def _reset_async_gpu_runner_state(self) -> None:
+        """Reset passive GPU runner state after context or graph reset."""
+        state = self._async_gpu_runner_state
+        state.epoch += 1
+        state.current_sample_slot = self._async_current_sample_slot
+        state.next_sample_slot = self._async_next_sample_slot
+        state.pending_retirements.clear()
+        state.reset_count += 1
+        state.last_disable_reason = None
+        self._async_gpu_runner_slot_epochs = [-1] * self._async_sample_slot_count
+        self._async_gpu_runner_slot_active_counts = [0] * self._async_sample_slot_count
+
+    def _record_async_gpu_runner_launch(
+        self, sample_slot: int, active_request_count: int
+    ) -> None:
+        """Record a graph launch in passive GPU runner state."""
+        state = self._async_gpu_runner_state
+        state.launch_count += 1
+        state.current_sample_slot = sample_slot
+        state.next_sample_slot = self._async_next_sample_slot
+        self._async_gpu_runner_slot_epochs[sample_slot] = state.epoch
+        self._async_gpu_runner_slot_active_counts[sample_slot] = active_request_count
+
+    def _record_async_gpu_runner_disable_reason(self, reason: Optional[str]) -> None:
+        """Record the latest reason the GPU runner could not launch."""
+        self._async_gpu_runner_state.last_disable_reason = reason
 
     def _init_mtp_sampling_tensors(self):
         """Pre-allocate MTP sampling tensors.
@@ -312,6 +384,8 @@ class TextGenerationController:
     def _select_async_sample_slot(self, sample_slot: int) -> None:
         """Select the sampled-token buffers used by subsequent GPU sampling operations."""
         self._async_current_sample_slot = sample_slot
+        if hasattr(self, "_async_gpu_runner_state"):
+            self._async_gpu_runner_state.current_sample_slot = sample_slot
         self._sampled_tokens_cuda = self._sampled_tokens_cuda_slots[sample_slot]
         self._async_sample_values_cuda = self._async_sample_values_cuda_slots[sample_slot]
         self._async_sampled_tokens_cpu = self._async_sampled_tokens_cpu_slots[sample_slot]
@@ -1550,6 +1624,7 @@ class TextGenerationController:
             self._async_next_sample_slot = 0
             self._async_sample_slot_copy_pending = [False] * self._async_sample_slot_count
             context.reset()
+            self._reset_async_gpu_runner_state()
             torch.cuda.synchronize()
 
     def _capture_async_decode_graph(
@@ -1685,6 +1760,9 @@ class TextGenerationController:
         self._async_pending_cuda_graph_request_count = (
             self.inference_wrapped_model.inference_context.padded_active_request_count
         )
+        self._record_async_gpu_runner_launch(
+            sample_slot, async_decode_graph.batch_dimensions.decode_req_count
+        )
         return sample_slot
 
     def _launch_async_forward_graph(self, async_forward_graph: _AsyncForwardGraph) -> None:
@@ -1711,6 +1789,7 @@ class TextGenerationController:
         """Prepare next-step metadata and launch a captured async decode graph if possible."""
         context = self.inference_wrapped_model.inference_context
         self._async_disable_reason = self._async_scheduling_disabled_reason()
+        self._record_async_gpu_runner_disable_reason(self._async_disable_reason)
         if self._async_disable_reason is not None:
             return False, None, None, None, None, False
 
@@ -1719,11 +1798,13 @@ class TextGenerationController:
         range_pop()
         if not async_next_prepared:
             self._async_disable_reason = "failed to prepare next-step metadata"
+            self._record_async_gpu_runner_disable_reason(self._async_disable_reason)
             return False, None, None, None, None, False
 
         async_decode_graph = self._get_async_decode_graph()
         if async_decode_graph is None:
             self._async_disable_reason = "async decode graph not captured"
+            self._record_async_gpu_runner_disable_reason(self._async_disable_reason)
             return True, None, None, None, None, False
 
         range_push("async_decode_graph_launch")
@@ -1751,6 +1832,7 @@ class TextGenerationController:
         """Prepare next-step metadata for an async forward launched after sampling."""
         context = self.inference_wrapped_model.inference_context
         self._async_disable_reason = self._async_scheduling_disabled_reason(allow_mtp=True)
+        self._record_async_gpu_runner_disable_reason(self._async_disable_reason)
         if self._async_disable_reason is not None:
             return False
 
@@ -1759,6 +1841,7 @@ class TextGenerationController:
         range_pop()
         if not async_next_prepared:
             self._async_disable_reason = "failed to prepare next-step metadata"
+            self._record_async_gpu_runner_disable_reason(self._async_disable_reason)
             return False
 
         return True

@@ -736,6 +736,105 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         ]
 
     @pytest.mark.internal
+    def test_async_gpu_runner_state_initialization(self) -> None:
+        """GPU runner scaffolding initializes without changing async behavior."""
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=4,
+                num_gap_steps=0,
+                num_cuda_graphs=1,
+                force_build_cuda_graphs=True,
+                context_max_requests=4,
+                enable_async_scheduling=True,
+                termination_id=-1,
+                top_k=1,
+            )
+        )
+        controller = env.engine.controller
+        state = controller._async_gpu_runner_state
+
+        assert state.enabled
+        assert state.epoch == 1
+        assert state.reset_count == 1
+        assert state.current_sample_slot == 0
+        assert state.next_sample_slot == 0
+        assert state.pending_retirements == []
+        assert controller._async_gpu_runner_request_ids_cpu_slots.shape == (2, 4)
+        assert controller._async_gpu_runner_row_indices_cuda_slots.shape == (2, 4)
+        assert controller._async_gpu_runner_slot_epochs == [-1, -1]
+        assert controller._async_gpu_runner_slot_active_counts == [0, 0]
+
+    @pytest.mark.internal
+    def test_async_gpu_runner_state_reset_and_disable_reason(self) -> None:
+        """GPU runner scaffolding records reset epochs and launch disable reasons."""
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=4,
+                num_gap_steps=0,
+                num_cuda_graphs=1,
+                force_build_cuda_graphs=False,
+                context_max_requests=4,
+                enable_async_scheduling=False,
+                termination_id=-1,
+                top_k=1,
+            )
+        )
+        controller = env.engine.controller
+        state = controller._async_gpu_runner_state
+
+        assert not state.enabled
+        controller._async_gpu_runner_slot_epochs[0] = 3
+        controller._async_gpu_runner_slot_active_counts[0] = 4
+        state.pending_retirements.append(object())
+        controller._reset_async_gpu_runner_state()
+        assert state.epoch == 1
+        assert state.reset_count == 1
+        assert state.pending_retirements == []
+        assert controller._async_gpu_runner_slot_epochs == [-1, -1]
+        assert controller._async_gpu_runner_slot_active_counts == [0, 0]
+
+        launched, *_ = controller._try_launch_async_decode_graph(active_request_count=0)
+        assert not launched
+        assert state.last_disable_reason == "disabled"
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_gpu_runner_state_tracks_decode_graph_slots(self) -> None:
+        """GPU runner scaffolding tracks existing decode graph slot rotation."""
+        env = self._run_test(
+            num_requests=4,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=4,
+            num_gap_steps=0,
+            model_provider="gpt",
+            num_cuda_graphs=1,
+            cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+            force_build_cuda_graphs=True,
+            context_max_requests=4,
+            enable_async_scheduling=True,
+            termination_id=-1,
+            top_k=1,
+        )
+        controller = env.engine.controller
+        state = controller._async_gpu_runner_state
+
+        assert state.launch_count == controller._async_decode_graph_launch_count
+        assert state.launch_count > 0
+        assert state.current_sample_slot in (0, 1)
+        assert state.next_sample_slot in (0, 1)
+        assert any(epoch >= 0 for epoch in controller._async_gpu_runner_slot_epochs)
+        assert any(count > 0 for count in controller._async_gpu_runner_slot_active_counts)
+
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
