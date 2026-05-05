@@ -9,6 +9,7 @@ from importlib.metadata import PackageNotFoundError, version
 import torch
 
 from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.utils import get_model_config
 
 try:
@@ -73,19 +74,24 @@ def get_attention_mask(seq_length: int) -> torch.Tensor:
 
 # Initialize cache for sequence parallel modules
 moe_layer_cache = None
+_moe_layer_cache_model_id = None
 _moe_metadata_sync_initialized = False
 
 
 def _init_moe_expert_cache(model):
     """
-    Initialize the cache of MoE layers once
+    Initialize the cache of MoE layers for the current model.
     """
-    global moe_layer_cache
-    if moe_layer_cache is not None:
+    global moe_layer_cache, _moe_layer_cache_model_id, _moe_metadata_sync_initialized
+    model_id = id(model)
+    if moe_layer_cache is not None and _moe_layer_cache_model_id == model_id:
         return  # already initialized
 
     # Cache for moe layers.
     moe_layer_cache = []
+    _moe_layer_cache_model_id = model_id
+    _moe_metadata_sync_initialized = False
+    router_replay_instances = []
     seen_modules = set()
 
     def walk(module):
@@ -93,12 +99,17 @@ def _init_moe_expert_cache(model):
         if isinstance(module, MoELayer):
             oid = id(module)
             if oid not in seen_modules:
+                seen_modules.add(oid)
                 moe_layer_cache.append(module)
+                router_replay = getattr(getattr(module, "router", None), "router_replay", None)
+                if router_replay is not None:
+                    router_replay_instances.append(router_replay)
 
         for child in module.children():
             walk(child)
 
     walk(model)
+    RouterReplay.global_router_replay_instances = router_replay_instances
 
 
 def set_moe_metadata_sync(model) -> None:
@@ -109,10 +120,9 @@ def set_moe_metadata_sync(model) -> None:
     Must be called once after the model is built and put into eval mode.
     """
     global moe_layer_cache, _moe_metadata_sync_initialized
+    _init_moe_expert_cache(model)
     if _moe_metadata_sync_initialized:
         return
-    if moe_layer_cache is None:
-        _init_moe_expert_cache(model)
     for i, moe_layer in enumerate(moe_layer_cache):
         dispatcher = getattr(moe_layer, '_inference_token_dispatcher', None)
         if dispatcher is not None:

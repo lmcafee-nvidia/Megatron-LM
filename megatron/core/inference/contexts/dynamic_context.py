@@ -1862,7 +1862,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # Pre-construct shared objects (safe due to deep copy in DynamicInferenceRequest.__post_init__)
-        shared_sampling_params = SamplingParams(num_tokens_to_generate=1, termination_id=-1)
+        shared_sampling_params = SamplingParams(
+            num_tokens_to_generate=1, termination_id=-1, top_k=1
+        )
         shared_decode_tokens = torch.zeros(
             self.num_speculative_tokens + 1, dtype=torch.long, device='cpu'
         )
@@ -2610,13 +2612,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Advance decode bookkeeping directly in the GPU view.
 
         This mirrors the steady decode-only subset of
-        :meth:`prepare_async_decode_next_step` for greedy GPT and non-hybrid MTP
-        requests. It is graph-safe: all scratch storage is preallocated, and the
-        method only mutates fixed-address GPU-view tensors. KV block transitions
-        are supported when the reserved block table entries are already present in
-        the GPU view.
+        :meth:`prepare_async_decode_next_step` for greedy GPT and MTP requests.
+        It is graph-safe: all scratch storage is preallocated, and the method
+        only mutates fixed-address GPU-view tensors. KV block transitions are
+        supported when the reserved block table entries are already present in the
+        GPU view.
         """
-        if self.is_hybrid_model:
+        if self.is_hybrid_model and self.num_speculative_tokens == 0:
             return False
         if self.num_prefill_requests != 0 or self.padded_batch_dimensions.prefill_req_count != 0:
             return False
@@ -2678,7 +2680,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 dim=0,
                 out=self._async_decode_cu_position_steps[1 : active_request_count + 1],
             )
-            self._async_decode_cu_position_steps[0] = 0
+            self._async_decode_cu_position_steps[:1].zero_()
 
             token_rows = self._async_decode_token_request_rows[active_token_slice]
             torch.index_select(

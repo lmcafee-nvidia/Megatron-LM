@@ -830,6 +830,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             cuda_graph_request_count=4,
             sampled_tokens_cpu=torch.tensor([11, 12], dtype=torch.long),
             sampled_mtp_tokens_cpu=None,
+            accepted_tokens_cpu=None,
             sample_ready_event=torch.cuda.Event(),
             h2d_done_event=torch.cuda.Event(),
         )
@@ -839,6 +840,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             cuda_graph_request_count=4,
             sampled_tokens_cpu=torch.tensor([21, 22], dtype=torch.long),
             sampled_mtp_tokens_cpu=None,
+            accepted_tokens_cpu=None,
             sample_ready_event=torch.cuda.Event(),
             h2d_done_event=torch.cuda.Event(),
         )
@@ -878,15 +880,19 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         context.total_request_count = 2
         context.request_ids[:2] = torch.tensor([20, 30], dtype=context.request_ids.dtype)
 
-        sampled_tokens, sampled_mtp_tokens = controller._map_async_retirement_samples_to_current_rows(
-            sampled_tokens_cpu=torch.tensor([11, 22, 33], dtype=torch.long),
-            sampled_mtp_tokens_cpu=torch.tensor([[101, 202, 303], [111, 222, 333]]),
-            sampled_request_ids=torch.tensor([10, 20, 30], dtype=torch.long),
-            active_request_ids=context.request_ids[:2].long(),
+        sampled_tokens, sampled_mtp_tokens, accepted_tokens = (
+            controller._map_async_retirement_samples_to_current_rows(
+                sampled_tokens_cpu=torch.tensor([11, 22, 33], dtype=torch.long),
+                sampled_mtp_tokens_cpu=torch.tensor([[101, 202, 303], [111, 222, 333]]),
+                accepted_tokens_cpu=torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.long),
+                sampled_request_ids=torch.tensor([10, 20, 30], dtype=torch.long),
+                active_request_ids=context.request_ids[:2].long(),
+            )
         )
 
         assert sampled_tokens.tolist() == [22, 33]
         assert sampled_mtp_tokens.tolist() == [[202, 303], [222, 333]]
+        assert accepted_tokens.tolist() == [[3, 4], [5, 6]]
         assert controller._async_gpu_runner_retirement_row_map_count == 1
         assert controller._async_gpu_runner_state.repair_count == 1
 
@@ -924,6 +930,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             cuda_graph_request_count=4,
             sampled_tokens_cpu=torch.tensor([11, 22], dtype=torch.long),
             sampled_mtp_tokens_cpu=None,
+            accepted_tokens_cpu=None,
             sample_ready_event=sample_ready_event,
             h2d_done_event=h2d_done_event,
         )
@@ -1529,9 +1536,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             async_env.engine.controller._async_forward_launch_count > 0
         ), async_env.engine.controller._async_disable_reason
         assert (
-            async_env.engine.controller._async_forward_graph_launch_count > 0
+            async_env.engine.controller._async_gpu_decode_packet_launch_count > 0
         ), async_env.engine.controller._async_decode_graph_capture_failed_reason
-        assert async_env.engine.controller._async_deferred_mtp_release_count > 0
+        assert async_env.engine.controller._async_decode_graph_h2d_launch_count == 0
         assert [request.generated_tokens for request in async_env.requests] == [
             request.generated_tokens for request in serial_env.requests
         ]
@@ -6493,9 +6500,9 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             async_env.engine.controller._async_forward_launch_count > 0
         ), async_env.engine.controller._async_disable_reason
         assert (
-            async_env.engine.controller._async_forward_graph_launch_count > 0
+            async_env.engine.controller._async_gpu_decode_packet_launch_count > 0
         ), async_env.engine.controller._async_decode_graph_capture_failed_reason
-        assert async_env.engine.controller._async_deferred_mtp_release_count > 0
+        assert async_env.engine.controller._async_decode_graph_h2d_launch_count == 0
         assert [request.generated_tokens for request in async_env.requests] == serial_tokens
 
 
