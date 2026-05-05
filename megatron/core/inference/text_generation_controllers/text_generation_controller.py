@@ -117,6 +117,9 @@ class _AsyncGpuRunnerState:
     reset_count: int = 0
     repair_count: int = 0
     retirement_count: int = 0
+    max_retirement_lag: int = 0
+    retirement_lag_total: int = 0
+    retirement_lag_observation_count: int = 0
     last_disable_reason: Optional[str] = None
     pending_retirements: List[_AsyncGpuRunnerRetirement] = field(default_factory=list)
 
@@ -232,6 +235,9 @@ class TextGenerationController:
         self._async_gpu_runner_repair_barrier_count = 0
         self._async_gpu_runner_retirement_row_map_count = 0
         self._async_gpu_runner_discard_count = 0
+        self._async_gpu_advance_replay_count = 0
+        self._async_launch_critical_h2d_count = 0
+        self._async_forbidden_steady_h2d_count = 0
         self._async_pending_forward_done_event = torch.cuda.Event()
         self._async_pending_forward_done_event_recorded = False
         self._async_deferred_mtp_release_count = 0
@@ -341,6 +347,9 @@ class TextGenerationController:
         state.pending_retirements.clear()
         state.reset_count += 1
         state.last_disable_reason = None
+        state.max_retirement_lag = 0
+        state.retirement_lag_total = 0
+        state.retirement_lag_observation_count = 0
         self._async_gpu_runner_slot_epochs = [-1] * self._async_sample_slot_count
         self._async_gpu_runner_slot_active_counts = [0] * self._async_sample_slot_count
         self._async_pending_forward_done_event_recorded = False
@@ -392,6 +401,10 @@ class TextGenerationController:
                 request_ids=self._active_request_ids_cpu(),
             )
         )
+        retirement_lag = len(state.pending_retirements)
+        state.max_retirement_lag = max(state.max_retirement_lag, retirement_lag)
+        state.retirement_lag_total += retirement_lag
+        state.retirement_lag_observation_count += 1
 
     def _pop_async_gpu_runner_retirement(self) -> _AsyncGpuRunnerRetirement:
         """Pop the oldest async GPU packet that still needs CPU retirement."""
@@ -2092,6 +2105,21 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         return self._async_forward_graphs.get(context.padded_batch_dimensions)
 
+    def _record_async_launch_critical_h2d(self, active_request_count: int) -> None:
+        """Record an H2D transfer on the async launch-critical path."""
+        self._async_launch_critical_h2d_count += 1
+        context = self.inference_wrapped_model.inference_context
+        async_decode_graph = self._get_async_decode_graph()
+        steady_gpu_packet_available = (
+            async_decode_graph is not None
+            and async_decode_graph.uses_gpu_advance
+            and active_request_count == async_decode_graph.batch_dimensions.decode_req_count
+            and context._async_reserved_kv_block_count == 0
+            and self._async_disable_reason is None
+        )
+        if steady_gpu_packet_available:
+            self._async_forbidden_steady_h2d_count += 1
+
     def _mtp_decode_packet_preprepare_block_reason(
         self,
         active_request_count: int,
@@ -2157,7 +2185,14 @@ class TextGenerationController:
             self._async_sample_slot_copy_pending[sample_slot] = False
             self._async_sample_slot_wait_count += 1
         self._select_async_sample_slot(sample_slot)
+        replay_range = (
+            "async_gpu_packet_replay"
+            if async_decode_graph.uses_gpu_advance
+            else "async_h2d_decode_graph_replay"
+        )
+        range_push(replay_range)
         async_decode_graph.graphs[sample_slot].replay()
+        range_pop()
         self._record_async_pending_forward_done()
         self._async_next_sample_slot = (sample_slot + 1) % self._async_sample_slot_count
         self._async_sample_slot_launch_counts[sample_slot] += 1
@@ -2165,6 +2200,7 @@ class TextGenerationController:
         self._async_decode_graph_launch_count += 1
         if async_decode_graph.uses_gpu_advance:
             self._async_gpu_decode_packet_launch_count += 1
+            self._async_gpu_advance_replay_count += 1
         else:
             self._async_decode_graph_h2d_launch_count += 1
         self._async_pending_forward = True
@@ -3199,9 +3235,11 @@ class TextGenerationController:
         range_pop()
 
         if repair_barrier_required and finished_request_ids.numel() > 0:
+            range_push("async_gpu_runner_repair_barrier")
             torch.cuda.current_stream().synchronize()
             self._async_gpu_runner_state.repair_count += 1
             self._async_gpu_runner_repair_barrier_count += 1
+            range_pop()
 
         if h2d_done_event is not None:
             h2d_done_event.synchronize()
@@ -3484,6 +3522,7 @@ class TextGenerationController:
                     range_pop()
                 else:
                     range_push("async_transfer_bookkeeping_to_gpu")
+                    self._record_async_launch_critical_h2d(active_request_count)
                     async_h2d_done_event = context.transfer_bookkeeping_to_gpu(
                         include_token_to_input_ids=False,
                         refresh_request_staging=False,

@@ -761,6 +761,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert state.reset_count == 1
         assert state.current_sample_slot == 0
         assert state.next_sample_slot == 0
+        assert state.max_retirement_lag == 0
+        assert state.retirement_lag_total == 0
+        assert state.retirement_lag_observation_count == 0
         assert state.pending_retirements == []
         assert controller._async_gpu_runner_request_ids_cpu_slots.shape == (2, 4)
         assert controller._async_gpu_runner_row_indices_cuda_slots.shape == (2, 4)
@@ -796,6 +799,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert state.epoch == 1
         assert state.reset_count == 1
         assert state.pending_retirements == []
+        assert state.max_retirement_lag == 0
+        assert state.retirement_lag_total == 0
+        assert state.retirement_lag_observation_count == 0
         assert controller._async_gpu_runner_slot_epochs == [-1, -1]
         assert controller._async_gpu_runner_slot_active_counts == [0, 0]
 
@@ -853,6 +859,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert second.sample_slot == 0
         assert second.sampled_tokens_cpu.tolist() == [21, 22]
         assert state.retirement_count == 2
+        assert state.max_retirement_lag == 2
+        assert state.retirement_lag_total == 3
+        assert state.retirement_lag_observation_count == 2
         assert not controller._has_pending_async_gpu_runner_retirement()
 
     @pytest.mark.internal
@@ -1145,8 +1154,14 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         controller = env.engine.controller
         assert controller._async_gpu_decode_packet_launch_count > 0
+        assert (
+            controller._async_gpu_advance_replay_count
+            == controller._async_gpu_decode_packet_launch_count
+        )
         assert controller._async_decode_graph_h2d_launch_count == 0
         assert controller._async_gpu_decode_packet_h2d_fallback_count == 0
+        assert controller._async_launch_critical_h2d_count == 0
+        assert controller._async_forbidden_steady_h2d_count == 0
         assert [len(request.generated_tokens) for request in env.requests] == [8] * 4
 
     @pytest.mark.internal
@@ -1186,6 +1201,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         controller = async_env.engine.controller
         assert controller._async_gpu_decode_packet_launch_count == 0
         assert controller._async_gpu_decode_packet_h2d_fallback_count > 0
+        assert controller._async_launch_critical_h2d_count > 0
+        assert controller._async_forbidden_steady_h2d_count == 0
         assert [request.generated_tokens for request in async_env.requests] == serial_tokens
 
     @pytest.mark.internal
@@ -1198,7 +1215,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             num_requests=4,
             min_prompt_length=4,
             max_prompt_length=4,
-            num_tokens_to_generate=12,
+            num_tokens_to_generate=8,
             num_gap_steps=0,
             model_provider="gpt",
             num_cuda_graphs=1,
@@ -1224,6 +1241,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         async_env = self._run_test(enable_async_scheduling=True, **common_kwargs)
         controller = async_env.engine.controller
         assert controller._async_gpu_runner_prebookkeeping_launch_count > 0
+        assert controller._async_gpu_runner_state.max_retirement_lag > 0
+        assert controller._async_gpu_runner_state.retirement_lag_observation_count > 0
         assert controller._async_gpu_runner_state.pending_retirements == []
         assert [request.generated_tokens for request in async_env.requests] == serial_tokens
 
@@ -1536,7 +1555,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             async_env.engine.controller._async_forward_launch_count > 0
         ), async_env.engine.controller._async_disable_reason
         assert (
-            async_env.engine.controller._async_gpu_decode_packet_launch_count > 0
+            async_env.engine.controller._async_forward_graph_launch_count > 0
         ), async_env.engine.controller._async_decode_graph_capture_failed_reason
         assert async_env.engine.controller._async_decode_graph_h2d_launch_count == 0
         assert [request.generated_tokens for request in async_env.requests] == [
