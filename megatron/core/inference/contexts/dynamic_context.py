@@ -1087,6 +1087,31 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._async_decode_block_idx_scratch = torch.empty(
             self.max_requests, dtype=torch.int32, device=torch.cuda.current_device()
         )
+        async_decode_max_tokens = self.max_requests * (self.num_speculative_tokens + 1)
+        self._async_decode_token_request_rows = torch.arange(
+            self.max_requests, dtype=torch.long, device=torch.cuda.current_device()
+        ).repeat_interleave(self.num_speculative_tokens + 1)
+        self._async_decode_token_position_deltas = torch.arange(
+            self.num_speculative_tokens + 1, dtype=torch.int32, device=torch.cuda.current_device()
+        ).repeat(self.max_requests)
+        self._async_decode_request_position_steps = torch.empty(
+            self.max_requests, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        self._async_decode_cu_position_steps = torch.empty(
+            self.max_requests + 1, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        self._async_decode_token_positions = torch.empty(
+            async_decode_max_tokens, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        self._async_decode_token_position_steps = torch.empty(
+            async_decode_max_tokens, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        self._async_decode_token_block_columns = torch.empty(
+            async_decode_max_tokens, dtype=torch.int64, device=torch.cuda.current_device()
+        )
+        self._async_decode_token_block_idx_scratch = torch.empty(
+            async_decode_max_tokens, dtype=torch.int32, device=torch.cuda.current_device()
+        )
 
         # MHA flash-attention metadata views (write-only on CPU, read-only on
         # GPU via the matching region of ContextGPUView._buf). Populated per
@@ -2578,17 +2603,20 @@ class DynamicInferenceContext(BaseInferenceContext):
         return True
 
     def advance_async_decode_gpu_bookkeeping(
-        self, active_request_count: Optional[int] = None
+        self,
+        active_request_count: Optional[int] = None,
+        accepted_token_counts: Optional[Tensor] = None,
     ) -> bool:
-        """Advance GPT decode bookkeeping directly in the GPU view.
+        """Advance decode bookkeeping directly in the GPU view.
 
         This mirrors the steady decode-only subset of
-        :meth:`prepare_async_decode_next_step` for greedy GPT requests. It is
-        graph-safe: all scratch storage is preallocated, and the method only
-        mutates fixed-address GPU-view tensors. KV block transitions are supported
-        when the reserved block table entries are already present in the GPU view.
+        :meth:`prepare_async_decode_next_step` for greedy GPT and non-hybrid MTP
+        requests. It is graph-safe: all scratch storage is preallocated, and the
+        method only mutates fixed-address GPU-view tensors. KV block transitions
+        are supported when the reserved block table entries are already present in
+        the GPU view.
         """
-        if self.num_speculative_tokens != 0 or self.is_hybrid_model:
+        if self.is_hybrid_model:
             return False
         if self.num_prefill_requests != 0 or self.padded_batch_dimensions.prefill_req_count != 0:
             return False
@@ -2599,46 +2627,134 @@ class DynamicInferenceContext(BaseInferenceContext):
         if active_request_count <= 0 or active_request_count > self.max_requests:
             return False
 
-        active_slice = slice(0, active_request_count)
+        tokens_per_request = self.num_speculative_tokens + 1
+        active_request_slice = slice(0, active_request_count)
+        active_token_count = active_request_count * tokens_per_request
+        active_token_slice = slice(0, active_token_count)
         gpu_view = self.gpu_view
 
-        gpu_view.token_to_pos_ids[active_slice].add_(1)
-        gpu_view.token_to_position_in_request[active_slice].add_(1)
-        gpu_view.token_to_local_position_within_kv_block[active_slice].add_(1)
-        gpu_view.token_to_local_position_within_kv_block[active_slice].remainder_(
-            self.block_size_tokens
-        )
-        gpu_view.request_kv_length_offsets[active_slice].add_(1)
-        gpu_view.mha_kv_seq_lengths[active_slice].add_(1)
-        gpu_view.mha_cu_kv_seq_lengths[1 : active_request_count + 1].add_(
-            self._async_decode_cu_request_offsets[:active_request_count]
-        )
+        if tokens_per_request == 1:
+            gpu_view.token_to_pos_ids[active_request_slice].add_(1)
+            gpu_view.token_to_position_in_request[active_request_slice].add_(1)
+            gpu_view.token_to_local_position_within_kv_block[active_request_slice].add_(1)
+            gpu_view.token_to_local_position_within_kv_block[
+                active_request_slice
+            ].remainder_(self.block_size_tokens)
+            gpu_view.request_kv_length_offsets[active_request_slice].add_(1)
+            gpu_view.mha_kv_seq_lengths[active_request_slice].add_(1)
+            gpu_view.mha_cu_kv_seq_lengths[1 : active_request_count + 1].add_(
+                self._async_decode_cu_request_offsets[:active_request_count]
+            )
 
-        torch.div(
-            gpu_view.token_to_position_in_request[active_slice],
-            self.block_size_tokens,
-            rounding_mode="floor",
-            out=self._async_decode_block_columns[active_slice],
-        )
-        torch.gather(
-            gpu_view.mha_block_table[:active_request_count],
-            1,
-            self._async_decode_block_columns[active_slice].view(active_request_count, 1),
-            out=self._async_decode_block_idx_scratch[active_slice].view(active_request_count, 1),
-        )
-        gpu_view.token_to_block_idx[active_slice].copy_(
-            self._async_decode_block_idx_scratch[active_slice]
-        )
+            torch.div(
+                gpu_view.token_to_position_in_request[active_request_slice],
+                self.block_size_tokens,
+                rounding_mode="floor",
+                out=self._async_decode_block_columns[active_request_slice],
+            )
+            torch.gather(
+                gpu_view.mha_block_table[:active_request_count],
+                1,
+                self._async_decode_block_columns[active_request_slice].view(
+                    active_request_count, 1
+                ),
+                out=self._async_decode_block_idx_scratch[active_request_slice].view(
+                    active_request_count, 1
+                ),
+            )
+            gpu_view.token_to_block_idx[active_request_slice].copy_(
+                self._async_decode_block_idx_scratch[active_request_slice]
+            )
+        else:
+            if accepted_token_counts is None:
+                return False
+
+            self._async_decode_request_position_steps[active_request_slice].copy_(
+                accepted_token_counts[:active_request_count]
+            )
+            self._async_decode_request_position_steps[active_request_slice].add_(1)
+            torch.cumsum(
+                self._async_decode_request_position_steps[active_request_slice],
+                dim=0,
+                out=self._async_decode_cu_position_steps[1 : active_request_count + 1],
+            )
+            self._async_decode_cu_position_steps[0] = 0
+
+            token_rows = self._async_decode_token_request_rows[active_token_slice]
+            torch.index_select(
+                gpu_view.request_kv_length_offsets,
+                0,
+                token_rows,
+                out=self._async_decode_token_positions[active_token_slice],
+            )
+            torch.index_select(
+                self._async_decode_request_position_steps,
+                0,
+                token_rows,
+                out=self._async_decode_token_position_steps[active_token_slice],
+            )
+            self._async_decode_token_positions[active_token_slice].add_(
+                self._async_decode_token_position_steps[active_token_slice]
+            )
+            self._async_decode_token_positions[active_token_slice].add_(
+                self._async_decode_token_position_deltas[active_token_slice]
+            )
+
+            gpu_view.token_to_pos_ids[active_token_slice].copy_(
+                self._async_decode_token_positions[active_token_slice]
+            )
+            gpu_view.token_to_position_in_request[active_token_slice].copy_(
+                self._async_decode_token_positions[active_token_slice]
+            )
+            torch.remainder(
+                self._async_decode_token_positions[active_token_slice],
+                self.block_size_tokens,
+                out=gpu_view.token_to_local_position_within_kv_block[active_token_slice],
+            )
+
+            gpu_view.request_kv_length_offsets[active_request_slice].add_(
+                self._async_decode_request_position_steps[active_request_slice]
+            )
+            gpu_view.mha_kv_seq_lengths[active_request_slice].add_(
+                self._async_decode_request_position_steps[active_request_slice]
+            )
+            gpu_view.mha_cu_kv_seq_lengths[1 : active_request_count + 1].add_(
+                self._async_decode_cu_position_steps[1 : active_request_count + 1]
+            )
+
+            torch.div(
+                gpu_view.token_to_position_in_request[active_token_slice],
+                self.block_size_tokens,
+                rounding_mode="floor",
+                out=self._async_decode_token_block_columns[active_token_slice],
+            )
+            torch.gather(
+                gpu_view.mha_block_table[:active_request_count],
+                1,
+                self._async_decode_token_block_columns[active_token_slice].view(
+                    active_request_count, tokens_per_request
+                ),
+                out=self._async_decode_token_block_idx_scratch[active_token_slice].view(
+                    active_request_count, tokens_per_request
+                ),
+            )
+            gpu_view.token_to_block_idx[active_token_slice].copy_(
+                self._async_decode_token_block_idx_scratch[active_token_slice]
+            )
         if active_request_count < self.padded_batch_dimensions.decode_req_count:
             pad_slice = slice(active_request_count, self.padded_batch_dimensions.decode_req_count)
+            token_pad_slice = slice(
+                active_token_count,
+                self.padded_batch_dimensions.decode_req_count * tokens_per_request,
+            )
             cu_pad_slice = slice(
                 active_request_count + 1, self.padded_batch_dimensions.decode_req_count + 1
             )
-            gpu_view.token_to_block_idx[pad_slice] = self.kv_block_allocator.dummy_block_idx
-            gpu_view.token_to_local_position_within_kv_block[pad_slice] = 0
-            gpu_view.token_to_request_idx[pad_slice] = -1
-            gpu_view.token_to_position_in_request[pad_slice] = 0
-            gpu_view.token_to_pos_ids[pad_slice] = 0
+            gpu_view.token_to_block_idx[token_pad_slice] = self.kv_block_allocator.dummy_block_idx
+            gpu_view.token_to_local_position_within_kv_block[token_pad_slice] = 0
+            gpu_view.token_to_request_idx[token_pad_slice] = -1
+            gpu_view.token_to_position_in_request[token_pad_slice] = 0
+            gpu_view.token_to_pos_ids[token_pad_slice] = 0
             gpu_view.request_in_prefill_status[pad_slice] = 0
             gpu_view.request_query_lengths[pad_slice] = 0
             gpu_view.request_kv_length_offsets[pad_slice] = 0

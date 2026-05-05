@@ -1005,15 +1005,24 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         }
 
     def _assert_gpu_decode_advance_matches_cpu_prepare(
-        self, *, num_requests: int, prompt_length: int, block_size_tokens: int
+        self,
+        *,
+        num_requests: int,
+        prompt_length: int,
+        block_size_tokens: int,
+        num_speculative_tokens: int = 0,
+        accepted_counts: Optional[list[int]] = None,
     ) -> None:
-        """Compare device-side GPT advance against CPU prepare plus H2D."""
+        """Compare device-side decode advance against CPU prepare plus H2D."""
+        if accepted_counts is None:
+            accepted_counts = [0] * num_requests
         env = self._build_test_env(
             DynamicEngineTestConfig(
                 num_requests=num_requests,
                 min_prompt_length=prompt_length,
                 max_prompt_length=prompt_length,
                 num_tokens_to_generate=4,
+                num_speculative_tokens=num_speculative_tokens,
                 num_gap_steps=0,
                 model_provider="gpt",
                 num_cuda_graphs=1,
@@ -1033,12 +1042,21 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         controller = env.engine.controller
         context = env.engine.context
-        assert context.is_decode_only()
+        accepted_counts_cuda = torch.tensor(
+            accepted_counts, dtype=torch.long, device=torch.cuda.current_device()
+        )
         with torch.inference_mode():
             controller._dynamic_step_context_init()
+            assert context.is_decode_only()
             assert context.using_cuda_graph_this_step()
             before_gpu = context.gpu_view._buf.clone()
 
+            if num_speculative_tokens > 0:
+                controller._accepted_token_counts_per_request[:num_requests].copy_(
+                    accepted_counts_cuda
+                )
+                blocks_to_release, remove_mask = controller._rewind_kv_cache()
+                context.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
             assert context.prepare_async_decode_next_step()
             assert context._async_reserved_kv_block_count == 0
             context.transfer_bookkeeping_to_gpu(
@@ -1047,7 +1065,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             expected = self._gpu_decode_bookkeeping_snapshot(context)
 
             context.gpu_view._buf.copy_(before_gpu)
-            assert context.advance_async_decode_gpu_bookkeeping()
+            assert context.advance_async_decode_gpu_bookkeeping(
+                accepted_token_counts=accepted_counts_cuda
+            )
             actual = self._gpu_decode_bookkeeping_snapshot(context)
 
         for label, expected_tensor in expected.items():
@@ -1071,6 +1091,27 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         """GPU GPT metadata advance matches CPU prepare next to a KV block boundary."""
         self._assert_gpu_decode_advance_matches_cpu_prepare(
             num_requests=4, prompt_length=254, block_size_tokens=256
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize(
+        "accepted_counts",
+        ([0, 0, 0], [0, 1, 2], [2, 2, 2]),
+        ids=["all_rejected", "partial", "all_accepted"],
+    )
+    def test_async_gpu_mtp_decode_advance_matches_cpu_prepare(
+        self, accepted_counts: list[int]
+    ) -> None:
+        """GPU MTP metadata advance uses accepted-count deltas like CPU prepare."""
+        self._assert_gpu_decode_advance_matches_cpu_prepare(
+            num_requests=3,
+            prompt_length=4,
+            block_size_tokens=256,
+            num_speculative_tokens=2,
+            accepted_counts=accepted_counts,
         )
 
     @pytest.mark.internal
