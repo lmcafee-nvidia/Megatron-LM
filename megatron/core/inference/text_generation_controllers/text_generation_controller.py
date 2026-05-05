@@ -96,6 +96,12 @@ class _AsyncGpuRunnerRetirement:
     epoch: int
     sample_slot: int
     active_request_count: int
+    cuda_graph_request_count: Optional[int] = None
+    sampled_tokens_cpu: Optional[Tensor] = None
+    sampled_mtp_tokens_cpu: Optional[Tensor] = None
+    sample_ready_event: Optional[torch.cuda.Event] = None
+    h2d_done_event: Optional[torch.cuda.Event] = None
+    request_ids: Optional[Tensor] = None
 
 
 @dataclass
@@ -218,15 +224,12 @@ class TextGenerationController:
         self._async_gpu_decode_packet_launch_count = 0
         self._async_decode_graph_h2d_launch_count = 0
         self._async_gpu_decode_packet_h2d_fallback_count = 0
+        self._async_gpu_runner_prebookkeeping_launch_count = 0
+        self._async_gpu_runner_prebookkeeping_block_count = 0
         self._async_deferred_mtp_release_count = 0
         self._async_decode_graph_capture_failed_reason = None
         self._async_decode_graphs: Dict[InferenceBatchDimensions, _AsyncDecodeGraph] = {}
         self._async_forward_graphs: Dict[InferenceBatchDimensions, _AsyncForwardGraph] = {}
-        self._async_pending_sampled_tokens_cpu = None
-        self._async_pending_sampled_mtp_tokens_cpu = None
-        self._async_pending_sample_ready_event = None
-        self._async_pending_h2d_done_event = None
-        self._async_pending_sample_cuda_graph_request_count = None
         self._async_pending_forward_request_ids = None
         self._async_admission_barrier_requested = False
         self._async_row_mapped_forward_count = 0
@@ -337,6 +340,44 @@ class TextGenerationController:
     def _record_async_gpu_runner_disable_reason(self, reason: Optional[str]) -> None:
         """Record the latest reason the GPU runner could not launch."""
         self._async_gpu_runner_state.last_disable_reason = reason
+
+    def _has_pending_async_gpu_runner_retirement(self) -> bool:
+        """Return whether an async GPU packet has CPU bookkeeping pending."""
+        return bool(self._async_gpu_runner_state.pending_retirements)
+
+    def _enqueue_async_gpu_runner_retirement(
+        self,
+        *,
+        sample_slot: int,
+        active_request_count: int,
+        cuda_graph_request_count: Optional[int],
+        sampled_tokens_cpu: Tensor,
+        sampled_mtp_tokens_cpu: Optional[Tensor],
+        sample_ready_event: torch.cuda.Event,
+        h2d_done_event: torch.cuda.Event,
+    ) -> None:
+        """Queue one sampled packet for ordered CPU retirement."""
+        state = self._async_gpu_runner_state
+        state.pending_retirements.append(
+            _AsyncGpuRunnerRetirement(
+                epoch=state.epoch,
+                sample_slot=sample_slot,
+                active_request_count=active_request_count,
+                cuda_graph_request_count=cuda_graph_request_count,
+                sampled_tokens_cpu=sampled_tokens_cpu,
+                sampled_mtp_tokens_cpu=sampled_mtp_tokens_cpu,
+                sample_ready_event=sample_ready_event,
+                h2d_done_event=h2d_done_event,
+                request_ids=self._active_request_ids_cpu(),
+            )
+        )
+
+    def _pop_async_gpu_runner_retirement(self) -> _AsyncGpuRunnerRetirement:
+        """Pop the oldest async GPU packet that still needs CPU retirement."""
+        state = self._async_gpu_runner_state
+        retirement = state.pending_retirements.pop(0)
+        state.retirement_count += 1
+        return retirement
 
     def _init_mtp_sampling_tensors(self):
         """Pre-allocate MTP sampling tensors.
@@ -1425,7 +1466,7 @@ class TextGenerationController:
 
     def has_pending_async_forward(self) -> bool:
         """Whether a speculative async forward has already been launched for the next step."""
-        return self._async_pending_forward
+        return self._async_pending_forward or self._has_pending_async_gpu_runner_retirement()
 
     def request_async_admission_barrier(self) -> None:
         """Stop chaining async forwards once so waiting requests can be admitted."""
@@ -1858,6 +1899,85 @@ class TextGenerationController:
             async_decode_graph.h2d_done_events[sample_slot],
             True,
         )
+
+    def _async_gpu_runner_prebookkeeping_block_reason(
+        self, active_request_count: int
+    ) -> Optional[str]:
+        """Return why the GPU runner cannot launch another packet before CPU retirement."""
+        context = self.inference_wrapped_model.inference_context
+        if not self._async_pending_forward:
+            return "no pending forward"
+        if self._has_pending_async_gpu_runner_retirement():
+            return "retirement queue already has a newer packet"
+
+        reason = self._async_scheduling_disabled_reason()
+        if reason is not None:
+            return reason
+
+        async_decode_graph = self._get_async_decode_graph()
+        if async_decode_graph is None:
+            return "async decode graph not captured"
+        if not async_decode_graph.uses_gpu_advance:
+            return "gpu advance packet not captured"
+        if context._async_reserved_kv_block_count != 0:
+            return "reserved kv block needs repair"
+        if active_request_count != async_decode_graph.batch_dimensions.decode_req_count:
+            return "active request count changed"
+        if not self._pending_async_forward_matches_current_rows():
+            return "pending forward rows changed"
+
+        active_slice = slice(0, active_request_count)
+        active_metadata = context.active_request_metadata
+        if (active_metadata["termination_id"][active_slice] >= 0).any():
+            return "termination repair pending"
+        active_sequence_lengths = context.get_active_sequence_lengths()
+        max_sequence_lengths = context.get_max_sequence_lengths()
+        if (active_sequence_lengths + 1 >= max_sequence_lengths).any():
+            return "finish repair pending"
+        active_request_slice = slice(context.paused_request_count, context.total_request_count)
+        active_block_capacity = (
+            context.request_kv_block_counts[active_request_slice] * context.block_size_tokens
+        )
+        if (active_sequence_lengths + 2 >= active_block_capacity).any():
+            return "kv block repair pending"
+        return None
+
+    def _try_launch_async_gpu_runner_before_bookkeeping(self, active_request_count: int) -> bool:
+        """Launch the next GPT GPU packet before retiring the oldest sampled packet."""
+        reason = self._async_gpu_runner_prebookkeeping_block_reason(active_request_count)
+        self._record_async_gpu_runner_disable_reason(reason)
+        if reason is not None:
+            self._async_gpu_runner_prebookkeeping_block_count += 1
+            return False
+
+        async_decode_graph = self._get_async_decode_graph()
+        assert async_decode_graph is not None
+        range_push("async_gpu_runner_prebookkeeping_launch")
+        sample_slot = self._launch_async_decode_graph(async_decode_graph)
+        (
+            sampled_tokens_cpu,
+            sampled_mtp_tokens_cpu,
+            sample_ready_event,
+        ) = self._async_transfer_samples_to_cpu(
+            active_request_count,
+            async_decode_graph.sample_ready_events[sample_slot],
+            sample_slot=sample_slot,
+        )
+        self._async_chained_decode_graph_launch_count += 1
+        self._async_gpu_runner_prebookkeeping_launch_count += 1
+        self._enqueue_async_gpu_runner_retirement(
+            sample_slot=sample_slot,
+            active_request_count=active_request_count,
+            cuda_graph_request_count=(
+                self.inference_wrapped_model.inference_context.padded_active_request_count
+            ),
+            sampled_tokens_cpu=sampled_tokens_cpu,
+            sampled_mtp_tokens_cpu=sampled_mtp_tokens_cpu,
+            sample_ready_event=sample_ready_event,
+            h2d_done_event=async_decode_graph.h2d_done_events[sample_slot],
+        )
+        range_pop()
+        return True
 
     def _try_prepare_async_decode_after_sampling(self) -> bool:
         """Prepare next-step metadata for an async forward launched after sampling."""
@@ -2655,21 +2775,20 @@ class TextGenerationController:
         pending_forward_reused = False
         pending_forward_row_indices = None
         pending_forward_row_mapped = False
-        pending_async_sample = self._async_pending_sampled_tokens_cpu is not None
+        pending_async_sample = self._has_pending_async_gpu_runner_retirement()
 
         if pending_async_sample:
+            pending_retirement = self._pop_async_gpu_runner_retirement()
             async_next_prepared = True
             async_sample_already_launched = True
-            cuda_graph_request_count = self._async_pending_sample_cuda_graph_request_count
-            async_sampled_tokens_cpu = self._async_pending_sampled_tokens_cpu
-            async_sampled_mtp_tokens_cpu = self._async_pending_sampled_mtp_tokens_cpu
-            async_sample_ready_event = self._async_pending_sample_ready_event
-            async_h2d_done_event = self._async_pending_h2d_done_event
-            self._async_pending_sampled_tokens_cpu = None
-            self._async_pending_sampled_mtp_tokens_cpu = None
-            self._async_pending_sample_ready_event = None
-            self._async_pending_h2d_done_event = None
-            self._async_pending_sample_cuda_graph_request_count = None
+            cuda_graph_request_count = pending_retirement.cuda_graph_request_count
+            async_sampled_tokens_cpu = pending_retirement.sampled_tokens_cpu
+            async_sampled_mtp_tokens_cpu = pending_retirement.sampled_mtp_tokens_cpu
+            async_sample_ready_event = pending_retirement.sample_ready_event
+            async_h2d_done_event = pending_retirement.h2d_done_event
+            self._try_launch_async_gpu_runner_before_bookkeeping(
+                pending_retirement.active_request_count
+            )
 
         if not pending_async_sample:
             with torch.inference_mode():
@@ -2883,7 +3002,7 @@ class TextGenerationController:
                 )
                 if (
                     self._async_pending_forward
-                    and self._async_pending_sampled_tokens_cpu is None
+                    and not self._has_pending_async_gpu_runner_retirement()
                     and next_active_request_count > 0
                     and self._pending_async_forward_matches_current_rows()
                 ):
@@ -2900,14 +3019,14 @@ class TextGenerationController:
                         assert pending_sample_ready_event is not None
                         assert pending_h2d_done_event is not None
                         self._async_chained_decode_graph_launch_count += 1
-                        self._async_pending_sampled_tokens_cpu = pending_sampled_tokens_cpu
-                        self._async_pending_sampled_mtp_tokens_cpu = (
-                            pending_sampled_mtp_tokens_cpu
-                        )
-                        self._async_pending_sample_ready_event = pending_sample_ready_event
-                        self._async_pending_h2d_done_event = pending_h2d_done_event
-                        self._async_pending_sample_cuda_graph_request_count = (
-                            context.padded_active_request_count
+                        self._enqueue_async_gpu_runner_retirement(
+                            sample_slot=self._async_current_sample_slot,
+                            active_request_count=next_active_request_count,
+                            cuda_graph_request_count=context.padded_active_request_count,
+                            sampled_tokens_cpu=pending_sampled_tokens_cpu,
+                            sampled_mtp_tokens_cpu=pending_sampled_mtp_tokens_cpu,
+                            sample_ready_event=pending_sample_ready_event,
+                            h2d_done_event=pending_h2d_done_event,
                         )
                 elif self._async_pending_forward and next_active_request_count == 0:
                     torch.cuda.current_stream().synchronize()
@@ -2915,6 +3034,7 @@ class TextGenerationController:
                     self._async_pending_forward = False
                     self._async_pending_cuda_graph_request_count = None
                     self._async_pending_forward_request_ids = None
+                    self._async_gpu_runner_state.pending_retirements.clear()
 
             ret = {
                 "accepted_tokens": (

@@ -804,6 +804,56 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert state.last_disable_reason == "disabled"
 
     @pytest.mark.internal
+    def test_async_gpu_runner_retirement_queue_preserves_order(self) -> None:
+        """GPU runner retirements are popped in launch order."""
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=4,
+                num_gap_steps=0,
+                num_cuda_graphs=1,
+                force_build_cuda_graphs=True,
+                context_max_requests=4,
+                enable_async_scheduling=True,
+                termination_id=-1,
+                top_k=1,
+            )
+        )
+        controller = env.engine.controller
+        state = controller._async_gpu_runner_state
+
+        controller._enqueue_async_gpu_runner_retirement(
+            sample_slot=1,
+            active_request_count=2,
+            cuda_graph_request_count=4,
+            sampled_tokens_cpu=torch.tensor([11, 12], dtype=torch.long),
+            sampled_mtp_tokens_cpu=None,
+            sample_ready_event=torch.cuda.Event(),
+            h2d_done_event=torch.cuda.Event(),
+        )
+        controller._enqueue_async_gpu_runner_retirement(
+            sample_slot=0,
+            active_request_count=2,
+            cuda_graph_request_count=4,
+            sampled_tokens_cpu=torch.tensor([21, 22], dtype=torch.long),
+            sampled_mtp_tokens_cpu=None,
+            sample_ready_event=torch.cuda.Event(),
+            h2d_done_event=torch.cuda.Event(),
+        )
+
+        assert controller.has_pending_async_forward()
+        first = controller._pop_async_gpu_runner_retirement()
+        second = controller._pop_async_gpu_runner_retirement()
+        assert first.sample_slot == 1
+        assert first.sampled_tokens_cpu.tolist() == [11, 12]
+        assert second.sample_slot == 0
+        assert second.sampled_tokens_cpu.tolist() == [21, 22]
+        assert state.retirement_count == 2
+        assert not controller._has_pending_async_gpu_runner_retirement()
+
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -1002,6 +1052,45 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         controller = async_env.engine.controller
         assert controller._async_gpu_decode_packet_launch_count == 0
         assert controller._async_gpu_decode_packet_h2d_fallback_count > 0
+        assert [request.generated_tokens for request in async_env.requests] == serial_tokens
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_gpu_runner_prebookkeeping_launches_steady_gpt(self) -> None:
+        """Steady GPT decode launches the next packet before CPU retirement."""
+        common_kwargs = dict(
+            num_requests=4,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=12,
+            num_gap_steps=0,
+            model_provider="gpt",
+            num_cuda_graphs=1,
+            cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+            force_build_cuda_graphs=True,
+            context_max_requests=4,
+            termination_id=-1,
+            top_k=1,
+        )
+
+        serial_env = self._run_test(enable_async_scheduling=False, **common_kwargs)
+        serial_tokens = [request.generated_tokens for request in serial_env.requests]
+
+        delete_cuda_graphs()
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+        )
+
+        async_env = self._run_test(enable_async_scheduling=True, **common_kwargs)
+        controller = async_env.engine.controller
+        assert controller._async_gpu_runner_prebookkeeping_launch_count > 0
+        assert controller._async_gpu_runner_state.pending_retirements == []
         assert [request.generated_tokens for request in async_env.requests] == serial_tokens
 
     @pytest.mark.internal
