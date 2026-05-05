@@ -1722,6 +1722,33 @@ class TextGenerationController:
         self._async_add_deferral_count += 1
         self._async_admission_barrier_requested = True
 
+    def _hybrid_mtp_lifecycle_repair_pending(self) -> bool:
+        """Return whether hybrid MTP must stay on repair graphs after lifecycle changes."""
+        context = self.inference_wrapped_model.inference_context
+        return bool(
+            context.is_hybrid_model
+            and self.num_speculative_tokens > 0
+            and (
+                self._async_add_deferral_count > 0
+                or self._async_pause_boundary_count > 0
+                or self._async_evict_boundary_count > 0
+                or self._async_row_mapped_forward_count > 0
+                or self._async_discarded_forward_count > 0
+                or self._async_gpu_runner_state.repair_count > 0
+            )
+        )
+
+    def _hybrid_mtp_multi_block_repair_pending(self, active_request_count: int) -> bool:
+        """Return whether hybrid MTP has crossed into multi-block repair territory."""
+        context = self.inference_wrapped_model.inference_context
+        if not context.is_hybrid_model or self.num_speculative_tokens == 0:
+            return False
+        active_context_slice = slice(
+            context.paused_request_count,
+            context.paused_request_count + active_request_count,
+        )
+        return bool((context.request_kv_block_counts[active_context_slice] > 1).any())
+
     def _active_request_ids_cpu(self) -> Tensor:
         """Return the current active request IDs in row order."""
         context = self.inference_wrapped_model.inference_context
@@ -2136,6 +2163,8 @@ class TextGenerationController:
             return "gpu advance packet needs h2d repair"
 
         context = self.inference_wrapped_model.inference_context
+        if self._hybrid_mtp_lifecycle_repair_pending():
+            return "hybrid lifecycle repair pending"
 
         if not context.async_reserved_kv_blocks_match_active_requests(active_request_count):
             return "reserved kv block rows changed"
@@ -2148,22 +2177,19 @@ class TextGenerationController:
         active_sequence_lengths = context.get_active_sequence_lengths()
         max_sequence_lengths = context.get_max_sequence_lengths()
         tokens_per_request = self.num_speculative_tokens + 1
-        if (active_sequence_lengths + tokens_per_request >= max_sequence_lengths).any():
+        prebookkeeping_token_margin = (
+            2 * tokens_per_request if self.num_speculative_tokens > 0 else tokens_per_request
+        )
+        if (active_sequence_lengths + prebookkeeping_token_margin >= max_sequence_lengths).any():
             return "finish repair pending"
 
-        active_context_slice = slice(
-            context.paused_request_count,
-            context.paused_request_count + active_request_count,
-        )
-        if context.is_hybrid_model and (
-            context.request_kv_block_counts[active_context_slice] > 1
-        ).any():
+        if self._hybrid_mtp_multi_block_repair_pending(active_request_count):
             return "hybrid kv repair pending"
 
         active_block_capacity = context.async_decode_effective_block_capacity(
             active_request_count
         )
-        if (active_sequence_lengths + tokens_per_request > active_block_capacity).any():
+        if (active_sequence_lengths + prebookkeeping_token_margin > active_block_capacity).any():
             return "gpu advance packet needs h2d repair"
 
         return None
@@ -2323,18 +2349,26 @@ class TextGenerationController:
             return "active request count changed"
         if require_pending_forward_rows and not self._pending_async_forward_matches_current_rows():
             return "pending forward rows changed"
+        if self._hybrid_mtp_lifecycle_repair_pending():
+            return "hybrid lifecycle repair pending"
+        if self._hybrid_mtp_multi_block_repair_pending(active_request_count):
+            return "hybrid kv repair pending"
 
         active_slice = slice(0, active_request_count)
         active_metadata = context.active_request_metadata
         if (active_metadata["termination_id"][active_slice] >= 0).any():
             return "termination repair pending"
 
+        tokens_per_request = self.num_speculative_tokens + 1
+        prebookkeeping_token_margin = (
+            2 * tokens_per_request if self.num_speculative_tokens > 0 else 2
+        )
         active_sequence_lengths = context.get_active_sequence_lengths()
         max_sequence_lengths = context.get_max_sequence_lengths()
-        if (active_sequence_lengths + 1 >= max_sequence_lengths).any():
+        if (active_sequence_lengths + prebookkeeping_token_margin >= max_sequence_lengths).any():
             return "finish repair pending"
         active_block_capacity = context.async_decode_effective_block_capacity(active_request_count)
-        if (active_sequence_lengths + 2 >= active_block_capacity).any():
+        if (active_sequence_lengths + prebookkeeping_token_margin >= active_block_capacity).any():
             return "kv block repair pending"
         return None
 

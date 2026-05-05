@@ -2380,7 +2380,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     def test_async_scheduling_hybrid_mtp_staggered_add_repair_graph_e2e(self) -> None:
-        """Hybrid MTP resumes GPU packets after staggered-add repair graphs."""
+        """Hybrid MTP stays on repair graphs after staggered-add lifecycle changes."""
         skip_if_mamba_sequence_packing_not_available("hybrid")
 
         serial_env = self._run_hybrid_mtp_staggered_add_packet_env(
@@ -2396,7 +2396,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert [request.generated_tokens for request in async_env.requests] == serial_tokens
         assert controller._async_add_deferral_count > 0
         assert controller._async_forward_graph_launch_count > 0
-        assert controller._async_gpu_decode_packet_launch_count > 0
+        assert controller._async_gpu_decode_packet_launch_count == 0
         assert controller._async_decode_graph_h2d_launch_count == 0
 
     @pytest.mark.internal
@@ -2496,6 +2496,78 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             mtp_context, "get_max_sequence_lengths", lambda: torch.tensor([8], device='cpu')
         )
         assert mtp_controller._async_scheduling_disabled_reason(allow_mtp=True) is None
+
+        decode_graph = types.SimpleNamespace(
+            uses_gpu_advance=True,
+            batch_dimensions=InferenceBatchDimensions(
+                token_count=3, prefill_req_count=0, decode_req_count=1
+            ),
+        )
+        monkeypatch.setattr(mtp_controller, "_get_async_decode_graph", lambda: decode_graph)
+        monkeypatch.setattr(
+            mtp_context,
+            "async_reserved_kv_blocks_match_active_requests",
+            lambda active_request_count: True,
+        )
+        monkeypatch.setattr(
+            mtp_controller, "_pending_async_forward_matches_current_rows", lambda: True
+        )
+        mtp_controller._async_pending_forward = True
+        monkeypatch.setattr(mtp_context, "is_hybrid_model", True)
+
+        monkeypatch.setattr(
+            mtp_context, "get_active_sequence_lengths", lambda: torch.tensor([4], device='cpu')
+        )
+        monkeypatch.setattr(
+            mtp_context, "get_max_sequence_lengths", lambda: torch.tensor([20], device='cpu')
+        )
+        with torch.inference_mode():
+            mtp_context.request_kv_block_counts[0] = 2
+        assert (
+            mtp_controller._async_gpu_runner_prebookkeeping_block_reason(1)
+            == "hybrid kv repair pending"
+        )
+        with torch.inference_mode():
+            mtp_context.request_kv_block_counts[0] = 1
+
+        mtp_controller._async_gpu_runner_state.repair_count = 1
+        assert (
+            mtp_controller._async_gpu_runner_prebookkeeping_block_reason(1)
+            == "hybrid lifecycle repair pending"
+        )
+        mtp_controller._async_gpu_runner_state.repair_count = 0
+
+        monkeypatch.setattr(
+            mtp_context, "get_active_sequence_lengths", lambda: torch.tensor([5], device='cpu')
+        )
+        monkeypatch.setattr(
+            mtp_context, "get_max_sequence_lengths", lambda: torch.tensor([11], device='cpu')
+        )
+        assert (
+            mtp_controller._mtp_decode_packet_preprepare_block_reason(1, decode_graph)
+            == "finish repair pending"
+        )
+        assert (
+            mtp_controller._async_gpu_runner_prebookkeeping_block_reason(1)
+            == "finish repair pending"
+        )
+
+        monkeypatch.setattr(
+            mtp_context, "get_max_sequence_lengths", lambda: torch.tensor([20], device='cpu')
+        )
+        monkeypatch.setattr(
+            mtp_context,
+            "async_decode_effective_block_capacity",
+            lambda active_request_count: torch.tensor([10], device='cpu'),
+        )
+        assert (
+            mtp_controller._mtp_decode_packet_preprepare_block_reason(1, decode_graph)
+            == "gpu advance packet needs h2d repair"
+        )
+        assert (
+            mtp_controller._async_gpu_runner_prebookkeeping_block_reason(1)
+            == "kv block repair pending"
+        )
 
     @pytest.mark.internal
     @pytest.mark.skipif(
