@@ -2339,6 +2339,82 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._clear_async_reserved_kv_blocks()
         return torch.tensor(adopted_request_ids, dtype=self.request_ids.dtype, device='cpu')
 
+    def async_reserved_kv_blocks_match_active_requests(self, active_request_count: int) -> bool:
+        """Return whether pending async-reserved KV blocks still belong to active rows."""
+        count = self._async_reserved_kv_block_count
+        if count == 0:
+            return True
+
+        active_slice = slice(
+            self.paused_request_count, self.paused_request_count + active_request_count
+        )
+        active_request_ids = {
+            int(request_id) for request_id in self.request_ids[active_slice].tolist()
+        }
+        for slot in range(count):
+            if int(self._async_reserved_kv_block_request_ids[slot]) not in active_request_ids:
+                return False
+        return True
+
+    def apply_async_reserved_kv_blocks_to_gpu(self, active_request_count: int) -> bool:
+        """Publish pending async-reserved KV block-table entries to the GPU view."""
+        count = self._async_reserved_kv_block_count
+        if count == 0:
+            return True
+
+        active_slice = slice(
+            self.paused_request_count, self.paused_request_count + active_request_count
+        )
+        request_row_by_id = {
+            int(request_id): row
+            for row, request_id in enumerate(self.request_ids[active_slice].tolist())
+        }
+        rows = []
+        columns = []
+        block_ids = []
+        for slot in range(count):
+            request_id = int(self._async_reserved_kv_block_request_ids[slot])
+            row = request_row_by_id.get(request_id)
+            if row is None:
+                return False
+            column = int(self._async_reserved_kv_block_columns[slot])
+            if column < 0 or column >= self.max_kv_block_count:
+                return False
+            rows.append(row)
+            columns.append(column)
+            block_ids.append(int(self._async_reserved_kv_block_ids[slot]))
+
+        device = self.gpu_view.mha_block_table.device
+        row_tensor = torch.tensor(rows, dtype=torch.long, device=device)
+        column_tensor = torch.tensor(columns, dtype=torch.long, device=device)
+        block_tensor = torch.tensor(block_ids, dtype=torch.int32, device=device)
+        self.gpu_view.mha_block_table[row_tensor, column_tensor] = block_tensor
+        return True
+
+    def async_decode_effective_block_capacity(self, active_request_count: int) -> Tensor:
+        """Return active block capacity including pending async-reserved KV blocks."""
+        active_slice = slice(
+            self.paused_request_count, self.paused_request_count + active_request_count
+        )
+        effective_block_counts = self.request_kv_block_counts[active_slice].clone()
+        count = self._async_reserved_kv_block_count
+        if count == 0:
+            return effective_block_counts * self.block_size_tokens
+
+        request_row_by_id = {
+            int(request_id): row
+            for row, request_id in enumerate(self.request_ids[active_slice].tolist())
+        }
+        for slot in range(count):
+            request_id = int(self._async_reserved_kv_block_request_ids[slot])
+            row = request_row_by_id.get(request_id)
+            if row is None:
+                continue
+            reserved_block_count = int(self._async_reserved_kv_block_columns[slot]) + 1
+            if effective_block_counts[row].item() < reserved_block_count:
+                effective_block_counts[row] = reserved_block_count
+        return effective_block_counts * self.block_size_tokens
+
     def _execute_pending_mamba_ops(self) -> None:
         """Execute Mamba GPU operations deferred from add_request() / update_requests().
 
@@ -2509,9 +2585,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         This mirrors the steady decode-only subset of
         :meth:`prepare_async_decode_next_step` for greedy GPT requests. It is
         graph-safe: all scratch storage is preallocated, and the method only
-        mutates fixed-address GPU-view tensors. KV block transitions still need
-        CPU-reserved block-table repair, so callers should avoid this path when
-        the CPU prepare step reserved a new KV block.
+        mutates fixed-address GPU-view tensors. KV block transitions are supported
+        when the reserved block table entries are already present in the GPU view.
         """
         if self.num_speculative_tokens != 0 or self.is_hybrid_model:
             return False

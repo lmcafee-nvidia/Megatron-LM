@@ -336,6 +336,90 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    def test_async_reserved_kv_block_capacity_tracks_active_rows(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=512,
+            buffer_size_gb=1.0,
+            block_size_tokens=128,
+            max_tokens=None,
+            num_cuda_graphs=1,
+        )
+        for request_id in range(2):
+            dynamic_context.add_request(
+                DynamicInferenceRequest(
+                    request_id=request_id,
+                    prompt_tokens=torch.arange(0, 127, dtype=torch.long, device='cpu'),
+                    sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=-1),
+                )
+            )
+        dynamic_context.initialize_attention_state()
+        dynamic_context.update_requests(
+            active_requests_mask=torch.ones(2, dtype=torch.int32, device='cpu'),
+            new_tokens=torch.tensor([7, 8], dtype=torch.long, device='cpu'),
+        )
+        dynamic_context.initialize_attention_state()
+
+        assert dynamic_context.prepare_async_decode_next_step()
+        assert dynamic_context._async_reserved_kv_block_count == 2
+        assert dynamic_context.async_reserved_kv_blocks_match_active_requests(2)
+        assert dynamic_context.async_decode_effective_block_capacity(2).tolist() == [256, 256]
+        reserved_block_ids = dynamic_context._async_reserved_kv_block_ids[:2].tolist()
+
+        dynamic_context.gpu_view.mha_block_table[:2, :2].fill_(-1)
+        assert dynamic_context.apply_async_reserved_kv_blocks_to_gpu(2)
+        torch.cuda.synchronize()
+        assert dynamic_context.gpu_view.mha_block_table[:2, :2].cpu().tolist() == [
+            [-1, reserved_block_ids[0]],
+            [-1, reserved_block_ids[1]],
+        ]
+
+        dynamic_context.request_ids[1] = 99
+
+        assert not dynamic_context.async_reserved_kv_blocks_match_active_requests(2)
+        assert not dynamic_context.apply_async_reserved_kv_blocks_to_gpu(2)
+        assert dynamic_context.async_decode_effective_block_capacity(2).tolist() == [256, 128]
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_prepare_async_decode_next_step_oom_boundary_leaves_state_clear(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=512,
+            buffer_size_gb=1.0,
+            block_size_tokens=128,
+            max_tokens=None,
+            num_cuda_graphs=1,
+        )
+        dynamic_context.add_request(
+            DynamicInferenceRequest(
+                request_id=0,
+                prompt_tokens=torch.arange(0, 127, dtype=torch.long, device='cpu'),
+                sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=-1),
+            )
+        )
+        dynamic_context.initialize_attention_state()
+        dynamic_context.update_requests(
+            active_requests_mask=torch.ones(1, dtype=torch.int32, device='cpu'),
+            new_tokens=torch.tensor([7], dtype=torch.long, device='cpu'),
+        )
+        dynamic_context.initialize_attention_state()
+
+        dynamic_context.kv_block_allocator.total_avail = 0
+
+        assert not dynamic_context.prepare_async_decode_next_step()
+        assert dynamic_context._async_reserved_kv_block_count == 0
+        assert dynamic_context.request_kv_block_counts[0].item() == 1
+        assert dynamic_context.async_decode_effective_block_capacity(1).tolist() == [128]
+
+    @pytest.mark.internal
+    @rounder_override(64)
     def test_async_lifecycle_pause_matrix(self):
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,

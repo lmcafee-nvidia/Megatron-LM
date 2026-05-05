@@ -1416,6 +1416,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             async_env.engine.controller._async_forward_launch_count > 0
         ), async_env.engine.controller._async_disable_reason
         assert async_env.engine.context._async_reserved_kv_block_adoption_count > 0
+        assert async_env.engine.controller._async_gpu_runner_reserved_kv_launch_count > 0
         assert async_env.engine.controller._async_gpu_decode_packet_h2d_fallback_count > 0
         assert async_env.engine.context._async_deferred_kv_blocks_to_release.numel() == 0
         assert [request.generated_tokens for request in async_env.requests] == serial_tokens

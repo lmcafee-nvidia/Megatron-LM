@@ -226,9 +226,12 @@ class TextGenerationController:
         self._async_gpu_decode_packet_h2d_fallback_count = 0
         self._async_gpu_runner_prebookkeeping_launch_count = 0
         self._async_gpu_runner_prebookkeeping_block_count = 0
+        self._async_gpu_runner_reserved_kv_launch_count = 0
         self._async_gpu_runner_repair_barrier_count = 0
         self._async_gpu_runner_retirement_row_map_count = 0
         self._async_gpu_runner_discard_count = 0
+        self._async_pending_forward_done_event = torch.cuda.Event()
+        self._async_pending_forward_done_event_recorded = False
         self._async_deferred_mtp_release_count = 0
         self._async_decode_graph_capture_failed_reason = None
         self._async_decode_graphs: Dict[InferenceBatchDimensions, _AsyncDecodeGraph] = {}
@@ -317,6 +320,16 @@ class TextGenerationController:
         self._async_gpu_runner_slot_epochs = [-1] * self._async_sample_slot_count
         self._async_gpu_runner_slot_active_counts = [0] * self._async_sample_slot_count
 
+    def _record_async_pending_forward_done(self) -> None:
+        """Record when the currently queued speculative forward finishes."""
+        self._async_pending_forward_done_event.record(torch.cuda.current_stream())
+        self._async_pending_forward_done_event_recorded = True
+
+    def _wait_async_pending_forward_done(self) -> None:
+        """Make graph replay wait for logits produced by an earlier speculative forward."""
+        if self._async_pending_forward_done_event_recorded:
+            torch.cuda.current_stream().wait_event(self._async_pending_forward_done_event)
+
     def _reset_async_gpu_runner_state(self) -> None:
         """Reset passive GPU runner state after context or graph reset."""
         state = self._async_gpu_runner_state
@@ -328,6 +341,7 @@ class TextGenerationController:
         state.last_disable_reason = None
         self._async_gpu_runner_slot_epochs = [-1] * self._async_sample_slot_count
         self._async_gpu_runner_slot_active_counts = [0] * self._async_sample_slot_count
+        self._async_pending_forward_done_event_recorded = False
 
     def _record_async_gpu_runner_launch(
         self, sample_slot: int, active_request_count: int
@@ -1872,6 +1886,7 @@ class TextGenerationController:
             self._async_sample_slot_wait_count += 1
         self._select_async_sample_slot(sample_slot)
         async_decode_graph.graphs[sample_slot].replay()
+        self._record_async_pending_forward_done()
         self._async_next_sample_slot = (sample_slot + 1) % self._async_sample_slot_count
         self._async_sample_slot_launch_counts[sample_slot] += 1
         self._async_forward_launch_count += 1
@@ -1893,6 +1908,7 @@ class TextGenerationController:
     def _launch_async_forward_graph(self, async_forward_graph: _AsyncForwardGraph) -> None:
         """Enqueue a captured bookkeeping/forward graph on the current stream."""
         async_forward_graph.graph.replay()
+        self._record_async_pending_forward_done()
         self._async_forward_launch_count += 1
         self._async_forward_graph_launch_count += 1
         self._async_pending_forward = True
@@ -1962,11 +1978,15 @@ class TextGenerationController:
         )
 
     def _async_gpu_runner_prebookkeeping_block_reason(
-        self, active_request_count: int
+        self,
+        active_request_count: int,
+        *,
+        require_pending_forward: bool = True,
+        require_pending_forward_rows: bool = True,
     ) -> Optional[str]:
         """Return why the GPU runner cannot launch another packet before CPU retirement."""
         context = self.inference_wrapped_model.inference_context
-        if not self._async_pending_forward:
+        if require_pending_forward and not self._async_pending_forward:
             return "no pending forward"
         if self._has_pending_async_gpu_runner_retirement():
             return "retirement queue already has a newer packet"
@@ -1980,11 +2000,11 @@ class TextGenerationController:
             return "async decode graph not captured"
         if not async_decode_graph.uses_gpu_advance:
             return "gpu advance packet not captured"
-        if context._async_reserved_kv_block_count != 0:
-            return "reserved kv block needs repair"
+        if not context.async_reserved_kv_blocks_match_active_requests(active_request_count):
+            return "reserved kv block rows changed"
         if active_request_count != async_decode_graph.batch_dimensions.decode_req_count:
             return "active request count changed"
-        if not self._pending_async_forward_matches_current_rows():
+        if require_pending_forward_rows and not self._pending_async_forward_matches_current_rows():
             return "pending forward rows changed"
 
         active_slice = slice(0, active_request_count)
@@ -1996,10 +2016,7 @@ class TextGenerationController:
         max_sequence_lengths = context.get_max_sequence_lengths()
         if (active_sequence_lengths + 1 >= max_sequence_lengths).any():
             return "finish repair pending"
-        active_request_slice = slice(context.paused_request_count, context.total_request_count)
-        active_block_capacity = (
-            context.request_kv_block_counts[active_request_slice] * context.block_size_tokens
-        )
+        active_block_capacity = context.async_decode_effective_block_capacity(active_request_count)
         if (active_sequence_lengths + 2 >= active_block_capacity).any():
             return "kv block repair pending"
         return None
@@ -2014,6 +2031,14 @@ class TextGenerationController:
 
         async_decode_graph = self._get_async_decode_graph()
         assert async_decode_graph is not None
+        context = self.inference_wrapped_model.inference_context
+        reserved_kv_block_pending = context._async_reserved_kv_block_count != 0
+        if reserved_kv_block_pending and not context.apply_async_reserved_kv_blocks_to_gpu(
+            active_request_count
+        ):
+            self._async_gpu_runner_prebookkeeping_block_count += 1
+            self._record_async_gpu_runner_disable_reason("reserved kv block rows changed")
+            return False
         range_push("async_gpu_runner_prebookkeeping_launch")
         sample_slot = self._launch_async_decode_graph(async_decode_graph)
         (
@@ -2027,6 +2052,8 @@ class TextGenerationController:
         )
         self._async_chained_decode_graph_launch_count += 1
         self._async_gpu_runner_prebookkeeping_launch_count += 1
+        if reserved_kv_block_pending:
+            self._async_gpu_runner_reserved_kv_launch_count += 1
         self._enqueue_async_gpu_runner_retirement(
             sample_slot=sample_slot,
             active_request_count=active_request_count,
@@ -2040,6 +2067,62 @@ class TextGenerationController:
         )
         range_pop()
         return True
+
+    def _try_launch_async_gpu_runner_for_current_bookkeeping(
+        self, active_request_count: int
+    ) -> Tuple[
+        bool,
+        Optional[Tensor],
+        Optional[Tensor],
+        Optional[torch.cuda.Event],
+        Optional[torch.cuda.Event],
+    ]:
+        """Launch a GPT GPU packet whose sample retires in the current CPU step."""
+        context = self.inference_wrapped_model.inference_context
+        reason = self._async_gpu_runner_prebookkeeping_block_reason(
+            active_request_count,
+            require_pending_forward=False,
+            require_pending_forward_rows=False,
+        )
+        self._record_async_gpu_runner_disable_reason(reason)
+        if reason is not None:
+            self._async_gpu_runner_prebookkeeping_block_count += 1
+            return False, None, None, None, None
+        async_decode_graph = self._get_async_decode_graph()
+        assert async_decode_graph is not None
+
+        reserved_kv_block_pending = context._async_reserved_kv_block_count != 0
+        range_push("async_gpu_runner_current_bookkeeping_launch")
+        self._wait_async_pending_forward_done()
+        if reserved_kv_block_pending and not context.apply_async_reserved_kv_blocks_to_gpu(
+            active_request_count
+        ):
+            self._async_gpu_runner_prebookkeeping_block_count += 1
+            self._record_async_gpu_runner_disable_reason("reserved kv block rows changed")
+            range_pop()
+            return False, None, None, None, None
+        sample_slot = self._launch_async_decode_graph(async_decode_graph)
+        (
+            sampled_tokens_cpu,
+            sampled_mtp_tokens_cpu,
+            sample_ready_event,
+        ) = self._async_transfer_samples_to_cpu(
+            active_request_count,
+            async_decode_graph.sample_ready_events[sample_slot],
+            sample_slot=sample_slot,
+        )
+        self._async_chained_decode_graph_launch_count += 1
+        self._async_gpu_runner_prebookkeeping_launch_count += 1
+        if reserved_kv_block_pending:
+            self._async_gpu_runner_reserved_kv_launch_count += 1
+        range_pop()
+        return (
+            True,
+            sampled_tokens_cpu,
+            sampled_mtp_tokens_cpu,
+            sample_ready_event,
+            async_decode_graph.h2d_done_events[sample_slot],
+        )
 
     def _try_prepare_async_decode_after_sampling(self) -> bool:
         """Prepare next-step metadata for an async forward launched after sampling."""
@@ -2959,10 +3042,27 @@ class TextGenerationController:
                 if not async_sample_already_launched:
                     self._dynamic_step_sample_logits_greedy_to_next_input_ids()
             elif pending_forward_reused and self.num_speculative_tokens == 0:
-                self._dynamic_step_sample_logits_greedy_to_next_input_ids(
-                    row_indices=pending_forward_row_indices
-                )
-                async_next_prepared = self._try_prepare_async_decode_after_sampling()
+                if (
+                    not pending_forward_row_mapped
+                    and context._async_reserved_kv_block_count != 0
+                ):
+                    (
+                        async_next_prepared,
+                        async_sampled_tokens_cpu,
+                        async_sampled_mtp_tokens_cpu,
+                        async_sample_ready_event,
+                        async_h2d_done_event,
+                    ) = self._try_launch_async_gpu_runner_for_current_bookkeeping(
+                        active_request_count
+                    )
+                    async_sample_already_launched = async_next_prepared
+                    async_prebookkeeping_forward_launched = async_next_prepared
+
+                if not async_sample_already_launched:
+                    self._dynamic_step_sample_logits_greedy_to_next_input_ids(
+                        row_indices=pending_forward_row_indices
+                    )
+                    async_next_prepared = self._try_prepare_async_decode_after_sampling()
             elif self.num_speculative_tokens > 0:
                 if pending_forward_reused:
                     self._dynamic_step_sample_bookkeeping()
@@ -3025,6 +3125,7 @@ class TextGenerationController:
                     range_push("async_forward_launch")
                     next_input_ids, next_position_ids = context.current_input_and_position_ids()
                     self._dynamic_step_forward_logits(next_input_ids, next_position_ids)
+                    self._record_async_pending_forward_done()
                     self._async_forward_launch_count += 1
                     self._async_pending_forward = True
                     self._record_async_pending_forward_requests()
