@@ -834,6 +834,109 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert any(epoch >= 0 for epoch in controller._async_gpu_runner_slot_epochs)
         assert any(count > 0 for count in controller._async_gpu_runner_slot_active_counts)
 
+    @staticmethod
+    def _gpu_decode_bookkeeping_snapshot(
+        context: DynamicInferenceContext,
+    ) -> Dict[str, torch.Tensor]:
+        """Copy the GPU decode bookkeeping fields used by a decode forward."""
+        token_count = context.padded_active_token_count
+        request_count = context.padded_active_request_count
+        gpu_view = context.gpu_view
+        return {
+            "token_to_pos_ids": gpu_view.token_to_pos_ids[:token_count].clone(),
+            "token_to_block_idx": gpu_view.token_to_block_idx[:token_count].clone(),
+            "token_to_local_position_within_kv_block": (
+                gpu_view.token_to_local_position_within_kv_block[:token_count].clone()
+            ),
+            "token_to_request_idx": gpu_view.token_to_request_idx[:token_count].clone(),
+            "token_to_position_in_request": (
+                gpu_view.token_to_position_in_request[:token_count].clone()
+            ),
+            "request_in_prefill_status": (
+                gpu_view.request_in_prefill_status[:request_count].clone()
+            ),
+            "request_query_lengths": gpu_view.request_query_lengths[:request_count].clone(),
+            "request_kv_length_offsets": (
+                gpu_view.request_kv_length_offsets[:request_count].clone()
+            ),
+            "mha_query_lengths": gpu_view.mha_query_lengths[:request_count].clone(),
+            "mha_cu_query_seq_lengths": (
+                gpu_view.mha_cu_query_seq_lengths[: request_count + 1].clone()
+            ),
+            "mha_kv_seq_lengths": gpu_view.mha_kv_seq_lengths[:request_count].clone(),
+            "mha_cu_kv_seq_lengths": (gpu_view.mha_cu_kv_seq_lengths[: request_count + 1].clone()),
+            "mha_block_table": gpu_view.mha_block_table[:request_count].clone(),
+        }
+
+    def _assert_gpu_decode_advance_matches_cpu_prepare(
+        self, *, num_requests: int, prompt_length: int, block_size_tokens: int
+    ) -> None:
+        """Compare device-side GPT advance against CPU prepare plus H2D."""
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=num_requests,
+                min_prompt_length=prompt_length,
+                max_prompt_length=prompt_length,
+                num_tokens_to_generate=4,
+                num_gap_steps=0,
+                model_provider="gpt",
+                num_cuda_graphs=1,
+                cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+                force_build_cuda_graphs=True,
+                context_block_size_tokens=block_size_tokens,
+                context_max_requests=4,
+                enable_async_scheduling=False,
+                termination_id=-1,
+                top_k=1,
+            )
+        )
+        for request in env.requests:
+            env.engine._add_request(request)
+            request.state = "pending"
+        self._run_step(env)
+
+        controller = env.engine.controller
+        context = env.engine.context
+        assert context.is_decode_only()
+        with torch.inference_mode():
+            controller._dynamic_step_context_init()
+            assert context.using_cuda_graph_this_step()
+            before_gpu = context.gpu_view._buf.clone()
+
+            assert context.prepare_async_decode_next_step()
+            assert context._async_reserved_kv_block_count == 0
+            context.transfer_bookkeeping_to_gpu(
+                include_token_to_input_ids=False, refresh_request_staging=False
+            )
+            expected = self._gpu_decode_bookkeeping_snapshot(context)
+
+            context.gpu_view._buf.copy_(before_gpu)
+            assert context.advance_async_decode_gpu_bookkeeping()
+            actual = self._gpu_decode_bookkeeping_snapshot(context)
+
+        for label, expected_tensor in expected.items():
+            assert torch.equal(actual[label], expected_tensor), label
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_gpu_decode_advance_matches_cpu_prepare_steady_state(self) -> None:
+        """GPU GPT metadata advance matches CPU prepare for padded steady decode."""
+        self._assert_gpu_decode_advance_matches_cpu_prepare(
+            num_requests=3, prompt_length=4, block_size_tokens=256
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_gpu_decode_advance_matches_cpu_prepare_boundary_adjacent(self) -> None:
+        """GPU GPT metadata advance matches CPU prepare next to a KV block boundary."""
+        self._assert_gpu_decode_advance_matches_cpu_prepare(
+            num_requests=4, prompt_length=254, block_size_tokens=256
+        )
+
     @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"

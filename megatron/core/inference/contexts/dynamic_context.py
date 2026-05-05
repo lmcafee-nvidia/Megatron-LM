@@ -1078,6 +1078,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._decode_logit_idxs = torch.arange(
             max_logit_idxs, dtype=torch.int32, device=torch.cuda.current_device()
         )
+        self._async_decode_cu_request_offsets = torch.arange(
+            1, self.max_requests + 1, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        self._async_decode_block_columns = torch.empty(
+            self.max_requests, dtype=torch.int64, device=torch.cuda.current_device()
+        )
+        self._async_decode_block_idx_scratch = torch.empty(
+            self.max_requests, dtype=torch.int32, device=torch.cuda.current_device()
+        )
 
         # MHA flash-attention metadata views (write-only on CPU, read-only on
         # GPU via the matching region of ContextGPUView._buf). Populated per
@@ -2490,6 +2499,79 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         self._prepare_mamba_metadata(active_slice=active_slice, attn_dimensions=attn_dimensions)
         self._prepare_moe_metadata_recording()
+        return True
+
+    def advance_async_decode_gpu_bookkeeping(
+        self, active_request_count: Optional[int] = None
+    ) -> bool:
+        """Advance GPT decode bookkeeping directly in the GPU view.
+
+        This mirrors the steady decode-only subset of
+        :meth:`prepare_async_decode_next_step` for greedy GPT requests. It is
+        graph-safe: all scratch storage is preallocated, and the method only
+        mutates fixed-address GPU-view tensors. KV block transitions still need
+        CPU-reserved block-table repair, so callers should avoid this path when
+        the CPU prepare step reserved a new KV block.
+        """
+        if self.num_speculative_tokens != 0 or self.is_hybrid_model:
+            return False
+        if self.num_prefill_requests != 0 or self.padded_batch_dimensions.prefill_req_count != 0:
+            return False
+
+        n_active = self.total_request_count - self.paused_request_count
+        if active_request_count is None:
+            active_request_count = n_active
+        if active_request_count <= 0 or active_request_count > self.max_requests:
+            return False
+
+        active_slice = slice(0, active_request_count)
+        gpu_view = self.gpu_view
+
+        gpu_view.token_to_pos_ids[active_slice].add_(1)
+        gpu_view.token_to_position_in_request[active_slice].add_(1)
+        gpu_view.token_to_local_position_within_kv_block[active_slice].add_(1)
+        gpu_view.token_to_local_position_within_kv_block[active_slice].remainder_(
+            self.block_size_tokens
+        )
+        gpu_view.request_kv_length_offsets[active_slice].add_(1)
+        gpu_view.mha_kv_seq_lengths[active_slice].add_(1)
+        gpu_view.mha_cu_kv_seq_lengths[1 : active_request_count + 1].add_(
+            self._async_decode_cu_request_offsets[:active_request_count]
+        )
+
+        torch.div(
+            gpu_view.token_to_position_in_request[active_slice],
+            self.block_size_tokens,
+            rounding_mode="floor",
+            out=self._async_decode_block_columns[active_slice],
+        )
+        torch.gather(
+            gpu_view.mha_block_table[:active_request_count],
+            1,
+            self._async_decode_block_columns[active_slice].view(active_request_count, 1),
+            out=self._async_decode_block_idx_scratch[active_slice].view(active_request_count, 1),
+        )
+        gpu_view.token_to_block_idx[active_slice].copy_(
+            self._async_decode_block_idx_scratch[active_slice]
+        )
+        if active_request_count < self.padded_batch_dimensions.decode_req_count:
+            pad_slice = slice(active_request_count, self.padded_batch_dimensions.decode_req_count)
+            cu_pad_slice = slice(
+                active_request_count + 1, self.padded_batch_dimensions.decode_req_count + 1
+            )
+            gpu_view.token_to_block_idx[pad_slice] = self.kv_block_allocator.dummy_block_idx
+            gpu_view.token_to_local_position_within_kv_block[pad_slice] = 0
+            gpu_view.token_to_request_idx[pad_slice] = -1
+            gpu_view.token_to_position_in_request[pad_slice] = 0
+            gpu_view.token_to_pos_ids[pad_slice] = 0
+            gpu_view.request_in_prefill_status[pad_slice] = 0
+            gpu_view.request_query_lengths[pad_slice] = 0
+            gpu_view.request_kv_length_offsets[pad_slice] = 0
+            gpu_view.mha_query_lengths[pad_slice] = 0
+            gpu_view.mha_kv_seq_lengths[pad_slice] = 0
+            gpu_view.mha_cu_kv_seq_lengths[cu_pad_slice] = gpu_view.mha_cu_kv_seq_lengths[
+                active_request_count
+            ]
         return True
 
     def transfer_bookkeeping_to_gpu(
