@@ -854,6 +854,92 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert not controller._has_pending_async_gpu_runner_retirement()
 
     @pytest.mark.internal
+    @torch.inference_mode()
+    def test_async_gpu_runner_retirement_maps_current_rows(self) -> None:
+        """Delayed retirements are mapped by request ID after finished rows disappear."""
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=4,
+                num_gap_steps=0,
+                num_cuda_graphs=1,
+                force_build_cuda_graphs=True,
+                context_max_requests=4,
+                enable_async_scheduling=True,
+                termination_id=-1,
+                top_k=1,
+            )
+        )
+        controller = env.engine.controller
+        context = env.engine.context
+        context.paused_request_count = 0
+        context.total_request_count = 2
+        context.request_ids[:2] = torch.tensor([20, 30], dtype=context.request_ids.dtype)
+
+        sampled_tokens, sampled_mtp_tokens = controller._map_async_retirement_samples_to_current_rows(
+            sampled_tokens_cpu=torch.tensor([11, 22, 33], dtype=torch.long),
+            sampled_mtp_tokens_cpu=torch.tensor([[101, 202, 303], [111, 222, 333]]),
+            sampled_request_ids=torch.tensor([10, 20, 30], dtype=torch.long),
+            active_request_ids=context.request_ids[:2].long(),
+        )
+
+        assert sampled_tokens.tolist() == [22, 33]
+        assert sampled_mtp_tokens.tolist() == [[202, 303], [222, 333]]
+        assert controller._async_gpu_runner_retirement_row_map_count == 1
+        assert controller._async_gpu_runner_state.repair_count == 1
+
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_async_gpu_runner_discards_retirement_missing_active_row(self) -> None:
+        """A packet is discarded if a newly active row was not in the speculative forward."""
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=4,
+                num_gap_steps=0,
+                num_cuda_graphs=1,
+                force_build_cuda_graphs=True,
+                context_max_requests=4,
+                enable_async_scheduling=True,
+                termination_id=-1,
+                top_k=1,
+            )
+        )
+        controller = env.engine.controller
+        context = env.engine.context
+        context.paused_request_count = 0
+        context.total_request_count = 2
+        context.request_ids[:2] = torch.tensor([20, 40], dtype=context.request_ids.dtype)
+        sample_ready_event = torch.cuda.Event()
+        sample_ready_event.record(torch.cuda.current_stream())
+        h2d_done_event = torch.cuda.Event()
+        h2d_done_event.record(torch.cuda.current_stream())
+        controller._enqueue_async_gpu_runner_retirement(
+            sample_slot=0,
+            active_request_count=2,
+            cuda_graph_request_count=4,
+            sampled_tokens_cpu=torch.tensor([11, 22], dtype=torch.long),
+            sampled_mtp_tokens_cpu=None,
+            sample_ready_event=sample_ready_event,
+            h2d_done_event=h2d_done_event,
+        )
+        retirement = controller._pop_async_gpu_runner_retirement()
+        retirement.request_ids = torch.tensor([10, 20], dtype=torch.long)
+        controller._async_pending_forward = True
+        controller._async_pending_cuda_graph_request_count = 4
+
+        assert not controller._retirement_covers_current_active_rows(retirement)
+        controller._discard_async_gpu_runner_retirement(retirement)
+
+        assert not controller._async_pending_forward
+        assert controller._async_gpu_runner_discard_count == 1
+        assert controller._async_gpu_runner_state.repair_count == 1
+
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )

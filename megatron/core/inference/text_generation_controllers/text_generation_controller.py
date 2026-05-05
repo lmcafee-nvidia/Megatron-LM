@@ -226,6 +226,9 @@ class TextGenerationController:
         self._async_gpu_decode_packet_h2d_fallback_count = 0
         self._async_gpu_runner_prebookkeeping_launch_count = 0
         self._async_gpu_runner_prebookkeeping_block_count = 0
+        self._async_gpu_runner_repair_barrier_count = 0
+        self._async_gpu_runner_retirement_row_map_count = 0
+        self._async_gpu_runner_discard_count = 0
         self._async_deferred_mtp_release_count = 0
         self._async_decode_graph_capture_failed_reason = None
         self._async_decode_graphs: Dict[InferenceBatchDimensions, _AsyncDecodeGraph] = {}
@@ -378,6 +381,64 @@ class TextGenerationController:
         retirement = state.pending_retirements.pop(0)
         state.retirement_count += 1
         return retirement
+
+    def _retirement_covers_current_active_rows(
+        self, retirement: _AsyncGpuRunnerRetirement
+    ) -> bool:
+        """Return whether a delayed packet has samples for every current active row."""
+        if retirement.request_ids is None:
+            return True
+
+        current_request_ids = self._active_request_ids_cpu()
+        if current_request_ids.numel() == 0:
+            return True
+
+        retirement_request_id_set = {
+            int(request_id) for request_id in retirement.request_ids.tolist()
+        }
+        return all(int(request_id) in retirement_request_id_set for request_id in current_request_ids)
+
+    def _discard_async_gpu_runner_retirement(
+        self, retirement: _AsyncGpuRunnerRetirement
+    ) -> None:
+        """Discard a delayed packet that cannot be reconciled with current active rows."""
+        if retirement.sample_ready_event is not None:
+            retirement.sample_ready_event.synchronize()
+            self._mark_async_sample_copy_consumed(retirement.sample_ready_event)
+        torch.cuda.current_stream().synchronize()
+        context = self.inference_wrapped_model.inference_context
+        context.release_deferred_async_kv_blocks()
+        self._async_pending_forward = False
+        self._async_pending_cuda_graph_request_count = None
+        self._async_pending_forward_request_ids = None
+        self._async_gpu_runner_state.repair_count += 1
+        self._async_gpu_runner_discard_count += 1
+
+    def _map_async_retirement_samples_to_current_rows(
+        self,
+        *,
+        sampled_tokens_cpu: Tensor,
+        sampled_mtp_tokens_cpu: Optional[Tensor],
+        sampled_request_ids: Optional[Tensor],
+        active_request_ids: Tensor,
+    ) -> Tuple[Tensor, Optional[Tensor]]:
+        """Drop retired packet rows that no longer belong to active requests."""
+        if sampled_request_ids is None or torch.equal(sampled_request_ids, active_request_ids):
+            return sampled_tokens_cpu, sampled_mtp_tokens_cpu
+
+        row_by_request_id = {
+            int(request_id): row for row, request_id in enumerate(sampled_request_ids.tolist())
+        }
+        mapped_rows = [
+            row_by_request_id[int(request_id)] for request_id in active_request_ids.tolist()
+        ]
+        row_indices = torch.tensor(mapped_rows, dtype=torch.long, device=sampled_tokens_cpu.device)
+        sampled_tokens_cpu = sampled_tokens_cpu.index_select(0, row_indices)
+        if sampled_mtp_tokens_cpu is not None:
+            sampled_mtp_tokens_cpu = sampled_mtp_tokens_cpu.index_select(1, row_indices)
+        self._async_gpu_runner_state.repair_count += 1
+        self._async_gpu_runner_retirement_row_map_count += 1
+        return sampled_tokens_cpu, sampled_mtp_tokens_cpu
 
     def _init_mtp_sampling_tensors(self):
         """Pre-allocate MTP sampling tensors.
@@ -1930,6 +1991,7 @@ class TextGenerationController:
         active_metadata = context.active_request_metadata
         if (active_metadata["termination_id"][active_slice] >= 0).any():
             return "termination repair pending"
+
         active_sequence_lengths = context.get_active_sequence_lengths()
         max_sequence_lengths = context.get_max_sequence_lengths()
         if (active_sequence_lengths + 1 >= max_sequence_lengths).any():
@@ -2604,8 +2666,10 @@ class TextGenerationController:
         self,
         sampled_tokens_cpu: Optional[Tensor] = None,
         sampled_mtp_tokens_cpu: Optional[Tensor] = None,
+        sampled_request_ids: Optional[Tensor] = None,
         sample_ready_event: Optional[torch.cuda.Event] = None,
         h2d_done_event: Optional[torch.cuda.Event] = None,
+        repair_barrier_required: bool = False,
     ) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
 
@@ -2641,6 +2705,15 @@ class TextGenerationController:
         range_push("active_request_mask")
         # Everything below is 100% CPU.
         active_request_ids = context.request_ids[active_request_slice].long()
+        if sampled_tokens_cpu is not None:
+            sampled_tokens_cpu, sampled_mtp_tokens_cpu = (
+                self._map_async_retirement_samples_to_current_rows(
+                    sampled_tokens_cpu=sampled_tokens_cpu,
+                    sampled_mtp_tokens_cpu=sampled_mtp_tokens_cpu,
+                    sampled_request_ids=sampled_request_ids,
+                    active_request_ids=active_request_ids,
+                )
+            )
         active_sequence_lengths = context.get_active_sequence_lengths()
 
         # After the forward pass and KV-cache rewind, get_active_sequence_lengths()
@@ -2699,6 +2772,11 @@ class TextGenerationController:
         # which would corrupt the reused buffer.
         new_sample_copy = sampled_tokens_cpu.clone()
         range_pop()
+
+        if repair_barrier_required and finished_request_ids.numel() > 0:
+            torch.cuda.current_stream().synchronize()
+            self._async_gpu_runner_state.repair_count += 1
+            self._async_gpu_runner_repair_barrier_count += 1
 
         if h2d_done_event is not None:
             h2d_done_event.synchronize()
@@ -2767,7 +2845,9 @@ class TextGenerationController:
         async_h2d_done_event = None
         async_sampled_tokens_cpu = None
         async_sampled_mtp_tokens_cpu = None
+        async_sampled_request_ids = None
         async_sample_already_launched = False
+        async_prebookkeeping_forward_launched = False
         async_forward_graph = None
         deferred_mtp_blocks_to_release = None
         deferred_mtp_release_mask = None
@@ -2779,16 +2859,23 @@ class TextGenerationController:
 
         if pending_async_sample:
             pending_retirement = self._pop_async_gpu_runner_retirement()
-            async_next_prepared = True
-            async_sample_already_launched = True
-            cuda_graph_request_count = pending_retirement.cuda_graph_request_count
-            async_sampled_tokens_cpu = pending_retirement.sampled_tokens_cpu
-            async_sampled_mtp_tokens_cpu = pending_retirement.sampled_mtp_tokens_cpu
-            async_sample_ready_event = pending_retirement.sample_ready_event
-            async_h2d_done_event = pending_retirement.h2d_done_event
-            self._try_launch_async_gpu_runner_before_bookkeeping(
-                pending_retirement.active_request_count
-            )
+            if self._retirement_covers_current_active_rows(pending_retirement):
+                async_next_prepared = True
+                async_sample_already_launched = True
+                cuda_graph_request_count = pending_retirement.cuda_graph_request_count
+                async_sampled_tokens_cpu = pending_retirement.sampled_tokens_cpu
+                async_sampled_mtp_tokens_cpu = pending_retirement.sampled_mtp_tokens_cpu
+                async_sampled_request_ids = pending_retirement.request_ids
+                async_sample_ready_event = pending_retirement.sample_ready_event
+                async_h2d_done_event = pending_retirement.h2d_done_event
+                async_prebookkeeping_forward_launched = (
+                    self._try_launch_async_gpu_runner_before_bookkeeping(
+                        pending_retirement.active_request_count
+                    )
+                )
+            else:
+                self._discard_async_gpu_runner_retirement(pending_retirement)
+                pending_async_sample = False
 
         if not pending_async_sample:
             with torch.inference_mode():
@@ -2993,8 +3080,10 @@ class TextGenerationController:
                 request_bookkeeping = self._dynamic_step_context_bookkeeping(
                     sampled_tokens_cpu=async_sampled_tokens_cpu,
                     sampled_mtp_tokens_cpu=async_sampled_mtp_tokens_cpu,
+                    sampled_request_ids=async_sampled_request_ids,
                     sample_ready_event=async_sample_ready_event,
                     h2d_done_event=async_h2d_done_event,
+                    repair_barrier_required=async_prebookkeeping_forward_launched,
                 )
 
                 next_active_request_count = (
