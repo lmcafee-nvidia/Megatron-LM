@@ -2380,7 +2380,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     def test_async_scheduling_hybrid_mtp_staggered_add_repair_graph_e2e(self) -> None:
-        """Hybrid MTP stays correct on repair graphs after staggered-add barriers."""
+        """Hybrid MTP resumes GPU packets after staggered-add repair graphs."""
         skip_if_mamba_sequence_packing_not_available("hybrid")
 
         serial_env = self._run_hybrid_mtp_staggered_add_packet_env(
@@ -2396,7 +2396,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert [request.generated_tokens for request in async_env.requests] == serial_tokens
         assert controller._async_add_deferral_count > 0
         assert controller._async_forward_graph_launch_count > 0
-        assert controller._async_gpu_decode_packet_launch_count == 0
+        assert controller._async_gpu_decode_packet_launch_count > 0
+        assert controller._async_decode_graph_h2d_launch_count == 0
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -6659,7 +6660,7 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             num_requests=4,
             min_prompt_length=4,
             max_prompt_length=4,
-            num_tokens_to_generate=6,
+            num_tokens_to_generate=12,
             num_gap_steps=0,
             model_provider="hybrid",
             expert_model_parallel_size=ep_size,

@@ -2136,15 +2136,6 @@ class TextGenerationController:
             return "gpu advance packet needs h2d repair"
 
         context = self.inference_wrapped_model.inference_context
-        if context.is_hybrid_model and (
-            self._async_add_deferral_count > 0
-            or self._async_pause_boundary_count > 0
-            or self._async_evict_boundary_count > 0
-            or self._async_row_mapped_forward_count > 0
-            or self._async_discarded_forward_count > 0
-            or self._async_gpu_runner_state.repair_count > 0
-        ):
-            return "hybrid lifecycle repair pending"
 
         if not context.async_reserved_kv_blocks_match_active_requests(active_request_count):
             return "reserved kv block rows changed"
