@@ -2304,6 +2304,16 @@ class DynamicInferenceContext(BaseInferenceContext):
             self._async_reserved_kv_block_columns[:count] = -1
         self._async_reserved_kv_block_count = 0
 
+    def cancel_async_reserved_kv_blocks(self) -> None:
+        """Release async-reserved KV blocks when a speculative repair is abandoned."""
+        count = self._async_reserved_kv_block_count
+        if count == 0:
+            return
+        self.kv_block_allocator.release_memory_blocks(
+            self._async_reserved_kv_block_ids[:count].clone()
+        )
+        self._clear_async_reserved_kv_blocks()
+
     def release_deferred_async_kv_blocks(self) -> None:
         """Release async-reserved blocks after their speculative forward retires."""
         if self._async_deferred_kv_blocks_to_release.numel() == 0:

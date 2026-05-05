@@ -1806,6 +1806,73 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert controller._async_mtp_finish_boundary_count > 0
         assert [request.generated_tokens for request in async_env.requests] == serial_tokens
 
+    def _run_hybrid_mtp_kv_repair_env(self, *, enable_async_scheduling: bool):
+        """Run two hybrid MTP requests where one starts next to a KV block boundary."""
+        block_size_tokens = 256
+        num_speculative_tokens = 2
+        boundary_prompt_length = block_size_tokens - (num_speculative_tokens + 1)
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0,
+                min_prompt_length=4,
+                max_prompt_length=block_size_tokens,
+                num_tokens_to_generate=12,
+                num_gap_steps=0,
+                model_provider="hybrid",
+                num_speculative_tokens=num_speculative_tokens,
+                num_cuda_graphs=1,
+                cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+                force_build_cuda_graphs=True,
+                context_max_requests=4,
+                context_block_size_tokens=block_size_tokens,
+                termination_id=-1,
+                top_k=1,
+                enable_async_scheduling=enable_async_scheduling,
+            )
+        )
+        env.requests = [None] * 2
+
+        for request_id, prompt_length in [(0, 4), (1, boundary_prompt_length)]:
+            request = DynamicInferenceRequest(
+                request_id=request_id,
+                prompt_tokens=(
+                    torch.arange(prompt_length, dtype=torch.int64, device='cuda')
+                    % DynamicEngineTestConfig.vocab_size
+                ),
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=12, termination_id=-1, top_k=1
+                ),
+            )
+            env.requests[request_id] = request
+            env.engine._add_request(request)
+            request.state = "pending"
+
+        while env.engine.has_unfinished_requests():
+            self._run_step(env)
+
+        return env
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_scheduling_hybrid_mtp_kv_repair_matches_serial(self) -> None:
+        """Hybrid MTP H2D repair runs verification before preparing the next forward."""
+        skip_if_mamba_sequence_packing_not_available("hybrid")
+
+        serial_env = self._run_hybrid_mtp_kv_repair_env(enable_async_scheduling=False)
+        serial_tokens = [request.generated_tokens for request in serial_env.requests]
+
+        self._reinitialize_model_parallel_for_async_test()
+
+        async_env = self._run_hybrid_mtp_kv_repair_env(enable_async_scheduling=True)
+        controller = async_env.engine.controller
+
+        assert [request.generated_tokens for request in async_env.requests] == serial_tokens
+        assert controller._async_forward_graph_launch_count > 0
+        assert controller._async_gpu_decode_packet_h2d_fallback_count > 0
+        assert controller._async_discarded_forward_count == 0
+
     def _run_async_pause_boundary_e2e(self, model_provider: str, num_speculative_tokens: int):
         skip_if_mamba_sequence_packing_not_available(model_provider)
         block_size_tokens = 256
@@ -2158,7 +2225,24 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         controller = async_env.engine.controller
 
         assert controller._async_forward_launch_count > 0, controller._async_disable_reason
-        assert controller._async_add_deferral_count > 0
+        if model_provider == "hybrid" and num_speculative_tokens > 0:
+            assert controller._async_forward_graph_launch_count > 0
+        if model_provider == "hybrid" and num_speculative_tokens > 0:
+            assert (
+                controller._async_add_deferral_count
+                + controller._async_mtp_finish_boundary_count
+                + controller._async_gpu_runner_state.repair_count
+                > 0
+            )
+        elif memory_pressure:
+            assert (
+                controller._async_add_deferral_count
+                + controller._async_pause_boundary_count
+                + controller._async_evict_boundary_count
+                > 0
+            )
+        else:
+            assert controller._async_add_deferral_count > 0
         assert controller._async_finish_boundary_count + controller._async_mtp_finish_boundary_count > 0
         if memory_pressure:
             assert controller._async_pause_boundary_count > 0
@@ -2212,6 +2296,88 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         self._assert_lifecycle_interaction_parity(
             "hybrid", num_speculative_tokens=2, memory_pressure=True
         )
+
+    def _run_hybrid_mtp_staggered_add_packet_env(self, *, enable_async_scheduling: bool):
+        """Run staggered hybrid MTP adds with a steady four-row decode tail."""
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=30,
+                num_gap_steps=0,
+                model_provider="hybrid",
+                num_speculative_tokens=2,
+                num_cuda_graphs=1,
+                cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+                force_build_cuda_graphs=True,
+                context_max_requests=4,
+                termination_id=-1,
+                top_k=1,
+                enable_async_scheduling=enable_async_scheduling,
+            )
+        )
+        env.requests = [None] * 4
+        request_specs = {
+            0: [0, 1],
+            2: [2],
+            4: [3],
+        }
+
+        def add_request(request_id: int) -> None:
+            request = DynamicInferenceRequest(
+                request_id=request_id,
+                prompt_tokens=(
+                    torch.arange(4, dtype=torch.int64, device='cuda')
+                    % DynamicEngineTestConfig.vocab_size
+                ),
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=30, termination_id=-1, top_k=1
+                ),
+            )
+            env.requests[request_id] = request
+            env.engine._add_request(request)
+            request.state = "pending"
+
+        with torch.inference_mode():
+            for step_idx in range(80):
+                for request_id in request_specs.get(step_idx, []):
+                    add_request(request_id)
+
+                if all(
+                    request is not None and request.status == Status.COMPLETED
+                    for request in env.requests
+                ) and not env.engine.has_unfinished_requests():
+                    break
+
+                self._run_step(env)
+            else:
+                raise AssertionError("staggered add packet schedule did not finish")
+
+        return env
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_scheduling_hybrid_mtp_staggered_add_repair_graph_e2e(self) -> None:
+        """Hybrid MTP stays correct on repair graphs after staggered-add barriers."""
+        skip_if_mamba_sequence_packing_not_available("hybrid")
+
+        serial_env = self._run_hybrid_mtp_staggered_add_packet_env(
+            enable_async_scheduling=False
+        )
+        serial_tokens = [request.generated_tokens for request in serial_env.requests]
+
+        self._reinitialize_model_parallel_for_async_test()
+
+        async_env = self._run_hybrid_mtp_staggered_add_packet_env(enable_async_scheduling=True)
+        controller = async_env.engine.controller
+
+        assert [request.generated_tokens for request in async_env.requests] == serial_tokens
+        assert controller._async_add_deferral_count > 0
+        assert controller._async_forward_graph_launch_count > 0
+        assert controller._async_gpu_decode_packet_launch_count == 0
 
     @pytest.mark.internal
     @pytest.mark.skipif(

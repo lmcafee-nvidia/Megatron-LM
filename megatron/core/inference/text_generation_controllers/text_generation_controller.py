@@ -1745,6 +1745,12 @@ class TextGenerationController:
         if torch.equal(pending_request_ids, current_request_ids):
             return True, None, False
 
+        context = self.inference_wrapped_model.inference_context
+        if context.is_hybrid_model and self.num_speculative_tokens > 0:
+            self._async_discarded_forward_count += 1
+            self._async_gpu_runner_state.repair_count += 1
+            return False, None, False
+
         pending_row_by_request_id = {
             int(request_id): row
             for row, request_id in enumerate(pending_request_ids.tolist())
@@ -2086,6 +2092,63 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         return self._async_forward_graphs.get(context.padded_batch_dimensions)
 
+    def _mtp_decode_packet_preprepare_block_reason(
+        self,
+        active_request_count: int,
+        async_decode_graph: Optional[_AsyncDecodeGraph],
+    ) -> Optional[str]:
+        """Return why MTP must sample before preparing a repair/fallback forward."""
+        if self.num_speculative_tokens == 0:
+            return None
+        if async_decode_graph is None:
+            return "async decode graph not captured"
+        if not async_decode_graph.uses_gpu_advance:
+            return "gpu advance packet not captured"
+        if active_request_count != async_decode_graph.batch_dimensions.decode_req_count:
+            return "gpu advance packet needs h2d repair"
+
+        context = self.inference_wrapped_model.inference_context
+        if context.is_hybrid_model and (
+            self._async_add_deferral_count > 0
+            or self._async_pause_boundary_count > 0
+            or self._async_evict_boundary_count > 0
+            or self._async_row_mapped_forward_count > 0
+            or self._async_discarded_forward_count > 0
+            or self._async_gpu_runner_state.repair_count > 0
+        ):
+            return "hybrid lifecycle repair pending"
+
+        if not context.async_reserved_kv_blocks_match_active_requests(active_request_count):
+            return "reserved kv block rows changed"
+
+        active_slice = slice(0, active_request_count)
+        active_metadata = context.active_request_metadata
+        if (active_metadata["termination_id"][active_slice] >= 0).any():
+            return "termination repair pending"
+
+        active_sequence_lengths = context.get_active_sequence_lengths()
+        max_sequence_lengths = context.get_max_sequence_lengths()
+        tokens_per_request = self.num_speculative_tokens + 1
+        if (active_sequence_lengths + tokens_per_request >= max_sequence_lengths).any():
+            return "finish repair pending"
+
+        active_context_slice = slice(
+            context.paused_request_count,
+            context.paused_request_count + active_request_count,
+        )
+        if context.is_hybrid_model and (
+            context.request_kv_block_counts[active_context_slice] > 1
+        ).any():
+            return "hybrid kv repair pending"
+
+        active_block_capacity = context.async_decode_effective_block_capacity(
+            active_request_count
+        )
+        if (active_sequence_lengths + tokens_per_request > active_block_capacity).any():
+            return "gpu advance packet needs h2d repair"
+
+        return None
+
     def _launch_async_decode_graph(self, async_decode_graph: _AsyncDecodeGraph) -> int:
         """Enqueue a captured async decode graph on the current stream."""
         sample_slot = self._async_next_sample_slot
@@ -2146,6 +2209,17 @@ class TextGenerationController:
         if self._async_disable_reason is not None:
             return False, None, None, None, None, None, False
 
+        async_decode_graph = self._get_async_decode_graph()
+        mtp_preprepare_block_reason = self._mtp_decode_packet_preprepare_block_reason(
+            active_request_count, async_decode_graph
+        )
+        if mtp_preprepare_block_reason is not None:
+            self._async_disable_reason = mtp_preprepare_block_reason
+            if mtp_preprepare_block_reason == "gpu advance packet needs h2d repair":
+                self._async_gpu_decode_packet_h2d_fallback_count += 1
+            self._record_async_gpu_runner_disable_reason(self._async_disable_reason)
+            return False, None, None, None, None, None, False
+
         range_push("async_prepare_next_step")
         async_next_prepared = context.prepare_async_decode_next_step()
         range_pop()
@@ -2154,7 +2228,6 @@ class TextGenerationController:
             self._record_async_gpu_runner_disable_reason(self._async_disable_reason)
             return False, None, None, None, None, None, False
 
-        async_decode_graph = self._get_async_decode_graph()
         if async_decode_graph is None:
             self._async_disable_reason = "async decode graph not captured"
             self._record_async_gpu_runner_disable_reason(self._async_disable_reason)
@@ -2166,6 +2239,9 @@ class TextGenerationController:
             self._async_disable_reason = "gpu advance packet needs h2d repair"
             self._async_gpu_decode_packet_h2d_fallback_count += 1
             self._record_async_gpu_runner_disable_reason(self._async_disable_reason)
+            if self.num_speculative_tokens > 0:
+                context.cancel_async_reserved_kv_blocks()
+                return False, None, None, None, None, None, False
             return True, None, None, None, None, None, False
 
         range_push("async_decode_graph_launch")
@@ -2361,6 +2437,32 @@ class TextGenerationController:
 
         return True
 
+    def _hybrid_mtp_postsampling_async_forward_block_reason(
+        self, active_request_count: int
+    ) -> Optional[str]:
+        """Return why hybrid MTP must not launch a discardable post-sampling forward."""
+        context = self.inference_wrapped_model.inference_context
+        if self.num_speculative_tokens == 0 or not context.is_hybrid_model:
+            return None
+
+        active_sequence_lengths = context.get_active_sequence_lengths().clone()
+        active_sequence_lengths += 1
+        max_sequence_lengths = context.get_max_sequence_lengths()
+        if (active_sequence_lengths >= max_sequence_lengths).any():
+            return "hybrid mtp finish repair pending"
+
+        active_slice = slice(
+            context.paused_request_count,
+            context.paused_request_count + active_request_count,
+        )
+        block_repair_threshold = context.block_size_tokens - 1 - self.num_speculative_tokens
+        if (
+            context.request_last_kv_block_offset[active_slice] >= block_repair_threshold
+        ).any():
+            return "hybrid mtp kv repair pending"
+
+        return None
+
     def _async_scheduling_disabled_reason(self, *, allow_mtp: bool = False) -> Optional[str]:
         """Return why async scheduling cannot be used for the current step, or None."""
         context = self.inference_wrapped_model.inference_context
@@ -2398,7 +2500,6 @@ class TextGenerationController:
         if active_request_count <= 0:
             return "no active requests"
         if self._async_admission_barrier_requested:
-            self._async_admission_barrier_requested = False
             return "waiting request admission deferred"
 
         if self._has_active_stop_words_callback is not None:
@@ -2973,6 +3074,7 @@ class TextGenerationController:
         sample_ready_event: Optional[torch.cuda.Event] = None,
         h2d_done_event: Optional[torch.cuda.Event] = None,
         repair_barrier_required: bool = False,
+        kv_rewind_already_applied: bool = False,
     ) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
 
@@ -3021,7 +3123,11 @@ class TextGenerationController:
 
         async_mtp_blocks_to_release = None
         async_mtp_release_mask = None
-        if self.num_speculative_tokens > 0 and accepted_tokens_cpu is not None:
+        if (
+            self.num_speculative_tokens > 0
+            and accepted_tokens_cpu is not None
+            and not kv_rewind_already_applied
+        ):
             accepted_token_counts_cpu = (accepted_tokens_cpu != -1).sum(dim=1).to(
                 context.request_query_lengths.dtype
             )
@@ -3163,6 +3269,7 @@ class TextGenerationController:
 
         # No tokens and no active requests?
         if context.active_token_count == 0 and active_request_count == 0:
+            self._async_admission_barrier_requested = False
             return None
 
         async_next_prepared = False
@@ -3181,6 +3288,7 @@ class TextGenerationController:
         pending_forward_reused = False
         pending_forward_row_indices = None
         pending_forward_row_mapped = False
+        kv_rewind_already_applied = False
         pending_async_sample = self._has_pending_async_gpu_runner_retirement()
 
         if pending_async_sample:
@@ -3321,6 +3429,7 @@ class TextGenerationController:
                 # Phase 2: Rewind KV cache for rejected tokens.
                 nvtx_range_push("mtp-spec-decoding/rewind-kv-cache")
                 blocks_to_release, remove_mask = self._rewind_kv_cache()
+                kv_rewind_already_applied = True
                 nvtx_range_pop("mtp-spec-decoding/rewind-kv-cache")
 
                 # Disable MoE padding for MTP computation, unless CUDA graphs
@@ -3334,7 +3443,19 @@ class TextGenerationController:
                 self._compute_serial_mtp_and_sample()
                 nvtx_range_pop("mtp-spec-decoding/serial-mtp")
 
-                async_next_prepared = self._try_prepare_async_decode_after_sampling()
+                post_sampling_block_reason = (
+                    self._hybrid_mtp_postsampling_async_forward_block_reason(
+                        active_request_count
+                    )
+                )
+                if post_sampling_block_reason is not None:
+                    self._async_disable_reason = post_sampling_block_reason
+                    self._record_async_gpu_runner_disable_reason(
+                        post_sampling_block_reason
+                    )
+                    async_next_prepared = False
+                else:
+                    async_next_prepared = self._try_prepare_async_decode_after_sampling()
                 if async_next_prepared:
                     self._copy_sampled_decode_tokens_to_next_input_ids(active_request_count)
                     async_forward_graph = self._get_async_forward_graph()
@@ -3433,6 +3554,7 @@ class TextGenerationController:
                     sample_ready_event=async_sample_ready_event,
                     h2d_done_event=async_h2d_done_event,
                     repair_barrier_required=async_prebookkeeping_forward_launched,
+                    kv_rewind_already_applied=kv_rewind_already_applied,
                 )
 
                 next_active_request_count = (
@@ -3495,6 +3617,7 @@ class TextGenerationController:
                 self._accepted_tokens_per_request.fill_(-1)
                 self._accepted_token_counts_per_request.fill_(0)
             ret.update(request_bookkeeping)
+            self._async_admission_barrier_requested = False
             return ret
 
     @torch.inference_mode()
