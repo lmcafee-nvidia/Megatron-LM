@@ -77,6 +77,7 @@ class _AsyncDecodeGraph:
     graphs: Tuple[torch.cuda.CUDAGraph, ...]
     sample_ready_events: Tuple[torch.cuda.Event, ...]
     h2d_done_events: Tuple[torch.cuda.Event, ...]
+    uses_gpu_advance: bool = False
 
 
 @dataclass
@@ -214,6 +215,9 @@ class TextGenerationController:
         self._async_decode_graph_launch_count = 0
         self._async_chained_decode_graph_launch_count = 0
         self._async_forward_graph_launch_count = 0
+        self._async_gpu_decode_packet_launch_count = 0
+        self._async_decode_graph_h2d_launch_count = 0
+        self._async_gpu_decode_packet_h2d_fallback_count = 0
         self._async_deferred_mtp_release_count = 0
         self._async_decode_graph_capture_failed_reason = None
         self._async_decode_graphs: Dict[InferenceBatchDimensions, _AsyncDecodeGraph] = {}
@@ -1641,6 +1645,9 @@ class TextGenerationController:
         with torch.inference_mode():
             # Warm eager forward once so capture does not include one-time allocations.
             self._dynamic_step_forward_logits(input_ids, position_ids)
+            gpu_advance_packet = self.num_speculative_tokens == 0 and not context.is_hybrid_model
+            if gpu_advance_packet:
+                current_gpu_bookkeeping = context.gpu_view._buf.clone()
 
             if not context.prepare_async_decode_next_step():
                 raise RuntimeError(f"failed to prepare async decode graph {batch_dimensions}")
@@ -1654,14 +1661,23 @@ class TextGenerationController:
             for sample_slot in range(self._async_sample_slot_count):
                 self._select_async_sample_slot(sample_slot)
                 for _ in range(3):
+                    if gpu_advance_packet:
+                        context.gpu_view._buf.copy_(current_gpu_bookkeeping)
                     self._dynamic_step_sample_logits_greedy_to_next_input_ids(sample_count)
-                    context.transfer_bookkeeping_to_gpu(
-                        include_token_to_input_ids=False,
-                        refresh_request_staging=False,
-                    )
+                    if gpu_advance_packet:
+                        if not context.advance_async_decode_gpu_bookkeeping(sample_count):
+                            raise RuntimeError(
+                                f"failed to advance async decode graph {batch_dimensions}"
+                            )
+                    else:
+                        context.transfer_bookkeeping_to_gpu(
+                            include_token_to_input_ids=False, refresh_request_staging=False
+                        )
                     self._dynamic_step_forward_logits(next_input_ids, next_position_ids)
 
                 torch.cuda.synchronize()
+                if gpu_advance_packet:
+                    context.gpu_view._buf.copy_(current_gpu_bookkeeping)
 
                 graph = torch.cuda.CUDAGraph()
                 sample_ready_event = torch.cuda.Event(external=True)
@@ -1669,10 +1685,12 @@ class TextGenerationController:
                 with torch.cuda.graph(graph):
                     self._dynamic_step_sample_logits_greedy_to_next_input_ids(sample_count)
                     sample_ready_event.record(torch.cuda.current_stream())
-                    context.transfer_bookkeeping_to_gpu(
-                        include_token_to_input_ids=False,
-                        refresh_request_staging=False,
-                    )
+                    if gpu_advance_packet:
+                        context.advance_async_decode_gpu_bookkeeping(sample_count)
+                    else:
+                        context.transfer_bookkeeping_to_gpu(
+                            include_token_to_input_ids=False, refresh_request_staging=False
+                        )
                     h2d_done_event.record(torch.cuda.current_stream())
                     self._dynamic_step_forward_logits(next_input_ids, next_position_ids)
                 graphs.append(graph)
@@ -1684,6 +1702,7 @@ class TextGenerationController:
             graphs=tuple(graphs),
             sample_ready_events=tuple(sample_ready_events),
             h2d_done_events=tuple(h2d_done_events),
+            uses_gpu_advance=gpu_advance_packet,
         )
         self._select_async_sample_slot(0)
 
@@ -1755,6 +1774,10 @@ class TextGenerationController:
         self._async_sample_slot_launch_counts[sample_slot] += 1
         self._async_forward_launch_count += 1
         self._async_decode_graph_launch_count += 1
+        if async_decode_graph.uses_gpu_advance:
+            self._async_gpu_decode_packet_launch_count += 1
+        else:
+            self._async_decode_graph_h2d_launch_count += 1
         self._async_pending_forward = True
         self._record_async_pending_forward_requests()
         self._async_pending_cuda_graph_request_count = (
@@ -1804,6 +1827,14 @@ class TextGenerationController:
         async_decode_graph = self._get_async_decode_graph()
         if async_decode_graph is None:
             self._async_disable_reason = "async decode graph not captured"
+            self._record_async_gpu_runner_disable_reason(self._async_disable_reason)
+            return True, None, None, None, None, False
+        if async_decode_graph.uses_gpu_advance and (
+            context._async_reserved_kv_block_count != 0
+            or active_request_count != async_decode_graph.batch_dimensions.decode_req_count
+        ):
+            self._async_disable_reason = "gpu advance packet needs h2d repair"
+            self._async_gpu_decode_packet_h2d_fallback_count += 1
             self._record_async_gpu_runner_disable_reason(self._async_disable_reason)
             return True, None, None, None, None, False
 

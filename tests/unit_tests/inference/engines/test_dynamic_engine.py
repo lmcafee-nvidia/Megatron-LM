@@ -941,6 +941,73 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    def test_async_gpu_decode_packet_launches_without_h2d_steady_state(self) -> None:
+        """Steady GPT async decode replays GPU-advance packets instead of H2D graphs."""
+        env = self._run_test(
+            num_requests=4,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=8,
+            num_gap_steps=0,
+            model_provider="gpt",
+            num_cuda_graphs=1,
+            cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+            force_build_cuda_graphs=True,
+            context_max_requests=4,
+            enable_async_scheduling=True,
+            termination_id=-1,
+            top_k=1,
+        )
+
+        controller = env.engine.controller
+        assert controller._async_gpu_decode_packet_launch_count > 0
+        assert controller._async_decode_graph_h2d_launch_count == 0
+        assert controller._async_gpu_decode_packet_h2d_fallback_count == 0
+        assert [len(request.generated_tokens) for request in env.requests] == [8] * 4
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_async_gpu_decode_packet_falls_back_for_padded_shape(self) -> None:
+        """GPT async decode keeps H2D repair when active rows do not fill the graph."""
+        common_kwargs = dict(
+            num_requests=3,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=8,
+            num_gap_steps=0,
+            model_provider="gpt",
+            num_cuda_graphs=1,
+            cuda_graph_scope=[CudaGraphScope.full_iteration_inference],
+            force_build_cuda_graphs=True,
+            context_max_requests=4,
+            termination_id=-1,
+            top_k=1,
+        )
+
+        serial_env = self._run_test(enable_async_scheduling=False, **common_kwargs)
+        serial_tokens = [request.generated_tokens for request in serial_env.requests]
+
+        delete_cuda_graphs()
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+        )
+
+        async_env = self._run_test(enable_async_scheduling=True, **common_kwargs)
+        controller = async_env.engine.controller
+        assert controller._async_gpu_decode_packet_launch_count == 0
+        assert controller._async_gpu_decode_packet_h2d_fallback_count > 0
+        assert [request.generated_tokens for request in async_env.requests] == serial_tokens
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     def test_async_scheduling_decode_finish_boundary_cuda_graph_e2e(self) -> None:
         """Async scheduling keeps pending forward rows correct when requests finish."""
         common_kwargs = dict(
@@ -1174,6 +1241,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             async_env.engine.controller._async_forward_launch_count > 0
         ), async_env.engine.controller._async_disable_reason
         assert async_env.engine.context._async_reserved_kv_block_adoption_count > 0
+        assert async_env.engine.controller._async_gpu_decode_packet_h2d_fallback_count > 0
         assert async_env.engine.context._async_deferred_kv_blocks_to_release.numel() == 0
         assert [request.generated_tokens for request in async_env.requests] == serial_tokens
 
