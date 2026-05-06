@@ -640,6 +640,14 @@ class DynamicInferenceContext(BaseInferenceContext):
                 num_speculative_tokens=self.num_speculative_tokens,
             )
         )
+        self.smallest_non_decode_cuda_graph_size = min(
+            (
+                graph_dim.token_count
+                for graph_dim in self.cuda_graph_batch_dimensions_list
+                if graph_dim.prefill_req_count > 0
+            ),
+            default=0,
+        )
 
         # Allocate per-step dispatcher buffers upfront so update_metadata never
         # triggers an allocation inside a captured CUDA graph.
