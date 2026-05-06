@@ -2996,6 +2996,48 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    def test_ep_async_prepare_after_mtp_votes_skip_on_step_barrier(self, monkeypatch) -> None:
+        """Logging-barrier steps still notify EP peers that async launch is skipped."""
+        env = self._build_async_scheduling_eligibility_probe(
+            monkeypatch, num_speculative_tokens=2
+        )
+        controller = env.engine.controller
+        barrier_reason = "logging sync step barrier"
+        calls = []
+
+        controller.set_async_step_barrier(barrier_reason)
+        monkeypatch.setattr(
+            env.engine.context,
+            "prepare_async_decode_next_step",
+            lambda: pytest.fail("barrier step must not enter async prepare"),
+        )
+        monkeypatch.setattr(
+            controller,
+            "_ep_async_launch_agreement",
+            lambda **kwargs: calls.append(kwargs) or (False, None, False),
+        )
+
+        assert not controller._try_prepare_async_decode_after_sampling(
+            synchronize_ep_launch=True
+        )
+
+        assert calls == [
+            {
+                "local_has_work": True,
+                "local_requested": False,
+                "local_blocked": True,
+                "batch_dimensions": InferenceBatchDimensions(
+                    token_count=3, prefill_req_count=0, decode_req_count=1
+                ),
+            }
+        ]
+        diagnostics = controller.get_async_scheduling_diagnostics()
+        assert diagnostics["disable_reason_counts"][barrier_reason] == 1
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     def test_cancel_prepared_async_decode_next_step_releases_reserved_blocks(
         self, monkeypatch
     ) -> None:
