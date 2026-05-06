@@ -1608,6 +1608,11 @@ class TextGenerationController:
         if torch.equal(pending_request_ids, current_request_ids):
             return True, None, False
 
+        context = self.inference_wrapped_model.inference_context
+        if self.num_speculative_tokens > 0 and not context.config.materialize_only_last_token_logits:
+            self._async_discarded_forward_count += 1
+            return False, None, False
+
         pending_row_by_request_id = {
             int(request_id): row
             for row, request_id in enumerate(pending_request_ids.tolist())

@@ -2520,6 +2520,70 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert row_indices is None
         assert controller._async_discarded_forward_count == 2
 
+    @pytest.mark.internal
+    def test_async_mtp_full_logits_discards_shifted_pending_forward(self) -> None:
+        """MTP row remapping is only safe when pending logits are per-request last logits."""
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=4,
+                num_speculative_tokens=2,
+                materialize_only_last_token_logits=False,
+                num_gap_steps=0,
+                context_max_requests=4,
+                termination_id=-1,
+                top_k=1,
+            )
+        )
+        controller = env.engine.controller
+        context = env.engine.context
+
+        with torch.inference_mode():
+            context.paused_request_count = 0
+            context.total_request_count = 2
+            context.request_ids[:2] = torch.tensor([30, 10], device='cpu')
+            controller._async_pending_forward_request_ids = torch.tensor(
+                [10, 20, 30], device='cpu'
+            )
+
+        usable, row_indices, row_mapped = controller._resolve_pending_async_forward_rows()
+
+        assert not usable
+        assert not row_mapped
+        assert row_indices is None
+        assert controller._async_discarded_forward_count == 1
+        assert controller._async_row_mapped_forward_count == 0
+
+        with torch.inference_mode():
+            context.total_request_count = 2
+            context.request_ids[:2] = torch.tensor([30, 10], device='cpu')
+            controller._async_pending_forward_request_ids = torch.tensor([30, 10], device='cpu')
+
+        usable, row_indices, row_mapped = controller._resolve_pending_async_forward_rows()
+
+        assert usable
+        assert not row_mapped
+        assert row_indices is None
+        assert controller._async_discarded_forward_count == 1
+
+        context.config.materialize_only_last_token_logits = True
+        with torch.inference_mode():
+            context.total_request_count = 2
+            context.request_ids[:2] = torch.tensor([30, 10], device='cpu')
+            controller._async_pending_forward_request_ids = torch.tensor(
+                [10, 20, 30], device='cpu'
+            )
+
+        usable, row_indices, row_mapped = controller._resolve_pending_async_forward_rows()
+
+        assert usable
+        assert row_mapped
+        assert row_indices is not None
+        assert row_indices.cpu().tolist() == [2, 0]
+        assert controller._async_row_mapped_forward_count == 1
+
     def _run_lifecycle_interaction_schedule(
         self,
         model_provider: str,
