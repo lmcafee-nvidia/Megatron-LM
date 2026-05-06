@@ -2160,6 +2160,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         *,
         construct_graph_dimensions: Optional[InferenceBatchDimensions] = None,
         is_expert_parallel_dummy_cuda_graph_step: bool = False,
+        expert_parallel_dummy_graph_dimensions: Optional[InferenceBatchDimensions] = None,
         transfer_bookkeeping_to_gpu: bool = True,
     ) -> None:
         """Initialize attention state so that every layer can use it.
@@ -2169,6 +2170,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                 The graph config to use for constructing the cuda graphs.
             is_expert_parallel_dummy_cuda_graph_step (bool):
                 Whether this is a dummy expert model parallel step.
+            expert_parallel_dummy_graph_dimensions (Optional[InferenceBatchDimensions]):
+                Batch dimensions to mirror on a dummy expert parallel rank. When omitted,
+                the smallest decode-only dummy shape is used and EP graph matching raises it
+                to the real peers' shape.
             transfer_bookkeeping_to_gpu (bool):
                 Whether to transfer the prepared CPU bookkeeping snapshot to GPU before returning.
         Return:
@@ -2189,10 +2194,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.add_dummy_requests_for_cudagraph_capture(construct_graph_dimensions)
         elif is_expert_parallel_dummy_cuda_graph_step:
             self.add_dummy_requests_for_expert_parallel_step(
-                InferenceBatchDimensions(
-                    token_count=self.num_speculative_tokens + 1,
-                    prefill_req_count=0,
-                    decode_req_count=1,
+                (
+                    expert_parallel_dummy_graph_dimensions
+                    if expert_parallel_dummy_graph_dimensions is not None
+                    else InferenceBatchDimensions(
+                        token_count=self.num_speculative_tokens + 1,
+                        prefill_req_count=0,
+                        decode_req_count=1,
+                    )
                 )
             )
 

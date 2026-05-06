@@ -728,6 +728,8 @@ class TextGenerationController:
         self,
         construct_graph_dimensions: Optional[InferenceBatchDimensions] = None,
         is_dummy_forward: bool = False,
+        expert_parallel_dummy_graph_dimensions: Optional[InferenceBatchDimensions] = None,
+        transfer_bookkeeping_to_gpu: bool = True,
     ):
         """Initializes the inference context for dynamic batching.
 
@@ -735,6 +737,9 @@ class TextGenerationController:
             construct_graph_dimensions (Optional[InferenceBatchDimensions]): The graph config to use
                 for constructing the cuda graphs.
             is_dummy_forward (bool): Whether we are running an expert parallel dummy forward pass
+            expert_parallel_dummy_graph_dimensions (Optional[InferenceBatchDimensions]):
+                The EP-agreed shape to mirror for a dummy forward pass.
+            transfer_bookkeeping_to_gpu (bool): Whether to transfer bookkeeping after CPU setup.
 
         Return:
             input_ids (Tensor): The active input IDs.
@@ -751,14 +756,16 @@ class TextGenerationController:
         context.initialize_attention_state(
             construct_graph_dimensions=construct_graph_dimensions,
             is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
+            expert_parallel_dummy_graph_dimensions=expert_parallel_dummy_graph_dimensions,
             transfer_bookkeeping_to_gpu=False,
         )
         range_pop()
 
         # Single batch CPU-to-GPU transfer of bookkeeping state.
-        range_push("transfer_bookkeeping_to_gpu")
-        context.transfer_bookkeeping_to_gpu()
-        range_pop()
+        if transfer_bookkeeping_to_gpu:
+            range_push("transfer_bookkeeping_to_gpu")
+            context.transfer_bookkeeping_to_gpu()
+            range_pop()
 
         set_moe_metadata_sync(unwrapped_model)
 
@@ -2540,6 +2547,50 @@ class TextGenerationController:
 
         # clear the context of any temporary state from the dummy forward
         context.reset()
+        self._dummy_async_forward_after_mtp()
+
+    @torch.inference_mode()
+    def _dummy_async_forward_after_mtp(self) -> None:
+        """Mirror a real EP peer's post-MTP async base forward on a dummy rank."""
+        if self.num_speculative_tokens == 0 or not self._ep_async_collective_enabled():
+            return
+
+        launch, agreed_dimensions, _ = self._ep_async_launch_agreement(
+            local_has_work=False,
+            local_requested=False,
+            local_blocked=False,
+        )
+        if not launch or agreed_dimensions is None:
+            return
+
+        context = self.inference_wrapped_model.inference_context
+        range_push("ep_dummy_async_forward")
+        try:
+            input_ids, position_ids = self._dynamic_step_context_init(
+                is_dummy_forward=True,
+                expert_parallel_dummy_graph_dimensions=agreed_dimensions,
+            )
+            async_forward_graph = self._get_async_forward_graph()
+            final_launch, _, agreed_using_graph = self._ep_async_launch_agreement(
+                local_has_work=False,
+                local_requested=True,
+                local_blocked=False,
+                batch_dimensions=context.batch_dimensions,
+                using_graph=async_forward_graph is not None,
+            )
+            if final_launch:
+                if agreed_using_graph and async_forward_graph is not None:
+                    range_push("ep_dummy_async_forward_graph_launch")
+                    async_forward_graph.graph.replay()
+                    range_pop()
+                else:
+                    range_push("ep_dummy_async_forward_launch")
+                    self._dynamic_step_forward_logits(input_ids, position_ids)
+                    range_pop()
+                torch.cuda.current_stream().synchronize()
+        finally:
+            context.reset()
+            range_pop()
 
     @torch.inference_mode()
     def _dummy_serial_mtp_forward(self):

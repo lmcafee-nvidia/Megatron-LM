@@ -2845,6 +2845,85 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert diagnostics["ep_launches"] == 1
         assert diagnostics["ep_skips"] == 2
 
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_ep_dummy_async_forward_after_mtp_mirrors_launch(self, monkeypatch) -> None:
+        """Dummy EP ranks mirror the agreed post-MTP async base forward only."""
+
+        class FakeEPCommunicator:
+            world_size = 4
+
+            def __init__(self, results):
+                self.results = list(results)
+                self.calls = []
+
+            def sync_all_reduce_max(self, *values):
+                self.calls.append(values)
+                return self.results.pop(0)
+
+        env = self._build_async_scheduling_eligibility_probe(
+            monkeypatch, num_speculative_tokens=2
+        )
+        controller = env.engine.controller
+        context = env.engine.context
+        dims = InferenceBatchDimensions(token_count=6, prefill_req_count=0, decode_req_count=2)
+        calls = []
+
+        fake = FakeEPCommunicator(
+            [
+                (1, 1, 0, 6, 0, 2, 0),
+                (1, 1, 0, 6, 0, 2, 0),
+            ]
+        )
+        monkeypatch.setattr(context, "_ep_zmq_communicator", fake)
+
+        def fake_context_init(**kwargs):
+            calls.append(("init", kwargs))
+            context.batch_dimensions = dims
+            context.padded_batch_dimensions = dims
+            return (
+                torch.empty((1, dims.token_count), dtype=torch.long, device="cuda"),
+                torch.empty((1, dims.token_count), dtype=torch.long, device="cuda"),
+            )
+
+        monkeypatch.setattr(controller, "_dynamic_step_context_init", fake_context_init)
+        monkeypatch.setattr(controller, "_get_async_forward_graph", lambda: None)
+        monkeypatch.setattr(
+            controller,
+            "_dynamic_step_forward_logits",
+            lambda input_ids, position_ids: calls.append(("forward", tuple(input_ids.shape))),
+        )
+        monkeypatch.setattr(context, "reset", lambda: calls.append(("reset",)))
+        monkeypatch.setattr(
+            torch.cuda,
+            "current_stream",
+            lambda: types.SimpleNamespace(synchronize=lambda: calls.append(("sync",))),
+        )
+
+        controller._dummy_async_forward_after_mtp()
+
+        assert fake.calls == [
+            (0, 0, 0, 0, 0, 0, 0),
+            (0, 1, 0, 6, 0, 2, 0),
+        ]
+        assert calls[0] == (
+            "init",
+            {
+                "is_dummy_forward": True,
+                "expert_parallel_dummy_graph_dimensions": dims,
+            },
+        )
+        assert ("forward", (1, dims.token_count)) in calls
+        assert ("sync",) in calls
+        assert calls[-1] == ("reset",)
+
+        calls.clear()
+        fake.results = [(0, 0, 0, 0, 0, 0, 0)]
+        controller._dummy_async_forward_after_mtp()
+        assert calls == []
+
     def _assert_async_logging_interval_parity(
         self,
         *,
