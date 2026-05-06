@@ -2928,6 +2928,52 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    def test_ep_dummy_forward_invokes_async_mirror_after_serial_mtp(self, monkeypatch) -> None:
+        """The production dummy path mirrors async forwards after normal MTP collectives."""
+        env = self._build_async_scheduling_eligibility_probe(
+            monkeypatch, num_speculative_tokens=2
+        )
+        controller = env.engine.controller
+        context = env.engine.context
+        calls = []
+
+        def fake_context_init(**kwargs):
+            calls.append(("init", kwargs))
+            return (
+                torch.empty((1, 3), dtype=torch.long, device="cuda"),
+                torch.empty((1, 3), dtype=torch.long, device="cuda"),
+            )
+
+        monkeypatch.setattr(controller, "_dynamic_step_context_init", fake_context_init)
+        monkeypatch.setattr(
+            controller,
+            "_dynamic_step_forward_logits",
+            lambda input_ids, position_ids: calls.append(("forward", tuple(input_ids.shape))),
+        )
+        monkeypatch.setattr(
+            controller, "_dummy_serial_mtp_forward", lambda: calls.append(("serial_mtp",))
+        )
+        monkeypatch.setattr(context, "reset", lambda: calls.append(("reset",)))
+        monkeypatch.setattr(
+            controller,
+            "_dummy_async_forward_after_mtp",
+            lambda: calls.append(("async_mirror",)),
+        )
+
+        controller.dummy_forward()
+
+        assert calls == [
+            ("init", {"is_dummy_forward": True}),
+            ("forward", (1, 3)),
+            ("serial_mtp",),
+            ("reset",),
+            ("async_mirror",),
+        ]
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     def test_ep_async_prepare_after_mtp_requires_final_agreement(self, monkeypatch) -> None:
         """Prepared real ranks cancel when an EP peer blocks the final async launch."""
         env = self._build_async_scheduling_eligibility_probe(
