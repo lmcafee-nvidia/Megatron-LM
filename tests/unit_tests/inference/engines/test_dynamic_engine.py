@@ -155,6 +155,7 @@ class DynamicEngineTestConfig:
     top_p: float = 0.0
     temperature: float = 1.0
     top_n_logprobs: int = 0
+    sampling_backend: str = 'torch'
 
     def __post_init__(self):
 
@@ -294,6 +295,7 @@ class DynamicInferenceEngineTestBase:
                 num_speculative_tokens=test_config.num_speculative_tokens,
                 enable_async_scheduling=test_config.enable_async_scheduling,
                 enable_async_decode_graphs=test_config.enable_async_decode_graphs,
+                sampling_backend=test_config.sampling_backend,
             ),
         )
 
@@ -847,10 +849,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 self.hostname = hostname
                 created.append(self)
 
-        context = types.SimpleNamespace(
-            _ep_zmq_communicator=None,
-            _ep_async_zmq_communicator=None,
-        )
+        context = types.SimpleNamespace(_ep_zmq_communicator=None, _ep_async_zmq_communicator=None)
 
         def set_ep_zmq_communicator(communicator):
             context._ep_zmq_communicator = communicator
@@ -866,8 +865,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         engine.context = context
 
         monkeypatch.setattr(
-            "megatron.core.inference.engines.dynamic_engine.AsyncZMQCommunicator",
-            FakeCommunicator,
+            "megatron.core.inference.engines.dynamic_engine.AsyncZMQCommunicator", FakeCommunicator
         )
 
         engine._initialize_expert_parallel_zmq_communicators("host0")
@@ -1139,9 +1137,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    def test_async_scheduling_generated_top_n_logprobs_gpt_cuda_graph_fallback_e2e(
-        self,
-    ) -> None:
+    def test_async_scheduling_generated_top_n_logprobs_gpt_cuda_graph_fallback_e2e(self) -> None:
         """Generated top-n logprobs match serial output while async forward overlap stays on."""
         common_kwargs = dict(
             num_requests=4,
@@ -1187,9 +1183,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    def test_async_scheduling_generated_logprobs_top_n_hybrid_mtp_cuda_graph_e2e(
-        self,
-    ) -> None:
+    def test_async_scheduling_generated_logprobs_top_n_hybrid_mtp_cuda_graph_e2e(self) -> None:
         """Hybrid MTP generated logprobs match serial output while async overlap stays on."""
         skip_if_mamba_sequence_packing_not_available("hybrid")
         common_kwargs = dict(
@@ -1274,7 +1268,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             request.generated_tokens for request in serial_requests
         ]
         for async_request, serial_request in zip(async_requests, serial_requests):
-            assert async_request.prompt_log_probs is None or len(async_request.prompt_log_probs) == 0
+            assert (
+                async_request.prompt_log_probs is None or len(async_request.prompt_log_probs) == 0
+            )
             assert (
                 async_request.prompt_top_n_logprobs is None
                 or len(async_request.prompt_top_n_logprobs) == 0
@@ -1286,8 +1282,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 serial_request.generated_top_n_logprobs
             )
             for async_top_n, serial_top_n in zip(
-                async_request.generated_top_n_logprobs,
-                serial_request.generated_top_n_logprobs,
+                async_request.generated_top_n_logprobs, serial_request.generated_top_n_logprobs
             ):
                 assert async_top_n.keys() == serial_top_n.keys()
                 for token in async_top_n:
@@ -1346,19 +1341,15 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         ]
         for async_request, serial_request in zip(async_requests, serial_requests):
             assert len(async_request.prompt_log_probs) == len(async_request.prompt_tokens) - 1
-            assert async_request.prompt_log_probs == pytest.approx(
-                serial_request.prompt_log_probs
-            )
+            assert async_request.prompt_log_probs == pytest.approx(serial_request.prompt_log_probs)
             assert async_request.generated_log_probs == pytest.approx(
                 serial_request.generated_log_probs
             )
             assert_top_n_match(
-                async_request.prompt_top_n_logprobs,
-                serial_request.prompt_top_n_logprobs,
+                async_request.prompt_top_n_logprobs, serial_request.prompt_top_n_logprobs
             )
             assert_top_n_match(
-                async_request.generated_top_n_logprobs,
-                serial_request.generated_top_n_logprobs,
+                async_request.generated_top_n_logprobs, serial_request.generated_top_n_logprobs
             )
 
     @pytest.mark.internal
@@ -1836,10 +1827,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert async_tokens == serial_tokens
 
     def _build_generate_until_env(
-        self,
-        *,
-        enable_async_scheduling: bool,
-        materialize_only_last_token_logits: bool = True,
+        self, *, enable_async_scheduling: bool, materialize_only_last_token_logits: bool = True
     ) -> DynamicEngineTestEnv:
         """Build an async-capable engine whose tokenizer accepts whitespace token IDs."""
         env = self._build_test_env(
@@ -1874,10 +1862,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         """Generate-style stop words are tokenized at admission and keep async active."""
         prompts = ["1 2 3 4", "2 3 4 5", "3 4 5 6", "4 5 6 7"]
         sampling_params = SamplingParams(
-            num_tokens_to_generate=8,
-            termination_id=-1,
-            top_k=1,
-            detokenize_stop_sequence=True,
+            num_tokens_to_generate=8, termination_id=-1, top_k=1, detokenize_stop_sequence=True
         )
 
         probe_env = self._build_generate_until_env(enable_async_scheduling=False)
@@ -2032,9 +2017,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
-    def test_async_scheduling_decode_only_mtp_cuda_graph_e2e(
-        self, model_provider: str
-    ) -> None:
+    def test_async_scheduling_decode_only_mtp_cuda_graph_e2e(self, model_provider: str) -> None:
         """Post-MTP async scheduling matches serial decode output."""
         skip_if_mamba_sequence_packing_not_available(model_provider)
         common_kwargs = dict(
@@ -2098,11 +2081,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         request = DynamicInferenceRequest(
             request_id=0,
             prompt_tokens=torch.tensor([1, 2, 3, 4], dtype=torch.int64, device='cuda'),
-            sampling_params=SamplingParams(
-                num_tokens_to_generate=8,
-                termination_id=7,
-                top_k=1,
-            ),
+            sampling_params=SamplingParams(num_tokens_to_generate=8, termination_id=7, top_k=1),
         )
         env.engine._add_request(request)
 
@@ -2203,9 +2182,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             context.request_ids[0] = 17
             context.active_request_metadata["termination_id"][0] = 7
             controller._accepted_tokens_per_request = torch.tensor(
-                [[7, -1], [-1, -1], [-1, -1], [-1, -1]],
-                dtype=torch.long,
-                device='cuda',
+                [[7, -1], [-1, -1], [-1, -1], [-1, -1]], dtype=torch.long, device='cuda'
             )
 
         monkeypatch.setattr(
@@ -2298,9 +2275,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         probe_tokens = [request.generated_tokens for request in probe_env.requests]
         termination_id = None
         for token_idx in range(common_kwargs["num_tokens_to_generate"] - 1):
-            step_tokens = [
-                tokens[token_idx] for tokens in probe_tokens if token_idx < len(tokens)
-            ]
+            step_tokens = [tokens[token_idx] for tokens in probe_tokens if token_idx < len(tokens)]
             for candidate in step_tokens:
                 finished_by_candidate = sum(candidate in tokens for tokens in probe_tokens)
                 if 0 < finished_by_candidate < len(probe_tokens):
@@ -2591,9 +2566,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             context.paused_request_count = 0
             context.total_request_count = 2
             context.request_ids[:2] = torch.tensor([30, 10], device='cpu')
-            controller._async_pending_forward_request_ids = torch.tensor(
-                [10, 20, 30], device='cpu'
-            )
+            controller._async_pending_forward_request_ids = torch.tensor([10, 20, 30], device='cpu')
 
         usable, row_indices, row_mapped = controller._resolve_pending_async_forward_rows()
 
@@ -2619,9 +2592,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         with torch.inference_mode():
             context.total_request_count = 2
             context.request_ids[:2] = torch.tensor([30, 10], device='cpu')
-            controller._async_pending_forward_request_ids = torch.tensor(
-                [10, 20, 30], device='cpu'
-            )
+            controller._async_pending_forward_request_ids = torch.tensor([10, 20, 30], device='cpu')
 
         usable, row_indices, row_mapped = controller._resolve_pending_async_forward_rows()
 
@@ -2747,7 +2718,10 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         assert controller._async_forward_launch_count > 0, controller._async_disable_reason
         assert controller._async_add_deferral_count > 0
-        assert controller._async_finish_boundary_count + controller._async_mtp_finish_boundary_count > 0
+        assert (
+            controller._async_finish_boundary_count + controller._async_mtp_finish_boundary_count
+            > 0
+        )
         if memory_pressure:
             assert controller._async_pause_boundary_count > 0
             assert controller._async_evict_boundary_count > 0
@@ -2831,9 +2805,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         context.active_token_count = tokens_per_request
         context.num_prefill_requests = 0
         context.padded_batch_dimensions = InferenceBatchDimensions(
-            token_count=tokens_per_request,
-            prefill_req_count=0,
-            decode_req_count=1,
+            token_count=tokens_per_request, prefill_req_count=0, decode_req_count=1
         )
         with torch.inference_mode():
             context.request_kv_length_offsets[0] = 4
@@ -2865,18 +2837,13 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     )
     def test_async_scheduling_step_barrier(self, monkeypatch) -> None:
         """Explicit step barriers disable async until cleared and are diagnosable."""
-        env = self._build_async_scheduling_eligibility_probe(
-            monkeypatch, num_speculative_tokens=2
-        )
+        env = self._build_async_scheduling_eligibility_probe(monkeypatch, num_speculative_tokens=2)
         controller = env.engine.controller
         barrier_reason = "logging sync step barrier"
 
         controller.set_async_step_barrier(barrier_reason)
         assert controller._async_scheduling_disabled_reason() == barrier_reason
-        assert (
-            controller._async_scheduling_disabled_reason(allow_mtp=True)
-            == barrier_reason
-        )
+        assert controller._async_scheduling_disabled_reason(allow_mtp=True) == barrier_reason
         controller._record_async_eligibility_result(barrier_reason)
         diagnostics = controller.get_async_scheduling_diagnostics()
         assert diagnostics["step_barrier_reason"] == barrier_reason
@@ -2937,9 +2904,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 self.calls.append(values)
                 return self.result
 
-        env = self._build_async_scheduling_eligibility_probe(
-            monkeypatch, num_speculative_tokens=2
-        )
+        env = self._build_async_scheduling_eligibility_probe(monkeypatch, num_speculative_tokens=2)
         controller = env.engine.controller
         context = env.engine.context
         dims = InferenceBatchDimensions(token_count=6, prefill_req_count=0, decode_req_count=2)
@@ -2958,9 +2923,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         fake = FakeEPCommunicator((1, 1, 0, 6, 0, 2, 1))
         monkeypatch.setattr(context, "_ep_async_zmq_communicator", fake)
         launch, agreed_dims, agreed_graph = controller._ep_async_launch_agreement(
-            local_has_work=False,
-            local_requested=False,
-            local_blocked=False,
+            local_has_work=False, local_requested=False, local_blocked=False
         )
         assert launch
         assert agreed_dims == dims
@@ -2969,9 +2932,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         fake.result = (1, 1, 1, 6, 0, 2, 1)
         launch, agreed_dims, agreed_graph = controller._ep_async_launch_agreement(
-            local_has_work=True,
-            local_requested=False,
-            local_blocked=False,
+            local_has_work=True, local_requested=False, local_blocked=False
         )
         assert not launch
         assert agreed_dims is None
@@ -2980,9 +2941,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         fake.result = (0, 0, 0, 0, 0, 0, 0)
         launch, agreed_dims, agreed_graph = controller._ep_async_launch_agreement(
-            local_has_work=False,
-            local_requested=False,
-            local_blocked=False,
+            local_has_work=False, local_requested=False, local_blocked=False
         )
         assert not launch
         assert agreed_dims is None
@@ -3011,39 +2970,32 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 self.calls.append(values)
                 return self.result
 
-        env = self._build_async_scheduling_eligibility_probe(
-            monkeypatch, num_speculative_tokens=2
-        )
+        env = self._build_async_scheduling_eligibility_probe(monkeypatch, num_speculative_tokens=2)
         controller = env.engine.controller
         context = env.engine.context
 
         assert controller._ep_pending_forward_reuse_agreement(
-            local_has_pending=True,
-            local_can_reuse=True,
+            local_has_pending=True, local_can_reuse=True
         )
         assert not controller._ep_pending_forward_reuse_agreement(
-            local_has_pending=True,
-            local_can_reuse=False,
+            local_has_pending=True, local_can_reuse=False
         )
 
         fake = FakeEPCommunicator((1, 0))
         monkeypatch.setattr(context, "_ep_async_zmq_communicator", fake)
         assert controller._ep_pending_forward_reuse_agreement(
-            local_has_pending=True,
-            local_can_reuse=True,
+            local_has_pending=True, local_can_reuse=True
         )
         assert fake.calls[-1] == (1, 0)
 
         fake.result = (1, 1)
         assert not controller._ep_pending_forward_reuse_agreement(
-            local_has_pending=True,
-            local_can_reuse=True,
+            local_has_pending=True, local_can_reuse=True
         )
         assert fake.calls[-1] == (1, 0)
 
         assert not controller._ep_pending_forward_reuse_agreement(
-            local_has_pending=True,
-            local_can_reuse=False,
+            local_has_pending=True, local_can_reuse=False
         )
         assert fake.calls[-1] == (1, 1)
 
@@ -3065,19 +3017,13 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 self.calls.append(values)
                 return self.results.pop(0)
 
-        env = self._build_async_scheduling_eligibility_probe(
-            monkeypatch, num_speculative_tokens=2
-        )
+        env = self._build_async_scheduling_eligibility_probe(monkeypatch, num_speculative_tokens=2)
         controller = env.engine.controller
         context = env.engine.context
         dims = InferenceBatchDimensions(token_count=6, prefill_req_count=0, decode_req_count=2)
         calls = []
 
-        fake = FakeEPCommunicator(
-            [
-                (1, 1, 0, 6, 0, 2, 0),
-            ]
-        )
+        fake = FakeEPCommunicator([(1, 1, 0, 6, 0, 2, 0)])
         monkeypatch.setattr(context, "_ep_async_zmq_communicator", fake)
 
         def fake_context_init(**kwargs):
@@ -3107,15 +3053,10 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         controller._dummy_async_forward_after_mtp()
 
-        assert fake.calls == [
-            (0, 0, 0, 0, 0, 0, 0),
-        ]
+        assert fake.calls == [(0, 0, 0, 0, 0, 0, 0)]
         assert calls[0] == (
             "init",
-            {
-                "is_dummy_forward": True,
-                "expert_parallel_dummy_graph_dimensions": dims,
-            },
+            {"is_dummy_forward": True, "expert_parallel_dummy_graph_dimensions": dims},
         )
         assert ("forward", (1, dims.token_count)) in calls
         assert ("sync",) in calls
@@ -3143,9 +3084,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     )
     def test_ep_dummy_forward_invokes_async_mirror_after_serial_mtp(self, monkeypatch) -> None:
         """The production dummy path mirrors async forwards after normal MTP collectives."""
-        env = self._build_async_scheduling_eligibility_probe(
-            monkeypatch, num_speculative_tokens=2
-        )
+        env = self._build_async_scheduling_eligibility_probe(monkeypatch, num_speculative_tokens=2)
         controller = env.engine.controller
         context = env.engine.context
         calls = []
@@ -3168,9 +3107,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         )
         monkeypatch.setattr(context, "reset", lambda: calls.append(("reset",)))
         monkeypatch.setattr(
-            controller,
-            "_dummy_async_forward_after_mtp",
-            lambda: calls.append(("async_mirror",)),
+            controller, "_dummy_async_forward_after_mtp", lambda: calls.append(("async_mirror",))
         )
 
         controller.dummy_forward()
@@ -3189,9 +3126,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     )
     def test_ep_dummy_forward_skips_mtp_async_mirror_for_prefill(self, monkeypatch) -> None:
         """Dummy EP prefill steps mirror MTP collectives but skip async agreement."""
-        env = self._build_async_scheduling_eligibility_probe(
-            monkeypatch, num_speculative_tokens=2
-        )
+        env = self._build_async_scheduling_eligibility_probe(monkeypatch, num_speculative_tokens=2)
         controller = env.engine.controller
         context = env.engine.context
         prefill_dims = InferenceBatchDimensions(
@@ -3217,15 +3152,11 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             lambda input_ids, position_ids: calls.append(("forward", tuple(input_ids.shape))),
         )
         monkeypatch.setattr(
-            controller,
-            "_dummy_serial_mtp_forward",
-            lambda: calls.append(("serial_mtp",)),
+            controller, "_dummy_serial_mtp_forward", lambda: calls.append(("serial_mtp",))
         )
         monkeypatch.setattr(context, "reset", lambda: calls.append(("reset",)))
         monkeypatch.setattr(
-            controller,
-            "_dummy_async_forward_after_mtp",
-            lambda: calls.append(("async_mirror",)),
+            controller, "_dummy_async_forward_after_mtp", lambda: calls.append(("async_mirror",))
         )
 
         controller.dummy_forward()
@@ -3243,9 +3174,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     )
     def test_ep_dummy_forward_skips_async_mirror_for_eager_decode(self, monkeypatch) -> None:
         """Dummy eager fallback cannot infer that real EP peers are async-decode eligible."""
-        env = self._build_async_scheduling_eligibility_probe(
-            monkeypatch, num_speculative_tokens=2
-        )
+        env = self._build_async_scheduling_eligibility_probe(monkeypatch, num_speculative_tokens=2)
         controller = env.engine.controller
         context = env.engine.context
         dims = InferenceBatchDimensions(token_count=3, prefill_req_count=0, decode_req_count=1)
@@ -3268,17 +3197,13 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             lambda input_ids, position_ids: calls.append(("forward", tuple(input_ids.shape))),
         )
         monkeypatch.setattr(
-            controller,
-            "_dummy_serial_mtp_forward",
-            lambda: calls.append(("serial_mtp",)),
+            controller, "_dummy_serial_mtp_forward", lambda: calls.append(("serial_mtp",))
         )
         monkeypatch.setattr(context, "is_decode_only", lambda: True)
         monkeypatch.setattr(context, "using_cuda_graph_this_step", lambda: False)
         monkeypatch.setattr(context, "reset", lambda: calls.append(("reset",)))
         monkeypatch.setattr(
-            controller,
-            "_dummy_async_forward_after_mtp",
-            lambda: calls.append(("async_mirror",)),
+            controller, "_dummy_async_forward_after_mtp", lambda: calls.append(("async_mirror",))
         )
 
         controller.dummy_forward()
@@ -3296,13 +3221,13 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     )
     def test_ep_dummy_forward_reuses_mirrored_async_forward(self, monkeypatch) -> None:
         """Dummy EP ranks skip the base forward already mirrored asynchronously."""
-        env = self._build_async_scheduling_eligibility_probe(
-            monkeypatch, num_speculative_tokens=2
-        )
+        env = self._build_async_scheduling_eligibility_probe(monkeypatch, num_speculative_tokens=2)
         controller = env.engine.controller
         context = env.engine.context
         dims = InferenceBatchDimensions(token_count=6, prefill_req_count=0, decode_req_count=2)
-        padded_dims = InferenceBatchDimensions(token_count=12, prefill_req_count=0, decode_req_count=4)
+        padded_dims = InferenceBatchDimensions(
+            token_count=12, prefill_req_count=0, decode_req_count=4
+        )
         calls = []
 
         controller._async_dummy_pending_forward = True
@@ -3336,24 +3261,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         monkeypatch.setattr(controller, "_dummy_serial_mtp_forward", fake_serial_mtp)
         monkeypatch.setattr(context, "reset", lambda: calls.append(("reset",)))
         monkeypatch.setattr(
-            controller,
-            "_dummy_async_forward_after_mtp",
-            lambda: calls.append(("async_mirror",)),
+            controller, "_dummy_async_forward_after_mtp", lambda: calls.append(("async_mirror",))
         )
 
         controller.dummy_forward()
 
-        assert calls == [
-            (
-                "serial_mtp",
-                dims,
-                padded_dims,
-                True,
-                4,
-            ),
-            ("reset",),
-            ("async_mirror",),
-        ]
+        assert calls == [("serial_mtp", dims, padded_dims, True, 4), ("reset",), ("async_mirror",)]
         assert not controller._async_dummy_pending_forward
         assert controller._async_dummy_pending_forward_dimensions is None
         assert controller._async_dummy_pending_forward_padded_dimensions is None
@@ -3380,9 +3293,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 self.calls.append(values)
                 return self.results.pop(0)
 
-        env = self._build_async_scheduling_eligibility_probe(
-            monkeypatch, num_speculative_tokens=2
-        )
+        env = self._build_async_scheduling_eligibility_probe(monkeypatch, num_speculative_tokens=2)
         controller = env.engine.controller
         context = env.engine.context
         dims = InferenceBatchDimensions(token_count=3, prefill_req_count=0, decode_req_count=1)
@@ -3423,9 +3334,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             lambda input_ids, position_ids: calls.append(("forward", tuple(input_ids.shape))),
         )
         monkeypatch.setattr(
-            controller,
-            "_dummy_serial_mtp_forward",
-            lambda: calls.append(("serial_mtp",)),
+            controller, "_dummy_serial_mtp_forward", lambda: calls.append(("serial_mtp",))
         )
         monkeypatch.setattr(context, "reset", lambda: calls.append(("reset",)))
 
@@ -3450,9 +3359,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     )
     def test_ep_async_prepare_after_mtp_requires_final_agreement(self, monkeypatch) -> None:
         """Prepared real ranks cancel when an EP peer blocks the async launch."""
-        env = self._build_async_scheduling_eligibility_probe(
-            monkeypatch, num_speculative_tokens=2
-        )
+        env = self._build_async_scheduling_eligibility_probe(monkeypatch, num_speculative_tokens=2)
         controller = env.engine.controller
         context = env.engine.context
         dims = InferenceBatchDimensions(token_count=3, prefill_req_count=0, decode_req_count=1)
@@ -3468,9 +3375,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         monkeypatch.setattr(context, "prepare_async_decode_next_step", fake_prepare)
         monkeypatch.setattr(controller, "_get_async_forward_graph", lambda: None)
         monkeypatch.setattr(
-            context,
-            "cancel_prepared_async_decode_next_step",
-            lambda: calls.append(("cancel",)),
+            context, "cancel_prepared_async_decode_next_step", lambda: calls.append(("cancel",))
         )
         monkeypatch.setattr(
             controller,
@@ -3478,9 +3383,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             lambda **kwargs: calls.append(("agreement", kwargs)) or (False, None, False),
         )
 
-        assert not controller._try_prepare_async_decode_after_sampling(
-            synchronize_ep_launch=True
-        )
+        assert not controller._try_prepare_async_decode_after_sampling(synchronize_ep_launch=True)
         assert calls == [
             ("prepare",),
             (
@@ -3503,16 +3406,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     )
     def test_ep_async_prepare_after_mtp_votes_skip_for_prefill(self, monkeypatch) -> None:
         """Non-decode real ranks vote skip so dummy EP peers leave the same agreement."""
-        env = self._build_async_scheduling_eligibility_probe(
-            monkeypatch, num_speculative_tokens=2
-        )
+        env = self._build_async_scheduling_eligibility_probe(monkeypatch, num_speculative_tokens=2)
         controller = env.engine.controller
         calls = []
 
         monkeypatch.setattr(
-            controller,
-            "_async_scheduling_disabled_reason",
-            lambda **kwargs: "not decode-only",
+            controller, "_async_scheduling_disabled_reason", lambda **kwargs: "not decode-only"
         )
         monkeypatch.setattr(
             controller,
@@ -3525,9 +3424,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             lambda: pytest.fail("prefill must not prepare async decode metadata"),
         )
 
-        assert not controller._try_prepare_async_decode_after_sampling(
-            synchronize_ep_launch=True
-        )
+        assert not controller._try_prepare_async_decode_after_sampling(synchronize_ep_launch=True)
         assert controller._async_disable_reason == "not decode-only"
         assert calls == [
             {
@@ -3547,9 +3444,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     )
     def test_ep_async_prepare_after_mtp_votes_skip_on_step_barrier(self, monkeypatch) -> None:
         """Logging-barrier steps still notify EP peers that async launch is skipped."""
-        env = self._build_async_scheduling_eligibility_probe(
-            monkeypatch, num_speculative_tokens=2
-        )
+        env = self._build_async_scheduling_eligibility_probe(monkeypatch, num_speculative_tokens=2)
         controller = env.engine.controller
         barrier_reason = "logging sync step barrier"
         calls = []
@@ -3566,9 +3461,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             lambda **kwargs: calls.append(kwargs) or (False, None, False),
         )
 
-        assert not controller._try_prepare_async_decode_after_sampling(
-            synchronize_ep_launch=True
-        )
+        assert not controller._try_prepare_async_decode_after_sampling(synchronize_ep_launch=True)
 
         assert calls == [
             {
@@ -3592,18 +3485,14 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         self, monkeypatch
     ) -> None:
         """Final length steps do not launch a useless async forward on EP peers."""
-        env = self._build_async_scheduling_eligibility_probe(
-            monkeypatch, num_speculative_tokens=2
-        )
+        env = self._build_async_scheduling_eligibility_probe(monkeypatch, num_speculative_tokens=2)
         controller = env.engine.controller
         context = env.engine.context
         calls = []
 
         with torch.inference_mode():
             context.request_output_lengths[0] = (
-                context.request_kv_length_offsets[0]
-                + context.request_query_lengths[0]
-                + 1
+                context.request_kv_length_offsets[0] + context.request_query_lengths[0] + 1
             )
 
         monkeypatch.setattr(
@@ -3617,9 +3506,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             lambda **kwargs: calls.append(kwargs) or (False, None, False),
         )
 
-        assert not controller._try_prepare_async_decode_after_sampling(
-            synchronize_ep_launch=True
-        )
+        assert not controller._try_prepare_async_decode_after_sampling(synchronize_ep_launch=True)
 
         assert controller._async_disable_reason == "all requests finish this step"
         assert calls == [
@@ -3642,9 +3529,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         self, monkeypatch
     ) -> None:
         """Cancelled async prepares release blocks that were reserved for launch."""
-        env = self._build_async_scheduling_eligibility_probe(
-            monkeypatch, num_speculative_tokens=2
-        )
+        env = self._build_async_scheduling_eligibility_probe(monkeypatch, num_speculative_tokens=2)
         context = env.engine.context
         released = []
 
@@ -3654,9 +3539,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 [11, 12], dtype=torch.int32
             )
             context._async_reserved_kv_block_ids[:2] = torch.tensor([7, 8], dtype=torch.int32)
-            context._async_reserved_kv_block_columns[:2] = torch.tensor(
-                [1, 1], dtype=torch.int32
-            )
+            context._async_reserved_kv_block_columns[:2] = torch.tensor([1, 1], dtype=torch.int32)
         monkeypatch.setattr(
             context.kv_block_allocator,
             "release_memory_blocks",
@@ -3672,20 +3555,14 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             torch.tensor([-1, -1], dtype=torch.int32),
         )
         assert torch.equal(
-            context._async_reserved_kv_block_ids[:2],
-            torch.tensor([-1, -1], dtype=torch.int32),
+            context._async_reserved_kv_block_ids[:2], torch.tensor([-1, -1], dtype=torch.int32)
         )
         assert torch.equal(
-            context._async_reserved_kv_block_columns[:2],
-            torch.tensor([-1, -1], dtype=torch.int32),
+            context._async_reserved_kv_block_columns[:2], torch.tensor([-1, -1], dtype=torch.int32)
         )
 
     def _assert_async_logging_interval_parity(
-        self,
-        *,
-        model_provider: str,
-        num_speculative_tokens: int,
-        logging_step_interval: int,
+        self, *, model_provider: str, num_speculative_tokens: int, logging_step_interval: int
     ) -> DynamicEngineTestEnv:
         """Run serial/async decode with logging enabled and compare outputs."""
         common_kwargs = dict(
@@ -3718,9 +3595,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     def test_async_scheduling_logging_interval_gpt_e2e(self) -> None:
         """GPT async scheduling continues on non-barrier steps with logging enabled."""
         async_env = self._assert_async_logging_interval_parity(
-            model_provider="gpt",
-            num_speculative_tokens=0,
-            logging_step_interval=3,
+            model_provider="gpt", num_speculative_tokens=0, logging_step_interval=3
         )
         diagnostics = async_env.engine.controller.get_async_scheduling_diagnostics()
         assert diagnostics["forward_launches"] > 0, diagnostics
@@ -3735,9 +3610,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         """Hybrid MTP async scheduling continues on non-barrier steps with logging enabled."""
         skip_if_mamba_sequence_packing_not_available("hybrid")
         async_env = self._assert_async_logging_interval_parity(
-            model_provider="hybrid",
-            num_speculative_tokens=2,
-            logging_step_interval=3,
+            model_provider="hybrid", num_speculative_tokens=2, logging_step_interval=3
         )
         diagnostics = async_env.engine.controller.get_async_scheduling_diagnostics()
         assert diagnostics["forward_launches"] > 0, diagnostics
@@ -3751,9 +3624,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     def test_async_scheduling_logging_interval_one_blocks_async_e2e(self) -> None:
         """Logging every step intentionally blocks async scheduling every step."""
         async_env = self._assert_async_logging_interval_parity(
-            model_provider="gpt",
-            num_speculative_tokens=0,
-            logging_step_interval=1,
+            model_provider="gpt", num_speculative_tokens=0, logging_step_interval=1
         )
         diagnostics = async_env.engine.controller.get_async_scheduling_diagnostics()
         assert diagnostics["forward_launches"] == 0, diagnostics
@@ -3873,9 +3744,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             mtp_context.active_request_metadata["top_n_logprobs"][0] = 0
             mtp_context.active_request_metadata["termination_id"][0] = 7
 
-        assert (
-            mtp_controller._async_scheduling_disabled_reason(allow_mtp=True) is None
-        )
+        assert mtp_controller._async_scheduling_disabled_reason(allow_mtp=True) is None
         with torch.inference_mode():
             mtp_context.active_request_metadata["top_k"][0] = 10
         assert mtp_controller._async_scheduling_disabled_reason(allow_mtp=True) is None
@@ -3966,9 +3835,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             context.paused_request_count = 0
             context.total_request_count = 2
             context.request_ids[:2] = torch.tensor([30, 20], device='cpu')
-            controller._async_pending_forward_request_ids = torch.tensor(
-                [10, 20, 30], device='cpu'
-            )
+            controller._async_pending_forward_request_ids = torch.tensor([10, 20, 30], device='cpu')
 
         usable, row_indices, row_mapped = controller._resolve_pending_async_forward_rows()
 
@@ -5770,9 +5637,15 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
-    def test_speculative_decoding_with_early_termination(self):
+    @pytest.mark.parametrize("sampling_backend", ["torch", "flashinfer"])
+    @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
+    def test_speculative_decoding_with_early_termination(
+        self, materialize_only_last_token_logits, sampling_backend
+    ):
         """Test that speculative decoding handles premature request termination safely
         (e.g. hitting max_sequence_length mid-speculative-batch)."""
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
 
         # Set max_sequence_length tight so it terminates during a speculative step
         test_config = DynamicEngineTestConfig(
@@ -5783,7 +5656,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             max_sequence_length=7,  # Will force termination after 3 tokens
             model_provider="gpt",
             num_speculative_tokens=3,
-            materialize_only_last_token_logits=False,
+            materialize_only_last_token_logits=materialize_only_last_token_logits,
+            sampling_backend=sampling_backend,
         )
 
         env = self._build_test_env(test_config)
@@ -5808,6 +5682,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             unwrapped_model._decoder_hidden_states_cache = torch.zeros(
                 tokens.size(1), 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
+            if test_config.materialize_only_last_token_logits:
+                base_logits = env.engine.context.last_token_logits(base_logits).unsqueeze(0)
             return base_logits
 
         def mock_compute_mtp_single_step(
@@ -5844,12 +5720,18 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
     @pytest.mark.internal
     @torch.inference_mode()
-    def test_speculative_block_boundary_crossing(self):
+    @pytest.mark.parametrize("sampling_backend", ["torch", "flashinfer"])
+    @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
+    def test_speculative_block_boundary_crossing(
+        self, materialize_only_last_token_logits, sampling_backend
+    ):
         """Test to verify KV cache block boundary crossing logic.
 
         When a request fills exactly one block and speculative decoding generates
         multiple tokens, the first new token shouldn't incorrectly overwrite the old block.
         """
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
         test_config = DynamicEngineTestConfig(
             num_requests=1,
             min_prompt_length=256,
@@ -5859,8 +5741,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             context_block_size_tokens=256,  # Exactly matches prompt length
             context_max_requests=16,
             model_provider="gpt",
-            materialize_only_last_token_logits=False,
+            materialize_only_last_token_logits=materialize_only_last_token_logits,
             use_fixed_output_lengths=True,
+            sampling_backend=sampling_backend,
         )
         env = self._build_test_env(test_config)
 
@@ -5900,9 +5783,13 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
-    def test_speculative_stop_word_hit(self):
+    @pytest.mark.parametrize("sampling_backend", ["torch", "flashinfer"])
+    @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
+    def test_speculative_stop_word_hit(self, materialize_only_last_token_logits, sampling_backend):
         """Test that if an accepted speculative token completes a stop word,
         the request correctly triggers the stop logic without crashing."""
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
 
         test_config = DynamicEngineTestConfig(
             num_requests=0,  # We will manually add our request cleanly
@@ -5910,8 +5797,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             max_prompt_length=4,
             num_tokens_to_generate=10,
             num_speculative_tokens=2,
-            materialize_only_last_token_logits=False,
+            materialize_only_last_token_logits=materialize_only_last_token_logits,
             model_provider="gpt",
+            sampling_backend=sampling_backend,
         )
         env = self._build_test_env(test_config)
 
@@ -5933,6 +5821,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             unwrapped_model._decoder_hidden_states_cache = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
+            if test_config.materialize_only_last_token_logits:
+                base_logits = env.engine.context.last_token_logits(base_logits).unsqueeze(0)
             return base_logits
 
         def mock_compute_mtp_single_step(
@@ -5986,9 +5876,15 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
-    def test_speculative_long_stop_word_hit(self):
+    @pytest.mark.parametrize("sampling_backend", ["torch", "flashinfer"])
+    @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
+    def test_speculative_long_stop_word_hit(
+        self, materialize_only_last_token_logits, sampling_backend
+    ):
         """Test that if an accepted speculative token completes a long stop word
         (length > num_speculative_tokens), it is correctly detected."""
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
 
         test_config = DynamicEngineTestConfig(
             num_requests=0,
@@ -5996,8 +5892,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             max_prompt_length=4,
             num_tokens_to_generate=10,
             num_speculative_tokens=2,
-            materialize_only_last_token_logits=False,
+            materialize_only_last_token_logits=materialize_only_last_token_logits,
             model_provider="gpt",
+            sampling_backend=sampling_backend,
         )
         env = self._build_test_env(test_config)
 
@@ -6019,6 +5916,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             unwrapped_model._decoder_hidden_states_cache = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
+            if test_config.materialize_only_last_token_logits:
+                base_logits = env.engine.context.last_token_logits(base_logits).unsqueeze(0)
             return base_logits
 
         def mock_compute_mtp_single_step(
@@ -6068,7 +5967,11 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
-    def test_speculative_stop_word_truncates_trailing_tokens(self):
+    @pytest.mark.parametrize("sampling_backend", ["torch", "flashinfer"])
+    @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
+    def test_speculative_stop_word_truncates_trailing_tokens(
+        self, materialize_only_last_token_logits, sampling_backend
+    ):
         """Test that when a stop word lands in the middle of speculative tokens,
         the extra tokens generated after the stop word are removed.
 
@@ -6076,6 +5979,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         (1 base + 2 speculative). If the stop word is [6] and the engine
         generates [5, 6, 7] in one step, token 7 must be truncated so the
         output ends with the stop word [6]."""
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
 
         test_config = DynamicEngineTestConfig(
             num_requests=0,
@@ -6083,8 +5988,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             max_prompt_length=4,
             num_tokens_to_generate=10,
             num_speculative_tokens=2,
-            materialize_only_last_token_logits=False,
+            materialize_only_last_token_logits=materialize_only_last_token_logits,
             model_provider="gpt",
+            sampling_backend=sampling_backend,
         )
         env = self._build_test_env(test_config)
 
@@ -6106,6 +6012,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             unwrapped_model._decoder_hidden_states_cache = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
+            if test_config.materialize_only_last_token_logits:
+                base_logits = env.engine.context.last_token_logits(base_logits).unsqueeze(0)
             return base_logits
 
         def mock_compute_mtp_single_step(
@@ -6186,9 +6094,16 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             "non_divisible_boundary",
         ],
     )
+    @pytest.mark.parametrize("sampling_backend", ["torch", "flashinfer"])
+    @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
     @torch.inference_mode()
     def test_speculative_tokens_exceed_max_sequence_length(
-        self, prompt_length, num_tokens_to_generate, num_speculative_tokens
+        self,
+        prompt_length,
+        num_tokens_to_generate,
+        num_speculative_tokens,
+        materialize_only_last_token_logits,
+        sampling_backend,
     ):
         """Test that speculative decoding correctly trims output when speculative
         tokens would push the sequence beyond max_sequence_length.
@@ -6198,6 +6113,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         speculative tokens are accepted and the boundary trimming logic is
         actually exercised.
         """
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
         max_sequence_length = prompt_length + num_tokens_to_generate
 
         test_config = DynamicEngineTestConfig(
@@ -6207,11 +6124,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             num_tokens_to_generate=num_tokens_to_generate,
             max_sequence_length=max_sequence_length,
             num_speculative_tokens=num_speculative_tokens,
-            materialize_only_last_token_logits=False,
+            materialize_only_last_token_logits=materialize_only_last_token_logits,
             model_provider="gpt",
             # Disable positional embeddings so speculative position IDs
             # beyond max_sequence_length don't cause out-of-bounds lookups.
             position_embedding_type="none",
+            sampling_backend=sampling_backend,
         )
         env = self._build_test_env(test_config)
 
@@ -6357,8 +6275,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.parametrize(
         "acceptance_mode", ["all_rejected", "all_accepted"], ids=["all_rejected", "all_accepted"]
     )
+    @pytest.mark.parametrize("sampling_backend", ["torch", "flashinfer"])
+    @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
     @torch.inference_mode()
-    def test_speculative_sequence_length_double_counting(self, acceptance_mode):
+    def test_speculative_sequence_length_double_counting(
+        self, acceptance_mode, materialize_only_last_token_logits, sampling_backend
+    ):
         """Test to verify active_sequence_lengths is not double-counted.
 
         If active sequence length is double-counted during speculative decoding,
@@ -6370,6 +6292,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         a faulty formula that adds accepted_tokens on top of the KV length will
         over-count by 2 per step, finishing the request after only 4 of 6 tokens.
         """
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
         test_config = DynamicEngineTestConfig(
             num_requests=0,
             min_prompt_length=4,
@@ -6379,10 +6303,11 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             context_max_requests=16,
             num_speculative_tokens=2,
             model_provider="gpt",
-            materialize_only_last_token_logits=False,
+            materialize_only_last_token_logits=materialize_only_last_token_logits,
             use_fixed_output_lengths=False,
             context_max_tokens=512,
             position_embedding_type="none",
+            sampling_backend=sampling_backend,
         )
         env = self._build_test_env(test_config)
 
@@ -6406,6 +6331,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 model._decoder_hidden_states_cache = torch.zeros(
                     s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
                 )
+                if test_config.materialize_only_last_token_logits:
+                    base_logits = env.engine.context.last_token_logits(base_logits).unsqueeze(0)
                 return base_logits
 
             def mock_compute_mtp(*args_mtp, **kwargs_mtp):
@@ -6477,12 +6404,18 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
-    def test_speculative_decoding_with_eviction_and_swapping(self):
+    @pytest.mark.parametrize("sampling_backend", ["torch", "flashinfer"])
+    @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
+    def test_speculative_decoding_with_eviction_and_swapping(
+        self, materialize_only_last_token_logits, sampling_backend
+    ):
         """Test that speculative decoding works correctly when requests are paused and evicted.
 
         This exercises the `_swap_book_keeping_tensors` logic with the 2D `new_speculative_tokens`
         tensor, ensuring no dimensional mismatch or index errors occur during tensor swapping.
         """
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
         # Very constrained memory environment to force pausing and eviction
         test_config = DynamicEngineTestConfig(
             num_requests=3,
@@ -6494,8 +6427,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             context_buffer_size_gb=0.00064,  # 640 KB
             context_paused_buffer_size_gb=0.0,  # 0 paused buffer forces immediate eviction
             model_provider="gpt",
-            materialize_only_last_token_logits=False,
+            materialize_only_last_token_logits=materialize_only_last_token_logits,
             use_fixed_output_lengths=True,
+            sampling_backend=sampling_backend,
         )
 
         env = self._build_test_env(test_config)
@@ -6518,6 +6452,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             unwrapped_model._decoder_hidden_states_cache = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
+            if test_config.materialize_only_last_token_logits:
+                base_logits = env.engine.context.last_token_logits(base_logits).unsqueeze(0)
             return base_logits
 
         def mock_compute_mtp_single_step(
@@ -8308,6 +8244,7 @@ class TestChunkedPrefillCudaGraphs:
             enable_chunked_prefill=enable_chunked_prefill,
             max_tokens=context_max_tokens,
             max_requests=128,
+            sampling_backend='torch',
         )
         if mamba_config is not None:
             inference_config_kwargs.update(mamba_inference_state_config=mamba_config)

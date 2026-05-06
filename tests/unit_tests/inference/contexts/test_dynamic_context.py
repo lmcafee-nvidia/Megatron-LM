@@ -247,8 +247,7 @@ class TestDynamicContext:
         original_kv_offsets = dynamic_context.request_kv_length_offsets.clone()
         tokens_per_request = num_speculative_tokens + 1
         predicted_start_pos = (
-            dynamic_context.request_kv_length_offsets[0]
-            + dynamic_context.request_query_lengths[0]
+            dynamic_context.request_kv_length_offsets[0] + dynamic_context.request_query_lengths[0]
         ).item()
         expected_positions = torch.arange(
             predicted_start_pos,
@@ -260,9 +259,7 @@ class TestDynamicContext:
 
         assert dynamic_context.prepare_async_decode_next_step()
         h2d_done = dynamic_context.transfer_bookkeeping_to_gpu(
-            include_token_to_input_ids=False,
-            refresh_request_staging=False,
-            record_done_event=True,
+            include_token_to_input_ids=False, refresh_request_staging=False, record_done_event=True
         )
         h2d_done.synchronize()
 
@@ -271,16 +268,13 @@ class TestDynamicContext:
         assert torch.equal(
             dynamic_context.token_to_pos_ids[:tokens_per_request], expected_positions
         )
-        assert (
-            dynamic_context._staging_request_kv_length_offsets[0].item() == predicted_start_pos
-        )
+        assert dynamic_context._staging_request_kv_length_offsets[0].item() == predicted_start_pos
         assert torch.equal(
             dynamic_context.gpu_view.token_to_input_ids[:tokens_per_request].cpu(),
             torch.full((tokens_per_request,), 77, dtype=torch.long),
         )
         assert torch.equal(
-            dynamic_context.gpu_view.token_to_pos_ids[:tokens_per_request].cpu(),
-            expected_positions,
+            dynamic_context.gpu_view.token_to_pos_ids[:tokens_per_request].cpu(), expected_positions
         )
         if is_hybrid_model:
             assert dynamic_context._pending_mamba_transfer is None
@@ -554,15 +548,12 @@ class TestDynamicContext:
         dynamic_context.kv_block_allocator.paused_count = 0
 
         evicted_ids = dynamic_context.evict_overflow_paused_requests(
-            active_request_count=2,
-            next_tokens=torch.tensor([1, 2, 3], device='cpu'),
+            active_request_count=2, next_tokens=torch.tensor([1, 2, 3], device='cpu')
         )
 
         assert evicted_ids is not None
         assert evicted_ids.tolist() == [10]
-        assert dynamic_context.mamba_metadata.mamba_state_free_slot_count == (
-            free_count_before + 1
-        )
+        assert dynamic_context.mamba_metadata.mamba_state_free_slot_count == (free_count_before + 1)
         active_mamba_idxs = dynamic_context.mamba_metadata.request_to_mamba_state_idx[:2]
         assert set(active_mamba_idxs.tolist()) == {1, 2}
         assert dynamic_context.mamba_metadata.request_to_mamba_state_idx[2].item() == -1
@@ -659,16 +650,19 @@ class TestDynamicContext:
 
         expected_active_ids = [idx for idx, is_active in enumerate(active_mask) if is_active]
         expected_finished_ids = [idx for idx, is_active in enumerate(active_mask) if not is_active]
-        assert dynamic_context.request_ids[: len(expected_active_ids)].tolist() == expected_active_ids
+        assert (
+            dynamic_context.request_ids[: len(expected_active_ids)].tolist() == expected_active_ids
+        )
         assert dynamic_context._async_reserved_kv_block_adoption_count == len(expected_active_ids)
         assert dynamic_context._async_deferred_kv_blocks_to_release.tolist() == [
             reserved_by_request[request_id] for request_id in expected_finished_ids
         ]
         for row, request_id in enumerate(expected_active_ids):
             assert dynamic_context.request_kv_block_counts[row].item() == 2
-            assert dynamic_context.request_to_kv_block_ids[row, 1].item() == reserved_by_request[
-                request_id
-            ]
+            assert (
+                dynamic_context.request_to_kv_block_ids[row, 1].item()
+                == reserved_by_request[request_id]
+            )
 
         dynamic_context.release_deferred_async_kv_blocks()
         assert dynamic_context._async_deferred_kv_blocks_to_release.numel() == 0
