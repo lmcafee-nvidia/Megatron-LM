@@ -2289,6 +2289,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             (0,), dtype=torch.int32, device='cpu'
         )
 
+    @torch.inference_mode()
+    def cancel_prepared_async_decode_next_step(self) -> None:
+        """Release blocks reserved by an async prepare that will not launch."""
+        count = self._async_reserved_kv_block_count
+        if count == 0:
+            return
+        self.kv_block_allocator.release_memory_blocks(
+            self._async_reserved_kv_block_ids[:count].clone()
+        )
+        self._clear_async_reserved_kv_blocks()
+
     def _append_deferred_async_kv_blocks(self, blocks: Tensor) -> None:
         """Defer releasing blocks that may still be used by an in-flight forward."""
         if blocks.numel() == 0:

@@ -2924,6 +2924,120 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         controller._dummy_async_forward_after_mtp()
         assert calls == []
 
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_ep_async_prepare_after_mtp_requires_final_agreement(self, monkeypatch) -> None:
+        """Prepared real ranks cancel when an EP peer blocks the final async launch."""
+        env = self._build_async_scheduling_eligibility_probe(
+            monkeypatch, num_speculative_tokens=2
+        )
+        controller = env.engine.controller
+        context = env.engine.context
+        dims = InferenceBatchDimensions(token_count=3, prefill_req_count=0, decode_req_count=1)
+        calls = []
+
+        monkeypatch.setattr(controller, "_async_scheduling_disabled_reason", lambda **kwargs: None)
+
+        def fake_prepare():
+            calls.append(("prepare",))
+            context.batch_dimensions = dims
+            return True
+
+        agreements = iter(
+            [
+                (True, dims, False),
+                (False, None, False),
+            ]
+        )
+        monkeypatch.setattr(context, "prepare_async_decode_next_step", fake_prepare)
+        monkeypatch.setattr(controller, "_get_async_forward_graph", lambda: None)
+        monkeypatch.setattr(
+            context,
+            "cancel_prepared_async_decode_next_step",
+            lambda: calls.append(("cancel",)),
+        )
+        monkeypatch.setattr(
+            controller,
+            "_ep_async_launch_agreement",
+            lambda **kwargs: calls.append(("agreement", kwargs)) or next(agreements),
+        )
+
+        assert not controller._try_prepare_async_decode_after_sampling(
+            synchronize_ep_launch=True
+        )
+        assert calls == [
+            (
+                "agreement",
+                {
+                    "local_has_work": True,
+                    "local_requested": True,
+                    "local_blocked": False,
+                    "batch_dimensions": dims,
+                },
+            ),
+            ("prepare",),
+            (
+                "agreement",
+                {
+                    "local_has_work": True,
+                    "local_requested": True,
+                    "local_blocked": False,
+                    "batch_dimensions": dims,
+                    "using_graph": False,
+                },
+            ),
+            ("cancel",),
+        ]
+        assert controller._async_disable_reason == "ep peer blocked prepared async launch"
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_cancel_prepared_async_decode_next_step_releases_reserved_blocks(
+        self, monkeypatch
+    ) -> None:
+        """Cancelled async prepares release blocks that were reserved for launch."""
+        env = self._build_async_scheduling_eligibility_probe(
+            monkeypatch, num_speculative_tokens=2
+        )
+        context = env.engine.context
+        released = []
+
+        with torch.inference_mode():
+            context._async_reserved_kv_block_count = 2
+            context._async_reserved_kv_block_request_ids[:2] = torch.tensor(
+                [11, 12], dtype=torch.int32
+            )
+            context._async_reserved_kv_block_ids[:2] = torch.tensor([7, 8], dtype=torch.int32)
+            context._async_reserved_kv_block_columns[:2] = torch.tensor(
+                [1, 1], dtype=torch.int32
+            )
+        monkeypatch.setattr(
+            context.kv_block_allocator,
+            "release_memory_blocks",
+            lambda blocks: released.append(blocks.clone()),
+        )
+
+        context.cancel_prepared_async_decode_next_step()
+
+        assert torch.equal(released[0], torch.tensor([7, 8], dtype=torch.int32))
+        assert context._async_reserved_kv_block_count == 0
+        assert torch.equal(
+            context._async_reserved_kv_block_request_ids[:2],
+            torch.tensor([-1, -1], dtype=torch.int32),
+        )
+        assert torch.equal(
+            context._async_reserved_kv_block_ids[:2],
+            torch.tensor([-1, -1], dtype=torch.int32),
+        )
+        assert torch.equal(
+            context._async_reserved_kv_block_columns[:2],
+            torch.tensor([-1, -1], dtype=torch.int32),
+        )
+
     def _assert_async_logging_interval_parity(
         self,
         *,

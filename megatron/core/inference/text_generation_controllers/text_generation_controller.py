@@ -1994,12 +1994,42 @@ class TextGenerationController:
             True,
         )
 
-    def _try_prepare_async_decode_after_sampling(self) -> bool:
+    def _async_decode_batch_dimensions(
+        self, active_request_count: Optional[int] = None
+    ) -> InferenceBatchDimensions:
+        """Return the decode-only batch dimensions for an async next-step forward."""
+        context = self.inference_wrapped_model.inference_context
+        if active_request_count is None:
+            active_request_count = context.total_request_count - context.paused_request_count
+        tokens_per_request = self.num_speculative_tokens + 1
+        return InferenceBatchDimensions(
+            token_count=active_request_count * tokens_per_request,
+            prefill_req_count=0,
+            decode_req_count=active_request_count,
+        )
+
+    def _try_prepare_async_decode_after_sampling(
+        self, *, synchronize_ep_launch: bool = False
+    ) -> bool:
         """Prepare next-step metadata for an async forward launched after sampling."""
         context = self.inference_wrapped_model.inference_context
         self._async_disable_reason = self._async_scheduling_disabled_reason(allow_mtp=True)
         self._record_async_eligibility_result(self._async_disable_reason)
-        if self._async_disable_reason is not None:
+        batch_dimensions = self._async_decode_batch_dimensions()
+        active_request_count = context.total_request_count - context.paused_request_count
+        if synchronize_ep_launch:
+            launch, _, _ = self._ep_async_launch_agreement(
+                local_has_work=active_request_count > 0,
+                local_requested=self._async_disable_reason is None,
+                local_blocked=self._async_disable_reason is not None,
+                batch_dimensions=batch_dimensions,
+            )
+            if not launch:
+                if self._async_disable_reason is None:
+                    self._async_disable_reason = "ep peer blocked async launch"
+                    self._record_async_disable_reason(self._async_disable_reason)
+                return False
+        elif self._async_disable_reason is not None:
             return False
 
         range_push("async_prepare_next_step")
@@ -2008,6 +2038,26 @@ class TextGenerationController:
         if not async_next_prepared:
             self._async_disable_reason = "failed to prepare next-step metadata"
             self._record_async_disable_reason(self._async_disable_reason)
+
+        if synchronize_ep_launch:
+            async_forward_graph = self._get_async_forward_graph() if async_next_prepared else None
+            final_launch, _, _ = self._ep_async_launch_agreement(
+                local_has_work=active_request_count > 0,
+                local_requested=async_next_prepared,
+                local_blocked=not async_next_prepared,
+                batch_dimensions=(
+                    context.batch_dimensions if async_next_prepared else batch_dimensions
+                ),
+                using_graph=async_forward_graph is not None,
+            )
+            if not final_launch:
+                if async_next_prepared:
+                    context.cancel_prepared_async_decode_next_step()
+                if self._async_disable_reason is None:
+                    self._async_disable_reason = "ep peer blocked prepared async launch"
+                    self._record_async_disable_reason(self._async_disable_reason)
+                return False
+        elif not async_next_prepared:
             return False
 
         return True
@@ -3002,7 +3052,9 @@ class TextGenerationController:
                 self._compute_serial_mtp_and_sample()
                 nvtx_range_pop("mtp-spec-decoding/serial-mtp")
 
-                async_next_prepared = self._try_prepare_async_decode_after_sampling()
+                async_next_prepared = self._try_prepare_async_decode_after_sampling(
+                    synchronize_ep_launch=True
+                )
                 if async_next_prepared:
                     self._copy_sampled_decode_tokens_to_next_input_ids(active_request_count)
                     async_forward_graph = self._get_async_forward_graph()
