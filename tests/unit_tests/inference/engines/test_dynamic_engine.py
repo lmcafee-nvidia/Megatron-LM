@@ -836,6 +836,53 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         return env
 
     @pytest.mark.internal
+    def test_ep_zmq_model_collectives_use_separate_channel(self, monkeypatch) -> None:
+        """Per-step EP collectives must not share the engine-loop consensus socket."""
+        created = []
+
+        class FakeCommunicator:
+            def __init__(self, zmq_context, *, process_group, hostname):
+                self.zmq_context = zmq_context
+                self.process_group = process_group
+                self.hostname = hostname
+                created.append(self)
+
+        context = types.SimpleNamespace(
+            _ep_zmq_communicator=None,
+            _ep_async_zmq_communicator=None,
+        )
+
+        def set_ep_zmq_communicator(communicator):
+            context._ep_zmq_communicator = communicator
+
+        def set_ep_async_zmq_communicator(communicator):
+            context._ep_async_zmq_communicator = communicator
+
+        context.set_ep_zmq_communicator = set_ep_zmq_communicator
+        context.set_ep_async_zmq_communicator = set_ep_async_zmq_communicator
+        engine = object.__new__(DynamicInferenceEngine)
+        engine.zmq_context = object()
+        engine.pg_collection = types.SimpleNamespace(ep=object())
+        engine.context = context
+
+        monkeypatch.setattr(
+            "megatron.core.inference.engines.dynamic_engine.AsyncZMQCommunicator",
+            FakeCommunicator,
+        )
+
+        engine._initialize_expert_parallel_zmq_communicators("host0")
+
+        assert len(created) == 3
+        assert engine.expert_parallel_zmq_communicator is created[0]
+        assert engine.expert_parallel_model_zmq_communicator is created[1]
+        assert engine.expert_parallel_async_zmq_communicator is created[2]
+        assert context._ep_zmq_communicator is created[1]
+        assert context._ep_async_zmq_communicator is created[2]
+        assert context._ep_zmq_communicator is not engine.expert_parallel_zmq_communicator
+        assert context._ep_async_zmq_communicator is not context._ep_zmq_communicator
+        assert all(communicator.hostname == "host0" for communicator in created)
+
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -2789,6 +2836,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             decode_req_count=1,
         )
         with torch.inference_mode():
+            context.request_kv_length_offsets[0] = 4
+            context.request_query_lengths[0] = tokens_per_request
+            context.request_output_lengths[0] = 4 + tokens_per_request + 8
             context.active_request_metadata["top_k"][0] = 1
             context.active_request_metadata["top_p"][0] = 0.0
             context.active_request_metadata["return_log_probs"][0] = False
@@ -2839,6 +2889,40 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    def test_async_scheduling_chained_decode_requires_full_graph(self, monkeypatch) -> None:
+        """Post-bookkeeping chaining only runs when a full greedy decode graph exists."""
+        mtp_env = self._build_async_scheduling_eligibility_probe(
+            monkeypatch, num_speculative_tokens=2
+        )
+        mtp_controller = mtp_env.engine.controller
+        mtp_controller._async_decode_graphs[mtp_env.engine.context.padded_batch_dimensions] = (
+            mock.Mock()
+        )
+        assert not mtp_controller._can_launch_chained_async_decode_graph(1)
+
+        env = self._build_async_scheduling_eligibility_probe(monkeypatch)
+        controller = env.engine.controller
+        context = env.engine.context
+
+        assert not controller._can_launch_chained_async_decode_graph(1)
+
+        controller._async_decode_graphs[context.padded_batch_dimensions] = mock.Mock()
+        assert controller._can_launch_chained_async_decode_graph(1)
+
+        with torch.inference_mode():
+            context.active_request_metadata["top_k"][0] = 2
+        assert not controller._can_launch_chained_async_decode_graph(1)
+
+        with torch.inference_mode():
+            context.active_request_metadata["top_k"][0] = 1
+            context.active_request_metadata["return_log_probs"][0] = True
+        controller._async_logprob_requests_seen = True
+        assert not controller._can_launch_chained_async_decode_graph(1)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     def test_ep_async_launch_agreement_matrix(self, monkeypatch) -> None:
         """EP async launch agreement lets dummy peers mirror only safe real launches."""
 
@@ -2872,7 +2956,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert agreed_graph
 
         fake = FakeEPCommunicator((1, 1, 0, 6, 0, 2, 1))
-        monkeypatch.setattr(context, "_ep_zmq_communicator", fake)
+        monkeypatch.setattr(context, "_ep_async_zmq_communicator", fake)
         launch, agreed_dims, agreed_graph = controller._ep_async_launch_agreement(
             local_has_work=False,
             local_requested=False,
@@ -2913,6 +2997,60 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    def test_ep_pending_forward_reuse_agreement_matrix(self, monkeypatch) -> None:
+        """EP peers collectively discard pending forwards when any real rank rejects."""
+
+        class FakeEPCommunicator:
+            world_size = 4
+
+            def __init__(self, result):
+                self.result = result
+                self.calls = []
+
+            def sync_all_reduce_max(self, *values):
+                self.calls.append(values)
+                return self.result
+
+        env = self._build_async_scheduling_eligibility_probe(
+            monkeypatch, num_speculative_tokens=2
+        )
+        controller = env.engine.controller
+        context = env.engine.context
+
+        assert controller._ep_pending_forward_reuse_agreement(
+            local_has_pending=True,
+            local_can_reuse=True,
+        )
+        assert not controller._ep_pending_forward_reuse_agreement(
+            local_has_pending=True,
+            local_can_reuse=False,
+        )
+
+        fake = FakeEPCommunicator((1, 0))
+        monkeypatch.setattr(context, "_ep_async_zmq_communicator", fake)
+        assert controller._ep_pending_forward_reuse_agreement(
+            local_has_pending=True,
+            local_can_reuse=True,
+        )
+        assert fake.calls[-1] == (1, 0)
+
+        fake.result = (1, 1)
+        assert not controller._ep_pending_forward_reuse_agreement(
+            local_has_pending=True,
+            local_can_reuse=True,
+        )
+        assert fake.calls[-1] == (1, 0)
+
+        assert not controller._ep_pending_forward_reuse_agreement(
+            local_has_pending=True,
+            local_can_reuse=False,
+        )
+        assert fake.calls[-1] == (1, 1)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     def test_ep_dummy_async_forward_after_mtp_mirrors_launch(self, monkeypatch) -> None:
         """Dummy EP ranks mirror the agreed post-MTP async base forward only."""
 
@@ -2938,15 +3076,16 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         fake = FakeEPCommunicator(
             [
                 (1, 1, 0, 6, 0, 2, 0),
-                (1, 1, 0, 6, 0, 2, 0),
             ]
         )
-        monkeypatch.setattr(context, "_ep_zmq_communicator", fake)
+        monkeypatch.setattr(context, "_ep_async_zmq_communicator", fake)
 
         def fake_context_init(**kwargs):
             calls.append(("init", kwargs))
             context.batch_dimensions = dims
             context.padded_batch_dimensions = dims
+            context._using_cuda_graph_this_step = True
+            controller._mtp_resolved_padded_count = 4
             return (
                 torch.empty((1, dims.token_count), dtype=torch.long, device="cuda"),
                 torch.empty((1, dims.token_count), dtype=torch.long, device="cuda"),
@@ -2970,7 +3109,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         assert fake.calls == [
             (0, 0, 0, 0, 0, 0, 0),
-            (0, 1, 0, 6, 0, 2, 0),
         ]
         assert calls[0] == (
             "init",
@@ -2981,9 +3119,20 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         )
         assert ("forward", (1, dims.token_count)) in calls
         assert ("sync",) in calls
-        assert calls[-1] == ("reset",)
+        assert ("reset",) in calls
+        assert calls.index(("sync",)) < calls.index(("reset",))
+        assert controller._async_dummy_pending_forward
+        assert controller._async_dummy_pending_forward_dimensions == dims
+        assert controller._async_dummy_pending_forward_padded_dimensions == dims
+        assert controller._async_dummy_pending_forward_mtp_padded_count == 4
+        assert controller._async_dummy_pending_forward_uses_cuda_graph
 
         calls.clear()
+        controller._async_dummy_pending_forward = False
+        controller._async_dummy_pending_forward_dimensions = None
+        controller._async_dummy_pending_forward_padded_dimensions = None
+        controller._async_dummy_pending_forward_mtp_padded_count = None
+        controller._async_dummy_pending_forward_uses_cuda_graph = False
         fake.results = [(0, 0, 0, 0, 0, 0, 0)]
         controller._dummy_async_forward_after_mtp()
         assert calls == []
@@ -3038,8 +3187,269 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    def test_ep_dummy_forward_skips_mtp_async_mirror_for_prefill(self, monkeypatch) -> None:
+        """Dummy EP prefill steps mirror MTP collectives but skip async agreement."""
+        env = self._build_async_scheduling_eligibility_probe(
+            monkeypatch, num_speculative_tokens=2
+        )
+        controller = env.engine.controller
+        context = env.engine.context
+        prefill_dims = InferenceBatchDimensions(
+            token_count=4, prefill_req_count=1, decode_req_count=0
+        )
+        calls = []
+        monkeypatch.setattr(context, "is_decode_only", lambda: False)
+
+        def fake_context_init(**kwargs):
+            calls.append(("init", kwargs))
+            context.batch_dimensions = prefill_dims
+            context.padded_batch_dimensions = prefill_dims
+            context._using_cuda_graph_this_step = True
+            return (
+                torch.empty((1, prefill_dims.token_count), dtype=torch.long, device="cuda"),
+                torch.empty((1, prefill_dims.token_count), dtype=torch.long, device="cuda"),
+            )
+
+        monkeypatch.setattr(controller, "_dynamic_step_context_init", fake_context_init)
+        monkeypatch.setattr(
+            controller,
+            "_dynamic_step_forward_logits",
+            lambda input_ids, position_ids: calls.append(("forward", tuple(input_ids.shape))),
+        )
+        monkeypatch.setattr(
+            controller,
+            "_dummy_serial_mtp_forward",
+            lambda: calls.append(("serial_mtp",)),
+        )
+        monkeypatch.setattr(context, "reset", lambda: calls.append(("reset",)))
+        monkeypatch.setattr(
+            controller,
+            "_dummy_async_forward_after_mtp",
+            lambda: calls.append(("async_mirror",)),
+        )
+
+        controller.dummy_forward()
+
+        assert calls == [
+            ("init", {"is_dummy_forward": True}),
+            ("forward", (1, prefill_dims.token_count)),
+            ("serial_mtp",),
+            ("reset",),
+        ]
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_ep_dummy_forward_skips_async_mirror_for_eager_decode(self, monkeypatch) -> None:
+        """Dummy eager fallback cannot infer that real EP peers are async-decode eligible."""
+        env = self._build_async_scheduling_eligibility_probe(
+            monkeypatch, num_speculative_tokens=2
+        )
+        controller = env.engine.controller
+        context = env.engine.context
+        dims = InferenceBatchDimensions(token_count=3, prefill_req_count=0, decode_req_count=1)
+        calls = []
+
+        def fake_context_init(**kwargs):
+            calls.append(("init", kwargs))
+            context.batch_dimensions = dims
+            context.padded_batch_dimensions = dims
+            context._using_cuda_graph_this_step = False
+            return (
+                torch.empty((1, dims.token_count), dtype=torch.long, device="cuda"),
+                torch.empty((1, dims.token_count), dtype=torch.long, device="cuda"),
+            )
+
+        monkeypatch.setattr(controller, "_dynamic_step_context_init", fake_context_init)
+        monkeypatch.setattr(
+            controller,
+            "_dynamic_step_forward_logits",
+            lambda input_ids, position_ids: calls.append(("forward", tuple(input_ids.shape))),
+        )
+        monkeypatch.setattr(
+            controller,
+            "_dummy_serial_mtp_forward",
+            lambda: calls.append(("serial_mtp",)),
+        )
+        monkeypatch.setattr(context, "is_decode_only", lambda: True)
+        monkeypatch.setattr(context, "using_cuda_graph_this_step", lambda: False)
+        monkeypatch.setattr(context, "reset", lambda: calls.append(("reset",)))
+        monkeypatch.setattr(
+            controller,
+            "_dummy_async_forward_after_mtp",
+            lambda: calls.append(("async_mirror",)),
+        )
+
+        controller.dummy_forward()
+
+        assert calls == [
+            ("init", {"is_dummy_forward": True}),
+            ("forward", (1, dims.token_count)),
+            ("serial_mtp",),
+            ("reset",),
+        ]
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_ep_dummy_forward_reuses_mirrored_async_forward(self, monkeypatch) -> None:
+        """Dummy EP ranks skip the base forward already mirrored asynchronously."""
+        env = self._build_async_scheduling_eligibility_probe(
+            monkeypatch, num_speculative_tokens=2
+        )
+        controller = env.engine.controller
+        context = env.engine.context
+        dims = InferenceBatchDimensions(token_count=6, prefill_req_count=0, decode_req_count=2)
+        padded_dims = InferenceBatchDimensions(token_count=12, prefill_req_count=0, decode_req_count=4)
+        calls = []
+
+        controller._async_dummy_pending_forward = True
+        controller._async_dummy_pending_forward_dimensions = dims
+        controller._async_dummy_pending_forward_padded_dimensions = padded_dims
+        controller._async_dummy_pending_forward_mtp_padded_count = 4
+        controller._async_dummy_pending_forward_uses_cuda_graph = True
+
+        def fake_context_init(**kwargs):
+            calls.append(("init", kwargs))
+            raise AssertionError("pending dummy async forwards must not enter EP graph sync")
+
+        monkeypatch.setattr(controller, "_dynamic_step_context_init", fake_context_init)
+        monkeypatch.setattr(
+            controller,
+            "_dynamic_step_forward_logits",
+            lambda input_ids, position_ids: calls.append(("forward", tuple(input_ids.shape))),
+        )
+
+        def fake_serial_mtp():
+            calls.append(
+                (
+                    "serial_mtp",
+                    context.batch_dimensions,
+                    context.padded_batch_dimensions,
+                    context.using_cuda_graph_this_step(),
+                    controller._mtp_resolved_padded_count,
+                )
+            )
+
+        monkeypatch.setattr(controller, "_dummy_serial_mtp_forward", fake_serial_mtp)
+        monkeypatch.setattr(context, "reset", lambda: calls.append(("reset",)))
+        monkeypatch.setattr(
+            controller,
+            "_dummy_async_forward_after_mtp",
+            lambda: calls.append(("async_mirror",)),
+        )
+
+        controller.dummy_forward()
+
+        assert calls == [
+            (
+                "serial_mtp",
+                dims,
+                padded_dims,
+                True,
+                4,
+            ),
+            ("reset",),
+            ("async_mirror",),
+        ]
+        assert not controller._async_dummy_pending_forward
+        assert controller._async_dummy_pending_forward_dimensions is None
+        assert controller._async_dummy_pending_forward_padded_dimensions is None
+        assert controller._async_dummy_pending_forward_mtp_padded_count is None
+        assert not controller._async_dummy_pending_forward_uses_cuda_graph
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_ep_dummy_forward_discards_mirrored_async_forward_on_peer_reject(
+        self, monkeypatch
+    ) -> None:
+        """Dummy EP ranks run a normal dummy forward when a real peer discards pending work."""
+
+        class FakeEPCommunicator:
+            world_size = 4
+
+            def __init__(self, results):
+                self.results = list(results)
+                self.calls = []
+
+            def sync_all_reduce_max(self, *values):
+                self.calls.append(values)
+                return self.results.pop(0)
+
+        env = self._build_async_scheduling_eligibility_probe(
+            monkeypatch, num_speculative_tokens=2
+        )
+        controller = env.engine.controller
+        context = env.engine.context
+        dims = InferenceBatchDimensions(token_count=3, prefill_req_count=0, decode_req_count=1)
+        calls = []
+
+        controller._async_dummy_pending_forward = True
+        controller._async_dummy_pending_forward_dimensions = InferenceBatchDimensions(
+            token_count=6, prefill_req_count=0, decode_req_count=2
+        )
+        controller._async_dummy_pending_forward_padded_dimensions = InferenceBatchDimensions(
+            token_count=24, prefill_req_count=0, decode_req_count=8
+        )
+        controller._async_dummy_pending_forward_mtp_padded_count = 8
+        controller._async_dummy_pending_forward_uses_cuda_graph = True
+
+        fake = FakeEPCommunicator(
+            [
+                (1, 1),  # a real peer rejected the pending forward
+                (0, 0, 0, 0, 0, 0, 0),  # no follow-up async launch
+            ]
+        )
+        monkeypatch.setattr(context, "_ep_async_zmq_communicator", fake)
+
+        def fake_context_init(**kwargs):
+            calls.append(("init", kwargs))
+            context.batch_dimensions = dims
+            context.padded_batch_dimensions = dims
+            context._using_cuda_graph_this_step = True
+            return (
+                torch.empty((1, dims.token_count), dtype=torch.long, device="cuda"),
+                torch.empty((1, dims.token_count), dtype=torch.long, device="cuda"),
+            )
+
+        monkeypatch.setattr(controller, "_dynamic_step_context_init", fake_context_init)
+        monkeypatch.setattr(
+            controller,
+            "_dynamic_step_forward_logits",
+            lambda input_ids, position_ids: calls.append(("forward", tuple(input_ids.shape))),
+        )
+        monkeypatch.setattr(
+            controller,
+            "_dummy_serial_mtp_forward",
+            lambda: calls.append(("serial_mtp",)),
+        )
+        monkeypatch.setattr(context, "reset", lambda: calls.append(("reset",)))
+
+        controller.dummy_forward()
+
+        assert fake.calls == [(1, 0), (0, 0, 0, 0, 0, 0, 0)]
+        assert calls == [
+            ("init", {"is_dummy_forward": True}),
+            ("forward", (1, dims.token_count)),
+            ("serial_mtp",),
+            ("reset",),
+        ]
+        assert not controller._async_dummy_pending_forward
+        assert controller._async_dummy_pending_forward_dimensions is None
+        assert controller._async_dummy_pending_forward_padded_dimensions is None
+        assert controller._async_dummy_pending_forward_mtp_padded_count is None
+        assert not controller._async_dummy_pending_forward_uses_cuda_graph
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     def test_ep_async_prepare_after_mtp_requires_final_agreement(self, monkeypatch) -> None:
-        """Prepared real ranks cancel when an EP peer blocks the final async launch."""
+        """Prepared real ranks cancel when an EP peer blocks the async launch."""
         env = self._build_async_scheduling_eligibility_probe(
             monkeypatch, num_speculative_tokens=2
         )
@@ -3055,12 +3465,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             context.batch_dimensions = dims
             return True
 
-        agreements = iter(
-            [
-                (True, dims, False),
-                (False, None, False),
-            ]
-        )
         monkeypatch.setattr(context, "prepare_async_decode_next_step", fake_prepare)
         monkeypatch.setattr(controller, "_get_async_forward_graph", lambda: None)
         monkeypatch.setattr(
@@ -3071,22 +3475,13 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         monkeypatch.setattr(
             controller,
             "_ep_async_launch_agreement",
-            lambda **kwargs: calls.append(("agreement", kwargs)) or next(agreements),
+            lambda **kwargs: calls.append(("agreement", kwargs)) or (False, None, False),
         )
 
         assert not controller._try_prepare_async_decode_after_sampling(
             synchronize_ep_launch=True
         )
         assert calls == [
-            (
-                "agreement",
-                {
-                    "local_has_work": True,
-                    "local_requested": True,
-                    "local_blocked": False,
-                    "batch_dimensions": dims,
-                },
-            ),
             ("prepare",),
             (
                 "agreement",
@@ -3101,6 +3496,50 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             ("cancel",),
         ]
         assert controller._async_disable_reason == "ep peer blocked prepared async launch"
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_ep_async_prepare_after_mtp_votes_skip_for_prefill(self, monkeypatch) -> None:
+        """Non-decode real ranks vote skip so dummy EP peers leave the same agreement."""
+        env = self._build_async_scheduling_eligibility_probe(
+            monkeypatch, num_speculative_tokens=2
+        )
+        controller = env.engine.controller
+        calls = []
+
+        monkeypatch.setattr(
+            controller,
+            "_async_scheduling_disabled_reason",
+            lambda **kwargs: "not decode-only",
+        )
+        monkeypatch.setattr(
+            controller,
+            "_ep_async_launch_agreement",
+            lambda **kwargs: calls.append(kwargs) or (False, None, False),
+        )
+        monkeypatch.setattr(
+            env.engine.context,
+            "prepare_async_decode_next_step",
+            lambda: pytest.fail("prefill must not prepare async decode metadata"),
+        )
+
+        assert not controller._try_prepare_async_decode_after_sampling(
+            synchronize_ep_launch=True
+        )
+        assert controller._async_disable_reason == "not decode-only"
+        assert calls == [
+            {
+                "local_has_work": True,
+                "local_requested": False,
+                "local_blocked": True,
+                "batch_dimensions": InferenceBatchDimensions(
+                    token_count=3, prefill_req_count=0, decode_req_count=1
+                ),
+                "using_graph": False,
+            }
+        ]
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -3139,10 +3578,61 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 "batch_dimensions": InferenceBatchDimensions(
                     token_count=3, prefill_req_count=0, decode_req_count=1
                 ),
+                "using_graph": False,
             }
         ]
         diagnostics = controller.get_async_scheduling_diagnostics()
         assert diagnostics["disable_reason_counts"][barrier_reason] == 1
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_ep_async_prepare_after_mtp_votes_skip_when_all_requests_finish(
+        self, monkeypatch
+    ) -> None:
+        """Final length steps do not launch a useless async forward on EP peers."""
+        env = self._build_async_scheduling_eligibility_probe(
+            monkeypatch, num_speculative_tokens=2
+        )
+        controller = env.engine.controller
+        context = env.engine.context
+        calls = []
+
+        with torch.inference_mode():
+            context.request_output_lengths[0] = (
+                context.request_kv_length_offsets[0]
+                + context.request_query_lengths[0]
+                + 1
+            )
+
+        monkeypatch.setattr(
+            context,
+            "prepare_async_decode_next_step",
+            lambda: pytest.fail("final step must not prepare async decode metadata"),
+        )
+        monkeypatch.setattr(
+            controller,
+            "_ep_async_launch_agreement",
+            lambda **kwargs: calls.append(kwargs) or (False, None, False),
+        )
+
+        assert not controller._try_prepare_async_decode_after_sampling(
+            synchronize_ep_launch=True
+        )
+
+        assert controller._async_disable_reason == "all requests finish this step"
+        assert calls == [
+            {
+                "local_has_work": True,
+                "local_requested": False,
+                "local_blocked": True,
+                "batch_dimensions": InferenceBatchDimensions(
+                    token_count=3, prefill_req_count=0, decode_req_count=1
+                ),
+                "using_graph": False,
+            }
+        ]
 
     @pytest.mark.internal
     @pytest.mark.skipif(

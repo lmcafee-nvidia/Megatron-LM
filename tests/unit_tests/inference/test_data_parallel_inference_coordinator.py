@@ -80,9 +80,17 @@ class DummyContext:
         self.enable_prefix_caching = False
         self.prefix_caching_coordinator_policy = None
         self.prefix_cache_lru_clock = 0
+        self._ep_zmq_communicator = None
+        self._ep_async_zmq_communicator = None
 
     def get_active_request_count(self) -> int:
         return self.active_cnt
+
+    def set_ep_zmq_communicator(self, communicator) -> None:
+        self._ep_zmq_communicator = communicator
+
+    def set_ep_async_zmq_communicator(self, communicator) -> None:
+        self._ep_async_zmq_communicator = communicator
 
 
 class DummyController:
@@ -231,7 +239,12 @@ async def cleanup_engine(engine, client=None, timeout=30.0):
             await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
         except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
             # Graceful stop failed — fall back to forcible cleanup.
-            for attr in ('expert_parallel_zmq_communicator', 'world_zmq_communicator'):
+            for attr in (
+                'expert_parallel_zmq_communicator',
+                'expert_parallel_model_zmq_communicator',
+                'expert_parallel_async_zmq_communicator',
+                'world_zmq_communicator',
+            ):
                 comm = getattr(engine, attr, None)
                 if comm is not None:
                     comm.close()
@@ -382,6 +395,19 @@ class TestCoordinator:
         await engine.start_listening_to_data_parallel_coordinator(
             inference_coordinator_port=port, launch_inference_coordinator=False
         )
+        if ep > 1:
+            assert engine.context._ep_zmq_communicator is (
+                engine.expert_parallel_model_zmq_communicator
+            )
+            assert engine.context._ep_async_zmq_communicator is (
+                engine.expert_parallel_async_zmq_communicator
+            )
+            assert engine.context._ep_zmq_communicator is not (
+                engine.expert_parallel_zmq_communicator
+            )
+            assert engine.context._ep_async_zmq_communicator is not (
+                engine.expert_parallel_model_zmq_communicator
+            )
 
         # Ensure all engines are registered before submitting requests.
         await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)

@@ -635,17 +635,11 @@ class DynamicInferenceEngine(AbstractEngine):
 
         torch.distributed.barrier(mp_group)
 
-        # initialize zmq-based EP communicator
+        # initialize zmq-based EP communicators
         self.ep_rank = get_pg_rank(self.pg_collection.ep)
         self.ep_world_size = get_pg_size(self.pg_collection.ep)
         if self.ep_world_size > 1:
-            self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(
-                self.zmq_context, process_group=self.pg_collection.ep, hostname=hostname
-            )
-            # Give the context a CPU-side MAX-reduction primitive so
-            # match_graph_config() can avoid a per-step NCCL AllReduce kernel.
-            if hasattr(self.context, "set_ep_zmq_communicator"):
-                self.context.set_ep_zmq_communicator(self.expert_parallel_zmq_communicator)
+            self._initialize_expert_parallel_zmq_communicators(hostname)
 
         # initialize zmq-based world communicator for consensus barriers
         total_world_size = torch.distributed.get_world_size()
@@ -666,6 +660,32 @@ class DynamicInferenceEngine(AbstractEngine):
         self.engine_loop_task = loop.create_task(self.run_engine_with_coordinator(loop=loop))
 
         return dp_addr
+
+    def _initialize_expert_parallel_zmq_communicators(self, hostname: str | None) -> None:
+        """Initialize independent EP ZMQ channels for engine and model collectives."""
+        self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(
+            self.zmq_context, process_group=self.pg_collection.ep, hostname=hostname
+        )
+        self.expert_parallel_model_zmq_communicator = AsyncZMQCommunicator(
+            self.zmq_context, process_group=self.pg_collection.ep, hostname=hostname
+        )
+        self.expert_parallel_async_zmq_communicator = AsyncZMQCommunicator(
+            self.zmq_context, process_group=self.pg_collection.ep, hostname=hostname
+        )
+        # Give the context a CPU-side MAX-reduction primitive so
+        # match_graph_config() can avoid a per-step NCCL AllReduce kernel.
+        # Use a separate communicator from the engine-loop work consensus:
+        # async scheduling can legitimately let ranks reach the next engine
+        # consensus while slower peers are still finishing per-step graph
+        # syncs and launch agreements.
+        if hasattr(self.context, "set_ep_zmq_communicator"):
+            self.context.set_ep_zmq_communicator(
+                self.expert_parallel_model_zmq_communicator
+            )
+        if hasattr(self.context, "set_ep_async_zmq_communicator"):
+            self.context.set_ep_async_zmq_communicator(
+                self.expert_parallel_async_zmq_communicator
+            )
 
     @contextmanager
     @staticmethod
@@ -2300,6 +2320,10 @@ class DynamicInferenceEngine(AbstractEngine):
             self.zmq_sockets.clear()
         if hasattr(self, "expert_parallel_zmq_communicator"):
             self.expert_parallel_zmq_communicator.close()
+        if hasattr(self, "expert_parallel_model_zmq_communicator"):
+            self.expert_parallel_model_zmq_communicator.close()
+        if hasattr(self, "expert_parallel_async_zmq_communicator"):
+            self.expert_parallel_async_zmq_communicator.close()
         if hasattr(self, "world_zmq_communicator"):
             self.world_zmq_communicator.close()
         if not self.zmq_context.closed:

@@ -332,7 +332,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         # the engine via set_ep_zmq_communicator() when available. When set,
         # match_graph_config() uses this to perform the MAX reduction on the
         # CPU, avoiding a per-step NCCL AllReduce kernel on the compute stream.
+        # Async launch decisions use a separate communicator because those
+        # collectives can overlap the next step's batch-dimension sync.
         self._ep_zmq_communicator = None
+        self._ep_async_zmq_communicator = None
 
         # Mamba states.
         mamba_inference_state_config = inference_config.mamba_inference_state_config
@@ -1660,6 +1663,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             communicator: AsyncZMQCommunicator over the EP process group.
         """
         self._ep_zmq_communicator = communicator
+
+    def set_ep_async_zmq_communicator(self, communicator) -> None:
+        """Attach the EP-group ZMQ communicator for async launch decisions."""
+        self._ep_async_zmq_communicator = communicator
 
     def reset_attention_state(self) -> None:
         """Reset state used within attention, after each step."""

@@ -210,6 +210,11 @@ class TextGenerationController:
         self._async_pending_h2d_done_event = None
         self._async_pending_sample_cuda_graph_request_count = None
         self._async_pending_forward_request_ids = None
+        self._async_dummy_pending_forward = False
+        self._async_dummy_pending_forward_dimensions = None
+        self._async_dummy_pending_forward_padded_dimensions = None
+        self._async_dummy_pending_forward_mtp_padded_count = None
+        self._async_dummy_pending_forward_uses_cuda_graph = False
         self._async_step_barrier_reason = None
         self._async_admission_barrier_requested = False
         self._async_logprob_requests_seen = False
@@ -1500,7 +1505,7 @@ class TextGenerationController:
     def _ep_async_collective_enabled(self) -> bool:
         """Whether async launch decisions must be shared across EP peers."""
         context = self.inference_wrapped_model.inference_context
-        communicator = getattr(context, "_ep_zmq_communicator", None)
+        communicator = getattr(context, "_ep_async_zmq_communicator", None)
         return bool(
             self._async_scheduling_enabled
             and communicator is not None
@@ -1533,7 +1538,7 @@ class TextGenerationController:
             return launch, batch_dimensions if launch else None, bool(using_graph and launch)
 
         context = self.inference_wrapped_model.inference_context
-        communicator = context._ep_zmq_communicator
+        communicator = context._ep_async_zmq_communicator
         (
             any_real_work,
             any_requested,
@@ -1587,6 +1592,61 @@ class TextGenerationController:
         if pending_request_ids is None:
             return True
         return torch.equal(pending_request_ids, self._active_request_ids_cpu())
+
+    def _pending_async_forward_can_reuse_current_rows(self) -> bool:
+        """Return whether the pending speculative forward can be consumed this step."""
+        pending_request_ids = self._async_pending_forward_request_ids
+        if pending_request_ids is None:
+            return True
+
+        current_request_ids = self._active_request_ids_cpu()
+        if current_request_ids.numel() == 0:
+            return False
+        if torch.equal(pending_request_ids, current_request_ids):
+            return True
+
+        context = self.inference_wrapped_model.inference_context
+        if self.num_speculative_tokens > 0 and not context.config.materialize_only_last_token_logits:
+            return False
+
+        pending_request_id_set = {int(request_id) for request_id in pending_request_ids.tolist()}
+        return all(int(request_id) in pending_request_id_set for request_id in current_request_ids.tolist())
+
+    def _clear_pending_async_forward(self, *, count_discard: bool) -> None:
+        """Clear a pending real-rank speculative forward without consuming its logits."""
+        if count_discard:
+            self._async_discarded_forward_count += 1
+        self._async_pending_forward = False
+        self._async_pending_cuda_graph_request_count = None
+        self._async_pending_forward_request_ids = None
+
+    def _clear_dummy_pending_async_forward(self) -> None:
+        """Clear a pending dummy-rank speculative forward without reusing it."""
+        self._async_dummy_pending_forward = False
+        self._async_dummy_pending_forward_dimensions = None
+        self._async_dummy_pending_forward_padded_dimensions = None
+        self._async_dummy_pending_forward_mtp_padded_count = None
+        self._async_dummy_pending_forward_uses_cuda_graph = False
+
+    def _ep_pending_forward_reuse_agreement(
+        self,
+        *,
+        local_has_pending: bool,
+        local_can_reuse: bool,
+    ) -> bool:
+        """Agree across EP ranks whether a pending speculative forward may be reused."""
+        if not local_has_pending:
+            return False
+        if not self._ep_async_collective_enabled():
+            return local_can_reuse
+
+        context = self.inference_wrapped_model.inference_context
+        communicator = context._ep_async_zmq_communicator
+        any_pending, any_reject = communicator.sync_all_reduce_max(
+            int(local_has_pending),
+            int(local_has_pending and not local_can_reuse),
+        )
+        return bool(any_pending and not any_reject and local_can_reuse)
 
     def _resolve_pending_async_forward_rows(self) -> tuple[bool, Optional[Tensor], bool]:
         """Map current active rows back to the pending speculative forward rows.
@@ -1911,6 +1971,26 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         return self._async_forward_graphs.get(context.padded_batch_dimensions)
 
+    def _can_launch_chained_async_decode_graph(self, active_request_count: int) -> bool:
+        """Return whether post-bookkeeping can safely chain a full async decode graph.
+
+        The chained path runs after request bookkeeping, outside the normal
+        sampling section. It is only safe when a captured graph will immediately
+        sample the pending logits and launch the next forward. The non-graph
+        fallback path must wait for the next step's sampling section instead.
+        """
+        if self.num_speculative_tokens != 0:
+            return False
+        if not self._async_decode_graphs:
+            return False
+        if self._active_requests_need_logprob_results():
+            return False
+        if not self._active_requests_use_greedy_sampling(active_request_count):
+            return False
+
+        context = self.inference_wrapped_model.inference_context
+        return context.padded_batch_dimensions in self._async_decode_graphs
+
     def _launch_async_decode_graph(self, async_decode_graph: _AsyncDecodeGraph) -> int:
         """Enqueue a captured async decode graph on the current stream."""
         sample_slot = self._async_next_sample_slot
@@ -2022,31 +2102,22 @@ class TextGenerationController:
         self._record_async_eligibility_result(self._async_disable_reason)
         batch_dimensions = self._async_decode_batch_dimensions()
         active_request_count = context.total_request_count - context.paused_request_count
-        if synchronize_ep_launch:
-            launch, _, _ = self._ep_async_launch_agreement(
-                local_has_work=active_request_count > 0,
-                local_requested=self._async_disable_reason is None,
-                local_blocked=self._async_disable_reason is not None,
-                batch_dimensions=batch_dimensions,
-            )
-            if not launch:
-                if self._async_disable_reason is None:
-                    self._async_disable_reason = "ep peer blocked async launch"
-                    self._record_async_disable_reason(self._async_disable_reason)
-                return False
-        elif self._async_disable_reason is not None:
+
+        if self._async_disable_reason is not None and not synchronize_ep_launch:
             return False
 
-        range_push("async_prepare_next_step")
-        async_next_prepared = context.prepare_async_decode_next_step()
-        range_pop()
-        if not async_next_prepared:
-            self._async_disable_reason = "failed to prepare next-step metadata"
-            self._record_async_disable_reason(self._async_disable_reason)
+        async_next_prepared = False
+        if self._async_disable_reason is None:
+            range_push("async_prepare_next_step")
+            async_next_prepared = context.prepare_async_decode_next_step()
+            range_pop()
+            if not async_next_prepared:
+                self._async_disable_reason = "failed to prepare next-step metadata"
+                self._record_async_disable_reason(self._async_disable_reason)
 
         if synchronize_ep_launch:
             async_forward_graph = self._get_async_forward_graph() if async_next_prepared else None
-            final_launch, _, _ = self._ep_async_launch_agreement(
+            launch, _, _ = self._ep_async_launch_agreement(
                 local_has_work=active_request_count > 0,
                 local_requested=async_next_prepared,
                 local_blocked=not async_next_prepared,
@@ -2055,7 +2126,7 @@ class TextGenerationController:
                 ),
                 using_graph=async_forward_graph is not None,
             )
-            if not final_launch:
+            if not launch:
                 if async_next_prepared:
                     context.cancel_prepared_async_decode_next_step()
                 if self._async_disable_reason is None:
@@ -2066,6 +2137,23 @@ class TextGenerationController:
             return False
 
         return True
+
+    def _all_active_requests_reach_max_length_this_step(
+        self, active_request_count: Optional[int] = None
+    ) -> bool:
+        """Return whether length bookkeeping will finish every active request."""
+        context = self.inference_wrapped_model.inference_context
+        if active_request_count is None:
+            active_request_count = context.total_request_count - context.paused_request_count
+        if active_request_count <= 0:
+            return True
+
+        active_sequence_lengths = context.get_active_sequence_lengths()[:active_request_count]
+        max_sequence_lengths = context.get_max_sequence_lengths()[:active_request_count]
+        # This mirrors _dynamic_step_context_bookkeeping(): after the current
+        # forward and any MTP rewind, query lengths already include accepted
+        # input tokens, while the freshly sampled base token still adds one.
+        return bool(torch.ge(active_sequence_lengths + 1, max_sequence_lengths).all().item())
 
     def _async_scheduling_disabled_reason(self, *, allow_mtp: bool = False) -> Optional[str]:
         """Return why async scheduling cannot be used for the current step, or None."""
@@ -2097,6 +2185,8 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
         if active_request_count <= 0:
             return "no active requests"
+        if self._all_active_requests_reach_max_length_this_step(active_request_count):
+            return "all requests finish this step"
         if self._async_admission_barrier_requested:
             self._async_admission_barrier_requested = False
             return "waiting request admission deferred"
@@ -2582,9 +2672,43 @@ class TextGenerationController:
 
         context = self.inference_wrapped_model.inference_context
 
-        # attempt to use cuda-graph if possible
-        input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
-        self._dynamic_step_forward_logits(input_ids, position_ids)
+        if self._async_dummy_pending_forward:
+            reuse_dummy_pending_forward = self._ep_pending_forward_reuse_agreement(
+                local_has_pending=True,
+                local_can_reuse=True,
+            )
+            if reuse_dummy_pending_forward:
+                # The previous dummy step already mirrored the real rank's async
+                # post-MTP base forward. Real ranks reuse that forward this step, so
+                # dummy ranks must not issue an extra base forward or enter the EP
+                # graph-shape sync before serial MTP.
+                pending_dimensions = self._async_dummy_pending_forward_dimensions
+                pending_padded_dimensions = self._async_dummy_pending_forward_padded_dimensions
+                self._async_dummy_pending_forward = False
+                self._async_dummy_pending_forward_dimensions = None
+                self._async_dummy_pending_forward_padded_dimensions = None
+                self._mtp_resolved_padded_count = (
+                    self._async_dummy_pending_forward_mtp_padded_count
+                )
+                self._async_dummy_pending_forward_mtp_padded_count = None
+                context.batch_dimensions = pending_dimensions
+                context.padded_batch_dimensions = pending_padded_dimensions
+                context._using_cuda_graph_this_step = (
+                    self._async_dummy_pending_forward_uses_cuda_graph
+                )
+                self._async_dummy_pending_forward_uses_cuda_graph = False
+            else:
+                self._clear_dummy_pending_async_forward()
+                input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
+                self._dynamic_step_forward_logits(input_ids, position_ids)
+        else:
+            # attempt to use cuda-graph if possible
+            input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
+            self._dynamic_step_forward_logits(input_ids, position_ids)
+
+        dummy_step_can_mirror_async = (
+            context.is_decode_only() and context.using_cuda_graph_this_step()
+        )
 
         # Disable MoE padding for MTP computation, unless CUDA graphs
         # are active (the graphs were captured with padding enabled).
@@ -2602,7 +2726,8 @@ class TextGenerationController:
 
         # clear the context of any temporary state from the dummy forward
         context.reset()
-        self._dummy_async_forward_after_mtp()
+        if dummy_step_can_mirror_async:
+            self._dummy_async_forward_after_mtp()
 
     @torch.inference_mode()
     def _dummy_async_forward_after_mtp(self) -> None:
@@ -2610,7 +2735,8 @@ class TextGenerationController:
         if self.num_speculative_tokens == 0 or not self._ep_async_collective_enabled():
             return
 
-        launch, agreed_dimensions, _ = self._ep_async_launch_agreement(
+        context = self.inference_wrapped_model.inference_context
+        launch, agreed_dimensions, agreed_using_graph = self._ep_async_launch_agreement(
             local_has_work=False,
             local_requested=False,
             local_blocked=False,
@@ -2618,33 +2744,35 @@ class TextGenerationController:
         if not launch or agreed_dimensions is None:
             return
 
-        context = self.inference_wrapped_model.inference_context
         range_push("ep_dummy_async_forward")
+        launched_pending_forward = False
         try:
             input_ids, position_ids = self._dynamic_step_context_init(
                 is_dummy_forward=True,
                 expert_parallel_dummy_graph_dimensions=agreed_dimensions,
             )
             async_forward_graph = self._get_async_forward_graph()
-            final_launch, _, agreed_using_graph = self._ep_async_launch_agreement(
-                local_has_work=False,
-                local_requested=True,
-                local_blocked=False,
-                batch_dimensions=context.batch_dimensions,
-                using_graph=async_forward_graph is not None,
+            if agreed_using_graph and async_forward_graph is not None:
+                range_push("ep_dummy_async_forward_graph_launch")
+                async_forward_graph.graph.replay()
+                range_pop()
+            else:
+                range_push("ep_dummy_async_forward_launch")
+                self._dynamic_step_forward_logits(input_ids, position_ids)
+                range_pop()
+            self._async_dummy_pending_forward = True
+            self._async_dummy_pending_forward_dimensions = context.batch_dimensions
+            self._async_dummy_pending_forward_padded_dimensions = context.padded_batch_dimensions
+            self._async_dummy_pending_forward_mtp_padded_count = (
+                self._mtp_resolved_padded_count
             )
-            if final_launch:
-                if agreed_using_graph and async_forward_graph is not None:
-                    range_push("ep_dummy_async_forward_graph_launch")
-                    async_forward_graph.graph.replay()
-                    range_pop()
-                else:
-                    range_push("ep_dummy_async_forward_launch")
-                    self._dynamic_step_forward_logits(input_ids, position_ids)
-                    range_pop()
-                torch.cuda.current_stream().synchronize()
-        finally:
+            self._async_dummy_pending_forward_uses_cuda_graph = context.using_cuda_graph_this_step()
+            torch.cuda.current_stream().synchronize()
             context.reset()
+            launched_pending_forward = True
+        finally:
+            if not launched_pending_forward:
+                context.reset()
             range_pop()
 
     @torch.inference_mode()
@@ -2947,16 +3075,26 @@ class TextGenerationController:
             with torch.inference_mode():
                 if self._async_pending_forward:
                     cuda_graph_request_count = self._async_pending_cuda_graph_request_count
-                    self._async_pending_forward = False
-                    self._async_pending_cuda_graph_request_count = None
-                    (
-                        pending_forward_reused,
-                        pending_forward_row_indices,
-                        pending_forward_row_mapped,
-                    ) = self._resolve_pending_async_forward_rows()
                     context.release_deferred_async_kv_blocks()
-                    if pending_forward_reused and self.num_speculative_tokens > 0:
-                        input_ids, _ = context.current_input_and_position_ids()
+                    local_can_reuse_pending_forward = (
+                        self._pending_async_forward_can_reuse_current_rows()
+                    )
+                    reuse_pending_forward = self._ep_pending_forward_reuse_agreement(
+                        local_has_pending=True,
+                        local_can_reuse=local_can_reuse_pending_forward,
+                    )
+                    if reuse_pending_forward:
+                        self._async_pending_forward = False
+                        self._async_pending_cuda_graph_request_count = None
+                        (
+                            pending_forward_reused,
+                            pending_forward_row_indices,
+                            pending_forward_row_mapped,
+                        ) = self._resolve_pending_async_forward_rows()
+                        if pending_forward_reused and self.num_speculative_tokens > 0:
+                            input_ids, _ = context.current_input_and_position_ids()
+                    else:
+                        self._clear_pending_async_forward(count_discard=True)
                 if not pending_forward_reused:
                     input_ids, position_ids = self._dynamic_step_context_init()
 
@@ -3171,6 +3309,7 @@ class TextGenerationController:
                     and self._async_pending_sampled_tokens_cpu is None
                     and next_active_request_count > 0
                     and self._pending_async_forward_matches_current_rows()
+                    and self._can_launch_chained_async_decode_graph(next_active_request_count)
                 ):
                     (
                         _,
