@@ -195,6 +195,9 @@ class TextGenerationController:
         self._async_chained_decode_graph_launch_count = 0
         self._async_forward_graph_launch_count = 0
         self._async_deferred_mtp_release_count = 0
+        self._async_ep_launch_agreement_count = 0
+        self._async_ep_launch_count = 0
+        self._async_ep_skip_count = 0
         self._async_eligibility_check_count = 0
         self._async_eligibility_pass_count = 0
         self._async_disable_reason_counts: Dict[str, int] = {}
@@ -1447,6 +1450,9 @@ class TextGenerationController:
             "decode_graph_launches": self._async_decode_graph_launch_count,
             "chained_decode_graph_launches": self._async_chained_decode_graph_launch_count,
             "forward_graph_launches": self._async_forward_graph_launch_count,
+            "ep_launch_agreements": self._async_ep_launch_agreement_count,
+            "ep_launches": self._async_ep_launch_count,
+            "ep_skips": self._async_ep_skip_count,
             "sample_slot_waits": self._async_sample_slot_wait_count,
         }
 
@@ -1483,6 +1489,75 @@ class TextGenerationController:
             (active_metadata["top_k"][active_slice] == 1).all()
             and (active_metadata["top_p"][active_slice] == 0.0).all()
         )
+
+    def _ep_async_collective_enabled(self) -> bool:
+        """Whether async launch decisions must be shared across EP peers."""
+        context = self.inference_wrapped_model.inference_context
+        communicator = getattr(context, "_ep_zmq_communicator", None)
+        return bool(
+            self._async_scheduling_enabled
+            and communicator is not None
+            and getattr(communicator, "world_size", 1) > 1
+        )
+
+    def _ep_async_launch_agreement(
+        self,
+        *,
+        local_has_work: bool,
+        local_requested: bool,
+        local_blocked: bool,
+        batch_dimensions: Optional[InferenceBatchDimensions] = None,
+        using_graph: bool = False,
+    ) -> Tuple[bool, Optional[InferenceBatchDimensions], bool]:
+        """Agree across EP ranks whether an async forward phase may run.
+
+        Dummy EP ranks have no local work, so they never block the launch.
+        Real-work ranks fail closed: if any one of them cannot request the
+        async phase, every EP peer skips it for this engine step.
+        """
+        if batch_dimensions is None:
+            batch_dimensions = InferenceBatchDimensions(
+                token_count=0, prefill_req_count=0, decode_req_count=0
+            )
+
+        local_real_blocked = bool(local_has_work and (local_blocked or not local_requested))
+        if not self._ep_async_collective_enabled():
+            launch = bool(local_requested and not local_real_blocked)
+            return launch, batch_dimensions if launch else None, bool(using_graph and launch)
+
+        context = self.inference_wrapped_model.inference_context
+        communicator = context._ep_zmq_communicator
+        (
+            any_real_work,
+            any_requested,
+            any_real_blocked,
+            max_token_count,
+            max_prefill_count,
+            max_decode_count,
+            any_using_graph,
+        ) = communicator.sync_all_reduce_max(
+            int(local_has_work),
+            int(local_requested),
+            int(local_real_blocked),
+            int(batch_dimensions.token_count) if local_requested else 0,
+            int(batch_dimensions.prefill_req_count) if local_requested else 0,
+            int(batch_dimensions.decode_req_count) if local_requested else 0,
+            int(using_graph) if local_requested else 0,
+        )
+
+        self._async_ep_launch_agreement_count += 1
+        launch = bool(any_real_work and any_requested and not any_real_blocked)
+        if launch:
+            self._async_ep_launch_count += 1
+            agreed_dimensions = InferenceBatchDimensions(
+                token_count=int(max_token_count),
+                prefill_req_count=int(max_prefill_count),
+                decode_req_count=int(max_decode_count),
+            )
+            return agreed_dimensions.token_count > 0, agreed_dimensions, bool(any_using_graph)
+
+        self._async_ep_skip_count += 1
+        return False, None, False
 
     def _active_requests_need_sampling_bookkeeping(self) -> bool:
         """Whether active requests need per-step sampling parameter buckets."""

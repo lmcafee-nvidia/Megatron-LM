@@ -2771,6 +2771,80 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         controller.clear_async_step_barrier()
         assert controller._async_scheduling_disabled_reason(allow_mtp=True) is None
 
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_ep_async_launch_agreement_matrix(self, monkeypatch) -> None:
+        """EP async launch agreement lets dummy peers mirror only safe real launches."""
+
+        class FakeEPCommunicator:
+            world_size = 4
+
+            def __init__(self, result):
+                self.result = result
+                self.calls = []
+
+            def sync_all_reduce_max(self, *values):
+                self.calls.append(values)
+                return self.result
+
+        env = self._build_async_scheduling_eligibility_probe(
+            monkeypatch, num_speculative_tokens=2
+        )
+        controller = env.engine.controller
+        context = env.engine.context
+        dims = InferenceBatchDimensions(token_count=6, prefill_req_count=0, decode_req_count=2)
+
+        launch, agreed_dims, agreed_graph = controller._ep_async_launch_agreement(
+            local_has_work=True,
+            local_requested=True,
+            local_blocked=False,
+            batch_dimensions=dims,
+            using_graph=True,
+        )
+        assert launch
+        assert agreed_dims == dims
+        assert agreed_graph
+
+        fake = FakeEPCommunicator((1, 1, 0, 6, 0, 2, 1))
+        monkeypatch.setattr(context, "_ep_zmq_communicator", fake)
+        launch, agreed_dims, agreed_graph = controller._ep_async_launch_agreement(
+            local_has_work=False,
+            local_requested=False,
+            local_blocked=False,
+        )
+        assert launch
+        assert agreed_dims == dims
+        assert agreed_graph
+        assert fake.calls[-1] == (0, 0, 0, 0, 0, 0, 0)
+
+        fake.result = (1, 1, 1, 6, 0, 2, 1)
+        launch, agreed_dims, agreed_graph = controller._ep_async_launch_agreement(
+            local_has_work=True,
+            local_requested=False,
+            local_blocked=False,
+        )
+        assert not launch
+        assert agreed_dims is None
+        assert not agreed_graph
+        assert fake.calls[-1] == (1, 0, 1, 0, 0, 0, 0)
+
+        fake.result = (0, 0, 0, 0, 0, 0, 0)
+        launch, agreed_dims, agreed_graph = controller._ep_async_launch_agreement(
+            local_has_work=False,
+            local_requested=False,
+            local_blocked=False,
+        )
+        assert not launch
+        assert agreed_dims is None
+        assert not agreed_graph
+
+        diagnostics = controller.get_async_scheduling_diagnostics()
+        assert diagnostics["ep_launch_agreements"] == 3
+        assert diagnostics["ep_launches"] == 1
+        assert diagnostics["ep_skips"] == 2
+
     def _assert_async_logging_interval_parity(
         self,
         *,
