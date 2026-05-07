@@ -3006,6 +3006,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         )
         controller._dummy_serial_mtp_forward = lambda: calls.append(("mtp",))
         controller._dummy_async_forward_after_mtp = lambda: calls.append(("async",))
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda: calls.append(("sync",)))
 
         controller.dummy_forward()
 
@@ -3017,6 +3018,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             ("init", {"is_dummy_forward": True}),
             ("forward",),
             ("mtp",),
+            ("sync",),
             ("reset",),
             ("async",),
         ]
@@ -3066,9 +3068,89 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             ("init", {"is_dummy_forward": True}),
             ("forward",),
             ("mtp",),
+            ("sync",),
             ("reset",),
             ("async",),
         ]
+
+    @pytest.mark.parametrize(("num_speculative_tokens", "token_count"), [(0, 1), (2, 3)])
+    def test_ep_dummy_forward_no_graph_async_handoff_observes_idle(
+        self, monkeypatch, num_speculative_tokens, token_count
+    ) -> None:
+        """No-graph dummy steps still join skipped EP async handoff checks."""
+
+        class FakeEPCommunicator:
+            world_size = 4
+
+            def __init__(self):
+                self.calls = []
+
+            def sync_all_reduce_max(self, *values):
+                self.calls.append(values)
+                if len(values) == 2:
+                    return (0, 0)
+                return (0, 0, 0, 0, 0, 0, 0)
+
+        calls = []
+        fake = FakeEPCommunicator()
+        context = types.SimpleNamespace(
+            batch_dimensions=None,
+            padded_batch_dimensions=None,
+            _using_cuda_graph_this_step=False,
+            _ep_async_zmq_communicator=fake,
+            is_decode_only=lambda: True,
+            reset=lambda: calls.append(("reset",)),
+            using_cuda_graph_this_step=lambda: context._using_cuda_graph_this_step,
+        )
+        controller = object.__new__(TextGenerationController)
+        controller.inference_wrapped_model = types.SimpleNamespace(inference_context=context)
+        controller.model_config = types.SimpleNamespace(
+            moe_pad_experts_for_cuda_graph_inference=False
+        )
+        controller.num_speculative_tokens = num_speculative_tokens
+        controller._async_scheduling_enabled = True
+        controller._async_ep_launch_agreement_count = 0
+        controller._async_ep_launch_count = 0
+        controller._async_ep_skip_count = 0
+        controller._dummy_forward_ep_async_idle = False
+        controller._async_dummy_pending_forward = False
+
+        dims = InferenceBatchDimensions(
+            token_count=token_count, prefill_req_count=0, decode_req_count=1
+        )
+
+        def fake_context_init(**kwargs):
+            calls.append(("init", kwargs))
+            context.batch_dimensions = dims
+            context.padded_batch_dimensions = dims
+            return (
+                torch.empty((1, dims.token_count), dtype=torch.long),
+                torch.empty((1, dims.token_count), dtype=torch.long),
+            )
+
+        monkeypatch.setattr(controller, "_dynamic_step_context_init", fake_context_init)
+        monkeypatch.setattr(
+            controller,
+            "_dynamic_step_forward_logits",
+            lambda input_ids, position_ids: calls.append(("forward", tuple(input_ids.shape))),
+        )
+        monkeypatch.setattr(
+            controller, "_dummy_serial_mtp_forward", lambda: calls.append(("serial_mtp",))
+        )
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda: calls.append(("sync",)))
+
+        controller.dummy_forward()
+
+        assert fake.calls == [(0, 1), (0, 0, 0, 0, 0, 0, 0)]
+        assert calls == [
+            ("init", {"is_dummy_forward": True}),
+            ("forward", (1, dims.token_count)),
+            ("serial_mtp",),
+            ("sync",),
+            ("reset",),
+        ]
+        assert controller.dummy_forward_observed_ep_async_idle()
+        assert not controller._async_dummy_pending_forward
 
     def test_ep_async_decode_graph_launch_agrees_before_replay(self) -> None:
         """EP ranks must agree before replaying a decode graph that includes forward."""
@@ -3204,6 +3286,53 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 },
             ),
             ("disabled", "failed to prepare next-step metadata"),
+        ]
+
+    def test_ep_async_launch_before_sampling_sends_existing_skip_reason(self) -> None:
+        """Real EP ranks preserve the concrete async-disable reason when voting skip."""
+        controller = object.__new__(TextGenerationController)
+        dims = InferenceBatchDimensions(token_count=1, prefill_req_count=0, decode_req_count=1)
+        calls = []
+
+        context = types.SimpleNamespace(
+            batch_dimensions=dims,
+            is_decode_only=lambda: True,
+            using_cuda_graph_this_step=lambda: False,
+            cancel_prepared_async_decode_next_step=lambda: calls.append(("cancel",)),
+        )
+        controller.inference_wrapped_model = types.SimpleNamespace(inference_context=context)
+        controller.num_speculative_tokens = 0
+        controller._async_disable_reason = "not using cuda graph"
+        controller._ep_async_collective_enabled = lambda: True
+        controller._async_decode_batch_dimensions = lambda active_request_count: dims
+        controller._record_async_disable_reason = lambda reason: calls.append(
+            ("disabled", reason)
+        )
+        controller._ep_async_launch_agreement = lambda **kwargs: calls.append(
+            ("agreement", kwargs)
+        ) or (False, None, False)
+
+        result = controller._maybe_sync_ep_async_launch_before_sampling(
+            active_request_count=1,
+            async_next_prepared=False,
+            async_sample_already_launched=False,
+            async_ep_launch_agreed=False,
+            async_forward_graph=None,
+        )
+
+        assert result == (False, True, None)
+        assert calls == [
+            (
+                "agreement",
+                {
+                    "local_has_work": True,
+                    "local_requested": False,
+                    "local_blocked": True,
+                    "batch_dimensions": dims,
+                    "using_graph": False,
+                },
+            ),
+            ("disabled", "not using cuda graph"),
         ]
 
     def test_ep_async_launch_before_sampling_sends_skip_when_not_graph(self) -> None:
