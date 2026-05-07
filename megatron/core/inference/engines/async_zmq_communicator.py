@@ -53,24 +53,32 @@ class AsyncZMQCommunicator:
             self.gather_sock.bind_to_random_port(f"tcp://{local_ip}")
             gather_socket_addr = self.gather_sock.getsockopt_string(zmq.LAST_ENDPOINT)
 
-            self.bcast_sock = zmq_context.socket(zmq.PUB)
-            self.bcast_sock.bind_to_random_port(f"tcp://{local_ip}")
-            bcast_socket_addr = self.bcast_sock.getsockopt_string(zmq.LAST_ENDPOINT)
+            # PUB/SUB can drop a collective result if a peer is not already
+            # receiving when the leader broadcasts. Use one reliable PUSH/PULL
+            # result channel per non-leader rank instead.
+            self.result_socks = []
+            result_socket_addrs = [None] * self.world_size
+            for peer_rank in range(1, self.world_size):
+                result_sock = zmq_context.socket(zmq.PUSH)
+                result_sock.bind_to_random_port(f"tcp://{local_ip}")
+                result_socket_addrs[peer_rank] = result_sock.getsockopt_string(
+                    zmq.LAST_ENDPOINT
+                )
+                self.result_socks.append(result_sock)
 
-            # Share the socket addresses with all peers
+            # Share the socket addresses with all peers.
             dist.broadcast_object_list(
-                [gather_socket_addr, bcast_socket_addr], src=src_rank, group=process_group
+                [gather_socket_addr, result_socket_addrs], src=src_rank, group=process_group
             )
 
         else:
             bcast_output = [None, None]
             dist.broadcast_object_list(bcast_output, src=src_rank, group=process_group)
-            gather_socket_addr, bcast_socket_addr = bcast_output
+            gather_socket_addr, result_socket_addrs = bcast_output
             self.gather_sock = zmq_context.socket(zmq.PUSH)
             self.gather_sock.connect(gather_socket_addr)
-            self.bcast_sock = zmq_context.socket(zmq.SUB)
-            self.bcast_sock.connect(bcast_socket_addr)
-            self.bcast_sock.setsockopt_string(zmq.SUBSCRIBE, "")
+            self.result_sock = zmq_context.socket(zmq.PULL)
+            self.result_sock.connect(result_socket_addrs[self.rank])
 
     async def all_reduce_max(self, *local_vals: int, async_op=True) -> int | tuple[int, ...]:
         """Element-wise all-reduce max of one or more integers.
@@ -104,7 +112,9 @@ class AsyncZMQCommunicator:
                     await asyncio.sleep(0.001)
 
             maxes = tuple(max(row[i] for row in rows) for i in range(n))
-            self.bcast_sock.send(struct.pack(fmt, *maxes))
+            result_payload = struct.pack(fmt, *maxes)
+            for result_sock in self.result_socks:
+                result_sock.send(result_payload)
             if not async_op:
                 await asyncio.sleep(
                     0
@@ -118,9 +128,9 @@ class AsyncZMQCommunicator:
             while True:
                 try:
                     if async_op:
-                        msg = self.bcast_sock.recv(flags=zmq.NOBLOCK)
+                        msg = self.result_sock.recv(flags=zmq.NOBLOCK)
                     else:
-                        msg = self.bcast_sock.recv()
+                        msg = self.result_sock.recv()
                     result = struct.unpack(fmt, msg)
                     if not async_op:
                         await asyncio.sleep(
@@ -162,11 +172,13 @@ class AsyncZMQCommunicator:
                 msg = self.gather_sock.recv()
                 rows.append(struct.unpack(fmt, msg))
             maxes = tuple(max(row[i] for row in rows) for i in range(n))
-            self.bcast_sock.send(struct.pack(fmt, *maxes))
+            result_payload = struct.pack(fmt, *maxes)
+            for result_sock in self.result_socks:
+                result_sock.send(result_payload)
             return maxes[0] if n == 1 else maxes
         else:
             self.gather_sock.send(payload)
-            msg = self.bcast_sock.recv()
+            msg = self.result_sock.recv()
             result = struct.unpack(fmt, msg)
             return result[0] if n == 1 else result
 
@@ -177,4 +189,8 @@ class AsyncZMQCommunicator:
         # linger=0: discard unsent messages immediately on close rather than blocking until sent.
         # The ZMQ default is to not allow `close` until all messages have been successfully sent.
         self.gather_sock.close(linger=0)
-        self.bcast_sock.close(linger=0)
+        if self.is_leader:
+            for result_sock in self.result_socks:
+                result_sock.close(linger=0)
+        else:
+            self.result_sock.close(linger=0)
