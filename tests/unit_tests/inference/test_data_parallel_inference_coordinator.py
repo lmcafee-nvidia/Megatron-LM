@@ -373,6 +373,27 @@ class TestCoordinator:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
+    def test_async_zmq_communicator_fanout_tuple_collectives(
+        self, initialize_model_parallel, test_case_communicator
+    ):
+        """AsyncZMQCommunicator returns every result value to every non-leader rank."""
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+
+        async_result = asyncio.run(
+            asyncio.wait_for(
+                test_case_communicator.all_reduce_max(rank, world_size - rank), timeout=30.0
+            )
+        )
+        assert async_result == (world_size - 1, world_size)
+
+        sync_result = test_case_communicator.sync_all_reduce_max(
+            rank + 1, 2 * world_size - rank
+        )
+        assert sync_result == (world_size, 2 * world_size)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "initialize_model_parallel",

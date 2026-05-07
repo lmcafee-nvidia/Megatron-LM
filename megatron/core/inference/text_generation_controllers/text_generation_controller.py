@@ -1975,11 +1975,15 @@ class TextGenerationController:
             return async_next_prepared, async_ep_launch_agreed, async_forward_graph
 
         context = self.inference_wrapped_model.inference_context
-        if not (context.is_decode_only() and context.using_cuda_graph_this_step()):
-            return async_next_prepared, async_ep_launch_agreed, async_forward_graph
+        step_can_launch_async = context.is_decode_only() and context.using_cuda_graph_this_step()
 
-        can_request_launch = async_next_prepared
+        # EP dummy ranks may already be waiting in the launch agreement. Even
+        # when this real rank cannot launch, it must still publish an explicit
+        # skip so all peers stay in the same per-step ZMQ collective sequence.
+        can_request_launch = async_next_prepared and step_can_launch_async
         skip_reason = self._async_disable_reason
+        if not step_can_launch_async:
+            skip_reason = "ep async launch skipped for non-decode or non-graph step"
         if can_request_launch and self._active_requests_need_logprob_results():
             can_request_launch = False
             skip_reason = "ep async launch skipped for logprob results"
@@ -2592,9 +2596,11 @@ class TextGenerationController:
             self._dynamic_step_forward_logits(input_ids, position_ids)
             launched_current_dummy_forward = True
 
+        # Non-MTP dummy ranks must mirror the launch rendezvous on every async
+        # EP step, including first/final steps where the real rank will skip.
         dummy_step_can_mirror_async = (
             context.is_decode_only() and context.using_cuda_graph_this_step()
-        )
+        ) or (ep_async_enabled and self.num_speculative_tokens == 0)
 
         # Disable MoE padding for MTP computation, unless CUDA graphs
         # are active (the graphs were captured with padding enabled).

@@ -2989,6 +2989,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         controller.model_config = types.SimpleNamespace(
             moe_pad_experts_for_cuda_graph_inference=False
         )
+        controller.num_speculative_tokens = 2
         controller._async_dummy_pending_forward = False
         controller._ep_async_collective_enabled = lambda: True
         controller._ep_pending_forward_reuse_agreement = lambda **kwargs: calls.append(
@@ -3017,6 +3018,56 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             ("forward",),
             ("mtp",),
             ("reset",),
+        ]
+
+    def test_ep_dummy_forward_mirrors_non_mtp_async_skip_on_eager_step(
+        self, monkeypatch
+    ) -> None:
+        """Non-MTP dummy ranks enter launch agreement even for non-graph steps."""
+        controller = object.__new__(TextGenerationController)
+        calls = []
+        context = types.SimpleNamespace(
+            is_decode_only=lambda: True,
+            using_cuda_graph_this_step=lambda: False,
+            reset=lambda: calls.append(("reset",)),
+        )
+
+        controller.inference_wrapped_model = types.SimpleNamespace(inference_context=context)
+        controller.model_config = types.SimpleNamespace(
+            moe_pad_experts_for_cuda_graph_inference=False
+        )
+        controller.num_speculative_tokens = 0
+        controller._async_dummy_pending_forward = False
+        controller._ep_async_collective_enabled = lambda: True
+        controller._ep_pending_forward_reuse_agreement = lambda **kwargs: calls.append(
+            ("reuse", kwargs)
+        ) or False
+        controller._dynamic_step_context_init = lambda **kwargs: calls.append(
+            ("init", kwargs)
+        ) or (
+            torch.empty((1, 1), dtype=torch.long),
+            torch.empty((1, 1), dtype=torch.long),
+        )
+        controller._dynamic_step_forward_logits = (
+            lambda input_ids, position_ids: calls.append(("forward",))
+        )
+        controller._dummy_serial_mtp_forward = lambda: calls.append(("mtp",))
+        controller._dummy_async_forward_after_mtp = lambda: calls.append(("async",))
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda: calls.append(("sync",)))
+
+        controller.dummy_forward()
+
+        assert calls == [
+            (
+                "reuse",
+                {"local_has_pending": False, "local_can_reuse": False},
+            ),
+            ("init", {"is_dummy_forward": True}),
+            ("forward",),
+            ("mtp",),
+            ("sync",),
+            ("reset",),
+            ("async",),
         ]
 
     def test_ep_async_decode_graph_launch_agrees_before_replay(self) -> None:
@@ -3153,6 +3204,53 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 },
             ),
             ("disabled", "failed to prepare next-step metadata"),
+        ]
+
+    def test_ep_async_launch_before_sampling_sends_skip_when_not_graph(self) -> None:
+        """Real non-MTP EP ranks pair dummy launch waits on non-graph steps."""
+        controller = object.__new__(TextGenerationController)
+        dims = InferenceBatchDimensions(token_count=1, prefill_req_count=0, decode_req_count=1)
+        calls = []
+
+        context = types.SimpleNamespace(
+            batch_dimensions=dims,
+            is_decode_only=lambda: True,
+            using_cuda_graph_this_step=lambda: False,
+            cancel_prepared_async_decode_next_step=lambda: calls.append(("cancel",)),
+        )
+        controller.inference_wrapped_model = types.SimpleNamespace(inference_context=context)
+        controller.num_speculative_tokens = 0
+        controller._async_disable_reason = None
+        controller._ep_async_collective_enabled = lambda: True
+        controller._record_async_disable_reason = lambda reason: calls.append(
+            ("disabled", reason)
+        )
+        controller._ep_async_launch_agreement = lambda **kwargs: calls.append(
+            ("agreement", kwargs)
+        ) or (False, None, False)
+
+        result = controller._maybe_sync_ep_async_launch_before_sampling(
+            active_request_count=1,
+            async_next_prepared=True,
+            async_sample_already_launched=False,
+            async_ep_launch_agreed=False,
+            async_forward_graph=None,
+        )
+
+        assert result == (False, True, None)
+        assert calls == [
+            (
+                "agreement",
+                {
+                    "local_has_work": True,
+                    "local_requested": False,
+                    "local_blocked": True,
+                    "batch_dimensions": dims,
+                    "using_graph": False,
+                },
+            ),
+            ("cancel",),
+            ("disabled", "ep async launch skipped for non-decode or non-graph step"),
         ]
 
     def test_ep_async_launch_before_sampling_requests_greedy_forward(self) -> None:
