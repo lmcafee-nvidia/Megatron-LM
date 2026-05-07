@@ -1975,8 +1975,11 @@ class TextGenerationController:
             return async_next_prepared, async_ep_launch_agreed, async_forward_graph
 
         context = self.inference_wrapped_model.inference_context
-        can_request_launch = async_next_prepared
+        step_can_launch_async = context.is_decode_only() and context.using_cuda_graph_this_step()
+        can_request_launch = async_next_prepared and step_can_launch_async
         skip_reason = self._async_disable_reason
+        if not step_can_launch_async and skip_reason is None:
+            skip_reason = "ep async launch skipped for non-decode or non-graph step"
         if can_request_launch and self._active_requests_need_logprob_results():
             can_request_launch = False
             skip_reason = "ep async launch skipped for logprob results"
@@ -2593,6 +2596,9 @@ class TextGenerationController:
             context.is_decode_only() and context.using_cuda_graph_this_step()
         )
         dummy_step_should_join_async_handoff = ep_async_enabled
+        dummy_step_must_drain_before_handoff = (
+            launched_current_dummy_forward and dummy_step_should_join_async_handoff
+        )
 
         # Disable MoE padding for MTP computation, unless CUDA graphs
         # are active (the graphs were captured with padding enabled).
@@ -2608,7 +2614,7 @@ class TextGenerationController:
         # collectives to avoid a hang.
         self._dummy_serial_mtp_forward()
 
-        if dummy_step_can_mirror_async and launched_current_dummy_forward:
+        if dummy_step_must_drain_before_handoff:
             # Real ranks cannot enter the next async-launch agreement until the
             # current forward is ready for sampling. Keep dummy ranks from
             # blocking in that CPU collective while their current GPU work is
