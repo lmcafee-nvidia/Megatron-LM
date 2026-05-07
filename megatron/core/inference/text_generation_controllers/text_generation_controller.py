@@ -1975,9 +1975,6 @@ class TextGenerationController:
             return async_next_prepared, async_ep_launch_agreed, async_forward_graph
 
         context = self.inference_wrapped_model.inference_context
-        if not (context.is_decode_only() and context.using_cuda_graph_this_step()):
-            return async_next_prepared, async_ep_launch_agreed, async_forward_graph
-
         can_request_launch = async_next_prepared
         skip_reason = self._async_disable_reason
         if can_request_launch and self._active_requests_need_logprob_results():
@@ -2595,6 +2592,7 @@ class TextGenerationController:
         dummy_step_can_mirror_async = (
             context.is_decode_only() and context.using_cuda_graph_this_step()
         )
+        dummy_step_should_join_async_handoff = ep_async_enabled
 
         # Disable MoE padding for MTP computation, unless CUDA graphs
         # are active (the graphs were captured with padding enabled).
@@ -2621,7 +2619,7 @@ class TextGenerationController:
 
         # clear the context of any temporary state from the dummy forward
         context.reset()
-        if dummy_step_can_mirror_async:
+        if dummy_step_should_join_async_handoff:
             self._dummy_async_forward_after_mtp()
 
     @torch.inference_mode()
