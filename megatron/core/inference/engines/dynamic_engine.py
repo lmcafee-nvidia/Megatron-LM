@@ -665,6 +665,9 @@ class DynamicInferenceEngine(AbstractEngine):
         self.expert_parallel_async_zmq_communicator = AsyncZMQCommunicator(
             self.zmq_context, process_group=self.pg_collection.ep, hostname=hostname
         )
+        self.expert_parallel_async_reuse_zmq_communicator = AsyncZMQCommunicator(
+            self.zmq_context, process_group=self.pg_collection.ep, hostname=hostname
+        )
         # Give the context a CPU-side MAX-reduction primitive so
         # match_graph_config() can avoid a per-step NCCL AllReduce kernel.
         # Use a separate communicator from the engine-loop work consensus:
@@ -675,6 +678,10 @@ class DynamicInferenceEngine(AbstractEngine):
             self.context.set_ep_zmq_communicator(self.expert_parallel_model_zmq_communicator)
         if hasattr(self.context, "set_ep_async_zmq_communicator"):
             self.context.set_ep_async_zmq_communicator(self.expert_parallel_async_zmq_communicator)
+        if hasattr(self.context, "set_ep_async_reuse_zmq_communicator"):
+            self.context.set_ep_async_reuse_zmq_communicator(
+                self.expert_parallel_async_reuse_zmq_communicator
+            )
 
     @contextmanager
     @staticmethod
@@ -2304,6 +2311,8 @@ class DynamicInferenceEngine(AbstractEngine):
             self.expert_parallel_model_zmq_communicator.close()
         if hasattr(self, "expert_parallel_async_zmq_communicator"):
             self.expert_parallel_async_zmq_communicator.close()
+        if hasattr(self, "expert_parallel_async_reuse_zmq_communicator"):
+            self.expert_parallel_async_reuse_zmq_communicator.close()
         if hasattr(self, "world_zmq_communicator"):
             self.world_zmq_communicator.close()
         if not self.zmq_context.closed:
@@ -2399,6 +2408,42 @@ class DynamicInferenceEngine(AbstractEngine):
             )
         nvtx_range_pop("world_barrier")
 
+    def _should_refresh_ep_consensus(self, global_work_from_last_consensus: int) -> bool:
+        """Return whether the engine loop should enter EP work consensus now."""
+        if global_work_from_last_consensus == 0:
+            return True
+
+        if self._ep_consensus_loop_counter % 20 != 0:
+            return False
+
+        ep_async_collective_enabled = getattr(
+            self.controller, "_ep_async_collective_enabled", None
+        )
+        if ep_async_collective_enabled is not None and ep_async_collective_enabled():
+            # With async scheduling, real and dummy EP ranks use separate per-step
+            # ZMQ collectives to agree on async forward handoffs. Dummy ranks can
+            # reach the next engine-loop boundary before real ranks finish CPU
+            # bookkeeping; entering periodic consensus at that point can put
+            # peers in different collectives and deadlock. Idle consensus above
+            # still picks up new work and pause/stop requests once work drains.
+            return False
+
+        return True
+
+    def _run_ep_dummy_forward_step(self) -> None:
+        """Run one dummy EP step and clear stale work consensus when it proves idle."""
+        self.step_start_event.record()
+        nvtx_range_push("EP-dummy-forward")
+        self.controller.dummy_forward()
+        if self.controller.dummy_forward_observed_ep_async_idle():
+            self._last_ep_consensus = (0, False)
+            self._ep_consensus_loop_counter = 0
+        self.step_end_event.record()
+        self.step_end_event.synchronize()
+        nvtx_range_pop("EP-dummy-forward")
+        self.context.step_count += 1
+        self.context.prefix_cache_lru_clock += 1
+
     @trace_async_exceptions
     async def run_engine_with_coordinator(
         self, *, loop: Optional[asyncio.AbstractEventLoop] = None
@@ -2437,31 +2482,20 @@ class DynamicInferenceEngine(AbstractEngine):
                         elif local_pending > 0:
                             await self.async_step()
                         else:
-                            self.step_start_event.record()
-                            nvtx_range_push("EP-dummy-forward")
-                            self.controller.dummy_forward()
-                            self.step_end_event.record()
-                            self.step_end_event.synchronize()
-                            nvtx_range_pop("EP-dummy-forward")
-                            self.context.step_count += 1
-                            self.context.prefix_cache_lru_clock += 1
+                            self._run_ep_dummy_forward_step()
                             # The consensus path yields via _ep_establish_consensus;
                             # without it we must still let other coroutines (signal
                             # delivery, request scheduling) run between steps.
                             await asyncio.sleep(0)
                         continue
                     global_work_from_last_consensus, _ = self._last_ep_consensus
-                    if (
-                        global_work_from_last_consensus == 0
-                        or self._ep_consensus_loop_counter % 20 == 0
-                    ):
+                    if self._should_refresh_ep_consensus(global_work_from_last_consensus):
                         # selectively enter ep_establish_consensus if
                         # 1. there is no global work -> engine is idle. At any step in the future
                         #    one of the ranks can receive work. So we should be eagerly checking for that
                         # 2. it has been 20 steps since we last established consensus, and that consensus
-                        #    had some work.
-                        # In the worst case, this delays pausing by 20 steps which is around
-                        # 200-400 milliseconds.
+                        #    had some work. Async EP scheduling suppresses this periodic refresh while
+                        #    work is active because peers may still be draining per-step handoff collectives.
                         self._last_ep_consensus = await self._ep_establish_consensus(
                             local_pending, signal_consensus=(self.state == EngineState.PAUSING)
                         )
@@ -2479,14 +2513,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             await self.async_step()
                         else:
                             # Dummy forward to participate in the EP collective.
-                            self.step_start_event.record()
-                            nvtx_range_push("EP-dummy-forward")
-                            self.controller.dummy_forward()
-                            self.step_end_event.record()
-                            self.step_end_event.synchronize()
-                            nvtx_range_pop("EP-dummy-forward")
-                            self.context.step_count += 1
-                            self.context.prefix_cache_lru_clock += 1
+                            self._run_ep_dummy_forward_step()
                     else:
                         # No work, but not all pausing: idle.
                         await asyncio.sleep(0.02)

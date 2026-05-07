@@ -216,6 +216,8 @@ class TextGenerationController:
         self._async_dummy_pending_forward_padded_dimensions = None
         self._async_dummy_pending_forward_mtp_padded_count = None
         self._async_dummy_pending_forward_uses_cuda_graph = False
+        self._ep_async_last_agreement_had_real_work = False
+        self._dummy_forward_ep_async_idle = False
         self._async_step_barrier_reason = None
         self._async_admission_barrier_requested = False
         self._async_logprob_requests_seen = False
@@ -1315,7 +1317,7 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         communicator = getattr(context, "_ep_async_zmq_communicator", None)
         return bool(
-            self._async_scheduling_enabled
+            getattr(self, "_async_scheduling_enabled", False)
             and communicator is not None
             and getattr(communicator, "world_size", 1) > 1
         )
@@ -1343,6 +1345,7 @@ class TextGenerationController:
         local_real_blocked = bool(local_has_work and (local_blocked or not local_requested))
         if not self._ep_async_collective_enabled():
             launch = bool(local_requested and not local_real_blocked)
+            self._ep_async_last_agreement_had_real_work = bool(local_has_work)
             return launch, batch_dimensions if launch else None, bool(using_graph and launch)
 
         context = self.inference_wrapped_model.inference_context
@@ -1366,6 +1369,7 @@ class TextGenerationController:
         )
 
         self._async_ep_launch_agreement_count += 1
+        self._ep_async_last_agreement_had_real_work = bool(any_real_work)
         launch = bool(any_real_work and any_requested and not any_real_blocked)
         if launch:
             self._async_ep_launch_count += 1
@@ -1447,17 +1451,22 @@ class TextGenerationController:
         self, *, local_has_pending: bool, local_can_reuse: bool
     ) -> bool:
         """Agree across EP ranks whether a pending speculative forward may be reused."""
-        if not local_has_pending:
-            return False
         if not self._ep_async_collective_enabled():
-            return local_can_reuse
+            return bool(local_has_pending and local_can_reuse)
 
         context = self.inference_wrapped_model.inference_context
-        communicator = context._ep_async_zmq_communicator
+        communicator = getattr(context, "_ep_async_reuse_zmq_communicator", None)
+        if communicator is None:
+            communicator = context._ep_async_zmq_communicator
         any_pending, any_reject = communicator.sync_all_reduce_max(
-            int(local_has_pending), int(local_has_pending and not local_can_reuse)
+            int(local_has_pending),
+            int((not local_has_pending) or (local_has_pending and not local_can_reuse)),
         )
-        return bool(any_pending and not any_reject and local_can_reuse)
+        return bool(any_pending and not any_reject and local_has_pending and local_can_reuse)
+
+    def dummy_forward_observed_ep_async_idle(self) -> bool:
+        """Whether the last dummy step observed that no EP peer had real async work."""
+        return bool(self._dummy_forward_ep_async_idle)
 
     def _resolve_pending_async_forward_rows(self) -> tuple[bool, Optional[Tensor], bool]:
         """Map current active rows back to the pending speculative forward rows.
@@ -1859,6 +1868,19 @@ class TextGenerationController:
             self._record_async_disable_reason(self._async_disable_reason)
             return True, None, None, None, None, False
 
+        launch, _, _ = self._ep_async_launch_agreement(
+            local_has_work=active_request_count > 0,
+            local_requested=True,
+            local_blocked=False,
+            batch_dimensions=context.batch_dimensions,
+            using_graph=True,
+        )
+        if not launch:
+            context.cancel_prepared_async_decode_next_step()
+            self._async_disable_reason = "ep peer blocked async decode graph launch"
+            self._record_async_disable_reason(self._async_disable_reason)
+            return False, None, None, None, None, False
+
         range_push("async_decode_graph_launch")
         sample_slot = self._launch_async_decode_graph(async_decode_graph)
         range_pop()
@@ -1936,6 +1958,68 @@ class TextGenerationController:
             return False
 
         return True
+
+    def _maybe_sync_ep_async_launch_before_sampling(
+        self,
+        *,
+        active_request_count: int,
+        async_next_prepared: bool,
+        async_sample_already_launched: bool,
+        async_ep_launch_agreed: bool,
+        async_forward_graph: Optional[_AsyncForwardGraph],
+    ) -> Tuple[bool, bool, Optional[_AsyncForwardGraph]]:
+        """Pair dummy-rank async handoff waits with a real-rank launch or skip."""
+        if async_sample_already_launched or async_ep_launch_agreed:
+            return async_next_prepared, async_ep_launch_agreed, async_forward_graph
+        if self.num_speculative_tokens != 0 or not self._ep_async_collective_enabled():
+            return async_next_prepared, async_ep_launch_agreed, async_forward_graph
+
+        context = self.inference_wrapped_model.inference_context
+        if not (context.is_decode_only() and context.using_cuda_graph_this_step()):
+            return async_next_prepared, async_ep_launch_agreed, async_forward_graph
+
+        can_request_launch = async_next_prepared
+        skip_reason = self._async_disable_reason
+        if can_request_launch and self._active_requests_need_logprob_results():
+            can_request_launch = False
+            skip_reason = "ep async launch skipped for logprob results"
+        if can_request_launch and not self._active_requests_use_greedy_sampling(
+            active_request_count
+        ):
+            can_request_launch = False
+            skip_reason = "ep async launch skipped for non-greedy sampling"
+
+        if can_request_launch:
+            async_forward_graph = self._get_async_forward_graph()
+            batch_dimensions = context.batch_dimensions
+        else:
+            async_forward_graph = None
+            batch_dimensions = (
+                context.batch_dimensions
+                if async_next_prepared
+                else self._async_decode_batch_dimensions(active_request_count)
+            )
+
+        launch, _, _ = self._ep_async_launch_agreement(
+            local_has_work=active_request_count > 0,
+            local_requested=can_request_launch,
+            local_blocked=not can_request_launch,
+            batch_dimensions=batch_dimensions,
+            using_graph=async_forward_graph is not None,
+        )
+        async_ep_launch_agreed = True
+        if launch:
+            return async_next_prepared, async_ep_launch_agreed, async_forward_graph
+
+        if async_next_prepared:
+            context.cancel_prepared_async_decode_next_step()
+        self._async_disable_reason = (
+            "ep peer blocked prepared async launch"
+            if can_request_launch
+            else skip_reason or "ep async launch skipped before sampling"
+        )
+        self._record_async_disable_reason(self._async_disable_reason)
+        return False, async_ep_launch_agreed, async_forward_graph
 
     def _all_active_requests_reach_max_length_this_step(
         self, active_request_count: Optional[int] = None
@@ -2467,37 +2551,46 @@ class TextGenerationController:
         on ranks that do not have any real requests. It may run in eager mode."""
 
         context = self.inference_wrapped_model.inference_context
+        launched_current_dummy_forward = False
+        self._dummy_forward_ep_async_idle = False
+        ep_async_enabled = (
+            self._ep_async_collective_enabled()
+            if hasattr(self, "_ep_async_collective_enabled")
+            else False
+        )
 
-        if self._async_dummy_pending_forward:
+        reuse_dummy_pending_forward = False
+        if ep_async_enabled:
             reuse_dummy_pending_forward = self._ep_pending_forward_reuse_agreement(
-                local_has_pending=True, local_can_reuse=True
+                local_has_pending=self._async_dummy_pending_forward,
+                local_can_reuse=self._async_dummy_pending_forward,
             )
-            if reuse_dummy_pending_forward:
-                # The previous dummy step already mirrored the real rank's async
-                # post-MTP base forward. Real ranks reuse that forward this step, so
-                # dummy ranks must not issue an extra base forward or enter the EP
-                # graph-shape sync before serial MTP.
-                pending_dimensions = self._async_dummy_pending_forward_dimensions
-                pending_padded_dimensions = self._async_dummy_pending_forward_padded_dimensions
-                self._async_dummy_pending_forward = False
-                self._async_dummy_pending_forward_dimensions = None
-                self._async_dummy_pending_forward_padded_dimensions = None
-                self._mtp_resolved_padded_count = self._async_dummy_pending_forward_mtp_padded_count
-                self._async_dummy_pending_forward_mtp_padded_count = None
-                context.batch_dimensions = pending_dimensions
-                context.padded_batch_dimensions = pending_padded_dimensions
-                context._using_cuda_graph_this_step = (
-                    self._async_dummy_pending_forward_uses_cuda_graph
-                )
-                self._async_dummy_pending_forward_uses_cuda_graph = False
-            else:
-                self._clear_dummy_pending_async_forward()
-                input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
-                self._dynamic_step_forward_logits(input_ids, position_ids)
+        elif self._async_dummy_pending_forward:
+            reuse_dummy_pending_forward = True
+
+        if self._async_dummy_pending_forward and reuse_dummy_pending_forward:
+            # The previous dummy step already mirrored the real rank's async
+            # post-MTP base forward. Real ranks reuse that forward this step, so
+            # dummy ranks must not issue an extra base forward or enter the EP
+            # graph-shape sync before serial MTP.
+            pending_dimensions = self._async_dummy_pending_forward_dimensions
+            pending_padded_dimensions = self._async_dummy_pending_forward_padded_dimensions
+            self._async_dummy_pending_forward = False
+            self._async_dummy_pending_forward_dimensions = None
+            self._async_dummy_pending_forward_padded_dimensions = None
+            self._mtp_resolved_padded_count = self._async_dummy_pending_forward_mtp_padded_count
+            self._async_dummy_pending_forward_mtp_padded_count = None
+            context.batch_dimensions = pending_dimensions
+            context.padded_batch_dimensions = pending_padded_dimensions
+            context._using_cuda_graph_this_step = self._async_dummy_pending_forward_uses_cuda_graph
+            self._async_dummy_pending_forward_uses_cuda_graph = False
         else:
+            if self._async_dummy_pending_forward:
+                self._clear_dummy_pending_async_forward()
             # attempt to use cuda-graph if possible
             input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
             self._dynamic_step_forward_logits(input_ids, position_ids)
+            launched_current_dummy_forward = True
 
         dummy_step_can_mirror_async = (
             context.is_decode_only() and context.using_cuda_graph_this_step()
@@ -2517,6 +2610,15 @@ class TextGenerationController:
         # collectives to avoid a hang.
         self._dummy_serial_mtp_forward()
 
+        if dummy_step_can_mirror_async and launched_current_dummy_forward:
+            # Real ranks cannot enter the next async-launch agreement until the
+            # current forward is ready for sampling. Keep dummy ranks from
+            # blocking in that CPU collective while their current GPU work is
+            # still needed by the real rank's EP forward. CUDA graph replay can
+            # involve non-default streams, so drain the device rather than only
+            # the current stream.
+            torch.cuda.synchronize()
+
         # clear the context of any temporary state from the dummy forward
         context.reset()
         if dummy_step_can_mirror_async:
@@ -2524,14 +2626,16 @@ class TextGenerationController:
 
     @torch.inference_mode()
     def _dummy_async_forward_after_mtp(self) -> None:
-        """Mirror a real EP peer's post-MTP async base forward on a dummy rank."""
-        if self.num_speculative_tokens == 0 or not self._ep_async_collective_enabled():
+        """Mirror a real EP peer's async base forward on a dummy rank."""
+        if not self._ep_async_collective_enabled():
             return
 
         context = self.inference_wrapped_model.inference_context
         launch, agreed_dimensions, agreed_using_graph = self._ep_async_launch_agreement(
             local_has_work=False, local_requested=False, local_blocked=False
         )
+        if not getattr(self, "_ep_async_last_agreement_had_real_work", True):
+            self._dummy_forward_ep_async_idle = True
         if not launch or agreed_dimensions is None:
             return
 
@@ -2555,7 +2659,9 @@ class TextGenerationController:
             self._async_dummy_pending_forward_padded_dimensions = context.padded_batch_dimensions
             self._async_dummy_pending_forward_mtp_padded_count = self._mtp_resolved_padded_count
             self._async_dummy_pending_forward_uses_cuda_graph = context.using_cuda_graph_this_step()
-            torch.cuda.current_stream().synchronize()
+            # CUDA graph replay may use non-default streams. Dummy ranks must not
+            # enter the next CPU handoff until their mirrored GPU work is complete.
+            torch.cuda.synchronize()
             context.reset()
             launched_pending_forward = True
         finally:
@@ -2836,6 +2942,7 @@ class TextGenerationController:
         async_sampled_tokens_cpu = None
         async_sampled_mtp_tokens_cpu = None
         async_sample_already_launched = False
+        async_ep_launch_agreed = False
         async_forward_graph = None
         deferred_mtp_blocks_to_release = None
         deferred_mtp_release_mask = None
@@ -2862,7 +2969,33 @@ class TextGenerationController:
 
         if not pending_async_sample:
             with torch.inference_mode():
-                if self._async_pending_forward:
+                if self._ep_async_collective_enabled():
+                    local_has_pending_forward = self._async_pending_forward
+                    local_can_reuse_pending_forward = False
+                    if local_has_pending_forward:
+                        cuda_graph_request_count = self._async_pending_cuda_graph_request_count
+                        context.release_deferred_async_kv_blocks()
+                        local_can_reuse_pending_forward = (
+                            self._pending_async_forward_can_reuse_current_rows()
+                        )
+                    reuse_pending_forward = self._ep_pending_forward_reuse_agreement(
+                        local_has_pending=local_has_pending_forward,
+                        local_can_reuse=local_can_reuse_pending_forward,
+                    )
+                    if local_has_pending_forward:
+                        if reuse_pending_forward:
+                            self._async_pending_forward = False
+                            self._async_pending_cuda_graph_request_count = None
+                            (
+                                pending_forward_reused,
+                                pending_forward_row_indices,
+                                pending_forward_row_mapped,
+                            ) = self._resolve_pending_async_forward_rows()
+                            if pending_forward_reused and self.num_speculative_tokens > 0:
+                                input_ids, _ = context.current_input_and_position_ids()
+                        else:
+                            self._clear_pending_async_forward(count_discard=True)
+                elif self._async_pending_forward:
                     cuda_graph_request_count = self._async_pending_cuda_graph_request_count
                     context.release_deferred_async_kv_blocks()
                     local_can_reuse_pending_forward = (
@@ -2926,6 +3059,23 @@ class TextGenerationController:
                         async_h2d_done_event,
                         async_sample_already_launched,
                     ) = self._try_launch_async_decode_graph(active_request_count)
+                    if (
+                        async_sample_already_launched
+                        or self._async_disable_reason == "ep peer blocked async decode graph launch"
+                    ):
+                        async_ep_launch_agreed = True
+
+                (
+                    async_next_prepared,
+                    async_ep_launch_agreed,
+                    async_forward_graph,
+                ) = self._maybe_sync_ep_async_launch_before_sampling(
+                    active_request_count=active_request_count,
+                    async_next_prepared=async_next_prepared,
+                    async_sample_already_launched=async_sample_already_launched,
+                    async_ep_launch_agreed=async_ep_launch_agreed,
+                    async_forward_graph=async_forward_graph,
+                )
 
         # This is the best place to yield control back to event loop.
         # At this point we have enqueued FW pass GPU kernels asynchronously.
@@ -2989,6 +3139,7 @@ class TextGenerationController:
                 if async_next_prepared:
                     self._copy_sampled_decode_tokens_to_next_input_ids(active_request_count)
                     async_forward_graph = self._get_async_forward_graph()
+                    async_ep_launch_agreed = True
                     deferred_mtp_blocks_to_release = blocks_to_release
                     deferred_mtp_release_mask = remove_mask
                 else:
@@ -3022,6 +3173,21 @@ class TextGenerationController:
                         top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(
                             log_probs_tensor
                         )
+
+            if async_next_prepared and not async_sample_already_launched:
+                if not async_ep_launch_agreed:
+                    launch, _, _ = self._ep_async_launch_agreement(
+                        local_has_work=active_request_count > 0,
+                        local_requested=True,
+                        local_blocked=False,
+                        batch_dimensions=context.batch_dimensions,
+                        using_graph=async_forward_graph is not None,
+                    )
+                    if not launch:
+                        context.cancel_prepared_async_decode_next_step()
+                        self._async_disable_reason = "ep peer blocked prepared async launch"
+                        self._record_async_disable_reason(self._async_disable_reason)
+                        async_next_prepared = False
 
             if async_next_prepared and not async_sample_already_launched:
                 (
