@@ -2596,11 +2596,12 @@ class TextGenerationController:
             self._dynamic_step_forward_logits(input_ids, position_ids)
             launched_current_dummy_forward = True
 
-        # Non-MTP dummy ranks must mirror the launch rendezvous on every async
-        # EP step, including first/final steps where the real rank will skip.
-        dummy_step_can_mirror_async = (
+        # Dummy ranks must join every EP async handoff so real ranks can publish
+        # either a launch or an explicit skip for this engine step.
+        dummy_step_should_join_async_handoff = ep_async_enabled
+        dummy_step_needs_device_drain = (
             context.is_decode_only() and context.using_cuda_graph_this_step()
-        ) or (ep_async_enabled and self.num_speculative_tokens == 0)
+        )
 
         # Disable MoE padding for MTP computation, unless CUDA graphs
         # are active (the graphs were captured with padding enabled).
@@ -2616,7 +2617,11 @@ class TextGenerationController:
         # collectives to avoid a hang.
         self._dummy_serial_mtp_forward()
 
-        if dummy_step_can_mirror_async and launched_current_dummy_forward:
+        if (
+            dummy_step_should_join_async_handoff
+            and dummy_step_needs_device_drain
+            and launched_current_dummy_forward
+        ):
             # Real ranks cannot enter the next async-launch agreement until the
             # current forward is ready for sampling. Keep dummy ranks from
             # blocking in that CPU collective while their current GPU work is
@@ -2627,7 +2632,7 @@ class TextGenerationController:
 
         # clear the context of any temporary state from the dummy forward
         context.reset()
-        if dummy_step_can_mirror_async:
+        if dummy_step_should_join_async_handoff:
             self._dummy_async_forward_after_mtp()
 
     @torch.inference_mode()
