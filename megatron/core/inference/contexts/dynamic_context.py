@@ -129,6 +129,16 @@ class RequestOverflowError(ContextOverflowError):
     pass
 
 
+def _should_cache_dsa_indexer_keys(
+    model_config: TransformerConfig, has_hybrid_dsa_layers: bool
+) -> bool:
+    """Return whether dynamic inference should allocate DSA indexer-key cache."""
+    is_gpt_dsa = getattr(model_config, "experimental_attention_variant", None) == "dsa"
+    return getattr(model_config, "dsa_kv_backend", None) == "gqa" and (
+        is_gpt_dsa or has_hybrid_dsa_layers
+    )
+
+
 class TokenOverflowError(ContextOverflowError):
     """Adding request would overflow max token count."""
 
@@ -282,12 +292,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.cache_mla_latent = (
             isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
         )
-        self.cache_dsa_indexer_keys = (
-            getattr(model_config, "experimental_attention_variant", None) == "dsa"
-        )
-        self.dsa_indexer_head_dim = (
-            getattr(model_config, "dsa_indexer_head_dim", 0) if self.cache_dsa_indexer_keys else 0
-        )
         if self.cache_mla_latent:
             assert (
                 inference_config.block_size_tokens == 64
@@ -397,9 +401,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 f"Using `DynamicInferenceContext` with no attention is not supported."
             )
 
-        self.cache_dsa_indexer_keys = (
-            getattr(model_config, "experimental_attention_variant", None) == "dsa"
-            or has_hybrid_dsa_layers
+        self.cache_dsa_indexer_keys = _should_cache_dsa_indexer_keys(
+            model_config, has_hybrid_dsa_layers
         )
         self.dsa_indexer_head_dim = (
             getattr(model_config, "dsa_indexer_head_dim", 0) if self.cache_dsa_indexer_keys else 0

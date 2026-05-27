@@ -6,6 +6,7 @@ import pytest
 import torch
 
 import megatron.core.parallel_state as parallel_state
+from megatron.core.inference.contexts.dynamic_context import _should_cache_dsa_indexer_keys
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_dsa_gqa_module_spec,
     get_dsa_mla_module_spec,
@@ -1719,3 +1720,39 @@ class TestDSAModuleSpecDispatch:
         config = self._make_dsa_config(dsa_kv_backend="gqa")
         with pytest.raises(ValueError, match="cannot be used with multi_latent_attention"):
             get_dsa_gqa_module_spec(config, backend=None)
+
+    def test_dsa_indexer_key_cache_is_gqa_only(self):
+        """Dynamic DSA indexer-key cache is only enabled for GQA-backed DSA."""
+        mla_config = self._make_dsa_config(experimental_attention_variant="dsa")
+        assert not _should_cache_dsa_indexer_keys(mla_config, has_hybrid_dsa_layers=False)
+
+        gqa_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=256,
+            num_attention_heads=16,
+            use_cpu_initialization=True,
+            experimental_attention_variant="dsa",
+            dsa_kv_backend="gqa",
+            dsa_indexer_n_heads=8,
+            dsa_indexer_head_dim=64,
+            dsa_indexer_topk=32,
+        )
+        assert _should_cache_dsa_indexer_keys(gqa_config, has_hybrid_dsa_layers=False)
+
+        hybrid_mla_config = self._make_dsa_config(experimental_attention_variant=None)
+        assert not _should_cache_dsa_indexer_keys(
+            hybrid_mla_config, has_hybrid_dsa_layers=True
+        )
+        hybrid_gqa_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=256,
+            num_attention_heads=16,
+            use_cpu_initialization=True,
+            dsa_kv_backend="gqa",
+            dsa_indexer_n_heads=8,
+            dsa_indexer_head_dim=64,
+            dsa_indexer_topk=32,
+        )
+        assert _should_cache_dsa_indexer_keys(
+            hybrid_gqa_config, has_hybrid_dsa_layers=True
+        )

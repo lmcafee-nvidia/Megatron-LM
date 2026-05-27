@@ -20,7 +20,6 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import is_using_quantization_scales
 
 try:
     from fast_hadamard_transform import hadamard_transform
@@ -321,34 +320,6 @@ def fused_qk_topk_naive(
     topk_indices = index_scores.topk(topk_k, dim=-1)[1]
 
     return index_scores, topk_indices
-
-
-def _gather_block_cache_sequence(
-    cache: torch.Tensor, block_table_row: torch.Tensor, sequence_length: int, block_size_tokens: int
-) -> torch.Tensor:
-    """Materialize one request sequence from a paged block cache."""
-    if sequence_length == 0:
-        return cache.new_empty((0,) + cache.shape[2:])
-    positions = torch.arange(sequence_length, device=cache.device, dtype=torch.long)
-    block_ids = block_table_row[(positions // block_size_tokens).to(block_table_row.device)].long()
-    local_positions = positions % block_size_tokens
-    return cache[block_ids, local_positions]
-
-
-def _build_shifted_causal_mask(
-    query_length: int, key_length: int, query_start_position: int, device: torch.device
-) -> torch.Tensor:
-    """Build a causal mask for a query chunk that starts at a non-zero KV offset."""
-    if query_length == 0 or key_length == 0:
-        return torch.empty((query_length, key_length), dtype=torch.float32, device=device)
-    query_positions = torch.arange(
-        query_start_position, query_start_position + query_length, device=device, dtype=torch.long
-    )
-    key_positions = torch.arange(key_length, device=device, dtype=torch.long)
-    invalid = key_positions.view(1, key_length) > query_positions.view(query_length, 1)
-    return torch.zeros((query_length, key_length), dtype=torch.float32, device=device).masked_fill(
-        invalid, float("-inf")
-    )
 
 
 def fwd_fused_indexer_loss_naive(
@@ -823,39 +794,6 @@ class DSAIndexer(MegatronModule):
         x = torch.cat([x_nope, x_pe], dim=-1)
         return x
 
-    def _get_dynamic_rotary_pos_emb(self, inference_context) -> Tuple[torch.Tensor, float]:
-        """Return RoPE tensors sized for the active dynamic-inference positions."""
-        n = inference_context.padded_active_token_count
-        if n == 0:
-            rotary_seq_len = 1
-        else:
-            rotary_seq_len = (
-                int(inference_context.gpu_view.token_to_position_in_request[:n].max().item()) + 1
-            )
-        if self.config.rope_type == "rope":
-            return self.rotary_pos_emb(rotary_seq_len, packed_seq=False), 1.0
-        return self.rotary_pos_emb(rotary_seq_len, packed_seq=False)
-
-    def _apply_rope_dynamic(
-        self, q: torch.Tensor, k: torch.Tensor, inference_context
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Apply RoPE to dynamic-inference indexer query/key tensors."""
-        rotary_pos_emb, mscale = self._get_dynamic_rotary_pos_emb(inference_context)
-        q_nope, q_pe = torch.split(
-            q, [self.index_head_dim - self.qk_pos_emb_head_dim, self.qk_pos_emb_head_dim], dim=-1
-        )
-        k_nope, k_pe = torch.split(
-            k, [self.index_head_dim - self.qk_pos_emb_head_dim, self.qk_pos_emb_head_dim], dim=-1
-        )
-        cu_seqlens_q, _ = inference_context.cu_query_lengths()
-        q_pe = inference_context.apply_rotary_emb_query(
-            q_pe, rotary_pos_emb, self.config, cu_seqlens_q, self.pg_collection.cp, mscale=mscale
-        )
-        k_pe = inference_context.apply_rotary_emb_key(
-            k_pe, rotary_pos_emb, self.config, self.pg_collection.cp, mscale=mscale
-        )
-        return torch.cat([q_nope, q_pe], dim=-1), torch.cat([k_nope, k_pe], dim=-1)
-
     def forward_before_topk(
         self, x: torch.Tensor, qr: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -921,35 +859,6 @@ class DSAIndexer(MegatronModule):
 
         return q, k, weights
 
-    def forward_before_topk_dynamic(
-        self, x: torch.Tensor, qr: torch.Tensor, inference_context
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """All indexer computations before top-k for dynamic inference."""
-        if self.config.sequence_parallel and self.pg_collection.tp.size() > 1:
-            x = gather_from_sequence_parallel_region(x, group=self.pg_collection.tp)
-            qr = gather_from_sequence_parallel_region(qr, group=self.pg_collection.tp)
-
-        seqlen, bsz, _ = x.size()
-        assert bsz == 1, "Dynamic DSA-MLA expects batch=1 flattened token layout."
-
-        q, _ = self.linear_wq_b(qr)
-        q = q.reshape(seqlen, bsz, self.index_n_heads, self.index_head_dim)
-
-        k, _ = self.linear_wk(x)
-        k = self.k_norm(k)
-        k = k.reshape(seqlen, bsz, 1, self.index_head_dim)
-
-        q, k = self._apply_rope_dynamic(q, k, inference_context)
-        k = k.reshape(seqlen, bsz, self.index_head_dim)
-
-        q = rotate_activation(q)
-        k = rotate_activation(k)
-
-        weights, _ = self.linear_weights_proj(x)
-        weights = weights * (self.index_n_heads**-0.5) * self.softmax_scale
-
-        return q, k, weights
-
     def forward_with_scores(
         self,
         x: torch.Tensor,
@@ -1007,9 +916,7 @@ class DSAIndexer(MegatronModule):
         return topk_indices
 
 
-def unfused_dsa_fn(
-    query, key, value, topk_indices, softmax_scale, mask: Optional[torch.Tensor] = None
-):
+def unfused_dsa_fn(query, key, value, topk_indices, softmax_scale):
     """
     Unfused sparse attention implementation.
     """
@@ -1035,14 +942,13 @@ def unfused_dsa_fn(
     # index_mask [b, sq, skv]
     index_mask = torch.full((b, sq, skv), float("-inf"), device=attention_scores.device)
     index_mask.scatter_(-1, topk_indices, 0)
-    if mask is None:
-        # causal_mask [sq, skv]
-        mask = torch.triu(
-            torch.full((sq, skv), float('-inf'), dtype=torch.float32, device=index_mask.device),
-            diagonal=1,
-        )
+    # causal_mask [sq, skv]
+    causal_mask = torch.triu(
+        torch.full((sq, skv), float('-inf'), dtype=torch.float32, device=index_mask.device),
+        diagonal=1,
+    )
     # [b, sq, skv] + [1, sq, skv] -> [b, sq, skv]
-    index_mask += mask.view(1, sq, skv)
+    index_mask += causal_mask.view(1, sq, skv)
     # [b, np, sq, skv] + [b, 1, sq, skv] -> [b, np, sq, skv]
     attention_scores += index_mask.unsqueeze(1)
     attention_scores = torch.nn.functional.softmax(attention_scores, dim=-1, dtype=torch.float32)
@@ -1208,141 +1114,5 @@ class DSAttention(MegatronModule):
             # Run sparse attention kernel
             # ===================================
             output = unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
-
-        return output
-
-    def forward_dynamic(
-        self,
-        query: torch.Tensor,
-        key_cache: torch.Tensor,
-        value_cache: Optional[torch.Tensor],
-        x: torch.Tensor,
-        qr: torch.Tensor,
-        inference_context,
-        provider_layer_number: int,
-        absorbed_mla: bool = False,
-        up_v_weight: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Reference dynamic-inference DSA for MLA cache layouts."""
-        assert not self.training, "Dynamic DSA-MLA inference only supports eval mode."
-        if absorbed_mla:
-            assert up_v_weight is not None, "Absorbed DSA-MLA requires V up-projection weights."
-        else:
-            assert value_cache is not None, "Unabsorbed DSA-MLA requires value cache."
-
-        q_index, k_index_current, weights = self.indexer.forward_before_topk_dynamic(
-            x, qr, inference_context
-        )
-        inference_context.append_dsa_key_cache(provider_layer_number, k_index_current)
-        dsa_key_cache, block_table = inference_context.dsa_key_cache(provider_layer_number)
-
-        query_lengths = inference_context.active_attn_metadata["mha_metadata"].state_data[
-            "query_lengths"
-        ]
-        kv_lengths = inference_context.active_attn_metadata["mha_metadata"].state_data[
-            "kv_seq_lengths"
-        ]
-        kv_offsets = inference_context.request_kv_length_offsets[
-            inference_context.paused_request_count : inference_context.total_request_count
-        ]
-
-        sq, b, np, _ = query.size()
-        if absorbed_mla:
-            output_head_dim = up_v_weight.size(1)
-        else:
-            output_head_dim = value_cache.size(-1)
-        output = query.new_zeros((sq, b, np * output_head_dim))
-
-        q_cursor = 0
-        block_size_tokens = inference_context.block_size_tokens
-        num_requests = inference_context.padded_active_request_count
-
-        for request_idx in range(num_requests):
-            query_length = int(query_lengths[request_idx].item())
-            if query_length == 0:
-                continue
-
-            key_length = int(kv_lengths[request_idx].item())
-            query_start = q_cursor
-            query_end = q_cursor + query_length
-            q_cursor = query_end
-
-            if key_length == 0:
-                continue
-
-            block_table_row = block_table[request_idx]
-            request_index_key = _gather_block_cache_sequence(
-                dsa_key_cache, block_table_row, key_length, block_size_tokens
-            ).unsqueeze(1)
-            request_query = query[query_start:query_end]
-            request_q_index = q_index[query_start:query_end]
-            request_weights = weights[query_start:query_end]
-            request_offset = (
-                int(kv_offsets[request_idx].item()) if request_idx < kv_offsets.numel() else 0
-            )
-            request_mask = _build_shifted_causal_mask(
-                query_length, key_length, request_offset, request_query.device
-            )
-
-            _, topk_indices = fused_qk_topk_naive(
-                request_q_index,
-                request_index_key,
-                request_weights,
-                self.indexer.index_topk,
-                request_mask,
-            )
-
-            if absorbed_mla:
-                request_kv = _gather_block_cache_sequence(
-                    key_cache, block_table_row, key_length, block_size_tokens
-                )
-                request_key = request_kv.unsqueeze(1).unsqueeze(2).expand(-1, -1, np, -1)
-                request_value = (
-                    request_kv[..., : self.config.kv_lora_rank]
-                    .unsqueeze(1)
-                    .unsqueeze(2)
-                    .expand(-1, -1, np, -1)
-                )
-                request_output = unfused_dsa_fn(
-                    request_query,
-                    request_key,
-                    request_value,
-                    topk_indices,
-                    self.softmax_scale,
-                    mask=request_mask,
-                )
-                request_output = request_output.view(
-                    request_output.size(0), request_output.size(1), np, -1
-                )
-                request_output = torch.einsum("sbhc,hdc->sbhd", request_output, up_v_weight)
-                request_output = request_output.contiguous().view(
-                    request_output.size(0), request_output.size(1), -1
-                )
-            else:
-                request_key = _gather_block_cache_sequence(
-                    key_cache, block_table_row, key_length, block_size_tokens
-                ).unsqueeze(1)
-                request_value = _gather_block_cache_sequence(
-                    value_cache, block_table_row, key_length, block_size_tokens
-                ).unsqueeze(1)
-                request_output = unfused_dsa_fn(
-                    request_query,
-                    request_key,
-                    request_value,
-                    topk_indices,
-                    self.softmax_scale,
-                    mask=request_mask,
-                )
-
-            output[query_start:query_end] = request_output
-
-        if q_cursor != inference_context.active_token_count:
-            raise RuntimeError(
-                f"DSA-MLA dynamic inference consumed {q_cursor} query tokens but context has "
-                f"{inference_context.active_token_count} active tokens."
-            )
-
-        if is_using_quantization_scales(self.config):
-            output[inference_context.padding_slice] = 0.0
 
         return output
