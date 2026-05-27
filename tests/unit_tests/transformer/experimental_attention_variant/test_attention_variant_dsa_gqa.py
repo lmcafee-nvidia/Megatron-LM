@@ -10,9 +10,11 @@ from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
     _gather_block_cache_sequence,
     batched_paged_gqa_dsa_indexer_topk_fn,
     compute_gqa_dsa_indexer_loss,
+    gqa_dsa_indexer_topk_fn,
     grouped_dsa_fn,
     paged_gqa_dsa_indexer_topk_fn,
     paged_grouped_dsa_fn,
+    triton_gqa_dsa_indexer_topk_fn,
     triton_grouped_dsa_fn,
     triton_grouped_dsa_tiled_fn,
     triton_paged_gqa_dsa_indexer_topk_fn,
@@ -162,6 +164,74 @@ def test_triton_grouped_dsa_fn_matches_reference():
     actual = triton_grouped_dsa_fn(query, key, value, topk_indices, head_dim**-0.5)
 
     torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA/Triton required")
+def test_triton_gqa_dsa_indexer_topk_matches_causal_reference_for_top1():
+    torch.manual_seed(123)
+
+    seqlen = 8
+    batch_size = 2
+    index_heads = 4
+    index_dim = 16
+    topk = 1
+
+    q_index = torch.randn(seqlen, batch_size, index_heads, index_dim, device="cuda")
+    k_index = torch.randn(seqlen, batch_size, index_dim, device="cuda")
+    weights = torch.randn(seqlen, batch_size, index_heads, device="cuda")
+    causal_mask = torch.triu(
+        torch.full((seqlen, seqlen), float("-inf"), device="cuda"), diagonal=1
+    )
+    _, expected = fused_qk_topk_naive(q_index, k_index, weights, topk, causal_mask)
+
+    actual = triton_gqa_dsa_indexer_topk_fn(q_index, k_index, weights, topk)
+
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA/Triton required")
+def test_gqa_dsa_indexer_topk_matches_causal_reference_with_prefix_rows():
+    torch.manual_seed(123)
+
+    seqlen = 8
+    batch_size = 2
+    index_heads = 4
+    index_dim = 16
+    topk = 4
+
+    q_index = torch.randn(seqlen, batch_size, index_heads, index_dim, device="cuda")
+    k_index = torch.randn(seqlen, batch_size, index_dim, device="cuda")
+    weights = torch.randn(seqlen, batch_size, index_heads, device="cuda")
+    causal_mask = torch.triu(
+        torch.full((seqlen, seqlen), float("-inf"), device="cuda"), diagonal=1
+    )
+    _, expected = fused_qk_topk_naive(q_index, k_index, weights, topk, causal_mask)
+
+    actual = gqa_dsa_indexer_topk_fn(q_index, k_index, weights, topk)
+
+    assert torch.equal(actual, expected)
+
+
+def test_gqa_dsa_indexer_topk_falls_back_on_cpu():
+    torch.manual_seed(123)
+
+    seqlen = 6
+    batch_size = 2
+    index_heads = 4
+    index_dim = 8
+    topk = 3
+
+    q_index = torch.randn(seqlen, batch_size, index_heads, index_dim)
+    k_index = torch.randn(seqlen, batch_size, index_dim)
+    weights = torch.randn(seqlen, batch_size, index_heads)
+    causal_mask = torch.triu(
+        torch.full((seqlen, seqlen), float("-inf"), dtype=torch.float32), diagonal=1
+    )
+    _, expected = fused_qk_topk_naive(q_index, k_index, weights, topk, causal_mask)
+
+    actual = gqa_dsa_indexer_topk_fn(q_index, k_index, weights, topk)
+
+    assert torch.equal(actual, expected)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA/Triton required")

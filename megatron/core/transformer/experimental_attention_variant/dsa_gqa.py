@@ -397,6 +397,199 @@ def _next_power_of_2(x: int) -> int:
 _PAGED_INDEXER_SEGMENT_SIZE = 128
 
 
+@triton.jit
+def _triton_gqa_dsa_indexer_topk_kernel(
+    q_ptr,
+    key_ptr,
+    weights_ptr,
+    local_scores_ptr,
+    local_indices_ptr,
+    stride_q_s,
+    stride_q_b,
+    stride_q_h,
+    stride_q_d,
+    stride_k_s,
+    stride_k_b,
+    stride_k_d,
+    stride_w_s,
+    stride_w_b,
+    stride_w_h,
+    SEQLEN_Q: tl.constexpr,
+    SEQLEN_K: tl.constexpr,
+    NUM_INDEX_HEADS: tl.constexpr,
+    INDEX_HEAD_DIM: tl.constexpr,
+    TOPK: tl.constexpr,
+    NUM_SEGMENTS: tl.constexpr,
+    SEGMENT_SIZE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    segment_idx = tl.program_id(0)
+    query_idx = tl.program_id(1)
+    batch_idx = tl.program_id(2)
+
+    offs_token = tl.arange(0, SEGMENT_SIZE)
+    token_idx = segment_idx * SEGMENT_SIZE + offs_token
+    valid_token = (token_idx < SEQLEN_K) & (token_idx <= query_idx)
+
+    offs_d = tl.arange(0, BLOCK_D)
+    scores = tl.full((SEGMENT_SIZE,), 0.0, dtype=tl.float32)
+    for head_idx in tl.static_range(0, NUM_INDEX_HEADS):
+        q = tl.load(
+            q_ptr
+            + query_idx * stride_q_s
+            + batch_idx * stride_q_b
+            + head_idx * stride_q_h
+            + offs_d * stride_q_d,
+            mask=offs_d < INDEX_HEAD_DIM,
+            other=0.0,
+        ).to(tl.float32)
+        key = tl.load(
+            key_ptr
+            + token_idx[:, None] * stride_k_s
+            + batch_idx * stride_k_b
+            + offs_d[None, :] * stride_k_d,
+            mask=valid_token[:, None] & (offs_d[None, :] < INDEX_HEAD_DIM),
+            other=0.0,
+        ).to(tl.float32)
+        dot = tl.sum(key * q[None, :], axis=1)
+        weight = tl.load(
+            weights_ptr
+            + query_idx * stride_w_s
+            + batch_idx * stride_w_b
+            + head_idx * stride_w_h
+        ).to(tl.float32)
+        scores += tl.maximum(dot, 0.0) * weight
+
+    scores = tl.where(valid_token, scores, -float("inf"))
+    out_base = ((batch_idx * SEQLEN_Q + query_idx) * NUM_SEGMENTS + segment_idx) * TOPK
+    for topk_idx in tl.static_range(0, TOPK):
+        max_score, max_offset = tl.max(scores, axis=0, return_indices=True)
+        has_value = max_score > -float("inf")
+        tl.store(local_scores_ptr + out_base + topk_idx, max_score)
+        tl.store(
+            local_indices_ptr + out_base + topk_idx,
+            tl.where(has_value, segment_idx * SEGMENT_SIZE + max_offset, -1),
+        )
+        scores = tl.where(offs_token == max_offset, -float("inf"), scores)
+
+
+def _can_use_triton_gqa_dsa_indexer_topk(
+    q_index: torch.Tensor,
+    k_index: torch.Tensor,
+    weights: torch.Tensor,
+    index_topk: int,
+) -> bool:
+    if not HAVE_TRITON:
+        return False
+    if not (q_index.is_cuda and k_index.is_cuda and weights.is_cuda):
+        return False
+    if q_index.dim() != 4 or k_index.dim() != 3:
+        return False
+    if weights.shape != (q_index.size(0), q_index.size(1), q_index.size(2)):
+        return False
+    if q_index.size(1) != k_index.size(1) or q_index.size(3) != k_index.size(2):
+        return False
+    if q_index.size(0) <= 0 or k_index.size(0) <= 0 or index_topk <= 0:
+        return False
+    if index_topk > _PAGED_INDEXER_SEGMENT_SIZE:
+        return False
+    return q_index.size(2) <= 64 and q_index.size(3) <= 256
+
+
+def triton_gqa_dsa_indexer_topk_fn(
+    q_index: torch.Tensor,
+    k_index: torch.Tensor,
+    weights: torch.Tensor,
+    index_topk: int,
+) -> torch.Tensor:
+    """Triton causal DSA-GQA indexer scoring/top-k for eval prefill."""
+    if not _can_use_triton_gqa_dsa_indexer_topk(q_index, k_index, weights, index_topk):
+        raise NotImplementedError("Triton DSA-GQA indexer top-k requires supported CUDA tensors.")
+
+    q_index = q_index.contiguous()
+    k_index = k_index.contiguous()
+    weights = weights.contiguous()
+
+    seqlen_q, batch_size, num_index_heads, index_head_dim = q_index.size()
+    seqlen_k = k_index.size(0)
+    topk = min(index_topk, seqlen_k)
+    num_segments = triton.cdiv(seqlen_k, _PAGED_INDEXER_SEGMENT_SIZE)
+    local_scores = torch.empty(
+        (batch_size, seqlen_q, num_segments, topk), dtype=torch.float32, device=q_index.device
+    )
+    local_indices = torch.empty(
+        (batch_size, seqlen_q, num_segments, topk), dtype=torch.long, device=q_index.device
+    )
+
+    _triton_gqa_dsa_indexer_topk_kernel[(num_segments, seqlen_q, batch_size)](
+        q_index,
+        k_index,
+        weights,
+        local_scores,
+        local_indices,
+        q_index.stride(0),
+        q_index.stride(1),
+        q_index.stride(2),
+        q_index.stride(3),
+        k_index.stride(0),
+        k_index.stride(1),
+        k_index.stride(2),
+        weights.stride(0),
+        weights.stride(1),
+        weights.stride(2),
+        SEQLEN_Q=seqlen_q,
+        SEQLEN_K=seqlen_k,
+        NUM_INDEX_HEADS=num_index_heads,
+        INDEX_HEAD_DIM=index_head_dim,
+        TOPK=topk,
+        NUM_SEGMENTS=num_segments,
+        SEGMENT_SIZE=_PAGED_INDEXER_SEGMENT_SIZE,
+        BLOCK_D=_next_power_of_2(index_head_dim),
+    )
+    _, candidate_indices = torch.topk(local_scores.reshape(batch_size, seqlen_q, -1), topk, dim=-1)
+    topk_indices = local_indices.reshape(batch_size, seqlen_q, -1).gather(2, candidate_indices)
+    return topk_indices
+
+
+def gqa_dsa_indexer_topk_fn(
+    q_index: torch.Tensor,
+    k_index: torch.Tensor,
+    weights: torch.Tensor,
+    index_topk: int,
+) -> torch.Tensor:
+    """Dispatch causal DSA-GQA indexer top-k to Triton with exact Torch fallback."""
+    if _can_use_triton_gqa_dsa_indexer_topk(q_index, k_index, weights, index_topk):
+        topk_indices = triton_gqa_dsa_indexer_topk_fn(q_index, k_index, weights, index_topk)
+        prefix_rows = min(max(index_topk - 1, 0), q_index.size(0))
+        if prefix_rows > 0:
+            prefix_mask = torch.triu(
+                torch.full(
+                    (prefix_rows, k_index.size(0)),
+                    float("-inf"),
+                    dtype=torch.float32,
+                    device=q_index.device,
+                ),
+                diagonal=1,
+            )
+            _, prefix_topk_indices = fused_qk_topk_naive(
+                q_index[:prefix_rows], k_index, weights[:prefix_rows], index_topk, prefix_mask
+            )
+            topk_indices[:, :prefix_rows] = prefix_topk_indices
+        return topk_indices
+
+    causal_mask = torch.triu(
+        torch.full(
+            (q_index.size(0), k_index.size(0)),
+            float("-inf"),
+            dtype=torch.float32,
+            device=q_index.device,
+        ),
+        diagonal=1,
+    )
+    _, topk_indices = fused_qk_topk_naive(q_index, k_index, weights, index_topk, causal_mask)
+    return topk_indices
+
+
 def _can_use_triton_grouped_dsa(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -1714,6 +1907,17 @@ class DSGQAIndexer(MegatronModule):
         assert packed_seq_params is None, "Packed sequence is not supported for DSA-GQA."
         q, k, weights = self.forward_before_topk(hidden_states, use_rope, packed_seq_params)
         return fused_qk_topk_naive(q, k, weights, self.index_topk, mask)
+
+    def forward_topk_inference(
+        self,
+        hidden_states: torch.Tensor,
+        use_rope: bool,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ) -> torch.Tensor:
+        """Compute causal top-k indices for eval prefill without returning full index scores."""
+        assert packed_seq_params is None, "Packed sequence is not supported for DSA-GQA."
+        q, k, weights = self.forward_before_topk(hidden_states, use_rope, packed_seq_params)
+        return gqa_dsa_indexer_topk_fn(q, k, weights, self.index_topk)
 
     def forward_before_topk_dynamic(
         self, hidden_states: torch.Tensor, use_rope: bool, inference_context

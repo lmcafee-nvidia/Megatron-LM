@@ -172,8 +172,13 @@ def _score_topk_static(
     mask: torch.Tensor,
     config: BenchConfig,
 ):
-    if backend in ("torch", "dispatch"):
+    if backend == "torch":
         return fused_qk_topk_naive(q_index, k_index, weights, config.topk, mask)
+    if backend == "dispatch":
+        return fused_qk_topk_naive(q_index, k_index, weights, config.topk, mask)
+    if backend == "triton-static":
+        fn = _require_backend("gqa_dsa_indexer_topk_fn")
+        return None, fn(q_index, k_index, weights, config.topk)
     raise RuntimeError(f"{backend} score/top-k backend is only valid for decode profiles.")
 
 
@@ -860,7 +865,9 @@ def parse_args():
     parser.add_argument("--query-length", type=int, default=1)
     parser.add_argument("--quick", action="store_true")
     parser.add_argument(
-        "--score-topk-backend", default="dispatch", choices=["torch", "dispatch", "triton-paged"]
+        "--score-topk-backend",
+        default="dispatch",
+        choices=["torch", "dispatch", "triton-static", "triton-paged"],
     )
     parser.add_argument("--sequence-length", type=int, default=1024)
     parser.add_argument("--topk", type=int, default=64)
