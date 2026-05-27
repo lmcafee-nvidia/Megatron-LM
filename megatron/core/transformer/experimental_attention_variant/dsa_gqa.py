@@ -1166,6 +1166,354 @@ def triton_paged_grouped_dsa_tiled_fn(
 
 
 @triton.jit
+def _triton_fused_paged_gqa_dsa_decode_kernel(
+    q_index_ptr,
+    query_ptr,
+    dsa_key_cache_ptr,
+    key_cache_ptr,
+    value_cache_ptr,
+    block_table_ptr,
+    weights_ptr,
+    output_ptr,
+    debug_topk_ptr,
+    stride_qi_h,
+    stride_qi_d,
+    stride_q_h,
+    stride_q_d,
+    stride_dk_block,
+    stride_dk_pos,
+    stride_dk_d,
+    stride_k_block,
+    stride_k_pos,
+    stride_k_h,
+    stride_k_d,
+    stride_v_block,
+    stride_v_pos,
+    stride_v_h,
+    stride_v_d,
+    stride_w_h,
+    stride_o_h,
+    stride_o_d,
+    query_position,
+    SOFTMAX_SCALE: tl.constexpr,
+    KEY_LENGTH: tl.constexpr,
+    BLOCK_SIZE_TOKENS: tl.constexpr,
+    NUM_INDEX_HEADS: tl.constexpr,
+    INDEX_HEAD_DIM: tl.constexpr,
+    NUM_QUERY_GROUPS: tl.constexpr,
+    HEADS_PER_GROUP: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    VALUE_HEAD_DIM: tl.constexpr,
+    TOPK: tl.constexpr,
+    SEGMENT_SIZE: tl.constexpr,
+    BLOCK_INDEX_D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+):
+    group_idx = tl.program_id(0)
+    offs_segment = tl.arange(0, SEGMENT_SIZE)
+    offs_topk = tl.arange(0, SEGMENT_SIZE)
+    top_scores = tl.full((SEGMENT_SIZE,), -float("inf"), dtype=tl.float32)
+    top_indices = tl.full((SEGMENT_SIZE,), -1, dtype=tl.int64)
+    offs_index_d = tl.arange(0, BLOCK_INDEX_D)
+
+    for segment_start in tl.range(0, KEY_LENGTH, SEGMENT_SIZE):
+        token_idx = segment_start + offs_segment
+        valid_token = (token_idx < KEY_LENGTH) & (token_idx <= query_position)
+        cache_block = tl.load(
+            block_table_ptr + (token_idx // BLOCK_SIZE_TOKENS), mask=valid_token, other=0
+        ).to(tl.int64)
+        cache_pos = token_idx % BLOCK_SIZE_TOKENS
+
+        scores = tl.full((SEGMENT_SIZE,), 0.0, dtype=tl.float32)
+        for index_head_idx in tl.static_range(0, NUM_INDEX_HEADS):
+            q_index = tl.load(
+                q_index_ptr + index_head_idx * stride_qi_h + offs_index_d * stride_qi_d,
+                mask=offs_index_d < INDEX_HEAD_DIM,
+                other=0.0,
+            ).to(tl.float32)
+            key_index = tl.load(
+                dsa_key_cache_ptr
+                + cache_block[:, None] * stride_dk_block
+                + cache_pos[:, None] * stride_dk_pos
+                + offs_index_d[None, :] * stride_dk_d,
+                mask=valid_token[:, None] & (offs_index_d[None, :] < INDEX_HEAD_DIM),
+                other=0.0,
+            ).to(tl.float32)
+            dot = tl.sum(key_index * q_index[None, :], axis=1)
+            weight = tl.load(weights_ptr + index_head_idx * stride_w_h).to(tl.float32)
+            scores += tl.maximum(dot, 0.0) * weight
+        scores = tl.where(valid_token, scores, -float("inf"))
+
+        merged_scores = tl.full((SEGMENT_SIZE,), -float("inf"), dtype=tl.float32)
+        merged_indices = tl.full((SEGMENT_SIZE,), -1, dtype=tl.int64)
+        for topk_idx in tl.static_range(0, TOPK):
+            old_score, old_offset = tl.max(top_scores, axis=0, return_indices=True)
+            new_score, new_offset = tl.max(scores, axis=0, return_indices=True)
+            take_old = old_score >= new_score
+            selected_score = tl.where(take_old, old_score, new_score)
+            selected_old_index = tl.sum(tl.where(offs_topk == old_offset, top_indices, 0), axis=0)
+            selected_new_index = segment_start + new_offset
+            selected_index = tl.where(take_old, selected_old_index, selected_new_index)
+            has_value = selected_score > -float("inf")
+            merged_scores = tl.where(offs_topk == topk_idx, selected_score, merged_scores)
+            merged_indices = tl.where(
+                offs_topk == topk_idx, tl.where(has_value, selected_index, -1), merged_indices
+            )
+            top_scores = tl.where(take_old & (offs_topk == old_offset), -float("inf"), top_scores)
+            scores = tl.where((~take_old) & (offs_segment == new_offset), -float("inf"), scores)
+        top_scores = merged_scores
+        top_indices = merged_indices
+
+    tl.store(
+        debug_topk_ptr + offs_topk,
+        top_indices,
+        mask=(group_idx == 0) & (offs_topk < TOPK),
+    )
+
+    key_indices = top_indices
+    valid_k = (offs_topk < TOPK) & (key_indices >= 0) & (key_indices < KEY_LENGTH)
+    cache_block = tl.load(
+        block_table_ptr + (key_indices // BLOCK_SIZE_TOKENS), mask=valid_k, other=0
+    ).to(tl.int64)
+    cache_pos = key_indices % BLOCK_SIZE_TOKENS
+
+    offs_d = tl.arange(0, BLOCK_D)
+    key_values = tl.load(
+        key_cache_ptr
+        + cache_block[:, None] * stride_k_block
+        + cache_pos[:, None] * stride_k_pos
+        + group_idx * stride_k_h
+        + offs_d[None, :] * stride_k_d,
+        mask=valid_k[:, None] & (offs_d[None, :] < HEAD_DIM),
+        other=0.0,
+    ).to(tl.float32)
+
+    offs_v = tl.arange(0, BLOCK_V)
+    value_values = tl.load(
+        value_cache_ptr
+        + cache_block[:, None] * stride_v_block
+        + cache_pos[:, None] * stride_v_pos
+        + group_idx * stride_v_h
+        + offs_v[None, :] * stride_v_d,
+        mask=valid_k[:, None] & (offs_v[None, :] < VALUE_HEAD_DIM),
+        other=0.0,
+    ).to(tl.float32)
+
+    valid_count = tl.sum(tl.where(valid_k, 1, 0), axis=0)
+    has_valid = valid_count > 0
+    for local_head_idx in tl.static_range(0, HEADS_PER_GROUP):
+        head_idx = group_idx * HEADS_PER_GROUP + local_head_idx
+        q = tl.load(
+            query_ptr + head_idx * stride_q_h + offs_d * stride_q_d,
+            mask=offs_d < HEAD_DIM,
+            other=0.0,
+        ).to(tl.float32)
+        attention_scores = tl.sum(key_values * q[None, :], axis=1) * SOFTMAX_SCALE
+        attention_scores = tl.where(valid_k, attention_scores, -float("inf"))
+        max_score = tl.max(attention_scores, axis=0)
+        max_score = tl.where(has_valid, max_score, 0.0)
+        attention_weights = tl.exp(attention_scores - max_score)
+        attention_weights = tl.where(valid_k, attention_weights, 0.0)
+        denom = tl.sum(attention_weights, axis=0)
+        attention_weights = attention_weights / tl.where(denom > 0.0, denom, 1.0)
+        output = tl.sum(attention_weights[:, None] * value_values, axis=0)
+        tl.store(
+            output_ptr + head_idx * stride_o_h + offs_v * stride_o_d,
+            output,
+            mask=offs_v < VALUE_HEAD_DIM,
+        )
+
+
+def _can_use_triton_fused_paged_gqa_dsa_decode(
+    q_index: torch.Tensor,
+    query: torch.Tensor,
+    dsa_key_cache: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table_row: torch.Tensor,
+    weights: torch.Tensor,
+    index_topk: int,
+    key_length: int,
+) -> bool:
+    if not HAVE_TRITON:
+        return False
+    tensors = (q_index, query, dsa_key_cache, key_cache, value_cache, block_table_row, weights)
+    if not all(tensor.is_cuda for tensor in tensors):
+        return False
+    if q_index.dim() != 4 or query.dim() != 4 or weights.dim() != 3:
+        return False
+    if q_index.size(0) != 1 or q_index.size(1) != 1 or query.size(0) != 1 or query.size(1) != 1:
+        return False
+    if weights.shape != (1, 1, q_index.size(2)):
+        return False
+    if dsa_key_cache.dim() != 3 or key_cache.dim() != 4 or value_cache.dim() != 4:
+        return False
+    if q_index.size(3) != dsa_key_cache.size(2):
+        return False
+    if query.size(3) != key_cache.size(3) or key_cache.size(0) != value_cache.size(0):
+        return False
+    if key_cache.size(1) != value_cache.size(1) or key_cache.size(2) != value_cache.size(2):
+        return False
+    if query.size(2) % key_cache.size(2) != 0:
+        return False
+    heads_per_group = query.size(2) // key_cache.size(2)
+    if not (1 <= heads_per_group <= 8):
+        return False
+    if index_topk <= 0 or index_topk > _PAGED_INDEXER_SEGMENT_SIZE or key_length <= 0:
+        return False
+    return q_index.size(2) <= 64 and q_index.size(3) <= 256 and query.size(3) <= 256
+
+
+def triton_fused_paged_gqa_dsa_decode_fn(
+    q_index: torch.Tensor,
+    query: torch.Tensor,
+    dsa_key_cache: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table_row: torch.Tensor,
+    weights: torch.Tensor,
+    index_topk: int,
+    softmax_scale: float,
+    query_start_position: int,
+    key_length: int,
+    block_size_tokens: int,
+    return_topk: bool = False,
+):
+    """Fused qlen=1 paged DSA-GQA decode scorer/top-k/attention."""
+    if not _can_use_triton_fused_paged_gqa_dsa_decode(
+        q_index, query, dsa_key_cache, key_cache, value_cache, block_table_row, weights, index_topk, key_length
+    ):
+        raise NotImplementedError("Fused Triton paged DSA-GQA decode requires supported CUDA qlen=1 tensors.")
+
+    q_index = q_index.squeeze(1).squeeze(0).contiguous()
+    query = query.squeeze(1).squeeze(0).contiguous()
+    weights = weights.squeeze(1).squeeze(0).contiguous()
+    dsa_key_cache = dsa_key_cache.contiguous()
+    key_cache = key_cache.contiguous()
+    value_cache = value_cache.contiguous()
+    block_table_row = block_table_row.contiguous()
+
+    num_query_heads, head_dim = query.size()
+    num_query_groups = key_cache.size(2)
+    heads_per_group = num_query_heads // num_query_groups
+    value_head_dim = value_cache.size(3)
+    topk = min(index_topk, key_length)
+    output = torch.empty((num_query_heads, value_head_dim), dtype=value_cache.dtype, device=query.device)
+    topk_indices = torch.empty((topk,), dtype=torch.long, device=query.device)
+
+    _triton_fused_paged_gqa_dsa_decode_kernel[(num_query_groups,)](
+        q_index,
+        query,
+        dsa_key_cache,
+        key_cache,
+        value_cache,
+        block_table_row,
+        weights,
+        output,
+        topk_indices,
+        q_index.stride(0),
+        q_index.stride(1),
+        query.stride(0),
+        query.stride(1),
+        dsa_key_cache.stride(0),
+        dsa_key_cache.stride(1),
+        dsa_key_cache.stride(2),
+        key_cache.stride(0),
+        key_cache.stride(1),
+        key_cache.stride(2),
+        key_cache.stride(3),
+        value_cache.stride(0),
+        value_cache.stride(1),
+        value_cache.stride(2),
+        value_cache.stride(3),
+        weights.stride(0),
+        output.stride(0),
+        output.stride(1),
+        query_start_position,
+        SOFTMAX_SCALE=softmax_scale,
+        KEY_LENGTH=key_length,
+        BLOCK_SIZE_TOKENS=block_size_tokens,
+        NUM_INDEX_HEADS=q_index.size(0),
+        INDEX_HEAD_DIM=q_index.size(1),
+        NUM_QUERY_GROUPS=num_query_groups,
+        HEADS_PER_GROUP=heads_per_group,
+        HEAD_DIM=head_dim,
+        VALUE_HEAD_DIM=value_head_dim,
+        TOPK=topk,
+        SEGMENT_SIZE=_PAGED_INDEXER_SEGMENT_SIZE,
+        BLOCK_INDEX_D=_next_power_of_2(q_index.size(1)),
+        BLOCK_D=_next_power_of_2(head_dim),
+        BLOCK_V=_next_power_of_2(value_head_dim),
+    )
+    output = output.unsqueeze(0).unsqueeze(1).reshape(1, 1, num_query_heads * value_head_dim)
+    if return_topk:
+        return output, topk_indices.view(1, 1, topk)
+    return output
+
+
+def fused_paged_gqa_dsa_decode_fn(
+    q_index: torch.Tensor,
+    query: torch.Tensor,
+    dsa_key_cache: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table_row: torch.Tensor,
+    weights: torch.Tensor,
+    index_topk: int,
+    softmax_scale: float,
+    query_start_position: int,
+    key_length: int,
+    block_size_tokens: int,
+    return_topk: bool = False,
+):
+    """Dispatch fused qlen=1 DSA-GQA decode with staged fallback."""
+    if _can_use_triton_fused_paged_gqa_dsa_decode(
+        q_index, query, dsa_key_cache, key_cache, value_cache, block_table_row, weights, index_topk, key_length
+    ):
+        return triton_fused_paged_gqa_dsa_decode_fn(
+            q_index,
+            query,
+            dsa_key_cache,
+            key_cache,
+            value_cache,
+            block_table_row,
+            weights,
+            index_topk,
+            softmax_scale,
+            query_start_position,
+            key_length,
+            block_size_tokens,
+            return_topk=return_topk,
+        )
+
+    topk_indices = paged_gqa_dsa_indexer_topk_fn(
+        q_index,
+        dsa_key_cache,
+        block_table_row,
+        weights,
+        index_topk,
+        query_start_position,
+        key_length,
+        block_size_tokens,
+    )
+    output = paged_grouped_dsa_fn(
+        query,
+        key_cache,
+        value_cache,
+        block_table_row,
+        topk_indices,
+        softmax_scale,
+        query_start_position,
+        key_length,
+        block_size_tokens,
+    )
+    if return_topk:
+        return output, topk_indices
+    return output
+
+
+@triton.jit
 def _triton_paged_gqa_dsa_indexer_topk_kernel(
     q_ptr,
     key_cache_ptr,

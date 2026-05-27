@@ -833,10 +833,85 @@ def run_decode_fused(
     baseline: dict | None = None,
 ):
     """Run a fused decode pipeline backend when one is available."""
-    raise RuntimeError(
-        "pipeline-backend=fused-triton requires fused_paged_gqa_dsa_decode_fn, "
-        "which is added by the fused decode implementation."
+    if config.batch_size != 1 or config.query_length != 1:
+        raise RuntimeError("pipeline-backend=fused-triton currently supports batch-size=1 and query-length=1.")
+
+    torch.manual_seed(5678)
+    hidden, linear_q_weight, linear_k_weight, linear_weight_proj = _projection_inputs(
+        config, config.query_length, 1, device
     )
+    q_index, _, weights = _project_indexer(
+        hidden, linear_q_weight, linear_k_weight, linear_weight_proj, config
+    )
+    dsa_key_sequence = torch.randn(
+        config.key_length, config.index_head_dim, device=device, dtype=config.dtype
+    )
+    num_blocks = math.ceil(config.key_length / config.block_size_tokens)
+    block_table_row = torch.arange(num_blocks, device=device, dtype=torch.long)
+    dsa_key_cache = _make_block_cache(dsa_key_sequence, block_table_row, config.block_size_tokens)
+    key_sequence = torch.randn(
+        config.key_length, config.num_query_groups, config.head_dim, device=device, dtype=config.dtype
+    )
+    value_sequence = torch.randn_like(key_sequence)
+    key_cache = _make_block_cache(key_sequence, block_table_row, config.block_size_tokens)
+    value_cache = _make_block_cache(value_sequence, block_table_row, config.block_size_tokens)
+    query = torch.randn(
+        config.query_length,
+        1,
+        config.num_query_heads,
+        config.head_dim,
+        device=device,
+        dtype=config.dtype,
+    )
+    query_start_position = config.key_length - config.query_length
+    fn = _require_backend("fused_paged_gqa_dsa_decode_fn")
+    output, topk_indices = fn(
+        q_index,
+        query,
+        dsa_key_cache,
+        key_cache,
+        value_cache,
+        block_table_row,
+        weights,
+        config.topk,
+        config.head_dim**-0.5,
+        query_start_position,
+        config.key_length,
+        config.block_size_tokens,
+        return_topk=True,
+    )
+
+    result = {
+        "projection_ms": _time_ms(
+            lambda: _project_indexer(hidden, linear_q_weight, linear_k_weight, linear_weight_proj, config),
+            config,
+            device,
+        ),
+        "pipeline_ms": _time_ms(
+            lambda: fn(
+                q_index,
+                query,
+                dsa_key_cache,
+                key_cache,
+                value_cache,
+                block_table_row,
+                weights,
+                config.topk,
+                config.head_dim**-0.5,
+                query_start_position,
+                config.key_length,
+                config.block_size_tokens,
+            ),
+            config,
+            device,
+        ),
+        "topk_indices": topk_indices,
+        "output": output,
+    }
+    if baseline is not None:
+        result["topk_match"] = torch.equal(result["topk_indices"], baseline["topk_indices"])
+        result["output_max_abs_diff"] = _max_abs_diff(result["output"], baseline["output"])
+    return result
 
 
 def parse_args():
