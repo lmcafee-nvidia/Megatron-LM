@@ -3,6 +3,7 @@
 """Microbenchmark DSA-GQA stages against explicit baseline backends."""
 
 import argparse
+import importlib.util
 import json
 import math
 import statistics
@@ -442,6 +443,56 @@ def _write_json(path: str, payload: dict) -> None:
     with open(path, "w", encoding="utf-8") as output_file:
         json.dump(payload, output_file, indent=2, sort_keys=True)
         output_file.write("\n")
+
+
+def _module_available(name: str) -> bool:
+    return importlib.util.find_spec(name) is not None
+
+
+def _run_library_experiment(backend: str) -> dict:
+    if backend == "flashinfer":
+        return {
+            "backend": backend,
+            "available": _module_available("flashinfer"),
+            "exact_semantics": False,
+            "status": "skipped",
+            "reason": (
+                "FlashInfer block-sparse attention does not compute the DSA token scorer/top-k; "
+                "using it would benchmark only an attention subproblem after a non-equivalent "
+                "top-k-to-block transform."
+            ),
+        }
+    if backend == "cudnn":
+        return {
+            "backend": backend,
+            "available": _module_available("cudnn") or _module_available("torch.backends.cudnn"),
+            "exact_semantics": False,
+            "status": "skipped",
+            "reason": (
+                "cuDNN SDPA does not expose the current learned token-level DSA sparsity and "
+                "scorer/top-k semantics as a drop-in backend."
+            ),
+        }
+    if backend == "deepgemm":
+        return {
+            "backend": backend,
+            "available": _module_available("deep_gemm") or _module_available("deepgemm"),
+            "exact_semantics": False,
+            "status": "skipped",
+            "reason": (
+                "DeepGEMM is unavailable here and its public scorer path emits full quantized "
+                "logits rather than exact BF16 token top-k indices."
+            ),
+        }
+    raise RuntimeError(f"Unknown library backend: {backend}")
+
+
+def _print_library_experiment(result: dict) -> None:
+    print(f"\nlibrary backend={result['backend']}")
+    print(f"  available: {result['available']}")
+    print(f"  exact_semantics: {result['exact_semantics']}")
+    print(f"  status: {result['status']}")
+    print(f"  reason: {result['reason']}")
 
 
 def run_static(
@@ -933,6 +984,7 @@ def parse_args():
     parser.add_argument("--indexer-cache-backend", default="gather", choices=["gather", "paged-direct"])
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--key-length", type=int, default=8192)
+    parser.add_argument("--library-backend", default="none", choices=["none", "flashinfer", "cudnn", "deepgemm"])
     parser.add_argument("--num-query-groups", type=int, default=8)
     parser.add_argument("--num-query-heads", type=int, default=32)
     parser.add_argument("--pipeline-backend", default="staged", choices=["staged", "fused-triton"])
@@ -1010,6 +1062,11 @@ def main():
             baseline,
         )
         results["decode"] = _result_for_json(result)
+
+    if args.library_backend != "none":
+        library_result = _run_library_experiment(args.library_backend)
+        _print_library_experiment(library_result)
+        results["library_experiment"] = library_result
 
     if args.export_json:
         _write_json(
