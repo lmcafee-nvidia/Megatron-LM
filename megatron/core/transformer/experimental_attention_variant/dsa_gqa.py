@@ -394,6 +394,244 @@ def grouped_dsa_fn(
     return unfused_grouped_dsa_fn(query, key, value, topk_indices, softmax_scale, mask=mask)
 
 
+@triton.jit
+def _triton_paged_grouped_dsa_kernel(
+    query_ptr,
+    key_cache_ptr,
+    value_cache_ptr,
+    block_table_ptr,
+    topk_ptr,
+    output_ptr,
+    stride_q_s,
+    stride_q_h,
+    stride_q_d,
+    stride_k_block,
+    stride_k_pos,
+    stride_k_h,
+    stride_k_d,
+    stride_v_block,
+    stride_v_pos,
+    stride_v_h,
+    stride_v_d,
+    stride_t_s,
+    stride_t_k,
+    stride_o_s,
+    stride_o_h,
+    stride_o_d,
+    query_start_position,
+    SOFTMAX_SCALE: tl.constexpr,
+    KEY_LENGTH: tl.constexpr,
+    BLOCK_SIZE_TOKENS: tl.constexpr,
+    NUM_QUERY_HEADS: tl.constexpr,
+    NUM_QUERY_GROUPS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    VALUE_HEAD_DIM: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    query_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    heads_per_group = NUM_QUERY_HEADS // NUM_QUERY_GROUPS
+    group_idx = head_idx // heads_per_group
+    query_position = query_start_position + query_idx
+
+    offs_d = tl.arange(0, BLOCK_D)
+    q = tl.load(
+        query_ptr + query_idx * stride_q_s + head_idx * stride_q_h + offs_d * stride_q_d,
+        mask=offs_d < HEAD_DIM,
+        other=0.0,
+    ).to(tl.float32)
+
+    offs_k = tl.arange(0, BLOCK_K)
+    key_indices = tl.load(
+        topk_ptr + query_idx * stride_t_s + offs_k * stride_t_k,
+        mask=offs_k < TOPK,
+        other=0,
+    ).to(tl.int64)
+    valid_k = (offs_k < TOPK) & (key_indices >= 0) & (key_indices < KEY_LENGTH)
+    valid_k = valid_k & (key_indices <= query_position)
+    cache_block = tl.load(
+        block_table_ptr + (key_indices // BLOCK_SIZE_TOKENS), mask=valid_k, other=0
+    ).to(tl.int64)
+    cache_pos = key_indices % BLOCK_SIZE_TOKENS
+
+    key_values = tl.load(
+        key_cache_ptr
+        + cache_block[:, None] * stride_k_block
+        + cache_pos[:, None] * stride_k_pos
+        + group_idx * stride_k_h
+        + offs_d[None, :] * stride_k_d,
+        mask=valid_k[:, None] & (offs_d[None, :] < HEAD_DIM),
+        other=0.0,
+    ).to(tl.float32)
+    scores = tl.sum(key_values * q[None, :], axis=1) * SOFTMAX_SCALE
+    scores = tl.where(valid_k, scores, -float("inf"))
+
+    valid_count = tl.sum(tl.where(valid_k, 1, 0), axis=0)
+    has_valid = valid_count > 0
+    max_score = tl.max(scores, axis=0)
+    max_score = tl.where(has_valid, max_score, 0.0)
+    weights = tl.exp(scores - max_score)
+    weights = tl.where(valid_k, weights, 0.0)
+    denom = tl.sum(weights, axis=0)
+    weights = weights / tl.where(denom > 0.0, denom, 1.0)
+
+    offs_v = tl.arange(0, BLOCK_V)
+    value_values = tl.load(
+        value_cache_ptr
+        + cache_block[:, None] * stride_v_block
+        + cache_pos[:, None] * stride_v_pos
+        + group_idx * stride_v_h
+        + offs_v[None, :] * stride_v_d,
+        mask=valid_k[:, None] & (offs_v[None, :] < VALUE_HEAD_DIM),
+        other=0.0,
+    ).to(tl.float32)
+    output = tl.sum(weights[:, None] * value_values, axis=0)
+    tl.store(
+        output_ptr + query_idx * stride_o_s + head_idx * stride_o_h + offs_v * stride_o_d,
+        output,
+        mask=offs_v < VALUE_HEAD_DIM,
+    )
+
+
+def _can_use_triton_paged_grouped_dsa(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table_row: torch.Tensor,
+    topk_indices: torch.Tensor,
+) -> bool:
+    if not HAVE_TRITON:
+        return False
+    tensors = (query, key_cache, value_cache, block_table_row, topk_indices)
+    if not all(tensor.is_cuda for tensor in tensors):
+        return False
+    if query.dim() != 4 or key_cache.dim() != 4 or value_cache.dim() != 4:
+        return False
+    if query.size(1) != 1 or topk_indices.dim() != 3 or topk_indices.size(0) != 1:
+        return False
+    if key_cache.size(0) != value_cache.size(0) or key_cache.size(1) != value_cache.size(1):
+        return False
+    if key_cache.size(2) != value_cache.size(2) or query.size(2) % key_cache.size(2) != 0:
+        return False
+    if query.size(3) != key_cache.size(3) or topk_indices.size(1) != query.size(0):
+        return False
+    return query.size(3) <= 256 and value_cache.size(3) <= 256 and topk_indices.size(2) <= 256
+
+
+def triton_paged_grouped_dsa_fn(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table_row: torch.Tensor,
+    topk_indices: torch.Tensor,
+    softmax_scale: float,
+    query_start_position: int,
+    key_length: int,
+    block_size_tokens: int,
+):
+    """Triton GQA sparse attention that reads K/V directly from paged cache blocks."""
+    if not _can_use_triton_paged_grouped_dsa(
+        query, key_cache, value_cache, block_table_row, topk_indices
+    ):
+        raise NotImplementedError("Triton paged DSA-GQA requires CUDA paged-cache tensors.")
+
+    query = query.contiguous()
+    topk_indices = topk_indices.contiguous()
+    block_table_row = block_table_row.contiguous()
+    key_cache = key_cache.contiguous()
+    value_cache = value_cache.contiguous()
+
+    query_length, _, num_query_heads, head_dim = query.size()
+    num_query_groups = key_cache.size(2)
+    value_head_dim = value_cache.size(3)
+    topk = topk_indices.size(2)
+    output = torch.empty(
+        (query_length, num_query_heads, value_head_dim), dtype=value_cache.dtype, device=query.device
+    )
+
+    _triton_paged_grouped_dsa_kernel[(query_length, num_query_heads)](
+        query,
+        key_cache,
+        value_cache,
+        block_table_row,
+        topk_indices.squeeze(0),
+        output,
+        query.stride(0),
+        query.stride(2),
+        query.stride(3),
+        key_cache.stride(0),
+        key_cache.stride(1),
+        key_cache.stride(2),
+        key_cache.stride(3),
+        value_cache.stride(0),
+        value_cache.stride(1),
+        value_cache.stride(2),
+        value_cache.stride(3),
+        topk_indices.squeeze(0).stride(0),
+        topk_indices.squeeze(0).stride(1),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        query_start_position,
+        SOFTMAX_SCALE=softmax_scale,
+        KEY_LENGTH=key_length,
+        BLOCK_SIZE_TOKENS=block_size_tokens,
+        NUM_QUERY_HEADS=num_query_heads,
+        NUM_QUERY_GROUPS=num_query_groups,
+        HEAD_DIM=head_dim,
+        VALUE_HEAD_DIM=value_head_dim,
+        TOPK=topk,
+        BLOCK_D=_next_power_of_2(head_dim),
+        BLOCK_V=_next_power_of_2(value_head_dim),
+        BLOCK_K=_next_power_of_2(topk),
+    )
+    return output.unsqueeze(1).reshape(query_length, 1, num_query_heads * value_head_dim)
+
+
+def paged_grouped_dsa_fn(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table_row: torch.Tensor,
+    topk_indices: torch.Tensor,
+    softmax_scale: float,
+    query_start_position: int,
+    key_length: int,
+    block_size_tokens: int,
+):
+    """Dispatch dynamic GQA DSA attention to a paged Triton kernel when supported."""
+    if _can_use_triton_paged_grouped_dsa(
+        query, key_cache, value_cache, block_table_row, topk_indices
+    ):
+        return triton_paged_grouped_dsa_fn(
+            query,
+            key_cache,
+            value_cache,
+            block_table_row,
+            topk_indices,
+            softmax_scale,
+            query_start_position,
+            key_length,
+            block_size_tokens,
+        )
+
+    request_key = _gather_block_cache_sequence(
+        key_cache, block_table_row, key_length, block_size_tokens
+    ).unsqueeze(1)
+    request_value = _gather_block_cache_sequence(
+        value_cache, block_table_row, key_length, block_size_tokens
+    ).unsqueeze(1)
+    request_mask = _build_shifted_causal_mask(
+        query.size(0), key_length, query_start_position, query.device
+    )
+    return grouped_dsa_fn(
+        query, request_key, request_value, topk_indices, softmax_scale, mask=request_mask
+    )
+
+
 @dataclass
 class DSGQAIndexerSubmodules:
     linear_q: Union[ModuleSpec, type] = None
@@ -788,12 +1026,6 @@ class DSGQACoreAttention(MegatronModule):
                 continue
 
             block_table_row = block_table[request_idx]
-            request_key = _gather_block_cache_sequence(
-                key_cache, block_table_row, key_length, block_size_tokens
-            ).unsqueeze(1)
-            request_value = _gather_block_cache_sequence(
-                value_cache, block_table_row, key_length, block_size_tokens
-            ).unsqueeze(1)
             request_index_key = _gather_block_cache_sequence(
                 dsa_key_cache, block_table_row, key_length, block_size_tokens
             ).unsqueeze(1)
@@ -815,13 +1047,16 @@ class DSGQACoreAttention(MegatronModule):
                 self.indexer.index_topk,
                 request_mask,
             )
-            output[query_start:query_end] = grouped_dsa_fn(
+            output[query_start:query_end] = paged_grouped_dsa_fn(
                 request_query,
-                request_key,
-                request_value,
+                key_cache,
+                value_cache,
+                block_table_row,
                 topk_indices,
                 self.softmax_scale,
-                mask=request_mask,
+                request_offset,
+                key_length,
+                block_size_tokens,
             )
 
         if q_cursor != inference_context.active_token_count:
