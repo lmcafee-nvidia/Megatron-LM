@@ -3,6 +3,7 @@
 """Microbenchmark DSA-GQA stages against explicit baseline backends."""
 
 import argparse
+import json
 import math
 import statistics
 import time
@@ -24,6 +25,27 @@ from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
     unfused_grouped_dsa_fn,
 )
 
+WORKLOAD_TIERS = {
+    "quick": {
+        "sequence_length": 128,
+        "key_length": 512,
+        "query_length": 2,
+        "hidden_size": 1024,
+        "index_heads": 8,
+        "index_head_dim": 64,
+        "num_query_heads": 8,
+        "num_query_groups": 2,
+        "head_dim": 64,
+        "topk": 16,
+        "iters": 10,
+        "warmup": 3,
+    },
+    "8k": {"sequence_length": 8192, "key_length": 8192},
+    "64k": {"sequence_length": 65536, "key_length": 65536},
+    "256k": {"sequence_length": 262144, "key_length": 262144},
+    "1m": {"sequence_length": 1048576, "key_length": 1048576},
+}
+
 
 @dataclass
 class BenchConfig:
@@ -42,6 +64,15 @@ class BenchConfig:
     sequence_length: int
     topk: int
     warmup: int
+
+
+def _apply_workload_tier(args: argparse.Namespace) -> None:
+    if args.quick:
+        args.workload_tier = "quick"
+    if args.workload_tier == "custom":
+        return
+    for key, value in WORKLOAD_TIERS[args.workload_tier].items():
+        setattr(args, key, value)
 
 
 def _time_ms(fn: Callable[[], object], config: BenchConfig, device: torch.device) -> float:
@@ -71,19 +102,7 @@ def _time_ms(fn: Callable[[], object], config: BenchConfig, device: torch.device
 
 
 def _make_config(args: argparse.Namespace) -> BenchConfig:
-    if args.quick:
-        args.sequence_length = min(args.sequence_length, 128)
-        args.key_length = min(args.key_length, 512)
-        args.query_length = min(args.query_length, 2)
-        args.hidden_size = min(args.hidden_size, 1024)
-        args.index_heads = min(args.index_heads, 8)
-        args.index_head_dim = min(args.index_head_dim, 64)
-        args.num_query_heads = min(args.num_query_heads, 8)
-        args.num_query_groups = min(args.num_query_groups, 2)
-        args.head_dim = min(args.head_dim, 64)
-        args.topk = min(args.topk, 16)
-        args.iters = min(args.iters, 10)
-        args.warmup = min(args.warmup, 3)
+    _apply_workload_tier(args)
     return BenchConfig(
         batch_size=args.batch_size,
         block_size_tokens=args.block_size_tokens,
@@ -380,12 +399,22 @@ def _max_abs_diff(lhs: torch.Tensor, rhs: torch.Tensor) -> float:
 
 def _print_result(title: str, result: dict, baseline: dict | None = None):
     print(f"\n{title}")
-    total = result["projection_ms"] + result["score_topk_ms"] + result["attention_ms"]
-    if "indexer_cache_ms" in result:
-        total += result["indexer_cache_ms"]
-    result["total_ms"] = total
+    if "total_ms" not in result:
+        total = result.get("projection_ms", 0.0)
+        total += result.get("indexer_cache_ms", 0.0)
+        total += result.get("score_topk_ms", 0.0)
+        total += result.get("attention_ms", 0.0)
+        total += result.get("pipeline_ms", 0.0)
+        result["total_ms"] = total
 
-    for key in ("projection_ms", "indexer_cache_ms", "score_topk_ms", "attention_ms", "total_ms"):
+    for key in (
+        "projection_ms",
+        "indexer_cache_ms",
+        "score_topk_ms",
+        "attention_ms",
+        "pipeline_ms",
+        "total_ms",
+    ):
         if key in result:
             print(f"  {key}: {result[key]:.4f}")
 
@@ -394,6 +423,20 @@ def _print_result(title: str, result: dict, baseline: dict | None = None):
         print(f"  speedup_vs_baseline: {baseline_total / total:.3f}x")
         print(f"  topk_match: {result['topk_match']}")
         print(f"  output_max_abs_diff: {result['output_max_abs_diff']:.6g}")
+
+
+def _result_for_json(result: dict) -> dict:
+    return {
+        key: value
+        for key, value in result.items()
+        if not torch.is_tensor(value)
+    }
+
+
+def _write_json(path: str, payload: dict) -> None:
+    with open(path, "w", encoding="utf-8") as output_file:
+        json.dump(payload, output_file, indent=2, sort_keys=True)
+        output_file.write("\n")
 
 
 def run_static(
@@ -779,13 +822,30 @@ def run_decode_batched(
     return result
 
 
+def run_decode_fused(
+    config: BenchConfig,
+    device: torch.device,
+    baseline: dict | None = None,
+):
+    """Run a fused decode pipeline backend when one is available."""
+    raise RuntimeError(
+        "pipeline-backend=fused-triton requires fused_paged_gqa_dsa_decode_fn, "
+        "which is added by the fused decode implementation."
+    )
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--attention-backend", default="dispatch", choices=["torch", "dispatch", "triton", "triton-paged", "triton-gqa-tiled"])
+    parser.add_argument(
+        "--attention-backend",
+        default="dispatch",
+        choices=["torch", "dispatch", "triton", "triton-paged", "triton-gqa-tiled"],
+    )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--block-size-tokens", type=int, default=64)
     parser.add_argument("--compare-baseline", action="store_true")
     parser.add_argument("--dtype", default="bfloat16", choices=["float16", "bfloat16", "float32"])
+    parser.add_argument("--export-json", default=None)
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--hidden-size", type=int, default=4096)
     parser.add_argument("--index-head-dim", type=int, default=128)
@@ -795,13 +855,19 @@ def parse_args():
     parser.add_argument("--key-length", type=int, default=8192)
     parser.add_argument("--num-query-groups", type=int, default=8)
     parser.add_argument("--num-query-heads", type=int, default=32)
+    parser.add_argument("--pipeline-backend", default="staged", choices=["staged", "fused-triton"])
     parser.add_argument("--profile", default="both", choices=["static", "decode", "both"])
     parser.add_argument("--query-length", type=int, default=1)
     parser.add_argument("--quick", action="store_true")
-    parser.add_argument("--score-topk-backend", default="dispatch", choices=["torch", "dispatch", "triton-paged"])
+    parser.add_argument(
+        "--score-topk-backend", default="dispatch", choices=["torch", "dispatch", "triton-paged"]
+    )
     parser.add_argument("--sequence-length", type=int, default=1024)
     parser.add_argument("--topk", type=int, default=64)
     parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument(
+        "--workload-tier", default="custom", choices=["custom", *WORKLOAD_TIERS.keys()]
+    )
     return parser.parse_args()
 
 
@@ -813,38 +879,65 @@ def main():
         config.dtype = torch.float32
     print(f"device: {device}")
     print(f"dtype: {config.dtype}")
+    print(f"workload_tier: {args.workload_tier}")
+    print(f"pipeline_backend: {args.pipeline_backend}")
+    results = {}
 
     if args.profile in ("static", "both"):
+        if args.pipeline_backend != "staged":
+            raise RuntimeError("pipeline-backend=fused-triton is only valid for decode profiles.")
         baseline = None
         if args.compare_baseline:
             baseline = run_static("torch", "torch", config, device)
             _print_result("static baseline score=torch attention=torch", baseline)
+            results["static_baseline"] = _result_for_json(baseline)
         result = run_static(args.score_topk_backend, args.attention_backend, config, device, baseline)
         _print_result(
             f"static score={args.score_topk_backend} attention={args.attention_backend}",
             result,
             baseline,
         )
+        results["static"] = _result_for_json(result)
 
     if args.profile in ("decode", "both"):
         baseline = None
         if args.compare_baseline:
             baseline = run_decode("torch", "torch", "gather", config, device)
             _print_result("decode baseline score=torch cache=gather attention=torch", baseline)
-        result = run_decode(
-            args.score_topk_backend,
-            args.attention_backend if args.attention_backend != "triton" else "dispatch",
-            args.indexer_cache_backend,
-            config,
-            device,
-            baseline,
-        )
+            results["decode_baseline"] = _result_for_json(baseline)
+        if args.pipeline_backend == "staged":
+            result = run_decode(
+                args.score_topk_backend,
+                args.attention_backend if args.attention_backend != "triton" else "dispatch",
+                args.indexer_cache_backend,
+                config,
+                device,
+                baseline,
+            )
+            title = (
+                "decode "
+                f"pipeline=staged score={args.score_topk_backend} cache={args.indexer_cache_backend} "
+                f"attention={args.attention_backend}"
+            )
+        else:
+            result = run_decode_fused(config, device, baseline)
+            title = "decode pipeline=fused-triton"
         _print_result(
-            "decode "
-            f"score={args.score_topk_backend} cache={args.indexer_cache_backend} "
-            f"attention={args.attention_backend}",
+            title,
             result,
             baseline,
+        )
+        results["decode"] = _result_for_json(result)
+
+    if args.export_json:
+        _write_json(
+            args.export_json,
+            {
+                "args": vars(args),
+                "config": {**config.__dict__, "dtype": str(config.dtype)},
+                "device": str(device),
+                "results": results,
+            },
         )
 
 
