@@ -303,7 +303,6 @@ def fused_qk_topk_naive(
     mask: Optional[torch.Tensor] = None,
 ):
     """Naive implementation of QK Topk."""
-    seqlen = q.size(0)
     # =========================================
     # Compute index scores
     # =========================================
@@ -316,7 +315,7 @@ def fused_qk_topk_naive(
     # =========================================
     # Select top-k indices
     # =========================================
-    topk_k = min(index_topk, seqlen)
+    topk_k = min(index_topk, index_scores.size(-1))
     # [batch, seqlen, index_topk]
     topk_indices = index_scores.topk(topk_k, dim=-1)[1]
 

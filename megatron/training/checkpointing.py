@@ -158,6 +158,13 @@ def check_checkpoint_args(checkpoint_args):
     _compare('hidden_size')
     _compare('num_attention_heads')
     _compare('add_position_embedding', default=True)
+    _compare('experimental_attention_variant', default=None)
+    _compare('dsa_indexer_n_heads', default=None)
+    _compare('dsa_indexer_head_dim', default=None)
+    _compare('dsa_indexer_topk', default=None)
+    _compare('dsa_indexer_loss_coeff', default=None)
+    _compare('dsa_indexer_use_sparse_loss', default=False)
+    _compare('dsa_indexer_use_hadamard', default=False)
     if args.vocab_file:
         _compare('max_position_embeddings')
         _compare('make_vocab_size_divisible_by')
@@ -1543,6 +1550,13 @@ def load_args_from_checkpoint(
     _set_arg('apply_query_key_layer_scaling', force=True)
     _set_arg('attention_dropout', force=True)
     _set_arg('hidden_dropout', force=True)
+    _set_arg('experimental_attention_variant', force=True)
+    _set_arg('dsa_indexer_n_heads', force=True)
+    _set_arg('dsa_indexer_head_dim', force=True)
+    _set_arg('dsa_indexer_topk', force=True)
+    _set_arg('dsa_indexer_loss_coeff', force=True)
+    _set_arg('dsa_indexer_use_sparse_loss', force=True)
+    _set_arg('dsa_indexer_use_hadamard', force=True)
 
     # Legacy MTP pattern for old checkpoints
     _set_arg('mtp_hybrid_override_pattern', force=True)

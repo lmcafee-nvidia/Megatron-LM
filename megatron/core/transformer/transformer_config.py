@@ -272,6 +272,15 @@ class TransformerConfig(ModelParallelConfig):
     A list of integers: Defines a custom pattern where 1 means skip RoPE and 0 means apply RoPE.
     For example, [0,1,1,0] means: apply RoPE, skip RoPE, skip RoPE, apply RoPE."""
 
+    rope_type: str = "rope"
+    """Type of RoPE to use. Common attention defaults to rope."""
+
+    rotary_base: float = 10000
+    """Rotary base for the rotary embeddings."""
+
+    rotary_percent: float = 1.0
+    """Rotary percent for the rotary embeddings."""
+
     ####################
     # attention variant
     ####################
@@ -296,6 +305,9 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
+
+    dsa_indexer_use_hadamard: bool = False
+    """Whether to apply Hadamard rotation to DSA indexer queries and keys."""
 
     ####################
     # linear attention
@@ -2532,9 +2544,21 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.use_kitchen
 
         if self.experimental_attention_variant == "dsa":
+            assert self.dsa_indexer_n_heads is not None and self.dsa_indexer_n_heads > 0, (
+                "dsa_indexer_n_heads must be set to a positive integer when using DSA."
+            )
+            assert self.dsa_indexer_head_dim is not None and self.dsa_indexer_head_dim > 0, (
+                "dsa_indexer_head_dim must be set to a positive integer when using DSA."
+            )
+            assert self.dsa_indexer_topk is not None and self.dsa_indexer_topk > 0, (
+                "dsa_indexer_topk must be set to a positive integer when using DSA."
+            )
             assert (
                 self.context_parallel_size == 1
             ), "Currently context parallelism is not supported by DSAttention!"
+            assert not self.sequence_parallel, (
+                "Currently sequence parallelism is not supported by DSAttention."
+            )
             assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
 
         if self.inference_fuse_tp_communication:
