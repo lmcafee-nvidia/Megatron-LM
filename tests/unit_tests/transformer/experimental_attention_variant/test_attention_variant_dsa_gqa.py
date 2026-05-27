@@ -1,11 +1,15 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import pytest
 import torch
 
 from megatron.core.transformer.experimental_attention_variant.dsa import fused_qk_topk_naive
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
+    HAVE_TRITON,
     _build_shifted_causal_mask,
     compute_gqa_dsa_indexer_loss,
+    grouped_dsa_fn,
+    triton_grouped_dsa_fn,
     unfused_grouped_dsa_fn,
 )
 
@@ -86,6 +90,57 @@ def test_unfused_grouped_dsa_fn_output_shape():
 
     assert output.shape == (seqlen, batch_size, num_heads * head_dim)
     assert output.dtype == query.dtype
+
+
+def test_grouped_dsa_fn_uses_reference_on_cpu():
+    torch.manual_seed(123)
+
+    seqlen = 5
+    batch_size = 2
+    num_heads = 4
+    num_query_groups = 2
+    head_dim = 8
+    topk = 3
+
+    query = torch.randn(seqlen, batch_size, num_heads, head_dim, dtype=torch.float32)
+    key = torch.randn(seqlen, batch_size, num_query_groups, head_dim, dtype=torch.float32)
+    value = torch.randn(seqlen, batch_size, num_query_groups, head_dim, dtype=torch.float32)
+    causal_mask = torch.triu(
+        torch.full((seqlen, seqlen), float("-inf"), dtype=torch.float32), diagonal=1
+    )
+    topk_indices = (torch.randn(batch_size, seqlen, seqlen) + causal_mask).topk(topk, dim=-1).indices
+
+    expected = unfused_grouped_dsa_fn(query, key, value, topk_indices, head_dim**-0.5)
+    actual = grouped_dsa_fn(query, key, value, topk_indices, head_dim**-0.5)
+
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA/Triton required")
+def test_triton_grouped_dsa_fn_matches_reference():
+    torch.manual_seed(123)
+
+    seqlen = 7
+    batch_size = 2
+    num_heads = 4
+    num_query_groups = 2
+    head_dim = 16
+    topk = 4
+
+    query = torch.randn(seqlen, batch_size, num_heads, head_dim, device="cuda")
+    key = torch.randn(seqlen, batch_size, num_query_groups, head_dim, device="cuda")
+    value = torch.randn(seqlen, batch_size, num_query_groups, head_dim, device="cuda")
+    causal_mask = torch.triu(
+        torch.full((seqlen, seqlen), float("-inf"), device="cuda"), diagonal=1
+    )
+    topk_indices = (
+        torch.randn(batch_size, seqlen, seqlen, device="cuda") + causal_mask
+    ).topk(topk, dim=-1).indices
+
+    expected = unfused_grouped_dsa_fn(query, key, value, topk_indices, head_dim**-0.5)
+    actual = triton_grouped_dsa_fn(query, key, value, topk_indices, head_dim**-0.5)
+
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
 
 
 def test_fused_qk_topk_naive_caps_topk_by_key_length():

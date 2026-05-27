@@ -4,6 +4,7 @@ import copy
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
+from unittest.mock import MagicMock
 
 import torch
 
@@ -26,7 +27,18 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import is_using_quantization_scales
+from megatron.core.utils import is_using_quantization_scales, null_decorator
+
+try:
+    import triton
+    import triton.language as tl
+
+    HAVE_TRITON = True
+except ImportError:
+    triton = MagicMock()
+    triton.jit = null_decorator
+    tl = MagicMock()
+    HAVE_TRITON = False
 
 
 def _repeat_grouped_key_value(key: torch.Tensor, value: torch.Tensor, num_query_heads: int):
@@ -161,6 +173,225 @@ def unfused_grouped_dsa_fn(
     output = torch.bmm(attention_scores.to(value.dtype), value)
     output = output.reshape(b, np, sq, hnv).permute(2, 0, 1, 3).contiguous()
     return output.reshape(sq, b, np * hnv)
+
+
+@triton.jit
+def _triton_grouped_dsa_kernel(
+    query_ptr,
+    key_ptr,
+    value_ptr,
+    topk_ptr,
+    output_ptr,
+    stride_q_s,
+    stride_q_b,
+    stride_q_h,
+    stride_q_d,
+    stride_k_s,
+    stride_k_b,
+    stride_k_h,
+    stride_k_d,
+    stride_v_s,
+    stride_v_b,
+    stride_v_h,
+    stride_v_d,
+    stride_t_b,
+    stride_t_s,
+    stride_t_k,
+    stride_o_s,
+    stride_o_b,
+    stride_o_h,
+    stride_o_d,
+    SOFTMAX_SCALE: tl.constexpr,
+    SEQLEN_K: tl.constexpr,
+    NUM_QUERY_HEADS: tl.constexpr,
+    NUM_QUERY_GROUPS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    VALUE_HEAD_DIM: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    query_idx = tl.program_id(0)
+    batch_idx = tl.program_id(1)
+    head_idx = tl.program_id(2)
+    heads_per_group = NUM_QUERY_HEADS // NUM_QUERY_GROUPS
+    group_idx = head_idx // heads_per_group
+
+    offs_d = tl.arange(0, BLOCK_D)
+    q = tl.load(
+        query_ptr
+        + query_idx * stride_q_s
+        + batch_idx * stride_q_b
+        + head_idx * stride_q_h
+        + offs_d * stride_q_d,
+        mask=offs_d < HEAD_DIM,
+        other=0.0,
+    ).to(tl.float32)
+
+    offs_k = tl.arange(0, BLOCK_K)
+    key_indices = tl.load(
+        topk_ptr + batch_idx * stride_t_b + query_idx * stride_t_s + offs_k * stride_t_k,
+        mask=offs_k < TOPK,
+        other=0,
+    ).to(tl.int64)
+    valid_k = (offs_k < TOPK) & (key_indices >= 0) & (key_indices < SEQLEN_K)
+    valid_k = valid_k & (key_indices <= query_idx)
+
+    key_values = tl.load(
+        key_ptr
+        + key_indices[:, None] * stride_k_s
+        + batch_idx * stride_k_b
+        + group_idx * stride_k_h
+        + offs_d[None, :] * stride_k_d,
+        mask=valid_k[:, None] & (offs_d[None, :] < HEAD_DIM),
+        other=0.0,
+    ).to(tl.float32)
+    scores = tl.sum(key_values * q[None, :], axis=1) * SOFTMAX_SCALE
+    scores = tl.where(valid_k, scores, -float("inf"))
+
+    valid_count = tl.sum(tl.where(valid_k, 1, 0), axis=0)
+    has_valid = valid_count > 0
+    max_score = tl.max(scores, axis=0)
+    max_score = tl.where(has_valid, max_score, 0.0)
+    weights = tl.exp(scores - max_score)
+    weights = tl.where(valid_k, weights, 0.0)
+    denom = tl.sum(weights, axis=0)
+    weights = weights / tl.where(denom > 0.0, denom, 1.0)
+
+    offs_v = tl.arange(0, BLOCK_V)
+    value_values = tl.load(
+        value_ptr
+        + key_indices[:, None] * stride_v_s
+        + batch_idx * stride_v_b
+        + group_idx * stride_v_h
+        + offs_v[None, :] * stride_v_d,
+        mask=valid_k[:, None] & (offs_v[None, :] < VALUE_HEAD_DIM),
+        other=0.0,
+    ).to(tl.float32)
+    output = tl.sum(weights[:, None] * value_values, axis=0)
+    tl.store(
+        output_ptr
+        + query_idx * stride_o_s
+        + batch_idx * stride_o_b
+        + head_idx * stride_o_h
+        + offs_v * stride_o_d,
+        output,
+        mask=offs_v < VALUE_HEAD_DIM,
+    )
+
+
+def _next_power_of_2(x: int) -> int:
+    return 1 << (x - 1).bit_length()
+
+
+def _can_use_triton_grouped_dsa(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    topk_indices: torch.Tensor,
+    mask: Optional[torch.Tensor],
+) -> bool:
+    if not HAVE_TRITON or mask is not None:
+        return False
+    if not (query.is_cuda and key.is_cuda and value.is_cuda and topk_indices.is_cuda):
+        return False
+    if query.dim() != 4 or key.dim() != 4 or value.dim() != 4 or topk_indices.dim() != 3:
+        return False
+    if query.size(0) != key.size(0) or key.size(0) != value.size(0):
+        return False
+    if query.size(1) != key.size(1) or key.size(1) != value.size(1):
+        return False
+    if key.size(2) != value.size(2) or query.size(2) % key.size(2) != 0:
+        return False
+    if query.size(3) != key.size(3):
+        return False
+    if topk_indices.size(0) != query.size(1) or topk_indices.size(1) != query.size(0):
+        return False
+    return query.size(3) <= 256 and value.size(3) <= 256 and topk_indices.size(2) <= 256
+
+
+def triton_grouped_dsa_fn(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    topk_indices: torch.Tensor,
+    softmax_scale: float,
+):
+    """Triton grouped-query sparse attention over the selected top-k tokens."""
+    if not _can_use_triton_grouped_dsa(query, key, value, topk_indices, mask=None):
+        raise NotImplementedError("Triton DSA-GQA only supports CUDA full-sequence sparse attention.")
+
+    query = query.contiguous()
+    key = key.contiguous()
+    value = value.contiguous()
+    topk_indices = topk_indices.contiguous()
+
+    sq, batch_size, num_query_heads, head_dim = query.size()
+    skv = key.size(0)
+    num_query_groups = key.size(2)
+    value_head_dim = value.size(3)
+    topk = topk_indices.size(2)
+    output = torch.empty(
+        (sq, batch_size, num_query_heads, value_head_dim),
+        dtype=value.dtype,
+        device=value.device,
+    )
+    block_d = _next_power_of_2(head_dim)
+    block_v = _next_power_of_2(value_head_dim)
+    block_k = _next_power_of_2(topk)
+
+    _triton_grouped_dsa_kernel[(sq, batch_size, num_query_heads)](
+        query,
+        key,
+        value,
+        topk_indices,
+        output,
+        query.stride(0),
+        query.stride(1),
+        query.stride(2),
+        query.stride(3),
+        key.stride(0),
+        key.stride(1),
+        key.stride(2),
+        key.stride(3),
+        value.stride(0),
+        value.stride(1),
+        value.stride(2),
+        value.stride(3),
+        topk_indices.stride(0),
+        topk_indices.stride(1),
+        topk_indices.stride(2),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        output.stride(3),
+        SOFTMAX_SCALE=softmax_scale,
+        SEQLEN_K=skv,
+        NUM_QUERY_HEADS=num_query_heads,
+        NUM_QUERY_GROUPS=num_query_groups,
+        HEAD_DIM=head_dim,
+        VALUE_HEAD_DIM=value_head_dim,
+        TOPK=topk,
+        BLOCK_D=block_d,
+        BLOCK_V=block_v,
+        BLOCK_K=block_k,
+    )
+    return output.reshape(sq, batch_size, num_query_heads * value_head_dim)
+
+
+def grouped_dsa_fn(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    topk_indices: torch.Tensor,
+    softmax_scale: float,
+    mask: Optional[torch.Tensor] = None,
+):
+    """Dispatch GQA DSA attention to Triton when exact sparse semantics are supported."""
+    if _can_use_triton_grouped_dsa(query, key, value, topk_indices, mask):
+        return triton_grouped_dsa_fn(query, key, value, topk_indices, softmax_scale)
+    return unfused_grouped_dsa_fn(query, key, value, topk_indices, softmax_scale, mask=mask)
 
 
 @dataclass
@@ -493,7 +724,7 @@ class DSGQACoreAttention(MegatronModule):
                     num_layers=self.config.num_layers,
                 )
 
-            output = unfused_grouped_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
+            output = grouped_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
             if indexer_loss is not None:
                 output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
             return output
@@ -504,7 +735,7 @@ class DSGQACoreAttention(MegatronModule):
             mask=float_mask,
             packed_seq_params=packed_seq_params,
         )
-        return unfused_grouped_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
+        return grouped_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
 
     def forward_dynamic(
         self,
@@ -584,7 +815,7 @@ class DSGQACoreAttention(MegatronModule):
                 self.indexer.index_topk,
                 request_mask,
             )
-            output[query_start:query_end] = unfused_grouped_dsa_fn(
+            output[query_start:query_end] = grouped_dsa_fn(
                 request_query,
                 request_key,
                 request_value,
