@@ -5,11 +5,15 @@ from megatron.core.extensions.transformer_engine import (
     TEColumnParallelLinear,
     TEDotProductAttention,
     TELayerNormColumnParallelLinear,
-    TELinear,
     TENorm,
     TERowParallelLinear,
 )
+from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core.models.backends import InferenceSpecProvider
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    get_dsa_module_spec_for_backend,
+)
 from megatron.core.models.gpt.moe_module_specs import (
     get_inference_optimized_moe_spec,
     get_moe_module_spec,
@@ -24,21 +28,10 @@ from megatron.core.tensor_parallel import (
     InferenceLayerNormColumnParallelLinear,
     InferenceRowParallelLinear,
 )
-from megatron.core.transformer.attention import SelfAttentionSubmodules
+from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.experimental_attention_variant.dsa import (
-    DSAIndexer,
-    DSAIndexerSubmodules,
-    DSAttention,
-    DSAttentionSubmodules,
-)
-from megatron.core.transformer.experimental_attention_variant.dsa_gqa import DSGroupedSelfAttention
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
-from megatron.core.transformer.multi_latent_attention import (
-    MLASelfAttention,
-    MLASelfAttentionSubmodules,
-)
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     MultiTokenPredictionBlockSubmodules,
@@ -61,6 +54,27 @@ moe = get_moe_module_spec(
 
 # Inference-optimized MoE spec
 moe_inference = get_inference_optimized_moe_spec()
+
+
+class DSABackendTransformerLayer(TransformerLayer):
+    """Transformer layer whose DSA attention backend is selected by config.dsa_kv_backend."""
+
+    def __init__(self, *args, inference: bool = False, **kwargs):
+        config = kwargs["config"] if "config" in kwargs else args[0]
+        config.validate_dsa_config()
+        backend = InferenceSpecProvider() if inference else TESpecProvider()
+        attention = get_dsa_module_spec_for_backend(config=config, backend=backend)
+        rms_norm = config.normalization == "RMSNorm"
+        kwargs["submodules"] = TransformerLayerSubmodules(
+            input_layernorm=(
+                IdentityOp
+                if attention.metainfo.get("fuse_input_layernorm", False)
+                else backend.layer_norm(rms_norm=rms_norm, for_qk=False)
+            ),
+            self_attention=attention,
+            self_attn_bda=get_bias_dropout_add,
+        )
+        super().__init__(*args, **kwargs)
 
 
 # MTP block spec - provides norms and projection only.
@@ -120,7 +134,7 @@ hybrid_stack_spec = ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
                 self_attention=ModuleSpec(
-                    module=DSGroupedSelfAttention,
+                    module=SelfAttention,
                     params={"attn_mask_type": AttnMaskType.causal},
                     submodules=SelfAttentionSubmodules(
                         linear_qkv=TELayerNormColumnParallelLinear,
@@ -131,41 +145,7 @@ hybrid_stack_spec = ModuleSpec(
                 self_attn_bda=get_bias_dropout_add,
             ),
         ),
-        dsa_layer=ModuleSpec(
-            module=TransformerLayer,
-            submodules=TransformerLayerSubmodules(
-                input_layernorm=TENorm,
-                self_attention=ModuleSpec(
-                    module=MLASelfAttention,
-                    params={"attn_mask_type": AttnMaskType.causal},
-                    submodules=MLASelfAttentionSubmodules(
-                        linear_q_proj=TEColumnParallelLinear,
-                        linear_q_down_proj=TELinear,
-                        linear_q_up_proj=TEColumnParallelLinear,
-                        linear_kv_down_proj=TELinear,
-                        linear_kv_up_proj=TEColumnParallelLinear,
-                        core_attention=ModuleSpec(
-                            module=DSAttention,
-                            submodules=DSAttentionSubmodules(
-                                indexer=ModuleSpec(
-                                    module=DSAIndexer,
-                                    submodules=DSAIndexerSubmodules(
-                                        linear_wq_b=TELinear,
-                                        linear_wk=TELinear,
-                                        k_norm=TENorm,
-                                        linear_weights_proj=TELinear,
-                                    ),
-                                )
-                            ),
-                        ),
-                        linear_proj=TERowParallelLinear,
-                        q_layernorm=IdentityOp,
-                        kv_layernorm=IdentityOp,
-                    ),
-                ),
-                self_attn_bda=get_bias_dropout_add,
-            ),
-        ),
+        dsa_layer=ModuleSpec(module=DSABackendTransformerLayer, params={"inference": False}),
         # Started with spec from gpt_layer_specs.py
         # Using the TE spec because we had problems getting the non-TE spec
         # working
@@ -215,7 +195,7 @@ hybrid_inference_stack_spec = ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
                 self_attention=ModuleSpec(
-                    module=DSGroupedSelfAttention,
+                    module=SelfAttention,
                     params={"attn_mask_type": AttnMaskType.causal},
                     submodules=SelfAttentionSubmodules(
                         linear_qkv=InferenceLayerNormColumnParallelLinear,
@@ -226,41 +206,7 @@ hybrid_inference_stack_spec = ModuleSpec(
                 self_attn_bda=get_bias_dropout_add,
             ),
         ),
-        dsa_layer=ModuleSpec(
-            module=TransformerLayer,
-            submodules=TransformerLayerSubmodules(
-                input_layernorm=TENorm,
-                self_attention=ModuleSpec(
-                    module=MLASelfAttention,
-                    params={"attn_mask_type": AttnMaskType.causal},
-                    submodules=MLASelfAttentionSubmodules(
-                        linear_q_proj=TEColumnParallelLinear,
-                        linear_q_down_proj=TELinear,
-                        linear_q_up_proj=TEColumnParallelLinear,
-                        linear_kv_down_proj=TELinear,
-                        linear_kv_up_proj=TEColumnParallelLinear,
-                        core_attention=ModuleSpec(
-                            module=DSAttention,
-                            submodules=DSAttentionSubmodules(
-                                indexer=ModuleSpec(
-                                    module=DSAIndexer,
-                                    submodules=DSAIndexerSubmodules(
-                                        linear_wq_b=TELinear,
-                                        linear_wk=TELinear,
-                                        k_norm=TENorm,
-                                        linear_weights_proj=TELinear,
-                                    ),
-                                )
-                            ),
-                        ),
-                        linear_proj=InferenceRowParallelLinear,
-                        q_layernorm=IdentityOp,
-                        kv_layernorm=IdentityOp,
-                    ),
-                ),
-                self_attn_bda=get_bias_dropout_add,
-            ),
-        ),
+        dsa_layer=ModuleSpec(module=DSABackendTransformerLayer, params={"inference": True}),
         # Started with spec from gpt_layer_specs.py
         # Using the TE spec because we had problems getting the non-TE spec
         # working

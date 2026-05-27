@@ -7,6 +7,8 @@ import torch
 
 import megatron.core.parallel_state as parallel_state
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    get_dsa_gqa_module_spec,
+    get_dsa_mla_module_spec,
     get_dsa_module_spec_for_backend,
     get_experimental_attention_variant_module_spec,
 )
@@ -26,6 +28,11 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     compute_dsa_indexer_loss,
     fused_qk_topk_naive,
     rotate_activation,
+)
+from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
+    DSGQACoreAttention,
+    DSGQAIndexer,
+    DSGQASelfAttention,
 )
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -1620,7 +1627,7 @@ class TestDSAModuleSpecDispatch:
         Utils.destroy_model_parallel()
 
     def _make_dsa_config(self, **kwargs):
-        return MLATransformerConfig(
+        config_kwargs = dict(
             num_layers=2,
             hidden_size=256,
             num_attention_heads=16,
@@ -1638,8 +1645,10 @@ class TestDSAModuleSpecDispatch:
             dsa_indexer_n_heads=8,
             dsa_indexer_head_dim=64,
             dsa_indexer_topk=32,
-            **kwargs,
+            dsa_kv_backend="mla",
         )
+        config_kwargs.update(kwargs)
+        return MLATransformerConfig(**config_kwargs)
 
     def test_get_experimental_attention_variant_module_spec_dsa(self):
         """get_experimental_attention_variant_module_spec dispatches to DSA for variant='dsa'."""
@@ -1648,8 +1657,8 @@ class TestDSAModuleSpecDispatch:
         assert spec.module == MLASelfAttention
         assert spec.submodules.core_attention.module == DSAttention
 
-    def test_get_dsa_module_spec_for_backend(self):
-        """get_dsa_module_spec_for_backend returns the correct full spec structure."""
+    def test_get_dsa_module_spec_for_mla_backend(self):
+        """get_dsa_module_spec_for_backend returns the MLA DSA structure."""
         from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 
         config = self._make_dsa_config()
@@ -1660,16 +1669,53 @@ class TestDSAModuleSpecDispatch:
         assert spec.submodules.core_attention.submodules.indexer.module == DSAIndexer
         assert spec.params["attn_mask_type"] == AttnMaskType.causal
 
+    def test_get_dsa_module_spec_for_gqa_backend(self):
+        """get_dsa_module_spec_for_backend returns the GQA DSA structure."""
+        from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=256,
+            num_attention_heads=16,
+            use_cpu_initialization=True,
+            dsa_kv_backend="gqa",
+            dsa_indexer_n_heads=8,
+            dsa_indexer_head_dim=64,
+            dsa_indexer_topk=32,
+        )
+        spec = get_dsa_module_spec_for_backend(config, backend=TESpecProvider())
+        assert spec.module == DSGQASelfAttention
+        assert spec.submodules.core_attention.module == DSGQACoreAttention
+        assert spec.submodules.core_attention.submodules.indexer.module == DSGQAIndexer
+
+    def test_experimental_dsa_requires_backend(self):
+        """experimental_attention_variant='dsa' requires an explicit dsa_kv_backend."""
+        with pytest.raises(ValueError, match="dsa_kv_backend must be set"):
+            self._make_dsa_config(experimental_attention_variant="dsa", dsa_kv_backend=None)
+
+    def test_experimental_dsa_rejects_invalid_backend(self):
+        """experimental_attention_variant='dsa' validates dsa_kv_backend choices."""
+        with pytest.raises(ValueError, match="dsa_kv_backend must be set"):
+            self._make_dsa_config(experimental_attention_variant="dsa", dsa_kv_backend="invalid")
+
     def test_get_dsa_module_spec_requires_mla(self):
-        """get_dsa_module_spec_for_backend rejects configs without MLA."""
+        """MLA DSA spec rejects configs without MLA."""
         from megatron.core.transformer import TransformerConfig as _TransformerConfig
 
-        config = _TransformerConfig(num_layers=2, hidden_size=256, num_attention_heads=4)
-        with pytest.raises(AssertionError, match="only MLA supports sparse attention"):
-            get_dsa_module_spec_for_backend(config, backend=None)
+        config = _TransformerConfig(
+            num_layers=2, hidden_size=256, num_attention_heads=4, dsa_kv_backend="mla"
+        )
+        with pytest.raises(ValueError, match="requires multi_latent_attention"):
+            get_dsa_mla_module_spec(config, backend=None)
 
     def test_get_dsa_module_spec_rejects_qk_l2_norm(self):
-        """get_dsa_module_spec_for_backend rejects configs with qk_l2_norm=True."""
+        """MLA DSA spec rejects configs with qk_l2_norm=True."""
         config = self._make_dsa_config(qk_l2_norm=True)
-        with pytest.raises(AssertionError, match="qk_l2_norm is not supported"):
-            get_dsa_module_spec_for_backend(config, backend=None)
+        with pytest.raises(ValueError, match="qk_l2_norm is not supported"):
+            get_dsa_mla_module_spec(config, backend=None)
+
+    def test_get_dsa_gqa_module_spec_rejects_mla(self):
+        """GQA DSA spec rejects MLA configs."""
+        config = self._make_dsa_config(dsa_kv_backend="gqa")
+        with pytest.raises(ValueError, match="cannot be used with multi_latent_attention"):
+            get_dsa_gqa_module_spec(config, backend=None)

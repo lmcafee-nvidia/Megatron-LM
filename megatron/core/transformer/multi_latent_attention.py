@@ -401,36 +401,64 @@ class MultiLatentAttention(Attention):
                         **extra_kwargs,
                     )
             elif self.cache_mla_latents:
-                value, need_v_pad, orig_v_dim, padded_v_dim = _prepare_mla_core_attention_value(
-                    self, query, value, packed_seq_params
-                )
-                # Dynamic batching attention kernel.
-                q, k, v = (query, key, value)
-                cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
-                cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
+                if self.config.experimental_attention_variant == "dsa":
+                    if packed_seq_params is not None:
+                        raise NotImplementedError(
+                            "Packed sequence is not supported for DSA-MLA dynamic inference."
+                        )
+                    if inference_context.using_cuda_graph_this_step():
+                        raise NotImplementedError(
+                            "DSA-MLA dynamic inference does not yet support CUDA graphs."
+                        )
+                    provider_layer_number = (
+                        self.layer_number - self._get_pp_layer_offset_for_inference()
+                    )
+                    core_attn_out = self.core_attention.forward_dynamic(
+                        query=query,
+                        key_cache=key,
+                        value_cache=value,
+                        x=hidden_states,
+                        qr=q_compressed,
+                        inference_context=inference_context,
+                        provider_layer_number=provider_layer_number,
+                        absorbed_mla=inference_context.is_decode_only(),
+                        up_v_weight=getattr(self, "up_v_weight", None),
+                    )
+                else:
+                    value, need_v_pad, orig_v_dim, padded_v_dim = _prepare_mla_core_attention_value(
+                        self, query, value, packed_seq_params
+                    )
+                    # Dynamic batching attention kernel.
+                    q, k, v = (query, key, value)
+                    cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
+                    cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
 
-                core_attn_out = self.flash_decode_and_prefill(
-                    q,
-                    k,
-                    v,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    cu_query_lengths,
-                    cu_kv_lengths,
-                    kv_lengths,
-                    block_table,
-                )
-                # Only rearrange if not in absorption mode (Flash MLA handles format correctly)
-                if not inference_context.is_decode_only():
-                    core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
-                needs_output_trim = need_v_pad
+                    core_attn_out = self.flash_decode_and_prefill(
+                        q,
+                        k,
+                        v,
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        cu_query_lengths,
+                        cu_kv_lengths,
+                        kv_lengths,
+                        block_table,
+                    )
+                    # Only rearrange if not in absorption mode (Flash MLA handles format correctly)
+                    if not inference_context.is_decode_only():
+                        core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
+                    needs_output_trim = need_v_pad
             if self.offload_core_attention and self.training:
                 core_attn_out = off_interface.group_commit(
                     core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
                 )
 
         # We are doing absorption with cache mla latents and decode mode.
-        if self.cache_mla_latents and inference_context.is_decode_only():
+        if (
+            self.cache_mla_latents
+            and inference_context.is_decode_only()
+            and self.config.experimental_attention_variant != "dsa"
+        ):
             # core_attn_out = self.self.up_v_layer(core_attn_out)
             core_attn_out = torch.einsum("sbhc,hdc->sbhd", core_attn_out, self.up_v_weight)
             core_attn_out = core_attn_out.contiguous()

@@ -365,6 +365,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.num_attention_layers = len(attention_layer_map) + len(dsa_layer_map)
             self.num_mamba_layers = len(mamba_layer_map)
             self.layer_map = attention_layer_map | dsa_layer_map | mamba_layer_map
+            has_hybrid_dsa_layers = len(dsa_layer_map) > 0
         else:
             # The layer map is the identity function for pure Transformer models.
             # Use the same per-PP-rank layer count as TransformerBlock (handles
@@ -389,11 +390,22 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.num_mamba_layers = 0
             (self.mamba_conv_states_shape, self.mamba_ssm_states_shape) = (None, None)
             self.layer_map = {i: i for i in range(self.num_attention_layers)}
+            has_hybrid_dsa_layers = False
 
         if self.num_attention_layers == 0:
             raise NotImplementedError(
                 f"Using `DynamicInferenceContext` with no attention is not supported."
             )
+
+        self.cache_dsa_indexer_keys = (
+            getattr(model_config, "experimental_attention_variant", None) == "dsa"
+            or has_hybrid_dsa_layers
+        )
+        self.dsa_indexer_head_dim = (
+            getattr(model_config, "dsa_indexer_head_dim", 0) if self.cache_dsa_indexer_keys else 0
+        )
+        if self.cache_dsa_indexer_keys and self.dsa_indexer_head_dim <= 0:
+            raise ValueError("dsa_indexer_head_dim must be positive when caching DSA indexer keys.")
 
         # Block size tokens, bytes.
         kv_dtype_size_bytes = model_config.params_dtype.itemsize

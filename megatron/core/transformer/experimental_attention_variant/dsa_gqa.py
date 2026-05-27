@@ -7,7 +7,6 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from megatron.core.extensions.transformer_engine import TELinear, TENorm
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -192,7 +191,8 @@ class DSGQAIndexer(MegatronModule):
         self.index_head_dim = config.dsa_indexer_head_dim
         self.index_topk = config.dsa_indexer_topk
         self.softmax_scale = self.index_head_dim**-0.5
-        self.index_rotary_dim = int(self.index_head_dim * config.rotary_percent)
+        self.rope_type = getattr(config, "rope_type", "rope")
+        self.index_rotary_dim = int(self.index_head_dim * getattr(config, "rotary_percent", 1.0))
         self.index_rotary_dim -= self.index_rotary_dim % 2
 
         if pg_collection is None:
@@ -201,23 +201,25 @@ class DSGQAIndexer(MegatronModule):
 
         self.rotary_pos_emb = None
         if self.index_rotary_dim > 0:
-            if config.rope_type == 'rope':
+            if self.rope_type == 'rope':
                 self.rotary_pos_emb = RotaryEmbedding(
                     self.index_rotary_dim,
                     rotary_percent=1.0,
-                    rotary_base=config.rotary_base,
+                    rotary_base=getattr(config, "rotary_base", 10000),
                     cp_group=self.pg_collection.cp,
                 )
-            elif config.rope_type == 'yarn':
+            elif self.rope_type == 'yarn':
                 self.rotary_pos_emb = YarnRotaryEmbedding(
                     self.index_rotary_dim,
-                    rotary_base=config.rotary_base,
-                    scaling_factor=config.rotary_scaling_factor,
-                    original_max_position_embeddings=config.original_max_position_embeddings,
-                    beta_fast=config.beta_fast,
-                    beta_slow=config.beta_slow,
-                    mscale=config.mscale,
-                    mscale_all_dim=config.mscale_all_dim,
+                    rotary_base=getattr(config, "rotary_base", 10000),
+                    scaling_factor=getattr(config, "rotary_scaling_factor", 1.0),
+                    original_max_position_embeddings=getattr(
+                        config, "original_max_position_embeddings", None
+                    ),
+                    beta_fast=getattr(config, "beta_fast", 32),
+                    beta_slow=getattr(config, "beta_slow", 1),
+                    mscale=getattr(config, "mscale", 1.0),
+                    mscale_all_dim=getattr(config, "mscale_all_dim", 0.0),
                     cp_group=self.pg_collection.cp,
                 )
 
@@ -271,7 +273,7 @@ class DSGQAIndexer(MegatronModule):
         rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
             None, None, x, self.config, packed_seq_params
         )
-        if self.config.rope_type == "rope":
+        if self.rope_type == "rope":
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=False)
             mscale = 1.0
         else:
@@ -296,9 +298,9 @@ class DSGQAIndexer(MegatronModule):
             rotary_seq_len = 1
         else:
             rotary_seq_len = (
-                int(inference_context.token_to_position_in_request[:n].max().item()) + 1
+                int(inference_context.gpu_view.token_to_position_in_request[:n].max().item()) + 1
             )
-        if self.config.rope_type == "rope":
+        if self.rope_type == "rope":
             return self.rotary_pos_emb(rotary_seq_len, packed_seq=False), 1.0
         return self.rotary_pos_emb(rotary_seq_len, packed_seq=False)
 
@@ -315,12 +317,7 @@ class DSGQAIndexer(MegatronModule):
         )
         cu_seqlens_q, _ = inference_context.cu_query_lengths()
         q_pe = inference_context.apply_rotary_emb_query(
-            q_pe,
-            rotary_pos_emb,
-            self.config,
-            cu_seqlens_q,
-            self.pg_collection.cp,
-            mscale=mscale,
+            q_pe, rotary_pos_emb, self.config, cu_seqlens_q, self.pg_collection.cp, mscale=mscale
         )
         k_pe = inference_context.apply_rotary_emb_key(
             k_pe, rotary_pos_emb, self.config, self.pg_collection.cp, mscale=mscale
@@ -370,10 +367,7 @@ class DSGQAIndexer(MegatronModule):
         return fused_qk_topk_naive(q, k, weights, self.index_topk, mask)
 
     def forward_before_topk_dynamic(
-        self,
-        hidden_states: torch.Tensor,
-        use_rope: bool,
-        inference_context,
+        self, hidden_states: torch.Tensor, use_rope: bool, inference_context
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.config.sequence_parallel and self.pg_collection.tp.size() > 1:
             hidden_states = gather_from_sequence_parallel_region(
@@ -423,9 +417,7 @@ class DSGQACoreAttention(MegatronModule):
     ):
         super().__init__(config=config)
         self.layer_number = layer_number
-        self.indexer = build_module(
-            submodules.indexer, config=config, pg_collection=pg_collection
-        )
+        self.indexer = build_module(submodules.indexer, config=config, pg_collection=pg_collection)
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(
                 k_channels if k_channels is not None else config.kv_channels
@@ -470,7 +462,9 @@ class DSGQACoreAttention(MegatronModule):
         else:
             assert attention_mask.shape == (b, 1, sq, skv), 'attention_mask shape mismatch'
             mask = attention_mask.squeeze(1)
-            float_mask = torch.zeros_like(mask, dtype=torch.float32).masked_fill(mask, float('-inf'))
+            float_mask = torch.zeros_like(mask, dtype=torch.float32).masked_fill(
+                mask, float('-inf')
+            )
 
         indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0) or 0.0
         if self.training and torch.is_grad_enabled():
@@ -526,15 +520,17 @@ class DSGQACoreAttention(MegatronModule):
         assert value_cache is not None, "Dynamic DSA-GQA requires value cache."
 
         q_index, k_index_current, weights = self.indexer.forward_before_topk_dynamic(
-            hidden_states,
-            use_rope=use_indexer_rope,
-            inference_context=inference_context,
+            hidden_states, use_rope=use_indexer_rope, inference_context=inference_context
         )
         inference_context.append_dsa_key_cache(provider_layer_number, k_index_current)
         dsa_key_cache, block_table = inference_context.dsa_key_cache(provider_layer_number)
 
-        query_lengths = inference_context.active_attn_metadata["mha_metadata"].state_data["query_lengths"]
-        kv_lengths = inference_context.active_attn_metadata["mha_metadata"].state_data["kv_seq_lengths"]
+        query_lengths = inference_context.active_attn_metadata["mha_metadata"].state_data[
+            "query_lengths"
+        ]
+        kv_lengths = inference_context.active_attn_metadata["mha_metadata"].state_data[
+            "kv_seq_lengths"
+        ]
         kv_offsets = inference_context.request_kv_length_offsets[
             inference_context.paused_request_count : inference_context.total_request_count
         ]
@@ -574,7 +570,9 @@ class DSGQACoreAttention(MegatronModule):
             request_query = query[query_start:query_end]
             request_q_index = q_index[query_start:query_end]
             request_weights = weights[query_start:query_end]
-            request_offset = int(kv_offsets[request_idx].item()) if request_idx < kv_offsets.numel() else 0
+            request_offset = (
+                int(kv_offsets[request_idx].item()) if request_idx < kv_offsets.numel() else 0
+            )
             request_mask = _build_shifted_causal_mask(
                 query_length, key_length, request_offset, request_query.device
             )
@@ -607,7 +605,7 @@ class DSGQACoreAttention(MegatronModule):
         return output
 
 
-class DSGroupedSelfAttention(SelfAttention):
+class DSGQASelfAttention(SelfAttention):
     """Self-attention that swaps in token-level DSA for grouped-query attention."""
 
     def __init__(
@@ -619,23 +617,8 @@ class DSGroupedSelfAttention(SelfAttention):
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
         pp_layer_offset: Optional[int] = None,
+        name: str | None = None,
     ):
-        if config.experimental_attention_variant == "dsa":
-            submodules = copy.copy(submodules)
-            submodules.core_attention = ModuleSpec(
-                module=DSGQACoreAttention,
-                submodules=DSGQAAttentionSubmodules(
-                    indexer=ModuleSpec(
-                        module=DSGQAIndexer,
-                        submodules=DSGQAIndexerSubmodules(
-                            linear_q=ModuleSpec(module=TELinear),
-                            linear_k=ModuleSpec(module=TELinear),
-                            k_norm=ModuleSpec(module=TENorm),
-                            linear_weights_proj=ModuleSpec(module=TELinear),
-                        ),
-                    )
-                ),
-            )
         super().__init__(
             config=config,
             submodules=submodules,
@@ -644,9 +627,12 @@ class DSGroupedSelfAttention(SelfAttention):
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
+            name=name,
         )
 
-    def _use_indexer_rope(self, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, rotary_pos_cos_sin) -> bool:
+    def _use_indexer_rope(
+        self, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, rotary_pos_cos_sin
+    ) -> bool:
         no_rope = (
             self.config.no_rope_freq[self.layer_number - 1] if self.config.no_rope_freq else False
         )
@@ -676,7 +662,7 @@ class DSGroupedSelfAttention(SelfAttention):
         attn_mask_type: AttnMaskType,
         packed_seq_params: Optional[PackedSeqParams],
     ) -> dict:
-        if self.config.experimental_attention_variant != "dsa":
+        if not isinstance(self.core_attention, DSGQACoreAttention):
             return {}
         return {
             "hidden_states": hidden_states,
@@ -699,7 +685,7 @@ class DSGroupedSelfAttention(SelfAttention):
         hidden_states: torch.Tensor,
         use_indexer_rope: bool,
     ) -> torch.Tensor:
-        if self.config.experimental_attention_variant != "dsa":
+        if not isinstance(self.core_attention, DSGQACoreAttention):
             return super()._dynamic_core_attention_forward(
                 query,
                 key,
@@ -714,7 +700,9 @@ class DSGroupedSelfAttention(SelfAttention):
                 use_indexer_rope=use_indexer_rope,
             )
         if packed_seq_params is not None:
-            raise NotImplementedError("Packed sequence is not supported for DSA-GQA dynamic inference.")
+            raise NotImplementedError(
+                "Packed sequence is not supported for DSA-GQA dynamic inference."
+            )
         if inference_context.using_cuda_graph_this_step():
             raise NotImplementedError("DSA-GQA dynamic inference does not yet support CUDA graphs.")
 
@@ -728,3 +716,6 @@ class DSGroupedSelfAttention(SelfAttention):
             provider_layer_number=provider_layer_number,
             use_indexer_rope=use_indexer_rope,
         )
+
+
+DSGroupedSelfAttention = DSGQASelfAttention

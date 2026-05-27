@@ -13,6 +13,10 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
+from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
+    DSGQACoreAttention,
+    DSGQASelfAttention,
+)
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -69,6 +73,7 @@ class TestHybridBlock:
             rope_type='rope',
             rotary_base=10000,
             rotary_percent=1.0,
+            dsa_kv_backend="mla",
             dsa_indexer_n_heads=8,
             dsa_indexer_head_dim=64,
             dsa_indexer_topk=32,
@@ -266,7 +271,7 @@ class TestHybridBlock:
         assert output.dtype == torch.float32
 
     def test_dsa_layer_types(self):
-        """D symbol creates a TransformerLayer with MLASelfAttention."""
+        """D symbol with MLA backend creates a TransformerLayer with MLASelfAttention."""
         layer_pattern = Symbols.MAMBA + Symbols.DS_ATTENTION + Symbols.MAMBA
         block = self.get_dsa_mamba_block(layer_pattern)
         layers = block.layers
@@ -274,6 +279,23 @@ class TestHybridBlock:
         assert isinstance(layers[1], TransformerLayer)
         assert isinstance(layers[1].self_attention, MLASelfAttention)
         assert isinstance(layers[1].self_attention.core_attention, DSAttention)
+        assert isinstance(layers[2], MambaLayer)
+
+    def test_dsa_gqa_layer_types(self):
+        """D symbol with GQA backend creates a TransformerLayer with GQA DSA attention."""
+        layer_pattern = Symbols.MAMBA + Symbols.DS_ATTENTION + Symbols.MAMBA
+        block = self.get_hybrid_block(
+            layer_pattern,
+            dsa_kv_backend="gqa",
+            dsa_indexer_n_heads=4,
+            dsa_indexer_head_dim=32,
+            dsa_indexer_topk=8,
+        )
+        layers = block.layers
+        assert isinstance(layers[0], MambaLayer)
+        assert isinstance(layers[1], TransformerLayer)
+        assert isinstance(layers[1].self_attention, DSGQASelfAttention)
+        assert isinstance(layers[1].self_attention.core_attention, DSGQACoreAttention)
         assert isinstance(layers[2], MambaLayer)
 
     def test_mixed_attention_and_dsa_layer_types(self):

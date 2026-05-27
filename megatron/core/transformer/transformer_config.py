@@ -290,6 +290,9 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # DSA
     ####################
+    dsa_kv_backend: Optional[Literal['mla', 'gqa']] = None
+    """KV layout backend to use for DSA. Must be explicitly set to "mla" or "gqa" when DSA is selected."""
+
     dsa_indexer_n_heads: Optional[int] = None
     """Number of DSA indexer heads."""
 
@@ -1170,6 +1173,35 @@ class TransformerConfig(ModelParallelConfig):
     insert these joins. This feature is particularly useful when using with full-iteration CUDA
     graphs"""
 
+    def validate_dsa_config(self) -> None:
+        """Validate DeepSeek Sparse Attention backend and indexer settings."""
+        if self.dsa_kv_backend is None:
+            raise ValueError("dsa_kv_backend must be set to 'mla' or 'gqa' when using DSA.")
+        if self.dsa_indexer_n_heads is None or self.dsa_indexer_n_heads <= 0:
+            raise ValueError(
+                "dsa_indexer_n_heads must be set to a positive integer when using DSA."
+            )
+        if self.dsa_indexer_head_dim is None or self.dsa_indexer_head_dim <= 0:
+            raise ValueError(
+                "dsa_indexer_head_dim must be set to a positive integer when using DSA."
+            )
+        if self.dsa_indexer_topk is None or self.dsa_indexer_topk <= 0:
+            raise ValueError("dsa_indexer_topk must be set to a positive integer when using DSA.")
+        if self.dsa_kv_backend == "mla":
+            if not self.multi_latent_attention:
+                raise ValueError("dsa_kv_backend='mla' requires multi_latent_attention.")
+            if self.qk_l2_norm:
+                raise ValueError("qk_l2_norm is not supported with dsa_kv_backend='mla'.")
+        elif self.dsa_kv_backend == "gqa":
+            if self.multi_latent_attention:
+                raise ValueError("dsa_kv_backend='gqa' cannot be used with multi_latent_attention.")
+        else:
+            raise ValueError("dsa_kv_backend must be set to 'mla' or 'gqa' when using DSA.")
+        if self.context_parallel_size != 1:
+            raise ValueError("Currently context parallelism is not supported by DSAttention.")
+        if self.apply_rope_fusion:
+            raise ValueError("RoPE fusion is not supported for DSAttention.")
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -1260,7 +1292,7 @@ class TransformerConfig(ModelParallelConfig):
                 f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
             )
         elif self.experimental_attention_variant == "dsa":
-            pass
+            self.validate_dsa_config()
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling

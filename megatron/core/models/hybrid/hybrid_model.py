@@ -185,6 +185,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         )
 
         parsed = parse_hybrid_pattern(self.hybrid_layer_pattern)
+        if parsed.main_pattern and "D" in parsed.main_pattern:
+            self.config.validate_dsa_config()
         self.mtp_pattern = parsed.mtp_pattern
         self.mtp_num_depths = parsed.mtp_num_depths
 

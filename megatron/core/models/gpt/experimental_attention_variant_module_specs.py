@@ -5,6 +5,7 @@ from typing import List, Optional
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
+from megatron.core.transformer.attention import SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,
@@ -12,12 +13,20 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttention,
     DSAttentionSubmodules,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
+    DSGQAAttentionSubmodules,
+    DSGQACoreAttention,
+    DSGQAIndexer,
+    DSGQAIndexerSubmodules,
+    DSGQASelfAttention,
+)
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.multi_latent_attention import (
     MLASelfAttention,
     MLASelfAttentionSubmodules,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.torch_norm import L2Norm
 from megatron.core.transformer.transformer_block import (
     TransformerBlockSubmodules,
     get_num_layers_to_build,
@@ -76,12 +85,16 @@ def get_gated_delta_net_module_spec(
     return attention
 
 
-def get_dsa_module_spec_for_backend(
+def get_dsa_mla_module_spec(
     config: TransformerConfig, backend: BackendSpecProvider = None
 ) -> ModuleSpec:
-    """Helper function to get module spec for Sparse Attention."""
-    assert config.multi_latent_attention, "Currently only MLA supports sparse attention."
-    assert config.qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
+    """Build module spec for MLA-backed DSA."""
+    if not config.multi_latent_attention:
+        raise ValueError("dsa_kv_backend='mla' requires multi_latent_attention.")
+    if config.qk_l2_norm:
+        raise ValueError("qk_l2_norm is not supported with dsa_kv_backend='mla'.")
+    if backend is None:
+        backend = _get_backend_spec_provider(config=config)
 
     linear_q_up_proj = (
         backend.column_parallel_layer_norm_linear()
@@ -129,6 +142,63 @@ def get_dsa_module_spec_for_backend(
     )
 
     return attention
+
+
+def get_dsa_gqa_module_spec(
+    config: TransformerConfig, backend: BackendSpecProvider = None
+) -> ModuleSpec:
+    """Build module spec for GQA/MHA-backed DSA."""
+    if config.multi_latent_attention:
+        raise ValueError("dsa_kv_backend='gqa' cannot be used with multi_latent_attention.")
+    if backend is None:
+        backend = _get_backend_spec_provider(config=config)
+
+    qk_norm = backend.layer_norm(for_qk=True)
+    core_attention = ModuleSpec(
+        module=DSGQACoreAttention,
+        submodules=DSGQAAttentionSubmodules(
+            indexer=ModuleSpec(
+                module=DSGQAIndexer,
+                submodules=DSGQAIndexerSubmodules(
+                    linear_q=backend.linear(),
+                    linear_k=backend.linear(),
+                    k_norm=backend.layer_norm(rms_norm=False, for_qk=True),
+                    linear_weights_proj=backend.linear(),
+                ),
+            )
+        ),
+    )
+
+    return ModuleSpec(
+        module=DSGQASelfAttention,
+        params={"attn_mask_type": AttnMaskType.causal},
+        submodules=SelfAttentionSubmodules(
+            linear_qkv=backend.column_parallel_layer_norm_linear(),
+            core_attention=core_attention,
+            linear_proj=backend.row_parallel_linear(),
+            q_layernorm=(
+                L2Norm if config.qk_l2_norm else (qk_norm if config.qk_layernorm else IdentityOp)
+            ),
+            k_layernorm=(
+                L2Norm if config.qk_l2_norm else (qk_norm if config.qk_layernorm else IdentityOp)
+            ),
+        ),
+        metainfo={"fuse_input_layernorm": backend.fuse_layernorm_and_linear()},
+    )
+
+
+def get_dsa_module_spec_for_backend(
+    config: TransformerConfig, backend: BackendSpecProvider = None
+) -> ModuleSpec:
+    """Build module spec for DSA according to config.dsa_kv_backend."""
+    if backend is None:
+        backend = _get_backend_spec_provider(config=config)
+
+    if config.dsa_kv_backend == "mla":
+        return get_dsa_mla_module_spec(config=config, backend=backend)
+    if config.dsa_kv_backend == "gqa":
+        return get_dsa_gqa_module_spec(config=config, backend=backend)
+    raise ValueError("dsa_kv_backend must be set to 'mla' or 'gqa' when using DSA.")
 
 
 def get_experimental_attention_variant_module_spec(

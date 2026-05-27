@@ -195,6 +195,7 @@ class CoreAttentionInterface(Protocol):
         attn_mask_type: AttnMaskType,
         attention_bias: Tensor | None,
         packed_seq_params: PackedSeqParams | None,
+        **kwargs,
     ) -> Tensor:
         """Applies dot product attention."""
         ...
@@ -438,7 +439,7 @@ class Attention(MegatronModule, ABC):
         attn_mask_type: AttnMaskType,
         packed_seq_params: Optional[PackedSeqParams],
     ) -> dict:
-        """Hook for attention variants that need extra inputs in core attention."""
+        """Return variant-specific kwargs for core attention."""
         return {}
     def _checkpointed_attention_forward(
         self,
@@ -482,6 +483,25 @@ class Attention(MegatronModule, ABC):
         )
 
         return hidden_states
+
+    def _dynamic_core_attention_forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Tensor,
+        inference_context: BaseInferenceContext,
+        block_table: Tensor,
+        attn_mask_type: AttnMaskType,
+        attention_bias: Optional[Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+        **kwargs,
+    ) -> Tensor:
+        """Run variant-specific dynamic-batching attention."""
+        raise NotImplementedError(
+            "Dynamic batching is not supported for attention variants that require extra "
+            "core-attention kwargs."
+        )
 
     def _run_core_attention(
         self,
