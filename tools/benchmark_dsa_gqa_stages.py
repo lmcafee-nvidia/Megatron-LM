@@ -212,6 +212,85 @@ def _score_topk_decode(
     raise RuntimeError(f"Unknown score/top-k backend: {backend}")
 
 
+def _score_topk_decode_batched(
+    backend: str,
+    q_index: torch.Tensor,
+    dsa_key_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    weights: torch.Tensor,
+    row_to_request: torch.Tensor,
+    row_query_positions: torch.Tensor,
+    kv_lengths: torch.Tensor,
+    config: BenchConfig,
+):
+    if backend == "torch":
+        outputs = []
+        for request_idx in range(config.batch_size):
+            query_start = request_idx * config.query_length
+            query_end = query_start + config.query_length
+            key_length = int(kv_lengths[request_idx].item())
+            request_index_key = _gather_block_cache_sequence(
+                dsa_key_cache, block_table[request_idx], key_length, config.block_size_tokens
+            ).unsqueeze(1)
+            mask = _build_shifted_causal_mask(
+                config.query_length,
+                key_length,
+                int(row_query_positions[query_start].item()),
+                q_index.device,
+            )
+            _, request_topk = fused_qk_topk_naive(
+                q_index[query_start:query_end],
+                request_index_key,
+                weights[query_start:query_end],
+                config.topk,
+                mask,
+            )
+            outputs.append(request_topk)
+        return None, torch.cat(outputs, dim=1)
+
+    if backend == "dispatch":
+        fn = getattr(dsa_gqa, "batched_paged_gqa_dsa_indexer_topk_fn", None)
+        if fn is None:
+            return _score_topk_decode_batched(
+                "torch",
+                q_index,
+                dsa_key_cache,
+                block_table,
+                weights,
+                row_to_request,
+                row_query_positions,
+                kv_lengths,
+                config,
+            )
+        return None, fn(
+            q_index,
+            dsa_key_cache,
+            block_table,
+            weights,
+            config.topk,
+            row_to_request,
+            row_query_positions,
+            kv_lengths,
+            config.block_size_tokens,
+        )
+
+    if backend == "triton-paged":
+        fn = _require_backend("triton_batched_paged_gqa_dsa_indexer_topk_fn")
+        return None, fn(
+            q_index,
+            dsa_key_cache,
+            block_table,
+            weights,
+            config.topk,
+            row_to_request,
+            row_query_positions,
+            kv_lengths,
+            config.block_size_tokens,
+        )
+
+    raise RuntimeError(f"Unknown score/top-k backend: {backend}")
+
+
 def _attention_static(
     backend: str,
     query: torch.Tensor,
@@ -402,6 +481,54 @@ def _make_block_cache(sequence: torch.Tensor, block_table_row: torch.Tensor, blo
     return cache
 
 
+def _make_batched_block_cache(
+    sequence: torch.Tensor, block_table: torch.Tensor, block_size_tokens: int
+):
+    num_blocks = int(block_table.max().item()) + 1
+    cache = torch.zeros(
+        num_blocks,
+        block_size_tokens,
+        *sequence.shape[2:],
+        device=sequence.device,
+        dtype=sequence.dtype,
+    )
+    for request_idx in range(sequence.size(0)):
+        for token_idx in range(sequence.size(1)):
+            block_id = block_table[request_idx, token_idx // block_size_tokens]
+            local_idx = token_idx % block_size_tokens
+            cache[block_id, local_idx] = sequence[request_idx, token_idx]
+    return cache
+
+
+def _attention_decode_batched(
+    backend: str,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    topk_indices: torch.Tensor,
+    row_query_positions: torch.Tensor,
+    config: BenchConfig,
+):
+    outputs = []
+    for request_idx in range(config.batch_size):
+        query_start = request_idx * config.query_length
+        query_end = query_start + config.query_length
+        outputs.append(
+            _attention_decode(
+                backend,
+                query[query_start:query_end],
+                key_cache,
+                value_cache,
+                block_table[request_idx],
+                topk_indices[:, query_start:query_end],
+                int(row_query_positions[query_start].item()),
+                config,
+            )
+        )
+    return torch.cat(outputs, dim=0)
+
+
 def run_decode(
     score_backend: str,
     attention_backend: str,
@@ -412,6 +539,8 @@ def run_decode(
 ):
     if cache_backend == "paged-direct" and score_backend == "torch":
         raise RuntimeError("paged-direct cache backend requires dispatch or triton-paged score/top-k.")
+    if config.batch_size > 1:
+        return run_decode_batched(score_backend, attention_backend, cache_backend, config, device, baseline)
 
     torch.manual_seed(5678)
     hidden, linear_q_weight, linear_k_weight, linear_weight_proj = _projection_inputs(
@@ -499,6 +628,143 @@ def run_decode(
                 block_table_row,
                 topk_indices,
                 query_start_position,
+                config,
+            ),
+            config,
+            device,
+        ),
+        "topk_indices": topk_indices,
+        "output": output,
+    }
+    if baseline is not None:
+        result["topk_match"] = torch.equal(result["topk_indices"], baseline["topk_indices"])
+        result["output_max_abs_diff"] = _max_abs_diff(result["output"], baseline["output"])
+    return result
+
+
+def run_decode_batched(
+    score_backend: str,
+    attention_backend: str,
+    cache_backend: str,
+    config: BenchConfig,
+    device: torch.device,
+    baseline: dict | None = None,
+):
+    torch.manual_seed(5678)
+    query_rows = config.query_length * config.batch_size
+    hidden, linear_q_weight, linear_k_weight, linear_weight_proj = _projection_inputs(
+        config, query_rows, 1, device
+    )
+    q_index, _, weights = _project_indexer(
+        hidden, linear_q_weight, linear_k_weight, linear_weight_proj, config
+    )
+    num_blocks_per_request = math.ceil(config.key_length / config.block_size_tokens)
+    block_table = torch.arange(
+        config.batch_size * num_blocks_per_request, device=device, dtype=torch.long
+    ).reshape(config.batch_size, num_blocks_per_request)
+    dsa_key_sequence = torch.randn(
+        config.batch_size, config.key_length, config.index_head_dim, device=device, dtype=config.dtype
+    )
+    dsa_key_cache = _make_batched_block_cache(
+        dsa_key_sequence, block_table, config.block_size_tokens
+    )
+    key_sequence = torch.randn(
+        config.batch_size,
+        config.key_length,
+        config.num_query_groups,
+        config.head_dim,
+        device=device,
+        dtype=config.dtype,
+    )
+    value_sequence = torch.randn_like(key_sequence)
+    key_cache = _make_batched_block_cache(key_sequence, block_table, config.block_size_tokens)
+    value_cache = _make_batched_block_cache(value_sequence, block_table, config.block_size_tokens)
+    query = torch.randn(
+        query_rows,
+        1,
+        config.num_query_heads,
+        config.head_dim,
+        device=device,
+        dtype=config.dtype,
+    )
+    kv_lengths = torch.full(
+        (config.batch_size,), config.key_length, dtype=torch.long, device=device
+    )
+    query_start_position = config.key_length - config.query_length
+    row_to_request = torch.arange(config.batch_size, device=device, dtype=torch.long).repeat_interleave(
+        config.query_length
+    )
+    row_query_positions = torch.arange(
+        query_start_position,
+        query_start_position + config.query_length,
+        device=device,
+        dtype=torch.long,
+    ).repeat(config.batch_size)
+
+    _, topk_indices = _score_topk_decode_batched(
+        score_backend,
+        q_index,
+        dsa_key_cache,
+        block_table,
+        weights,
+        row_to_request,
+        row_query_positions,
+        kv_lengths,
+        config,
+    )
+    output = _attention_decode_batched(
+        attention_backend,
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        topk_indices,
+        row_query_positions,
+        config,
+    )
+
+    result = {
+        "projection_ms": _time_ms(
+            lambda: _project_indexer(hidden, linear_q_weight, linear_k_weight, linear_weight_proj, config),
+            config,
+            device,
+        ),
+        "indexer_cache_ms": 0.0
+        if cache_backend == "paged-direct"
+        else _time_ms(
+            lambda: [
+                _gather_block_cache_sequence(
+                    dsa_key_cache, block_table[request_idx], config.key_length, config.block_size_tokens
+                )
+                for request_idx in range(config.batch_size)
+            ],
+            config,
+            device,
+        ),
+        "score_topk_ms": _time_ms(
+            lambda: _score_topk_decode_batched(
+                score_backend,
+                q_index,
+                dsa_key_cache,
+                block_table,
+                weights,
+                row_to_request,
+                row_query_positions,
+                kv_lengths,
+                config,
+            ),
+            config,
+            device,
+        ),
+        "attention_ms": _time_ms(
+            lambda: _attention_decode_batched(
+                attention_backend,
+                query,
+                key_cache,
+                value_cache,
+                block_table,
+                topk_indices,
+                row_query_positions,
                 config,
             ),
             config,

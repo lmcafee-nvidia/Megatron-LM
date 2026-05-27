@@ -8,6 +8,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
     HAVE_TRITON,
     _build_shifted_causal_mask,
     _gather_block_cache_sequence,
+    batched_paged_gqa_dsa_indexer_topk_fn,
     compute_gqa_dsa_indexer_loss,
     grouped_dsa_fn,
     paged_gqa_dsa_indexer_topk_fn,
@@ -257,6 +258,117 @@ def test_triton_paged_gqa_dsa_indexer_topk_matches_gather_reference():
         topk,
         query_start_position,
         key_length,
+        block_size_tokens,
+    )
+
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA/Triton required")
+def test_triton_paged_gqa_dsa_indexer_topk_matches_gather_reference_for_query_chunk():
+    key_length = 9
+    query_length = 3
+    block_size_tokens = 4
+    index_heads = 4
+    index_dim = 16
+    topk = 4
+    query_start_position = key_length - query_length
+    block_table_row = torch.tensor([2, 0, 1], dtype=torch.long, device="cuda")
+
+    sequence_key = (
+        torch.arange(1, key_length + 1, dtype=torch.float32, device="cuda")
+        .view(key_length, 1)
+        .expand(key_length, index_dim)
+        .contiguous()
+    )
+    dsa_key_cache = _fill_paged_cache_from_sequence(
+        sequence_key, block_table_row, block_size_tokens, num_blocks=3
+    )
+    q_index = torch.ones(query_length, 1, index_heads, index_dim, dtype=torch.float32, device="cuda")
+    weights = torch.arange(1, index_heads + 1, dtype=torch.float32, device="cuda").view(
+        1, 1, index_heads
+    )
+    weights = weights.expand(query_length, 1, index_heads).contiguous()
+    request_index_key = _gather_block_cache_sequence(
+        dsa_key_cache, block_table_row, key_length, block_size_tokens
+    ).unsqueeze(1)
+    request_mask = _build_shifted_causal_mask(
+        query_length, key_length, query_start_position, q_index.device
+    )
+    _, expected = fused_qk_topk_naive(q_index, request_index_key, weights, topk, request_mask)
+
+    actual = triton_paged_gqa_dsa_indexer_topk_fn(
+        q_index,
+        dsa_key_cache,
+        block_table_row,
+        weights,
+        topk,
+        query_start_position,
+        key_length,
+        block_size_tokens,
+    )
+
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA/Triton required")
+def test_batched_paged_gqa_dsa_indexer_topk_matches_per_request_reference():
+    block_size_tokens = 4
+    index_heads = 4
+    index_dim = 16
+    topk = 3
+    kv_lengths = torch.tensor([6, 9], dtype=torch.long, device="cuda")
+    block_table = torch.tensor([[2, 0, 0], [4, 1, 3]], dtype=torch.long, device="cuda")
+    row_to_request = torch.tensor([0, 0, 1], dtype=torch.long, device="cuda")
+    row_query_positions = torch.tensor([4, 5, 8], dtype=torch.long, device="cuda")
+
+    dsa_key_cache = torch.zeros(5, block_size_tokens, index_dim, dtype=torch.float32, device="cuda")
+    for request_idx, key_length in enumerate(kv_lengths.tolist()):
+        sequence_key = (
+            torch.arange(1, key_length + 1, dtype=torch.float32, device="cuda")
+            .view(key_length, 1)
+            .expand(key_length, index_dim)
+            .contiguous()
+        )
+        for token_idx in range(key_length):
+            block_id = block_table[request_idx, token_idx // block_size_tokens]
+            local_idx = token_idx % block_size_tokens
+            dsa_key_cache[block_id, local_idx] = sequence_key[token_idx]
+
+    q_index = torch.ones(3, 1, index_heads, index_dim, dtype=torch.float32, device="cuda")
+    weights = torch.arange(1, index_heads + 1, dtype=torch.float32, device="cuda").view(
+        1, 1, index_heads
+    )
+    weights = weights.expand(q_index.size(0), 1, index_heads).contiguous()
+
+    expected_rows = []
+    for row_idx, request_idx in enumerate(row_to_request.tolist()):
+        key_length = int(kv_lengths[request_idx].item())
+        request_index_key = _gather_block_cache_sequence(
+            dsa_key_cache, block_table[request_idx], key_length, block_size_tokens
+        ).unsqueeze(1)
+        request_mask = _build_shifted_causal_mask(
+            1, key_length, int(row_query_positions[row_idx].item()), q_index.device
+        )
+        _, expected = fused_qk_topk_naive(
+            q_index[row_idx : row_idx + 1],
+            request_index_key,
+            weights[row_idx : row_idx + 1],
+            topk,
+            request_mask,
+        )
+        expected_rows.append(expected.squeeze(0))
+    expected = torch.cat(expected_rows, dim=0).unsqueeze(0)
+
+    actual = batched_paged_gqa_dsa_indexer_topk_fn(
+        q_index,
+        dsa_key_cache,
+        block_table,
+        weights,
+        topk,
+        row_to_request,
+        row_query_positions,
+        kv_lengths,
         block_size_tokens,
     )
 
