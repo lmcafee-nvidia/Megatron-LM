@@ -395,6 +395,8 @@ def _next_power_of_2(x: int) -> int:
 
 
 _PAGED_INDEXER_SEGMENT_SIZE = 128
+_FUSED_DECODE_MAX_KEY_LENGTH = 1024
+_FUSED_DECODE_MAX_TOPK = 32
 
 
 @triton.jit
@@ -1360,7 +1362,9 @@ def _can_use_triton_fused_paged_gqa_dsa_decode(
     heads_per_group = query.size(2) // key_cache.size(2)
     if not (1 <= heads_per_group <= 8):
         return False
-    if index_topk <= 0 or index_topk > _PAGED_INDEXER_SEGMENT_SIZE or key_length <= 0:
+    if index_topk <= 0 or index_topk > _FUSED_DECODE_MAX_TOPK or key_length <= 0:
+        return False
+    if key_length > _FUSED_DECODE_MAX_KEY_LENGTH:
         return False
     return q_index.size(2) <= 64 and q_index.size(3) <= 256 and query.size(3) <= 256
 
@@ -2479,8 +2483,9 @@ class DSGQACoreAttention(MegatronModule):
             )
 
         if request_spans:
+            use_fused_decode = len(request_spans) == 1 and request_spans[0][3] == 1
             active_min_kv_length = min(span[4] for span in request_spans)
-            use_batched_topk = active_min_kv_length >= self.indexer.index_topk
+            use_batched_topk = (not use_fused_decode) and active_min_kv_length >= self.indexer.index_topk
             topk_indices = None
             if use_batched_topk:
                 flat_q_index = torch.cat(
@@ -2507,6 +2512,23 @@ class DSGQACoreAttention(MegatronModule):
             for request_idx, query_start, query_end, query_length, key_length, request_offset in request_spans:
                 block_table_row = block_table[request_idx]
                 request_query = query[query_start:query_end]
+                if use_fused_decode:
+                    output[query_start:query_end] = fused_paged_gqa_dsa_decode_fn(
+                        q_index[query_start:query_end],
+                        request_query,
+                        dsa_key_cache,
+                        key_cache,
+                        value_cache,
+                        block_table_row,
+                        weights[query_start:query_end],
+                        self.indexer.index_topk,
+                        self.softmax_scale,
+                        request_offset,
+                        key_length,
+                        block_size_tokens,
+                    )
+                    continue
+
                 if topk_indices is None:
                     request_topk_indices = paged_gqa_dsa_indexer_topk_fn(
                         q_index[query_start:query_end],
