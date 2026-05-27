@@ -281,6 +281,115 @@ def _triton_grouped_dsa_kernel(
     )
 
 
+@triton.jit
+def _triton_grouped_dsa_tiled_kernel(
+    query_ptr,
+    key_ptr,
+    value_ptr,
+    topk_ptr,
+    output_ptr,
+    stride_q_s,
+    stride_q_b,
+    stride_q_h,
+    stride_q_d,
+    stride_k_s,
+    stride_k_b,
+    stride_k_h,
+    stride_k_d,
+    stride_v_s,
+    stride_v_b,
+    stride_v_h,
+    stride_v_d,
+    stride_t_b,
+    stride_t_s,
+    stride_t_k,
+    stride_o_s,
+    stride_o_b,
+    stride_o_h,
+    stride_o_d,
+    SOFTMAX_SCALE: tl.constexpr,
+    SEQLEN_K: tl.constexpr,
+    NUM_QUERY_GROUPS: tl.constexpr,
+    HEADS_PER_GROUP: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    VALUE_HEAD_DIM: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    query_idx = tl.program_id(0)
+    batch_idx = tl.program_id(1)
+    group_idx = tl.program_id(2)
+
+    offs_d = tl.arange(0, BLOCK_D)
+    offs_k = tl.arange(0, BLOCK_K)
+    key_indices = tl.load(
+        topk_ptr + batch_idx * stride_t_b + query_idx * stride_t_s + offs_k * stride_t_k,
+        mask=offs_k < TOPK,
+        other=0,
+    ).to(tl.int64)
+    valid_k = (offs_k < TOPK) & (key_indices >= 0) & (key_indices < SEQLEN_K)
+    valid_k = valid_k & (key_indices <= query_idx)
+
+    key_values = tl.load(
+        key_ptr
+        + key_indices[:, None] * stride_k_s
+        + batch_idx * stride_k_b
+        + group_idx * stride_k_h
+        + offs_d[None, :] * stride_k_d,
+        mask=valid_k[:, None] & (offs_d[None, :] < HEAD_DIM),
+        other=0.0,
+    ).to(tl.float32)
+
+    offs_v = tl.arange(0, BLOCK_V)
+    value_values = tl.load(
+        value_ptr
+        + key_indices[:, None] * stride_v_s
+        + batch_idx * stride_v_b
+        + group_idx * stride_v_h
+        + offs_v[None, :] * stride_v_d,
+        mask=valid_k[:, None] & (offs_v[None, :] < VALUE_HEAD_DIM),
+        other=0.0,
+    ).to(tl.float32)
+
+    valid_count = tl.sum(tl.where(valid_k, 1, 0), axis=0)
+    has_valid = valid_count > 0
+
+    for local_head_idx in tl.static_range(0, HEADS_PER_GROUP):
+        head_idx = group_idx * HEADS_PER_GROUP + local_head_idx
+        q = tl.load(
+            query_ptr
+            + query_idx * stride_q_s
+            + batch_idx * stride_q_b
+            + head_idx * stride_q_h
+            + offs_d * stride_q_d,
+            mask=offs_d < HEAD_DIM,
+            other=0.0,
+        ).to(tl.float32)
+
+        scores = tl.sum(key_values * q[None, :], axis=1) * SOFTMAX_SCALE
+        scores = tl.where(valid_k, scores, -float("inf"))
+
+        max_score = tl.max(scores, axis=0)
+        max_score = tl.where(has_valid, max_score, 0.0)
+        weights = tl.exp(scores - max_score)
+        weights = tl.where(valid_k, weights, 0.0)
+        denom = tl.sum(weights, axis=0)
+        weights = weights / tl.where(denom > 0.0, denom, 1.0)
+
+        output = tl.sum(weights[:, None] * value_values, axis=0)
+        tl.store(
+            output_ptr
+            + query_idx * stride_o_s
+            + batch_idx * stride_o_b
+            + head_idx * stride_o_h
+            + offs_v * stride_o_d,
+            output,
+            mask=offs_v < VALUE_HEAD_DIM,
+        )
+
+
 def _next_power_of_2(x: int) -> int:
     return 1 << (x - 1).bit_length()
 
@@ -312,6 +421,19 @@ def _can_use_triton_grouped_dsa(
     if topk_indices.size(0) != query.size(1) or topk_indices.size(1) != query.size(0):
         return False
     return query.size(3) <= 256 and value.size(3) <= 256 and topk_indices.size(2) <= 256
+
+
+def _can_use_triton_grouped_dsa_tiled(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    topk_indices: torch.Tensor,
+    mask: Optional[torch.Tensor],
+) -> bool:
+    if not _can_use_triton_grouped_dsa(query, key, value, topk_indices, mask):
+        return False
+    heads_per_group = query.size(2) // key.size(2)
+    return 1 < heads_per_group <= 8
 
 
 def triton_grouped_dsa_fn(
@@ -379,6 +501,73 @@ def triton_grouped_dsa_fn(
         BLOCK_D=block_d,
         BLOCK_V=block_v,
         BLOCK_K=block_k,
+    )
+    return output.reshape(sq, batch_size, num_query_heads * value_head_dim)
+
+
+def triton_grouped_dsa_tiled_fn(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    topk_indices: torch.Tensor,
+    softmax_scale: float,
+):
+    """Triton grouped-query sparse attention tiled over query heads sharing K/V."""
+    if not _can_use_triton_grouped_dsa_tiled(query, key, value, topk_indices, mask=None):
+        raise NotImplementedError("Tiled Triton DSA-GQA requires supported CUDA full-sequence tensors.")
+
+    query = query.contiguous()
+    key = key.contiguous()
+    value = value.contiguous()
+    topk_indices = topk_indices.contiguous()
+
+    sq, batch_size, num_query_heads, head_dim = query.size()
+    skv = key.size(0)
+    num_query_groups = key.size(2)
+    heads_per_group = num_query_heads // num_query_groups
+    value_head_dim = value.size(3)
+    topk = topk_indices.size(2)
+    output = torch.empty(
+        (sq, batch_size, num_query_heads, value_head_dim),
+        dtype=value.dtype,
+        device=value.device,
+    )
+
+    _triton_grouped_dsa_tiled_kernel[(sq, batch_size, num_query_groups)](
+        query,
+        key,
+        value,
+        topk_indices,
+        output,
+        query.stride(0),
+        query.stride(1),
+        query.stride(2),
+        query.stride(3),
+        key.stride(0),
+        key.stride(1),
+        key.stride(2),
+        key.stride(3),
+        value.stride(0),
+        value.stride(1),
+        value.stride(2),
+        value.stride(3),
+        topk_indices.stride(0),
+        topk_indices.stride(1),
+        topk_indices.stride(2),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        output.stride(3),
+        SOFTMAX_SCALE=softmax_scale,
+        SEQLEN_K=skv,
+        NUM_QUERY_GROUPS=num_query_groups,
+        HEADS_PER_GROUP=heads_per_group,
+        HEAD_DIM=head_dim,
+        VALUE_HEAD_DIM=value_head_dim,
+        TOPK=topk,
+        BLOCK_D=_next_power_of_2(head_dim),
+        BLOCK_V=_next_power_of_2(value_head_dim),
+        BLOCK_K=_next_power_of_2(topk),
     )
     return output.reshape(sq, batch_size, num_query_heads * value_head_dim)
 
@@ -499,6 +688,110 @@ def _triton_paged_grouped_dsa_kernel(
     )
 
 
+@triton.jit
+def _triton_paged_grouped_dsa_tiled_kernel(
+    query_ptr,
+    key_cache_ptr,
+    value_cache_ptr,
+    block_table_ptr,
+    topk_ptr,
+    output_ptr,
+    stride_q_s,
+    stride_q_h,
+    stride_q_d,
+    stride_k_block,
+    stride_k_pos,
+    stride_k_h,
+    stride_k_d,
+    stride_v_block,
+    stride_v_pos,
+    stride_v_h,
+    stride_v_d,
+    stride_t_s,
+    stride_t_k,
+    stride_o_s,
+    stride_o_h,
+    stride_o_d,
+    query_start_position,
+    SOFTMAX_SCALE: tl.constexpr,
+    KEY_LENGTH: tl.constexpr,
+    BLOCK_SIZE_TOKENS: tl.constexpr,
+    HEADS_PER_GROUP: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    VALUE_HEAD_DIM: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    query_idx = tl.program_id(0)
+    group_idx = tl.program_id(1)
+    query_position = query_start_position + query_idx
+
+    offs_d = tl.arange(0, BLOCK_D)
+    offs_k = tl.arange(0, BLOCK_K)
+    key_indices = tl.load(
+        topk_ptr + query_idx * stride_t_s + offs_k * stride_t_k,
+        mask=offs_k < TOPK,
+        other=0,
+    ).to(tl.int64)
+    valid_k = (offs_k < TOPK) & (key_indices >= 0) & (key_indices < KEY_LENGTH)
+    valid_k = valid_k & (key_indices <= query_position)
+    cache_block = tl.load(
+        block_table_ptr + (key_indices // BLOCK_SIZE_TOKENS), mask=valid_k, other=0
+    ).to(tl.int64)
+    cache_pos = key_indices % BLOCK_SIZE_TOKENS
+
+    key_values = tl.load(
+        key_cache_ptr
+        + cache_block[:, None] * stride_k_block
+        + cache_pos[:, None] * stride_k_pos
+        + group_idx * stride_k_h
+        + offs_d[None, :] * stride_k_d,
+        mask=valid_k[:, None] & (offs_d[None, :] < HEAD_DIM),
+        other=0.0,
+    ).to(tl.float32)
+
+    offs_v = tl.arange(0, BLOCK_V)
+    value_values = tl.load(
+        value_cache_ptr
+        + cache_block[:, None] * stride_v_block
+        + cache_pos[:, None] * stride_v_pos
+        + group_idx * stride_v_h
+        + offs_v[None, :] * stride_v_d,
+        mask=valid_k[:, None] & (offs_v[None, :] < VALUE_HEAD_DIM),
+        other=0.0,
+    ).to(tl.float32)
+
+    valid_count = tl.sum(tl.where(valid_k, 1, 0), axis=0)
+    has_valid = valid_count > 0
+
+    for local_head_idx in tl.static_range(0, HEADS_PER_GROUP):
+        head_idx = group_idx * HEADS_PER_GROUP + local_head_idx
+        q = tl.load(
+            query_ptr + query_idx * stride_q_s + head_idx * stride_q_h + offs_d * stride_q_d,
+            mask=offs_d < HEAD_DIM,
+            other=0.0,
+        ).to(tl.float32)
+
+        scores = tl.sum(key_values * q[None, :], axis=1) * SOFTMAX_SCALE
+        scores = tl.where(valid_k, scores, -float("inf"))
+
+        max_score = tl.max(scores, axis=0)
+        max_score = tl.where(has_valid, max_score, 0.0)
+        weights = tl.exp(scores - max_score)
+        weights = tl.where(valid_k, weights, 0.0)
+        denom = tl.sum(weights, axis=0)
+        weights = weights / tl.where(denom > 0.0, denom, 1.0)
+
+        output = tl.sum(weights[:, None] * value_values, axis=0)
+        tl.store(
+            output_ptr + query_idx * stride_o_s + head_idx * stride_o_h + offs_v * stride_o_d,
+            output,
+            mask=offs_v < VALUE_HEAD_DIM,
+        )
+
+
 def _can_use_triton_paged_grouped_dsa(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -522,6 +815,21 @@ def _can_use_triton_paged_grouped_dsa(
     if query.size(3) != key_cache.size(3) or topk_indices.size(1) != query.size(0):
         return False
     return query.size(3) <= 256 and value_cache.size(3) <= 256 and topk_indices.size(2) <= 256
+
+
+def _can_use_triton_paged_grouped_dsa_tiled(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table_row: torch.Tensor,
+    topk_indices: torch.Tensor,
+) -> bool:
+    if not _can_use_triton_paged_grouped_dsa(
+        query, key_cache, value_cache, block_table_row, topk_indices
+    ):
+        return False
+    heads_per_group = query.size(2) // key_cache.size(2)
+    return 1 < heads_per_group <= 8
 
 
 def triton_paged_grouped_dsa_fn(
@@ -584,6 +892,76 @@ def triton_paged_grouped_dsa_fn(
         BLOCK_SIZE_TOKENS=block_size_tokens,
         NUM_QUERY_HEADS=num_query_heads,
         NUM_QUERY_GROUPS=num_query_groups,
+        HEAD_DIM=head_dim,
+        VALUE_HEAD_DIM=value_head_dim,
+        TOPK=topk,
+        BLOCK_D=_next_power_of_2(head_dim),
+        BLOCK_V=_next_power_of_2(value_head_dim),
+        BLOCK_K=_next_power_of_2(topk),
+    )
+    return output.unsqueeze(1).reshape(query_length, 1, num_query_heads * value_head_dim)
+
+
+def triton_paged_grouped_dsa_tiled_fn(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table_row: torch.Tensor,
+    topk_indices: torch.Tensor,
+    softmax_scale: float,
+    query_start_position: int,
+    key_length: int,
+    block_size_tokens: int,
+):
+    """Triton paged GQA sparse attention tiled over query heads sharing K/V."""
+    if not _can_use_triton_paged_grouped_dsa_tiled(
+        query, key_cache, value_cache, block_table_row, topk_indices
+    ):
+        raise NotImplementedError("Tiled Triton paged DSA-GQA requires supported CUDA tensors.")
+
+    query = query.contiguous()
+    topk_indices = topk_indices.contiguous()
+    block_table_row = block_table_row.contiguous()
+    key_cache = key_cache.contiguous()
+    value_cache = value_cache.contiguous()
+
+    query_length, _, num_query_heads, head_dim = query.size()
+    num_query_groups = key_cache.size(2)
+    heads_per_group = num_query_heads // num_query_groups
+    value_head_dim = value_cache.size(3)
+    topk = topk_indices.size(2)
+    output = torch.empty(
+        (query_length, num_query_heads, value_head_dim), dtype=value_cache.dtype, device=query.device
+    )
+
+    _triton_paged_grouped_dsa_tiled_kernel[(query_length, num_query_groups)](
+        query,
+        key_cache,
+        value_cache,
+        block_table_row,
+        topk_indices.squeeze(0),
+        output,
+        query.stride(0),
+        query.stride(2),
+        query.stride(3),
+        key_cache.stride(0),
+        key_cache.stride(1),
+        key_cache.stride(2),
+        key_cache.stride(3),
+        value_cache.stride(0),
+        value_cache.stride(1),
+        value_cache.stride(2),
+        value_cache.stride(3),
+        topk_indices.squeeze(0).stride(0),
+        topk_indices.squeeze(0).stride(1),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        query_start_position,
+        SOFTMAX_SCALE=softmax_scale,
+        KEY_LENGTH=key_length,
+        BLOCK_SIZE_TOKENS=block_size_tokens,
+        HEADS_PER_GROUP=heads_per_group,
         HEAD_DIM=head_dim,
         VALUE_HEAD_DIM=value_head_dim,
         TOPK=topk,
@@ -1091,6 +1469,20 @@ def paged_grouped_dsa_fn(
     block_size_tokens: int,
 ):
     """Dispatch dynamic GQA DSA attention to a paged Triton kernel when supported."""
+    if _can_use_triton_paged_grouped_dsa_tiled(
+        query, key_cache, value_cache, block_table_row, topk_indices
+    ):
+        return triton_paged_grouped_dsa_tiled_fn(
+            query,
+            key_cache,
+            value_cache,
+            block_table_row,
+            topk_indices,
+            softmax_scale,
+            query_start_position,
+            key_length,
+            block_size_tokens,
+        )
     if _can_use_triton_paged_grouped_dsa(
         query, key_cache, value_cache, block_table_row, topk_indices
     ):

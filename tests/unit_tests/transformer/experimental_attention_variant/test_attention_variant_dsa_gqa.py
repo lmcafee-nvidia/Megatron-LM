@@ -14,8 +14,10 @@ from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
     paged_gqa_dsa_indexer_topk_fn,
     paged_grouped_dsa_fn,
     triton_grouped_dsa_fn,
+    triton_grouped_dsa_tiled_fn,
     triton_paged_gqa_dsa_indexer_topk_fn,
     triton_paged_grouped_dsa_fn,
+    triton_paged_grouped_dsa_tiled_fn,
     unfused_grouped_dsa_fn,
 )
 
@@ -163,6 +165,34 @@ def test_triton_grouped_dsa_fn_matches_reference():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA/Triton required")
+@pytest.mark.parametrize("heads_per_group", [2, 4])
+def test_triton_grouped_dsa_tiled_fn_matches_reference(heads_per_group):
+    torch.manual_seed(123)
+
+    seqlen = 7
+    batch_size = 2
+    num_query_groups = 2
+    num_heads = num_query_groups * heads_per_group
+    head_dim = 16
+    topk = 4
+
+    query = torch.randn(seqlen, batch_size, num_heads, head_dim, device="cuda")
+    key = torch.randn(seqlen, batch_size, num_query_groups, head_dim, device="cuda")
+    value = torch.randn(seqlen, batch_size, num_query_groups, head_dim, device="cuda")
+    causal_mask = torch.triu(
+        torch.full((seqlen, seqlen), float("-inf"), device="cuda"), diagonal=1
+    )
+    topk_indices = (
+        torch.randn(batch_size, seqlen, seqlen, device="cuda") + causal_mask
+    ).topk(topk, dim=-1).indices
+
+    expected = unfused_grouped_dsa_fn(query, key, value, topk_indices, head_dim**-0.5)
+    actual = triton_grouped_dsa_tiled_fn(query, key, value, topk_indices, head_dim**-0.5)
+
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA/Triton required")
 def test_triton_paged_grouped_dsa_fn_matches_gather_reference():
     torch.manual_seed(123)
 
@@ -207,6 +237,67 @@ def test_triton_paged_grouped_dsa_fn_matches_gather_reference():
         query, request_key, request_value, topk_indices, head_dim**-0.5, mask=request_mask
     )
     actual = triton_paged_grouped_dsa_fn(
+        query,
+        key_cache,
+        value_cache,
+        block_table_row,
+        topk_indices,
+        head_dim**-0.5,
+        query_start_position,
+        sequence_length,
+        block_size_tokens,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA/Triton required")
+@pytest.mark.parametrize("heads_per_group", [2, 4])
+def test_triton_paged_grouped_dsa_tiled_fn_matches_gather_reference(heads_per_group):
+    torch.manual_seed(123)
+
+    sequence_length = 7
+    query_length = 2
+    query_start_position = 5
+    block_size_tokens = 4
+    num_cache_blocks = 3
+    num_query_groups = 2
+    num_heads = num_query_groups * heads_per_group
+    head_dim = 16
+    topk = 4
+    block_table_row = torch.tensor([2, 0], dtype=torch.long, device="cuda")
+
+    sequence_key = torch.randn(sequence_length, 1, num_query_groups, head_dim, device="cuda")
+    sequence_value = torch.randn(sequence_length, 1, num_query_groups, head_dim, device="cuda")
+    key_cache = torch.zeros(
+        num_cache_blocks, block_size_tokens, num_query_groups, head_dim, device="cuda"
+    )
+    value_cache = torch.zeros_like(key_cache)
+    for token_idx in range(sequence_length):
+        block_id = block_table_row[token_idx // block_size_tokens]
+        local_idx = token_idx % block_size_tokens
+        key_cache[block_id, local_idx] = sequence_key[token_idx, 0]
+        value_cache[block_id, local_idx] = sequence_value[token_idx, 0]
+
+    query = torch.randn(query_length, 1, num_heads, head_dim, device="cuda")
+    request_mask = _build_shifted_causal_mask(
+        query_length, sequence_length, query_start_position, query.device
+    )
+    topk_indices = (
+        torch.randn(1, query_length, sequence_length, device="cuda")
+        + request_mask.view(1, query_length, sequence_length)
+    ).topk(topk, dim=-1).indices
+
+    request_key = _gather_block_cache_sequence(
+        key_cache, block_table_row, sequence_length, block_size_tokens
+    ).unsqueeze(1)
+    request_value = _gather_block_cache_sequence(
+        value_cache, block_table_row, sequence_length, block_size_tokens
+    ).unsqueeze(1)
+    expected = unfused_grouped_dsa_fn(
+        query, request_key, request_value, topk_indices, head_dim**-0.5, mask=request_mask
+    )
+    actual = triton_paged_grouped_dsa_tiled_fn(
         query,
         key_cache,
         value_cache,
