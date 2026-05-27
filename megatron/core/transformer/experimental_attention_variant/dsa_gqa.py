@@ -1237,26 +1237,21 @@ class DSGQACoreAttention(MegatronModule):
                 continue
 
             block_table_row = block_table[request_idx]
-            request_index_key = _gather_block_cache_sequence(
-                dsa_key_cache, block_table_row, key_length, block_size_tokens
-            ).unsqueeze(1)
-
             request_query = query[query_start:query_end]
             request_q_index = q_index[query_start:query_end]
             request_weights = weights[query_start:query_end]
             request_offset = (
                 int(kv_offsets[request_idx].item()) if request_idx < kv_offsets.numel() else 0
             )
-            request_mask = _build_shifted_causal_mask(
-                query_length, key_length, request_offset, request_query.device
-            )
-
-            _, topk_indices = fused_qk_topk_naive(
+            topk_indices = paged_gqa_dsa_indexer_topk_fn(
                 request_q_index,
-                request_index_key,
+                dsa_key_cache,
+                block_table_row,
                 request_weights,
                 self.indexer.index_topk,
-                request_mask,
+                request_offset,
+                key_length,
+                block_size_tokens,
             )
             output[query_start:query_end] = paged_grouped_dsa_fn(
                 request_query,

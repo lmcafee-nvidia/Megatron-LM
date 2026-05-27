@@ -343,6 +343,89 @@ def test_paged_gqa_dsa_indexer_topk_falls_back_on_cpu():
     assert torch.equal(actual, expected)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA/Triton required")
+def test_paged_gqa_dsa_decode_dispatch_matches_gather_reference():
+    key_length = 9
+    query_length = 1
+    query_start_position = key_length - 1
+    block_size_tokens = 4
+    num_heads = 4
+    num_query_groups = 2
+    head_dim = 16
+    index_heads = 4
+    index_dim = 16
+    topk = 4
+    block_table_row = torch.tensor([2, 0, 1], dtype=torch.long, device="cuda")
+
+    sequence_index_key = (
+        torch.arange(1, key_length + 1, dtype=torch.float32, device="cuda")
+        .view(key_length, 1)
+        .expand(key_length, index_dim)
+        .contiguous()
+    )
+    dsa_key_cache = _fill_paged_cache_from_sequence(
+        sequence_index_key, block_table_row, block_size_tokens, num_blocks=3
+    )
+    q_index = torch.ones(query_length, 1, index_heads, index_dim, dtype=torch.float32, device="cuda")
+    weights = torch.arange(1, index_heads + 1, dtype=torch.float32, device="cuda").view(
+        1, 1, index_heads
+    )
+
+    sequence_key = torch.randn(key_length, num_query_groups, head_dim, device="cuda")
+    sequence_value = torch.randn_like(sequence_key)
+    key_cache = _fill_paged_cache_from_sequence(
+        sequence_key, block_table_row, block_size_tokens, num_blocks=3
+    )
+    value_cache = _fill_paged_cache_from_sequence(
+        sequence_value, block_table_row, block_size_tokens, num_blocks=3
+    )
+    query = torch.randn(query_length, 1, num_heads, head_dim, device="cuda")
+
+    request_index_key = _gather_block_cache_sequence(
+        dsa_key_cache, block_table_row, key_length, block_size_tokens
+    ).unsqueeze(1)
+    request_mask = _build_shifted_causal_mask(
+        query_length, key_length, query_start_position, query.device
+    )
+    _, expected_topk = fused_qk_topk_naive(
+        q_index, request_index_key, weights, topk, request_mask
+    )
+    actual_topk = paged_gqa_dsa_indexer_topk_fn(
+        q_index,
+        dsa_key_cache,
+        block_table_row,
+        weights,
+        topk,
+        query_start_position,
+        key_length,
+        block_size_tokens,
+    )
+
+    request_key = _gather_block_cache_sequence(
+        key_cache, block_table_row, key_length, block_size_tokens
+    ).unsqueeze(1)
+    request_value = _gather_block_cache_sequence(
+        value_cache, block_table_row, key_length, block_size_tokens
+    ).unsqueeze(1)
+    expected = grouped_dsa_fn(
+        query, request_key, request_value, expected_topk, head_dim**-0.5, mask=request_mask
+    )
+    actual = paged_grouped_dsa_fn(
+        query,
+        key_cache,
+        value_cache,
+        block_table_row,
+        actual_topk,
+        head_dim**-0.5,
+        query_start_position,
+        key_length,
+        block_size_tokens,
+    )
+
+    assert torch.equal(actual_topk, expected_topk)
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+
+
 def test_paged_grouped_dsa_fn_falls_back_on_cpu():
     torch.manual_seed(123)
 
