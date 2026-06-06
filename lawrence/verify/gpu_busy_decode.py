@@ -118,6 +118,7 @@ def _preset_12b() -> Tuple[List[str], Dict[str, str]]:
         "--rotary-base", "1000000",
         "--rotary-percent", "1.0",
         "--normalization", "RMSNorm",
+        "--no-persist-layer-norm",
         "--disable-bias-linear",
         "--untie-embeddings-and-output-weights",
         "--bf16",
