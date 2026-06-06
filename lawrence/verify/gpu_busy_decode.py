@@ -482,7 +482,11 @@ def run_gpubusy(knobs, args, model, tokenizer, enable_async=None) -> Dict:
         "num_forwards_recorded": n,
         "non_decode_steps_in_window": non_decode_steps,
         "launch_before_commit_in_window": launch_during,
-        "prestage_in_shadow_count": int(controller._async_prestage_in_shadow_count),
+        # getattr default keeps the verifier runnable against an older controller (pre the
+        # shadow-prestage commit) for before/after A/B measurement.
+        "prestage_in_shadow_count": int(
+            getattr(controller, "_async_prestage_in_shadow_count", 0)
+        ),
         "block_size_tokens": int(context.block_size_tokens),
         "forward_us": _summ(fwd_us),
         "inter_forward_gap_us": _summ(gap_us),
