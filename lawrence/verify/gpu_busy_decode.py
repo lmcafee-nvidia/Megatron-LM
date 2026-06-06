@@ -81,7 +81,58 @@ def _preset_357m() -> Tuple[List[str], Dict[str, str]]:
     return argv, {"vocab_size_hint": "50304"}
 
 
-MODEL_PRESETS = {"357m": _preset_357m}
+def _preset_12b() -> Tuple[List[str], Dict[str, str]]:
+    """12B GPT (40L / hidden 5120 / GQA 8 / SwiGLU / RoPE / RMSNorm), bf16, TP1/PP1.
+
+    Architecture matches the checkpoint at
+    ``/lustre/.../checkpoints/12b/core-local-tp1-pp1`` (read off its saved args). We use the
+    NullTokenizer with the checkpoint's padded vocab size (131072) rather than the original
+    TikTokenizer: the gpubusy / correctness harness only needs ``tokenizer.vocab_size`` (prompts
+    are synthetic in-vocab token ids; detokenize is not exercised in gpubusy), so this avoids a
+    tokenizer-file dependency while keeping the embedding/output sizes identical to the checkpoint.
+    """
+    base = "/lustre/fsw/portfolios/adlr/users/lmcafee/checkpoints"
+    ckpt = f"{base}/12b/core-local-tp1-pp1"
+    argv = [
+        "--transformer-impl", "local",
+        "--model-provider", "gpt",
+        "--load", ckpt,
+        "--exit-on-missing-checkpoint",
+        "--inference-ckpt-non-strict",
+        "--tokenizer-type", "NullTokenizer",
+        "--vocab-size", "131072",
+        "--make-vocab-size-divisible-by", "128",
+        "--max-position-embeddings", "8192",
+        "--seq-length", "8192",
+        "--tensor-model-parallel-size", "1",
+        "--pipeline-model-parallel-size", "1",
+        "--num-layers", "40",
+        "--hidden-size", "5120",
+        "--num-attention-heads", "32",
+        "--group-query-attention",
+        "--num-query-groups", "8",
+        "--ffn-hidden-size", "14336",
+        "--kv-channels", "128",
+        "--swiglu",
+        "--position-embedding-type", "rope",
+        "--rotary-base", "1000000",
+        "--rotary-percent", "1.0",
+        "--normalization", "RMSNorm",
+        "--disable-bias-linear",
+        "--untie-embeddings-and-output-weights",
+        "--bf16",
+        "--micro-batch-size", "1",
+        "--attention-dropout", "0.0",
+        "--hidden-dropout", "0.0",
+        "--seed", "42",
+        "--use-flash-attn",
+        "--inference-rng-tracker",
+        "--inference-dynamic-batching",
+    ]
+    return argv, {"vocab_size_hint": "131072"}
+
+
+MODEL_PRESETS = {"357m": _preset_357m, "12b": _preset_12b}
 
 
 def build_megatron_argv(knobs) -> List[str]:
@@ -286,8 +337,12 @@ def run_correctness(knobs, args, model, tokenizer) -> Dict:
 # ---------------------------------------------------------------------------
 # Mode: gpubusy (Part B, programmatic).
 # ---------------------------------------------------------------------------
-def run_gpubusy(knobs, args, model, tokenizer) -> Dict:
+def run_gpubusy(knobs, args, model, tokenizer, enable_async=None) -> Dict:
     import torch
+
+    if enable_async is None:
+        enable_async = bool(knobs.gbd_async)
+    enable_async = bool(enable_async)
 
     vocab_size = tokenizer.vocab_size
     warmup = knobs.gbd_warmup_steps
@@ -299,7 +354,7 @@ def run_gpubusy(knobs, args, model, tokenizer) -> Dict:
 
     engine, controller, context = build_engine(
         args, model, tokenizer,
-        enable_async=bool(knobs.gbd_async), max_sequence_length=max_seq_len,
+        enable_async=enable_async, max_sequence_length=max_seq_len,
     )
 
     # ---- per-forward CUDA-event timer (script-level monkeypatch; no prod change) ----
@@ -329,34 +384,75 @@ def run_gpubusy(knobs, args, model, tokenizer) -> Dict:
     for req in requests:
         engine._add_request(req)
 
-    # Prefill + warm up to steady-state decode.
-    warm = 0
-    decode_seen = 0
-    while warm < warmup + 64 and decode_seen < warmup:
-        engine.step_modern()
-        warm += 1
-        if engine.is_decode_only:
-            decode_seen += 1
-    assert engine.is_decode_only, "did not reach steady-state decode during warmup"
-    active = context.total_request_count - context.paused_request_count
-
-    launch_before = int(controller._async_launch_before_commit_count)
-
-    # ---- measured steady-state window ----
+    # ---- driver: how decode steps are pumped ----
+    #
+    # step_modern: one engine.step_modern() (== _run_coroutine_sync(async_step())) per step, so
+    #   every step is its own run_until_complete -- the host pipeline of step K and the forward of
+    #   step K strictly alternate at the run_until_complete boundary (the historical driver).
+    # continuous: warmup + the entire steady window run inside ONE run_until_complete, awaiting
+    #   engine.async_step() in a loop. This mirrors the production engine loop (run_engine's body):
+    #   there is no per-step event-loop boundary, so the launch-before-commit host work of one step
+    #   (commit + prestage + bookkeeping) overlaps the next forward across step boundaries -- the
+    #   pipelining the per-step run_until_complete driver cannot exercise.
+    driver = knobs.gbd_driver
     nsys = bool(knobs.gbd_nsys)
-    if nsys:
-        torch.cuda.cudart().cudaProfilerStart()
-    state["recording"] = True
-    non_decode_steps = 0
-    for _ in range(steady):
-        engine.step_modern()
-        if not engine.is_decode_only:
-            non_decode_steps += 1
-    state["recording"] = False
-    if nsys:
-        torch.cuda.cudart().cudaProfilerStop()
-    torch.cuda.synchronize()
+    box = {"active": 0, "launch_before": 0, "non_decode_steps": 0}
 
+    def _profiler(start):
+        if nsys:
+            (torch.cuda.cudart().cudaProfilerStart if start else
+             torch.cuda.cudart().cudaProfilerStop)()
+
+    def _enter_steady_window():
+        assert engine.is_decode_only, "did not reach steady-state decode during warmup"
+        box["active"] = context.total_request_count - context.paused_request_count
+        box["launch_before"] = int(controller._async_launch_before_commit_count)
+        _profiler(True)
+        state["recording"] = True
+
+    def _exit_steady_window():
+        state["recording"] = False
+        _profiler(False)
+
+    if driver == "step_modern":
+        # Prefill + warm up to steady-state decode.
+        warm = 0
+        decode_seen = 0
+        while warm < warmup + 64 and decode_seen < warmup:
+            engine.step_modern()
+            warm += 1
+            if engine.is_decode_only:
+                decode_seen += 1
+        _enter_steady_window()
+        for _ in range(steady):
+            engine.step_modern()
+            if not engine.is_decode_only:
+                box["non_decode_steps"] += 1
+        _exit_steady_window()
+    elif driver == "continuous":
+        async def _drive():
+            warm = 0
+            decode_seen = 0
+            while warm < warmup + 64 and decode_seen < warmup:
+                await engine.async_step()
+                warm += 1
+                if engine.is_decode_only:
+                    decode_seen += 1
+            _enter_steady_window()
+            for _ in range(steady):
+                await engine.async_step()
+                if not engine.is_decode_only:
+                    box["non_decode_steps"] += 1
+            _exit_steady_window()
+
+        engine._loop.run_until_complete(_drive())
+    else:
+        raise ValueError(driver)
+
+    torch.cuda.synchronize()
+    active = box["active"]
+    launch_before = box["launch_before"]
+    non_decode_steps = box["non_decode_steps"]
     launch_during = int(controller._async_launch_before_commit_count) - launch_before
 
     # ---- compute metrics from CUDA events ----
@@ -374,7 +470,9 @@ def run_gpubusy(knobs, args, model, tokenizer) -> Dict:
     out = {
         "mode": "gpubusy",
         "method": "programmatic_cuda_events",
-        "async": bool(knobs.gbd_async),
+        "driver": driver,
+        "model": knobs.gbd_model,
+        "async": enable_async,
         "batch_size": knobs.gbd_batch_size,
         "active_decode_requests": int(active),
         "prompt_len": knobs.gbd_prompt_len,
@@ -383,6 +481,7 @@ def run_gpubusy(knobs, args, model, tokenizer) -> Dict:
         "num_forwards_recorded": n,
         "non_decode_steps_in_window": non_decode_steps,
         "launch_before_commit_in_window": launch_during,
+        "prestage_in_shadow_count": int(controller._async_prestage_in_shadow_count),
         "block_size_tokens": int(context.block_size_tokens),
         "forward_us": _summ(fwd_us),
         "inter_forward_gap_us": _summ(gap_us),
@@ -528,6 +627,8 @@ def parse_knobs(argv):
                    choices=["correctness", "gpubusy", "compareA", "nsysparse"])
     p.add_argument("--gbd-model", default="357m", choices=list(MODEL_PRESETS))
     p.add_argument("--gbd-async", type=int, default=0)
+    p.add_argument("--gbd-driver", default="step_modern",
+                   choices=["step_modern", "continuous"])
     p.add_argument("--gbd-batch-size", type=int, default=1)
     p.add_argument("--gbd-sampling", default="greedy", choices=["greedy", "torch"])
     p.add_argument("--gbd-prompt-len", type=int, default=8)
