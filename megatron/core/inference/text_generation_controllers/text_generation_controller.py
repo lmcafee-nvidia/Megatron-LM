@@ -5,6 +5,7 @@ import concurrent
 import copy
 import functools
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
 
 import numpy as np
@@ -88,6 +89,20 @@ from megatron.core.inference.text_generation_controllers.mtp_utils_triton import
     prepare_next_forward_pass,
     verify_speculative_tokens,
 )
+
+
+@dataclass(frozen=True)
+class DynamicDecodeHardCommit:
+    """CPU data required to hard-commit one dynamic decode step."""
+
+    active_request_ids: Tensor
+    active_request_mask: Tensor
+    finished_request_ids: Tensor
+    finished_routing_block_ids: Dict[int, List[int]]
+    sampled_tokens_cpu: Tensor
+    sampled_mtp_tokens_cpu: Optional[Tensor]
+    new_sample_copy: Tensor
+    sample_was_async: bool
 
 
 # pylint: disable=line-too-long
@@ -1761,6 +1776,19 @@ class TextGenerationController:
     ) -> AsyncPendingForwardDecision:
         """Return the centralized pending-forward reuse decision."""
         context = self.inference_wrapped_model.inference_context
+        if transaction.invalidation_reason is not None:
+            policy = AsyncRowMapPolicy.from_value(
+                getattr(self, "_async_row_map_policy", AsyncRowMapPolicy.IDENTITY_ONLY)
+            )
+            return AsyncPendingForwardDecision(
+                reusable=False,
+                row_map=None,
+                row_mapped=False,
+                reason=transaction.invalidation_reason,
+                row_map_policy=policy,
+                graph_compatible=True,
+                layout_compatible=False,
+            )
         current_plan = CommittedDecodePlan.from_committed_context(
             context, tokens_per_request=self.num_speculative_tokens + 1
         )
@@ -1855,6 +1883,13 @@ class TextGenerationController:
             self._async_step_transaction = None
             self._increment_async_counter("_async_discarded_forward_count")
             self._increment_async_counter("_async_rolled_back_forward_count")
+
+    def _invalidate_pending_async_transaction(self, reason: str) -> None:
+        """Mark the pending async transaction invalid with a structured CPU reason."""
+        transaction = self._pending_async_transaction()
+        if transaction is None:
+            return
+        transaction.invalidate(reason)
 
     def _decide_ep_step_begin(self, *, has_real_work: bool) -> EPStepBeginDecision:
         """Synchronize pending async state at the beginning of an EP work step."""
@@ -2781,6 +2816,137 @@ class TextGenerationController:
             sampled_mtp_tokens_cpu = None
         return sampled_tokens_cpu, sampled_mtp_tokens_cpu
 
+    def _prepare_dynamic_decode_hard_commit(
+        self,
+        sampled_tokens_cpu: Optional[Tensor] = None,
+        sampled_mtp_tokens_cpu: Optional[Tensor] = None,
+        sample_ready_event: Optional[torch.cuda.Event] = None,
+    ) -> DynamicDecodeHardCommit:
+        """Prepare CPU-only data needed to hard-commit the sampled decode step."""
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+        active_request_slice = slice(context.paused_request_count, context.total_request_count)
+
+        sample_was_async = sample_ready_event is not None
+        if sampled_tokens_cpu is None:
+            range_push("transfer_samples_to_cpu")
+            sampled_tokens_cpu, sampled_mtp_tokens_cpu = self._transfer_samples_to_cpu(
+                active_request_count
+            )
+            range_pop()
+        elif sample_ready_event is not None:
+            range_push("transfer_samples_to_cpu")
+            sample_ready_event.synchronize()
+            range_pop()
+
+        range_push("active_request_mask")
+        active_request_ids = context.request_ids[active_request_slice].long()
+        active_sequence_lengths = context.get_active_sequence_lengths()
+        active_sequence_lengths += 1
+        max_sequence_lengths = context.get_max_sequence_lengths()
+
+        termination_ids = context.active_request_metadata["termination_id"][:active_request_count]
+        termination_enabled = termination_ids >= 0
+        termination_hit = termination_enabled & (sampled_tokens_cpu == termination_ids)
+        if self.num_speculative_tokens > 0 and termination_enabled.any().item():
+            accepted_tokens_cpu = self._accepted_tokens_per_request[:active_request_count].cpu()
+            termination_hit |= termination_enabled & (
+                accepted_tokens_cpu == termination_ids[:, None]
+            ).any(dim=1)
+        active_request_mask = (~termination_hit).byte() & torch.less(
+            active_sequence_lengths, max_sequence_lengths
+        ).byte()
+
+        if self._get_stop_word_finished_ids_callback is not None:
+            request_ids_list = active_request_ids.tolist()
+            stop_word_finished_ids = self._get_stop_word_finished_ids_callback(request_ids_list)
+            if stop_word_finished_ids:
+                for idx, request_id in enumerate(request_ids_list):
+                    if request_id in stop_word_finished_ids:
+                        active_request_mask[idx] = 0
+
+        finished_idxs = (
+            torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
+        )
+        finished_request_ids = context.request_ids[finished_idxs]
+        for request_id in finished_request_ids.tolist():
+            self._request_sampling_rngs.pop(int(request_id), None)
+
+        finished_routing_block_ids = {}
+        if context.kv_block_allocator.block_routing and finished_idxs.numel() > 0:
+            for fidx in finished_idxs.tolist():
+                req_id = int(context.request_ids[fidx].item())
+                blocks = context.request_to_kv_block_ids[fidx]
+                valid = blocks[blocks >= 0].tolist()
+                if valid:
+                    finished_routing_block_ids[req_id] = valid
+
+        new_sample_copy = sampled_tokens_cpu.clone()
+        range_pop()
+
+        return DynamicDecodeHardCommit(
+            active_request_ids=active_request_ids,
+            active_request_mask=active_request_mask,
+            finished_request_ids=finished_request_ids,
+            finished_routing_block_ids=finished_routing_block_ids,
+            sampled_tokens_cpu=sampled_tokens_cpu,
+            sampled_mtp_tokens_cpu=sampled_mtp_tokens_cpu,
+            new_sample_copy=new_sample_copy,
+            sample_was_async=sample_was_async,
+        )
+
+    def _hard_commit_dynamic_decode_state(
+        self,
+        commit: DynamicDecodeHardCommit,
+        *,
+        h2d_done_event: Optional[torch.cuda.Event] = None,
+    ) -> Optional[Dict[str, Tensor]]:
+        """Mutate committed dynamic context state for the sampled decode step."""
+        context = self.inference_wrapped_model.inference_context
+        if h2d_done_event is not None:
+            h2d_done_event.synchronize()
+
+        range_push("update_requests")
+        update_result = context.update_requests(
+            commit.active_request_mask,
+            commit.new_sample_copy,
+            commit.sampled_mtp_tokens_cpu,
+        )
+        range_pop()
+
+        if commit.finished_request_ids.numel() > 0:
+            if self.num_speculative_tokens > 0:
+                self._async_mtp_finish_boundary_count += 1
+            else:
+                self._async_finish_boundary_count += 1
+        if update_result is not None:
+            newly_paused_request_ids = update_result.get("newly_paused_request_ids")
+            if newly_paused_request_ids is not None and newly_paused_request_ids.numel() > 0:
+                self._async_pause_boundary_count += 1
+            evict_request_ids = update_result.get("evict_request_ids")
+            if evict_request_ids is not None and evict_request_ids.numel() > 0:
+                self._async_evict_boundary_count += 1
+        return update_result
+
+    def _post_launch_dynamic_cpu_bookkeeping(
+        self,
+        commit: DynamicDecodeHardCommit,
+        update_result: Optional[Dict[str, Tensor]],
+    ) -> Dict[str, Tensor]:
+        """Format CPU-only dynamic-step output after any next async launch."""
+        returned_sample = (
+            commit.sampled_tokens_cpu.clone()
+            if commit.sample_was_async
+            else commit.sampled_tokens_cpu
+        )
+        return {
+            "active_request_ids": commit.active_request_ids,
+            "finished_request_ids": commit.finished_request_ids,
+            "sample": returned_sample,
+            "finished_routing_block_ids": commit.finished_routing_block_ids,
+            **(update_result or {}),
+        }
+
     def _dynamic_step_context_bookkeeping(
         self,
         sampled_tokens_cpu: Optional[Tensor] = None,
@@ -2802,123 +2968,15 @@ class TextGenerationController:
                 newly_paused_request_ids (Tensor): Newly paused request IDs.
                 finished_request_ids (Tensor): Finished request IDs.
         """
-        context = self.inference_wrapped_model.inference_context
-        active_request_count = context.total_request_count - context.paused_request_count
-        active_request_slice = slice(context.paused_request_count, context.total_request_count)
-
-        if sampled_tokens_cpu is None:
-            # Batch GPU-to-CPU transfer of all sampled tokens.
-            range_push("transfer_samples_to_cpu")
-            sampled_tokens_cpu, sampled_mtp_tokens_cpu = self._transfer_samples_to_cpu(
-                active_request_count
-            )
-            range_pop()
-        elif sample_ready_event is not None:
-            range_push("transfer_samples_to_cpu")
-            sample_ready_event.synchronize()
-            range_pop()
-
-        range_push("active_request_mask")
-        # Everything below is 100% CPU.
-        active_request_ids = context.request_ids[active_request_slice].long()
-        active_sequence_lengths = context.get_active_sequence_lengths()
-
-        # After the forward pass and KV-cache rewind, get_active_sequence_lengths()
-        # returns kv_offsets + query_lengths which already includes all accepted
-        # speculative tokens (they were part of the query and survived the rewind).
-        # Only the newly sampled base token is not yet in the KV cache, so add 1.
-        active_sequence_lengths += 1
-        max_sequence_lengths = context.get_max_sequence_lengths()
-
-        # Request finished if termination_id or length >= max_sequence_length.
-        # These operands are CPU: sampled_tokens_cpu was D2H'd above, and
-        # active_request_metadata is CPU-pinned. Under MTP, termination can be
-        # hit by an accepted speculative token before the new base sample.
-        termination_ids = context.active_request_metadata["termination_id"][:active_request_count]
-        termination_enabled = termination_ids >= 0
-        termination_hit = termination_enabled & (sampled_tokens_cpu == termination_ids)
-        if self.num_speculative_tokens > 0 and termination_enabled.any().item():
-            # Avoid a per-step CUDA sync in the common fixed-length MTP path.
-            # Accepted speculative tokens only need to be inspected when at
-            # least one active request can terminate by token id.
-            accepted_tokens_cpu = self._accepted_tokens_per_request[:active_request_count].cpu()
-            termination_hit |= termination_enabled & (
-                accepted_tokens_cpu == termination_ids[:, None]
-            ).any(dim=1)
-        active_request_mask = (~termination_hit).byte() & torch.less(
-            active_sequence_lengths, max_sequence_lengths
-        ).byte()
-
-        # Mark requests as finished if they hit stop words
-        # (detected in previous step's post_process_requests)
-        if self._get_stop_word_finished_ids_callback is not None:
-            request_ids_list = active_request_ids.tolist()
-            stop_word_finished_ids = self._get_stop_word_finished_ids_callback(request_ids_list)
-            if stop_word_finished_ids:
-                for idx, request_id in enumerate(request_ids_list):
-                    if request_id in stop_word_finished_ids:
-                        active_request_mask[idx] = 0
-
-        finished_idxs = (
-            torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
+        commit = self._prepare_dynamic_decode_hard_commit(
+            sampled_tokens_cpu=sampled_tokens_cpu,
+            sampled_mtp_tokens_cpu=sampled_mtp_tokens_cpu,
+            sample_ready_event=sample_ready_event,
         )
-        finished_request_ids = context.request_ids[finished_idxs]
-        for request_id in finished_request_ids.tolist():
-            self._request_sampling_rngs.pop(int(request_id), None)
-
-        # Save block IDs for finished requests before update_requests releases them.
-        # Needed for per-block routing reconstruction in the engine.
-        finished_routing_block_ids = {}
-        if context.kv_block_allocator.block_routing and finished_idxs.numel() > 0:
-            for fidx in finished_idxs.tolist():
-                req_id = int(context.request_ids[fidx].item())
-                blocks = context.request_to_kv_block_ids[fidx]
-                valid = blocks[blocks >= 0].tolist()
-                if valid:
-                    finished_routing_block_ids[req_id] = valid
-
-        # Clone needed: update_requests mutates next_tokens in-place via tensor_swap,
-        # which would corrupt the reused buffer.
-        new_sample_copy = sampled_tokens_cpu.clone()
-        range_pop()
-
-        if h2d_done_event is not None:
-            h2d_done_event.synchronize()
-
-        range_push("update_requests")
-        update_result = context.update_requests(
-            active_request_mask, new_sample_copy, sampled_mtp_tokens_cpu
+        update_result = self._hard_commit_dynamic_decode_state(
+            commit, h2d_done_event=h2d_done_event
         )
-        range_pop()
-
-        if finished_request_ids.numel() > 0:
-            if self.num_speculative_tokens > 0:
-                self._async_mtp_finish_boundary_count += 1
-            else:
-                self._async_finish_boundary_count += 1
-        if update_result is not None:
-            newly_paused_request_ids = update_result.get("newly_paused_request_ids")
-            if newly_paused_request_ids is not None and newly_paused_request_ids.numel() > 0:
-                self._async_pause_boundary_count += 1
-            evict_request_ids = update_result.get("evict_request_ids")
-            if evict_request_ids is not None and evict_request_ids.numel() > 0:
-                self._async_evict_boundary_count += 1
-
-        returned_sample = (
-            sampled_tokens_cpu.clone() if sample_ready_event is not None else sampled_tokens_cpu
-        )
-
-        return {
-            "active_request_ids": active_request_ids,
-            "finished_request_ids": finished_request_ids,
-            # Already a CPU tensor (independent of _sampled_tokens_cuda via the
-            # .cpu() in _transfer_samples_to_cpu; update_requests only mutates
-            # the separate new_sample_copy). Returning the CPU copy avoids a
-            # D2H sync when the engine later calls sample.tolist().
-            "sample": returned_sample,
-            "finished_routing_block_ids": finished_routing_block_ids,
-            **(update_result or {}),
-        }
+        return self._post_launch_dynamic_cpu_bookkeeping(commit, update_result)
 
     async def async_generate_output_tokens_dynamic_batch(
         self, skip_bookkeeping: Optional[bool] = False

@@ -52,6 +52,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from tests.unit_tests.inference.async_transaction_test_helpers import (
+    OverlapOrderProbe,
     assert_exact_plan_identity,
     fake_committed_decode_context,
 )
@@ -2195,6 +2196,77 @@ class _SyncEvent:
 
     def synchronize(self):
         self.sync_count += 1
+
+
+@pytest.mark.internal
+def test_dynamic_bookkeeping_splits_hard_commit_from_post_launch_cpu_work(monkeypatch):
+    monkeypatch.setattr(tgc_module, "range_push", lambda _msg: None)
+    monkeypatch.setattr(tgc_module, "range_pop", lambda: None)
+    context = _FakeBookkeepingContext(
+        request_ids=[10, 11],
+        sequence_lengths=[5, 5],
+        max_sequence_lengths=[10, 10],
+        termination_ids=[-1, -1],
+    )
+    events = []
+    original_update_requests = context.update_requests
+
+    def _update_requests(*args, **kwargs):
+        events.append("hard_commit")
+        return original_update_requests(*args, **kwargs)
+
+    context.update_requests = _update_requests
+    controller = object.__new__(TextGenerationController)
+    controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
+    controller.num_speculative_tokens = 0
+    controller._request_sampling_rngs = {10: object(), 11: object()}
+    controller._get_stop_word_finished_ids_callback = None
+    controller._async_finish_boundary_count = 0
+    controller._async_mtp_finish_boundary_count = 0
+    controller._async_pause_boundary_count = 0
+    controller._async_evict_boundary_count = 0
+    sample_ready_event = _SyncEvent()
+    h2d_done_event = _SyncEvent()
+    probe = OverlapOrderProbe(events=events)
+
+    commit = controller._prepare_dynamic_decode_hard_commit(
+        sampled_tokens_cpu=torch.tensor([4, 5], dtype=torch.int64),
+        sample_ready_event=sample_ready_event,
+    )
+
+    assert context.update_calls == []
+    assert sample_ready_event.sync_count == 1
+
+    update_result = controller._hard_commit_dynamic_decode_state(
+        commit, h2d_done_event=h2d_done_event
+    )
+    probe.launch()
+    result = controller._post_launch_dynamic_cpu_bookkeeping(commit, update_result)
+    probe.post_launch_cpu()
+
+    assert h2d_done_event.sync_count == 1
+    assert context.update_calls[0][1].tolist() == [4, 5]
+    assert result["sample"].tolist() == [4, 5]
+    assert events == ["hard_commit", "launch", "post_launch_cpu"]
+    probe.assert_launch_before_cpu()
+
+
+@pytest.mark.internal
+def test_late_cpu_invalidation_rejects_pending_transaction():
+    controller = _make_controller_with_rows([10, 11], [10, 11])
+    controller._async_row_map_policy = AsyncRowMapPolicy.IDENTITY_ONLY
+    transaction = controller._pending_async_transaction()
+    assert transaction is not None
+
+    controller._invalidate_pending_async_transaction("late stop-word invalidation")
+    reused, row_indices, row_mapped = controller._resolve_pending_async_forward()
+
+    assert not reused
+    assert row_indices is None
+    assert not row_mapped
+    assert transaction.invalidation_reason == "late stop-word invalidation"
+    assert transaction.discard_reason == "late stop-word invalidation"
+    assert transaction.diagnostics()["invalidation_reason"] == "late stop-word invalidation"
 
 
 @pytest.mark.internal

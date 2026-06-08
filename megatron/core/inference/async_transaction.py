@@ -874,6 +874,7 @@ class AsyncDecodeTransaction:
     ep_decision: object | None = None
     row_map: object | None = None
     discard_reason: str | None = None
+    invalidation_reason: str | None = None
     participants: tuple[AsyncTransactionParticipant, ...] = ()
     participant_state: dict[str, object] = field(default_factory=dict)
 
@@ -962,8 +963,15 @@ class AsyncDecodeTransaction:
         if self.state in (AsyncTxnState.COMMITTED, AsyncTxnState.ROLLED_BACK):
             return
         self.discard_reason = reason
+        self.invalidation_reason = self.invalidation_reason or reason
         self.rollback_participants()
         self.state = AsyncTxnState.ROLLED_BACK
+
+    def invalidate(self, reason: str) -> None:
+        """Mark the in-flight transaction as invalid without mutating its committed plan."""
+        if self.invalidation_reason is None:
+            self.invalidation_reason = reason
+        self.discard_reason = self.invalidation_reason
 
     def discard(self, reason: str) -> None:
         """Discard the transaction and remember why it could not commit."""
@@ -983,6 +991,7 @@ class AsyncDecodeTransaction:
             "request_ids": self.snapshot.request_ids.to(device="cpu").tolist(),
             "row_map": row_map,
             "discard_reason": self.discard_reason,
+            "invalidation_reason": self.invalidation_reason,
             "has_sample_ticket": self.sample_ticket is not None,
             "has_resources": self.resources is not None,
             "has_h2d_done_event": self.h2d_done_event is not None,
