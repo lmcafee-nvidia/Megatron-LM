@@ -1720,6 +1720,46 @@ class DynamicInferenceContext(BaseInferenceContext):
                 1 - self.mamba_metadata.request_to_mamba_state_bank[request_idx]
             )
 
+    def snapshot_async_mamba_state(self, request_ids: Tensor) -> Optional[Dict[str, Tensor]]:
+        """Snapshot live Mamba slots before an async decode launch."""
+        if not self.is_hybrid_model or request_ids.numel() == 0:
+            return None
+
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        active_request_ids = self.request_ids[active_slice]
+        request_idxs = []
+        for request_id in request_ids.to(device="cpu").tolist():
+            matches = torch.nonzero(active_request_ids == int(request_id), as_tuple=True)[0]
+            if matches.numel() == 0:
+                continue
+            request_idxs.append(self.paused_request_count + int(matches[0].item()))
+        if not request_idxs:
+            return None
+
+        request_idxs_tensor = torch.tensor(request_idxs, dtype=torch.long, device="cpu")
+        flat_indices = self._mamba_flat_indices_from_request_idxs(request_idxs_tensor).to(
+            dtype=torch.long, device=self.mamba_conv_states.device
+        )
+        return {
+            "flat_indices": flat_indices.detach().to(device="cpu", dtype=torch.long),
+            "conv_states": self.mamba_conv_states[:, flat_indices].clone(),
+            "ssm_states": self.mamba_ssm_states[:, flat_indices].clone(),
+        }
+
+    def restore_async_mamba_state(self, snapshot: Optional[Dict[str, Tensor]]) -> None:
+        """Restore live Mamba slots from an async rollback snapshot."""
+        if not self.is_hybrid_model or snapshot is None:
+            return
+        flat_indices = snapshot["flat_indices"].to(
+            dtype=torch.long, device=self.mamba_conv_states.device
+        )
+        self.mamba_conv_states[:, flat_indices].copy_(snapshot["conv_states"])
+        self.mamba_ssm_states[:, flat_indices].copy_(snapshot["ssm_states"])
+
+    def clear_async_mamba_snapshot(self, snapshot: Optional[Dict[str, Tensor]]) -> None:
+        """Drop an accepted Mamba rollback snapshot."""
+        return None
+
     # =========================================================================
     # Mamba prefix cache infrastructure
     # =========================================================================

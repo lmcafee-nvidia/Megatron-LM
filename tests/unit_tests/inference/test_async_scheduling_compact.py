@@ -2255,8 +2255,122 @@ def test_async_mamba_participant_commits_candidate_bank_once():
     transaction.rollback("late rollback")
 
     assert [request_ids.tolist() for request_ids in accepted_request_ids] == [[21, 22]]
-    assert participant.diagnostics() == {"committed": True, "rolled_back": False}
+    assert participant.diagnostics() == {
+        "has_snapshot": False,
+        "committed": True,
+        "rolled_back": False,
+    }
     assert transaction.state == AsyncTxnState.COMMITTED
+
+
+@pytest.mark.internal
+def test_async_mamba_participant_accept_clears_snapshot_without_restore():
+    events = []
+    snapshot = _make_async_layout_snapshot([21], cuda_graph_request_count=1)
+    mamba_snapshot = {"slot": 3}
+    context = SimpleNamespace(
+        is_hybrid_model=True,
+        snapshot_async_mamba_state=lambda request_ids: events.append(
+            ("snapshot", request_ids.tolist())
+        )
+        or mamba_snapshot,
+        clear_async_mamba_snapshot=lambda snapshot: events.append(("clear", snapshot)),
+        restore_async_mamba_state=lambda snapshot: events.append(("restore", snapshot)),
+    )
+    participant = AsyncMambaStateParticipant(context)
+    transaction = AsyncDecodeTransaction(
+        step_id=11,
+        state=AsyncTxnState.LAUNCHED,
+        snapshot=snapshot,
+        participants=(participant,),
+    )
+
+    transaction.prepare_participants()
+    transaction.mark_committed()
+
+    assert events == [("snapshot", [21]), ("clear", mamba_snapshot)]
+    assert participant.diagnostics() == {
+        "has_snapshot": False,
+        "committed": True,
+        "rolled_back": False,
+    }
+
+
+@pytest.mark.internal
+def test_async_mamba_rollback_restores_snapshot_after_forward_fence():
+    events = []
+    snapshot = _make_async_layout_snapshot([21], cuda_graph_request_count=1)
+    mamba_snapshot = {"slot": 3}
+
+    class _Fence:
+        def synchronize(self):
+            events.append("forward_done")
+
+    context = SimpleNamespace(
+        is_hybrid_model=True,
+        snapshot_async_mamba_state=lambda request_ids: events.append(
+            ("snapshot", request_ids.tolist())
+        )
+        or mamba_snapshot,
+        restore_async_mamba_state=lambda snapshot: events.append(("restore", snapshot)),
+    )
+    participant = AsyncMambaStateParticipant(context)
+    transaction = AsyncDecodeTransaction(
+        step_id=12,
+        state=AsyncTxnState.LAUNCHED,
+        snapshot=snapshot,
+        participants=(participant,),
+        forward_done_event=_Fence(),
+    )
+
+    transaction.prepare_participants()
+    transaction.rollback("identity mismatch")
+
+    assert events == [("snapshot", [21]), "forward_done", ("restore", mamba_snapshot)]
+    assert participant.diagnostics() == {
+        "has_snapshot": False,
+        "committed": False,
+        "rolled_back": True,
+    }
+
+
+@pytest.mark.internal
+def test_async_resource_rollback_waits_for_forward_done_before_release():
+    events = []
+
+    class _Fence:
+        def synchronize(self):
+            events.append("forward_done")
+
+    context = SimpleNamespace(
+        is_hybrid_model=False,
+        async_kv_deferred_release_count=0,
+        kv_block_allocator=SimpleNamespace(
+            release_memory_blocks=lambda blocks: events.append(("release", blocks.tolist()))
+        ),
+    )
+    ledger = AsyncResourceLedger(in_flight=True)
+    ledger.record_reservations(
+        request_ids=torch.tensor([10], dtype=torch.int32),
+        block_ids=torch.tensor([100], dtype=torch.int32),
+        block_columns=torch.tensor([1], dtype=torch.int32),
+    )
+    ledger.defer_kv_blocks(torch.tensor([200], dtype=torch.int32))
+    participant = AsyncResourceParticipant(ledger, context)
+    snapshot = _make_async_layout_snapshot([10], cuda_graph_request_count=1)
+    transaction = AsyncDecodeTransaction(
+        step_id=13,
+        state=AsyncTxnState.LAUNCHED,
+        snapshot=snapshot,
+        participants=(participant,),
+        forward_done_event=_Fence(),
+    )
+
+    transaction.rollback("identity mismatch")
+    transaction.rollback("again")
+
+    assert events == ["forward_done", ("release", [200, 100])]
+    assert context.async_kv_deferred_release_count == 2
 
 
 @pytest.mark.internal

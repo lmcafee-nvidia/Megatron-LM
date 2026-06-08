@@ -2124,6 +2124,10 @@ class TextGenerationController:
         range_push("async_forward_launch")
         next_input_ids, next_position_ids = context.current_input_and_position_ids()
         self._dynamic_step_forward_logits(next_input_ids, next_position_ids)
+        async_forward_done_event = None
+        if torch.cuda.is_available():
+            async_forward_done_event = torch.cuda.Event()
+            async_forward_done_event.record(torch.cuda.current_stream())
         self._async_forward_launch_count += 1
         self._increment_async_counter("_async_launched_forward_count")
         cuda_graph_request_count = (
@@ -2137,6 +2141,7 @@ class TextGenerationController:
         transaction.mark_launched(
             resources=resources,
             h2d_done_event=async_h2d_done_event,
+            forward_done_event=async_forward_done_event,
             output_handle=getattr(self, "_all_logits_cuda", None),
         )
         range_pop()

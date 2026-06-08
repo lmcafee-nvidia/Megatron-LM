@@ -985,6 +985,7 @@ class AsyncDecodeTransaction:
         """Mark the transaction as no longer owning in-flight state."""
         if self.state == AsyncTxnState.RETIRED:
             return
+        self._wait_for_forward_done()
         self.retire_participants()
         self.state = AsyncTxnState.RETIRED
 
@@ -994,6 +995,7 @@ class AsyncDecodeTransaction:
             return
         self.discard_reason = reason
         self.invalidation_reason = self.invalidation_reason or reason
+        self._wait_for_forward_done()
         self.rollback_participants()
         self.state = AsyncTxnState.ROLLED_BACK
 
@@ -1009,6 +1011,15 @@ class AsyncDecodeTransaction:
             return
         self.discard_reason = reason
         self.state = AsyncTxnState.DISCARDED
+
+    def _wait_for_forward_done(self) -> None:
+        """Wait for the transaction-owned forward fence before releasing resources."""
+        event = self.forward_done_event
+        if event is None:
+            return
+        synchronize = getattr(event, "synchronize", None)
+        if synchronize is not None:
+            synchronize()
 
     def diagnostics(self) -> dict[str, Any]:
         """Return stable transaction diagnostics for tests and benchmark logs."""
@@ -1444,14 +1455,18 @@ class AsyncResourceParticipant:
 
 @dataclass
 class AsyncMambaStateParticipant:
-    """Participant that commits async Mamba candidate banks."""
+    """Participant that snapshots and rolls back async Mamba writes."""
 
     context: object
+    snapshot: object | None = None
     committed: bool = False
     rolled_back: bool = False
 
     def prepare(self, plan: AsyncDecodePlan) -> dict[str, bool]:
-        """Mamba state is already prepared in context staging buffers."""
+        """Snapshot live Mamba slots before the async launch can write them."""
+        snapshot = getattr(self.context, "snapshot_async_mamba_state", None)
+        if snapshot is not None:
+            self.snapshot = snapshot(plan.request_ids)
         return self.diagnostics()
 
     def validate(self, plan: AsyncDecodePlan, current_state: object) -> bool:
@@ -1459,22 +1474,34 @@ class AsyncMambaStateParticipant:
         return True
 
     def commit(self, plan: AsyncDecodePlan) -> None:
-        """Accept candidate Mamba banks for active requests in the committed plan."""
+        """Accept async Mamba writes and release snapshot ownership."""
         if self.committed:
             return
-        if getattr(self.context, "is_hybrid_model", False):
+        clear_snapshot = getattr(self.context, "clear_async_mamba_snapshot", None)
+        if clear_snapshot is not None:
+            clear_snapshot(self.snapshot)
+        elif getattr(self.context, "is_hybrid_model", False):
             self.context.accept_async_mamba_state(plan.request_ids)
+        self.snapshot = None
         self.committed = True
 
     def rollback(self, plan: AsyncDecodePlan) -> None:
-        """Rollback does not publish candidate Mamba banks."""
-        if self.committed:
+        """Restore snapshotted Mamba slots before synchronous fallback."""
+        if self.committed or self.rolled_back:
             return
+        restore_snapshot = getattr(self.context, "restore_async_mamba_state", None)
+        if restore_snapshot is not None and self.snapshot is not None:
+            restore_snapshot(self.snapshot)
+        self.snapshot = None
         self.rolled_back = True
 
     def diagnostics(self) -> dict[str, bool]:
         """Return Mamba participant diagnostics."""
-        return {"committed": self.committed, "rolled_back": self.rolled_back}
+        return {
+            "has_snapshot": self.snapshot is not None,
+            "committed": self.committed,
+            "rolled_back": self.rolled_back,
+        }
 
 
 @dataclass
