@@ -22,15 +22,14 @@ from megatron.core.inference.async_transaction import (
     AsyncLayoutSnapshot,
     AsyncLogprobMTPParticipant,
     AsyncMambaStateParticipant,
-    AsyncPendingForwardDecision,
     AsyncResourceLedger,
     AsyncResourceParticipant,
-    AsyncRowMapPolicy,
     AsyncSampleReadback,
     AsyncSampleReadbackParticipant,
     AsyncSampleTicket,
     AsyncTxnState,
     CommittedDecodePlan,
+    CommittedPlanIdentityDecision,
     classify_async_eligibility,
     resolve_committed_plan_identity,
 )
@@ -229,10 +228,6 @@ class TextGenerationController:
         self._async_step_barrier_reason = None
         self._async_admission_barrier_requested = False
         self._async_logprob_requests_seen = False
-        self._async_row_map_policy = AsyncRowMapPolicy.from_value(
-            getattr(context.config, "async_row_map_policy", AsyncRowMapPolicy.REUSE.value)
-        )
-        self._async_row_mapped_forward_count = 0
         self._async_discarded_forward_count = 0
         self._async_add_deferral_count = 0
         self._async_finish_boundary_count = 0
@@ -1531,12 +1526,6 @@ class TextGenerationController:
         """Attach the EP async protocol used by coordinator-driven EP decoding."""
         self._ep_async_protocol = protocol
 
-    def set_async_row_map_policy(self, policy: AsyncRowMapPolicy | str) -> AsyncRowMapPolicy:
-        """Set pending-forward row reuse policy for async validation or benchmarking."""
-        resolved_policy = AsyncRowMapPolicy.from_value(policy)
-        self._async_row_map_policy = resolved_policy
-        return resolved_policy
-
     def request_async_admission_barrier(self) -> None:
         """Stop chaining async forwards once so waiting requests can be admitted."""
         self._async_add_deferral_count += 1
@@ -1556,9 +1545,6 @@ class TextGenerationController:
         return {
             "enabled": self._async_scheduling_enabled,
             "pending_forward": self._has_pending_async_forward_state(),
-            "row_map_policy": AsyncRowMapPolicy.from_value(
-                getattr(self, "_async_row_map_policy", AsyncRowMapPolicy.REUSE)
-            ).value,
             "step_barrier_reason": self._async_step_barrier_reason,
             "eligibility_checks": self._async_eligibility_check_count,
             "eligibility_passes": self._async_eligibility_pass_count,
@@ -1571,7 +1557,6 @@ class TextGenerationController:
             "committed_forwards": getattr(self, "_async_committed_forward_count", 0),
             "rolled_back_forwards": getattr(self, "_async_rolled_back_forward_count", 0),
             "discarded_forwards": getattr(self, "_async_discarded_forward_count", 0),
-            "row_mapped_forwards": getattr(self, "_async_row_mapped_forward_count", 0),
             "identity_reused_forwards": getattr(self, "_async_identity_forward_count", 0),
             "graph_mismatch_discards": getattr(
                 self, "_async_graph_mismatch_discard_count", 0
@@ -1773,19 +1758,13 @@ class TextGenerationController:
 
     def _pending_async_forward_decision(
         self, transaction: AsyncDecodeTransaction
-    ) -> AsyncPendingForwardDecision:
+    ) -> CommittedPlanIdentityDecision:
         """Return the centralized pending-forward reuse decision."""
         context = self.inference_wrapped_model.inference_context
         if transaction.invalidation_reason is not None:
-            policy = AsyncRowMapPolicy.from_value(
-                getattr(self, "_async_row_map_policy", AsyncRowMapPolicy.IDENTITY_ONLY)
-            )
-            return AsyncPendingForwardDecision(
+            return CommittedPlanIdentityDecision(
                 reusable=False,
-                row_map=None,
-                row_mapped=False,
                 reason=transaction.invalidation_reason,
-                row_map_policy=policy,
                 graph_compatible=True,
                 layout_compatible=False,
             )
@@ -1793,15 +1772,9 @@ class TextGenerationController:
             context, tokens_per_request=self.num_speculative_tokens + 1
         )
         if current_plan is None:
-            policy = AsyncRowMapPolicy.from_value(
-                getattr(self, "_async_row_map_policy", AsyncRowMapPolicy.IDENTITY_ONLY)
-            )
-            return AsyncPendingForwardDecision(
+            return CommittedPlanIdentityDecision(
                 reusable=False,
-                row_map=None,
-                row_mapped=False,
                 reason="current state is not committed decode-only",
-                row_map_policy=policy,
                 graph_compatible=False,
                 layout_compatible=False,
             )
@@ -1809,16 +1782,10 @@ class TextGenerationController:
         return resolve_committed_plan_identity(
             transaction.plan,
             current_plan,
-            row_map_policy=getattr(self, "_async_row_map_policy", AsyncRowMapPolicy.REUSE),
         )
 
-    def _pending_async_row_map(self, transaction: AsyncDecodeTransaction) -> Optional[Tensor]:
-        """Return the current-row to transaction-row map if the pending forward is reusable."""
-        decision = self._pending_async_forward_decision(transaction)
-        return decision.row_map if decision.reusable else None
-
     def _pending_async_forward_row_status(self) -> tuple[bool, bool]:
-        """Return whether the pending forward is reusable and whether row mapping is needed."""
+        """Return whether the pending forward is reusable; row mapping is no longer allowed."""
         transaction = self._pending_async_transaction()
         if transaction is None:
             return True, False
@@ -1826,13 +1793,14 @@ class TextGenerationController:
         decision = self._pending_async_forward_decision(transaction)
         if not decision.reusable:
             return False, False
-        return True, decision.row_mapped
+        return True, False
 
     def _resolve_pending_async_forward(self) -> tuple[bool, Optional[Tensor], bool]:
-        """Resolve the pending speculative forward's row layout for current consumers.
+        """Resolve the pending speculative forward for exact committed identity.
 
         Returns whether the forward was reused, optional CUDA row indices, and
-        whether row mapping was required.
+        whether row mapping was required. Row mapping is permanently disabled,
+        so the last two values are always ``None`` and ``False``.
         """
         transaction = self._pending_async_transaction()
         if transaction is None:
@@ -1842,21 +1810,10 @@ class TextGenerationController:
         assert transaction.plan is not None
         transaction.plan = transaction.plan.with_pending_forward_decision(decision)
         if decision.reusable:
-            row_map = decision.row_map
-            assert row_map is not None
-            if decision.row_mapped:
-                self._increment_async_counter("_async_row_mapped_forward_count")
-            else:
-                self._increment_async_counter("_async_identity_forward_count")
+            self._increment_async_counter("_async_identity_forward_count")
             self._increment_async_counter("_async_reused_forward_count")
-            transaction.row_map = row_map
             transaction.state = AsyncTxnState.RESOLVED
-            row_indices = (
-                row_map.to(device=torch.cuda.current_device(), dtype=torch.long)
-                if decision.row_mapped
-                else None
-            )
-            return True, row_indices, decision.row_mapped
+            return True, None, False
 
         if not decision.graph_compatible:
             self._increment_async_counter("_async_graph_mismatch_discard_count")
@@ -3032,7 +2989,6 @@ class TextGenerationController:
         cuda_graph_request_count = None
         pending_forward_reused = False
         pending_forward_row_indices = None
-        pending_forward_row_mapped = False
         self._async_prepare_deferred_until_after_sampling = False
         ep_step_begin_decision = self._decide_ep_step_begin(has_real_work=True)
         if ep_step_begin_decision.discard_pending_forward:
@@ -3046,24 +3002,8 @@ class TextGenerationController:
                 (
                     pending_forward_reused,
                     pending_forward_row_indices,
-                    pending_forward_row_mapped,
+                    _pending_forward_row_mapped,
                 ) = self._resolve_pending_async_forward()
-                pending_forward_row_mapped = (
-                    pending_forward_row_mapped or ep_step_begin_decision.row_mapped_forward
-                )
-                if (
-                    pending_forward_reused
-                    and pending_forward_row_mapped
-                    and not context.config.materialize_only_last_token_logits
-                    and not context.is_decode_only()
-                ):
-                    pending_forward_reused = False
-                    pending_forward_row_indices = None
-                    pending_forward_row_mapped = False
-                    self._increment_async_counter("_async_discarded_forward_count")
-                    self._increment_async_counter("_async_rolled_back_forward_count")
-                    if transaction is not None:
-                        transaction.rollback("row-mapped non-decode forward not reusable")
                 if (
                     pending_forward_reused
                     and context.is_hybrid_model
@@ -3109,7 +3049,7 @@ class TextGenerationController:
             else:
                 self._retire_dynamic_forward_side_effects()
 
-            if not pending_forward_row_mapped and self.num_speculative_tokens == 0:
+            if self.num_speculative_tokens == 0:
                 self._async_prepare_deferred_until_after_sampling = True
 
         # This is the best place to yield control back to event loop.
@@ -3175,13 +3115,10 @@ class TextGenerationController:
             log_probs = None
             top_n_logprobs = None
             if return_log_probs or return_top_n_logprobs:
-                logprob_row_indices = (
-                    pending_forward_row_indices if pending_forward_row_mapped else None
-                )
                 if self.num_speculative_tokens > 0:
                     log_probs, log_probs_tensor = (
                         self._dynamic_step_calculate_log_probs_speculative(
-                            row_indices=logprob_row_indices
+                            row_indices=None
                         )
                     )
                     if return_top_n_logprobs:
@@ -3190,7 +3127,7 @@ class TextGenerationController:
                         )
                 else:
                     log_probs, log_probs_tensor = self._dynamic_step_calculate_log_probs(
-                        row_indices=logprob_row_indices
+                        row_indices=None
                     )
                     if return_top_n_logprobs:
                         top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(

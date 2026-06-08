@@ -569,6 +569,30 @@ class CommittedDecodePlan:
 
 
 @dataclass(frozen=True)
+class CommittedPlanIdentityDecision:
+    """Exact committed-plan identity decision for pending async reuse."""
+
+    reusable: bool
+    reason: str | None
+    graph_compatible: bool
+    layout_compatible: bool
+
+    @property
+    def discard(self) -> bool:
+        """Whether a pending forward exists but must be discarded."""
+        return not self.reusable
+
+    def diagnostics(self) -> dict[str, Any]:
+        """Return a stable exact-identity decision snapshot."""
+        return {
+            "reusable": self.reusable,
+            "reason": self.reason,
+            "graph_compatible": self.graph_compatible,
+            "layout_compatible": self.layout_compatible,
+        }
+
+
+@dataclass(frozen=True)
 class AsyncPendingForwardDecision:
     """Structured decision for reusing or discarding one pending async forward."""
 
@@ -670,92 +694,65 @@ def resolve_committed_plan_identity(
     pending: CommittedDecodePlan,
     current: CommittedDecodePlan,
     *,
-    row_map_policy: AsyncRowMapPolicy | str = AsyncRowMapPolicy.IDENTITY_ONLY,
-) -> AsyncPendingForwardDecision:
+    row_map_policy: AsyncRowMapPolicy | str | None = None,
+) -> CommittedPlanIdentityDecision:
     """Return an exact committed-identity reuse decision for a pending forward."""
-    policy = AsyncRowMapPolicy.from_value(row_map_policy)
-
     graph_compatible = pending.cuda_graph_shape == current.cuda_graph_shape
     if not graph_compatible:
-        return AsyncPendingForwardDecision(
+        return CommittedPlanIdentityDecision(
             reusable=False,
-            row_map=None,
-            row_mapped=False,
             reason="committed graph shape mismatch",
-            row_map_policy=policy,
             graph_compatible=False,
             layout_compatible=False,
         )
     if pending.active_decode_count != current.active_decode_count:
-        return AsyncPendingForwardDecision(
+        return CommittedPlanIdentityDecision(
             reusable=False,
-            row_map=None,
-            row_mapped=False,
             reason="committed active decode count mismatch",
-            row_map_policy=policy,
             graph_compatible=True,
             layout_compatible=False,
         )
     if pending.decode_stride != current.decode_stride:
-        return AsyncPendingForwardDecision(
+        return CommittedPlanIdentityDecision(
             reusable=False,
-            row_map=None,
-            row_mapped=False,
             reason="committed decode stride mismatch",
-            row_map_policy=policy,
             graph_compatible=True,
             layout_compatible=False,
         )
     if not torch.equal(pending.request_ids.to(device="cpu"), current.request_ids.to(device="cpu")):
-        return AsyncPendingForwardDecision(
+        return CommittedPlanIdentityDecision(
             reusable=False,
-            row_map=None,
-            row_mapped=False,
             reason="committed request identity mismatch",
-            row_map_policy=policy,
             graph_compatible=True,
             layout_compatible=False,
         )
     if not torch.equal(pending.row_order.to(device="cpu"), current.row_order.to(device="cpu")):
-        return AsyncPendingForwardDecision(
+        return CommittedPlanIdentityDecision(
             reusable=False,
-            row_map=None,
-            row_mapped=False,
             reason="committed row order mismatch",
-            row_map_policy=policy,
             graph_compatible=True,
             layout_compatible=False,
         )
     if not torch.equal(
         pending.mamba_slot_ids.to(device="cpu"), current.mamba_slot_ids.to(device="cpu")
     ):
-        return AsyncPendingForwardDecision(
+        return CommittedPlanIdentityDecision(
             reusable=False,
-            row_map=None,
-            row_mapped=False,
             reason="committed mamba slot mismatch",
-            row_map_policy=policy,
             graph_compatible=True,
             layout_compatible=False,
         )
     if pending.identity_fingerprint != current.identity_fingerprint:
-        return AsyncPendingForwardDecision(
+        return CommittedPlanIdentityDecision(
             reusable=False,
-            row_map=None,
-            row_mapped=False,
             reason="committed resource identity mismatch",
-            row_map_policy=policy,
             graph_compatible=True,
             layout_compatible=False,
         )
 
-    row_map = torch.arange(pending.active_decode_count, dtype=torch.long, device="cpu")
-    return AsyncPendingForwardDecision(
+    return CommittedPlanIdentityDecision(
         reusable=True,
-        row_map=row_map,
-        row_mapped=False,
         reason=None,
-        row_map_policy=policy,
         graph_compatible=True,
         layout_compatible=True,
     )

@@ -335,15 +335,26 @@ def _make_controller_with_rows(pending_ids, current_ids, current_graph_count=Non
             pending_graph_count if pending_graph_count is not None else len(current_ids)
         )
     controller._async_discarded_forward_count = 0
-    controller._async_row_mapped_forward_count = 0
     controller._async_step_transaction = None
+    request_count = len(current_ids)
     controller.inference_wrapped_model = SimpleNamespace(
         inference_context=SimpleNamespace(
             request_ids=torch.tensor(current_ids, dtype=torch.int64),
             paused_request_count=0,
-            total_request_count=len(current_ids),
-            active_token_count=len(current_ids),
+            total_request_count=request_count,
+            active_token_count=request_count,
             padded_active_request_count=current_graph_count,
+            request_query_lengths=torch.ones(request_count, dtype=torch.int32),
+            request_kv_length_offsets=torch.arange(request_count, dtype=torch.int32),
+            token_to_request_idx=torch.arange(request_count, dtype=torch.int32),
+            token_to_pos_ids=torch.arange(request_count, dtype=torch.int64),
+            token_to_position_in_request=torch.arange(request_count, dtype=torch.int64),
+            token_to_block_idx=torch.arange(request_count, dtype=torch.int32),
+            token_to_local_position_within_kv_block=torch.arange(
+                request_count, dtype=torch.int32
+            ),
+            is_decode_only=lambda: True,
+            is_hybrid_model=False,
             using_cuda_graph_this_step=lambda: True,
         )
     )
@@ -541,6 +552,74 @@ def test_pending_async_forward_rows_reuse_map_or_discard(
     expected_discards = 0 if pending_ids is None else int(not expected_resolve[0])
     assert controller._async_discarded_forward_count == expected_discards
     assert controller._async_row_mapped_forward_count == int(expected_resolve[1])
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize(
+    ("pending_ids", "current_ids", "current_graph_count", "mamba_slots", "expected_reason"),
+    [
+        ([10, 11], [10, 11], None, None, None),
+        ([10, 11], [11, 10], None, None, "committed request identity mismatch"),
+        ([10, 11], [10], None, None, "committed graph shape mismatch"),
+        ([10, 11], [10, 11], 4, None, "committed graph shape mismatch"),
+        ([10, 11], [10, 11], None, [7, 9], "committed mamba slot mismatch"),
+    ],
+)
+def test_committed_pending_forward_accepts_only_exact_identity(
+    pending_ids, current_ids, current_graph_count, mamba_slots, expected_reason
+):
+    controller = _make_controller_with_rows(
+        pending_ids, current_ids, current_graph_count=current_graph_count
+    )
+    context = controller.inference_wrapped_model.inference_context
+    if mamba_slots is not None:
+        context.is_hybrid_model = True
+        context.mamba_slot_ids = torch.tensor(mamba_slots, dtype=torch.int32)
+
+    reused, row_indices, row_mapped = controller._resolve_pending_async_forward()
+    transaction = controller._async_step_transaction
+
+    assert row_indices is None
+    assert not row_mapped
+    if expected_reason is None:
+        assert reused
+        assert transaction.row_map is None
+        assert controller._async_identity_forward_count == 1
+    else:
+        assert not reused
+        assert transaction.discard_reason == expected_reason
+        assert transaction.state == AsyncTxnState.ROLLED_BACK
+
+
+@pytest.mark.internal
+def test_async_diagnostics_do_not_expose_row_map_policy_or_counters():
+    controller = object.__new__(TextGenerationController)
+    controller._async_scheduling_enabled = True
+    controller._async_step_barrier_reason = None
+    controller._async_eligibility_check_count = 0
+    controller._async_eligibility_pass_count = 0
+    controller._async_disable_reason_counts = {}
+    controller._async_disable_reason = None
+    controller._async_forward_launch_count = 0
+    controller._async_prepared_forward_count = 0
+    controller._async_launched_forward_count = 0
+    controller._async_reused_forward_count = 0
+    controller._async_committed_forward_count = 0
+    controller._async_rolled_back_forward_count = 0
+    controller._async_discarded_forward_count = 0
+    controller._async_identity_forward_count = 0
+    controller._ep_async_protocol = None
+    controller._async_step_transaction = None
+
+    diagnostics = controller.get_async_scheduling_diagnostics()
+
+    assert "row_map_policy" not in diagnostics
+    assert "row_mapped_forwards" not in diagnostics
+
+
+@pytest.mark.internal
+def test_inference_config_has_no_async_row_map_policy_default():
+    assert not hasattr(InferenceConfig(), "async_row_map_policy")
 
 
 @pytest.mark.internal
