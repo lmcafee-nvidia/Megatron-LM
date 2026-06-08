@@ -910,6 +910,12 @@ def _make_async_gate_controller(active_request_count=2):
     context = SimpleNamespace(
         total_request_count=active_request_count,
         paused_request_count=0,
+        active_request_metadata={
+            "termination_id": torch.full((active_request_count,), -1, dtype=torch.int64)
+        },
+        request_metadata={
+            "termination_id": torch.full((active_request_count,), -1, dtype=torch.int64)
+        },
         padded_batch_dimensions=InferenceBatchDimensions(
             active_request_count, 0, active_request_count
         ),
@@ -939,6 +945,8 @@ def _make_async_gate_controller(active_request_count=2):
         ("prefill", "not decode-only"),
         ("eager_step", "not using cuda graph"),
         ("empty", "no active requests"),
+        ("token_termination", "token termination can change request layout"),
+        ("token_termination_after_paused", "token termination can change request layout"),
         ("admission_barrier", "waiting request admission deferred"),
         ("stride_mismatch", "cuda graph shape does not match decode stride"),
     ],
@@ -974,6 +982,20 @@ def test_async_scheduling_disabled_reason_matrix(case, expected):
     elif case == "empty":
         context.total_request_count = 0
         context.padded_batch_dimensions = InferenceBatchDimensions(0, 0, 0)
+        context.active_request_metadata["termination_id"] = torch.empty(0, dtype=torch.int64)
+        context.request_metadata["termination_id"] = torch.empty(0, dtype=torch.int64)
+    elif case == "token_termination":
+        context.request_metadata["termination_id"][1] = 7
+    elif case == "token_termination_after_paused":
+        context.paused_request_count = 1
+        context.total_request_count = 3
+        context.padded_batch_dimensions = InferenceBatchDimensions(2, 0, 2)
+        context.active_request_metadata["termination_id"] = torch.tensor(
+            [-1, -1], dtype=torch.int64
+        )
+        context.request_metadata["termination_id"] = torch.tensor(
+            [-1, -1, 7], dtype=torch.int64
+        )
     elif case == "admission_barrier":
         controller._async_admission_barrier_requested = True
     elif case == "stride_mismatch":

@@ -3122,6 +3122,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             return False
 
         active_slice = slice(self.paused_request_count, self.total_request_count)
+        termination_ids = self.request_metadata["termination_id"][active_slice]
+        if (termination_ids >= 0).any().item():
+            return False
+
         if not torch.equal(plan.request_ids, self.request_ids[active_slice]):
             return False
 

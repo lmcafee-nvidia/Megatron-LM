@@ -2258,6 +2258,10 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
         if active_request_count <= 0:
             return "no active requests"
+        active_slice = slice(context.paused_request_count, context.total_request_count)
+        termination_ids = context.request_metadata["termination_id"][active_slice]
+        if (termination_ids >= 0).any().item():
+            return "token termination can change request layout"
         if self._async_admission_barrier_requested:
             self._async_admission_barrier_requested = False
             return "waiting request admission deferred"
