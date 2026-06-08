@@ -9,7 +9,6 @@ import torch
 
 from megatron.core import utils as core_utils
 from megatron.core.inference.async_transaction import (
-    AsyncDecodePlan,
     AsyncDecodeTransaction,
     AsyncEPParticipant,
     AsyncGraphShape,
@@ -18,7 +17,6 @@ from megatron.core.inference.async_transaction import (
     AsyncMambaStateParticipant,
     AsyncResourceLedger,
     AsyncResourceParticipant,
-    AsyncRowMapPolicy,
     AsyncSampleReadback,
     AsyncSampleReadbackParticipant,
     AsyncSampleTicket,
@@ -28,7 +26,6 @@ from megatron.core.inference.async_transaction import (
     CommittedDecodePlan,
     classify_async_eligibility,
     classify_committed_async_launch,
-    resolve_async_pending_forward,
     resolve_committed_plan_identity,
 )
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
@@ -140,45 +137,6 @@ async def test_ep_protocol_local_mode_nested_steps_and_collective_errors():
 
 
 @pytest.mark.internal
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("global_state", "expected"),
-    [
-        ((1, 1, 1, 0, 0, 0), (True, False, False)),
-        ((1, 1, 1, 1, 0, 0), (True, False, True)),
-        ((1, 1, 1, 0, 0, 1), (False, True, False)),
-        ((1, 1, 0, 0, 1, 0), (False, True, False)),
-    ],
-)
-async def test_ep_step_begin_reuses_or_discards_with_global_state(global_state, expected):
-    communicator = _RecordingEPCommunicator(
-        async_results=[(1, 0), 1], sync_results=[global_state, 1]
-    )
-    protocol = EPAsyncStepProtocol(communicator)
-    await protocol.establish_work_consensus(local_work=1, signal_consensus=False)
-
-    decision = protocol.decide_step_begin(
-        has_real_work=True,
-        has_pending_forward=True,
-        pending_forward_reusable=True,
-        pending_forward_row_mapped=bool(global_state[3]),
-    )
-    await protocol.complete_work_step()
-
-    assert (
-        decision.reuse_pending_forward,
-        decision.discard_pending_forward,
-        decision.row_mapped_forward,
-    ) == expected
-    assert communicator.calls[2] == (
-        "sync",
-        EPAsyncPhase.STEP_BEGIN,
-        0,
-        (1, 1, 1, int(bool(global_state[3])), 0, 0),
-    )
-
-
-@pytest.mark.internal
 @pytest.mark.parametrize(
     ("global_state", "expected"),
     [
@@ -250,7 +208,7 @@ def test_ep_async_handoff_launches_or_skips_with_global_state(
 @pytest.mark.internal
 def test_ep_protocol_diagnostics_count_reuse_discard_launch_and_skip():
     communicator = _RecordingEPCommunicator(
-        sync_results=[(1, 1, 1, 0, 0, 0), 1, (1, 1, 0, 0, 1, 0), 1, (1, 1, 0), 1, (1, 1, 1), 1]
+        sync_results=[(1, 1, 1, 0, 0), 1, (1, 1, 0, 1, 0), 1, (1, 1, 0), 1, (1, 1, 1), 1]
     )
     protocol = EPAsyncStepProtocol(communicator)
 
@@ -258,13 +216,11 @@ def test_ep_protocol_diagnostics_count_reuse_discard_launch_and_skip():
         has_real_work=True,
         has_pending_forward=True,
         pending_forward_reusable=True,
-        pending_forward_row_mapped=False,
     )
     discard = protocol.decide_step_begin(
         has_real_work=True,
         has_pending_forward=True,
         pending_forward_reusable=False,
-        pending_forward_row_mapped=False,
     )
     launch = protocol.decide_async_handoff(has_real_work=True, can_launch_async_handoff=True)
     skip = protocol.decide_async_handoff(has_real_work=True, can_launch_async_handoff=False)
@@ -447,7 +403,7 @@ def test_async_decode_coordinator_owns_transaction_state_machine():
     coordinator = AsyncDecodeCoordinator(controller)
     controller._async_decode_coordinator = coordinator
     snapshot = _make_async_layout_snapshot([10, 11], cuda_graph_request_count=2)
-    plan = AsyncDecodePlan.from_snapshot(snapshot)
+    plan = CommittedDecodePlan.from_snapshot(snapshot)
 
     transaction = coordinator.begin_transaction(snapshot=snapshot, plan=plan)
 
@@ -499,8 +455,7 @@ def test_committed_plan_exact_identity_accepts():
     decision = resolve_committed_plan_identity(pending, current)
 
     assert decision.reusable
-    assert not decision.row_mapped
-    assert decision.row_map.tolist() == [0, 1]
+    assert decision.reason is None
     assert pending.exact_identity_matches(current)
 
 
@@ -538,52 +493,6 @@ def test_committed_plan_exact_identity_rejects_reorder_graph_or_mamba_mismatch(
     assert decision.reason == reason
 
 
-def _async_layout_snapshot_status(controller):
-    transaction = controller._pending_async_transaction()
-    if transaction is None:
-        return True, False
-    pending_snapshot = transaction.snapshot
-    current_snapshot = AsyncLayoutSnapshot.from_context_current(
-        controller.inference_wrapped_model.inference_context, tokens_per_request=1
-    )
-    row_map = pending_snapshot.row_map_to_current(current_snapshot.request_ids)
-    if not pending_snapshot.graph_compatible_with(current_snapshot) or row_map is None:
-        return False, False
-    sequential_rows = torch.arange(row_map.numel(), dtype=torch.long, device="cpu")
-    return True, not torch.equal(row_map, sequential_rows)
-
-
-@pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="row mapping returns CUDA tensors")
-@pytest.mark.parametrize(
-    ("pending_ids", "current_ids", "expected_status", "expected_resolve", "expected_rows"),
-    [
-        (None, [10, 11], (True, False), (False, False), None),
-        ([10, 11], [10, 11], (True, False), (True, False), None),
-        ([10, 11, 12], [12, 10, 11], (True, True), (True, True), [2, 0, 1]),
-        ([10, 11, 12], [12, 10], (True, True), (True, True), [2, 0]),
-        ([10, 11], [10, 12], (False, False), (False, False), None),
-        ([10, 11], [], (False, False), (False, False), None),
-    ],
-)
-def test_pending_async_forward_rows_reuse_map_or_discard(
-    pending_ids, current_ids, expected_status, expected_resolve, expected_rows
-):
-    controller = _make_controller_with_rows(pending_ids, current_ids)
-
-    assert controller._pending_async_forward_row_status() == expected_status
-    usable, row_indices, row_mapped = controller._resolve_pending_async_forward()
-
-    assert (usable, row_mapped) == expected_resolve
-    if expected_rows is None:
-        assert row_indices is None
-    else:
-        assert row_indices.tolist() == expected_rows
-    expected_discards = 0 if pending_ids is None else int(not expected_resolve[0])
-    assert controller._async_discarded_forward_count == expected_discards
-    assert controller._async_row_mapped_forward_count == int(expected_resolve[1])
-
-
 @pytest.mark.internal
 @pytest.mark.parametrize(
     ("pending_ids", "current_ids", "current_graph_count", "mamba_slots", "expected_reason"),
@@ -613,7 +522,6 @@ def test_committed_pending_forward_accepts_only_exact_identity(
     assert not row_mapped
     if expected_reason is None:
         assert reused
-        assert transaction.row_map is None
         assert controller._async_identity_forward_count == 1
     else:
         assert not reused
@@ -653,98 +561,36 @@ def test_inference_config_has_no_async_row_map_policy_default():
 
 
 @pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="row mapping returns CUDA tensors")
-def test_pending_async_forward_rows_discard_when_graph_shape_changes():
-    controller = _make_controller_with_rows([10, 11, 12], [12, 10, 11], current_graph_count=4)
+def test_static_cleanup_removed_speculative_async_runtime_scaffolding():
+    module_names = [
+        "megatron.core.inference.async_transaction",
+        "megatron.core.inference.contexts.dynamic_context",
+        "megatron.core.inference.ep_async_protocol",
+    ]
+    source = inspect.getsource(tgc_module)
+    for module_name in module_names:
+        source += inspect.getsource(__import__(module_name, fromlist=[""]))
 
-    assert controller._pending_async_forward_row_status() == (False, False)
-    assert controller._resolve_pending_async_forward() == (False, None, False)
-    assert controller._async_discarded_forward_count == 1
+    removed_runtime_terms = [
+        "AsyncPendingForwardDecision",
+        "AsyncRowMapPolicy",
+        "resolve_async_pending_forward",
+        "row_map_to_current",
+        "layout_compatible_with",
+        "row_mapped_forward",
+        "pending_forward_row_mapped",
+        "_async_row_mapped_forward_count",
+        "set_async_row_map_policy",
+        "pre_sampling",
+        "_async_pre_sampling",
+        "publish_async_prepared_decode_plan",
+        "use_async_candidate_bank",
+        "accept_async_mamba_state",
+        "candidate_bank",
+    ]
 
-
-@pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="row mapping returns CUDA tensors")
-@pytest.mark.parametrize(
-    ("pending_ids", "current_ids", "current_graph_count", "expected_status"),
-    [
-        ([10, 11], [10, 11], None, (True, False)),
-        ([10, 11, 12], [12, 10, 11], None, (True, True)),
-        ([10, 11, 12], [12, 10], None, (True, True)),
-        ([10, 11], [10, 12], None, (False, False)),
-        ([10, 11], [], None, (False, False)),
-        ([10, 11, 12], [12, 10, 11], 4, (False, False)),
-    ],
-)
-def test_async_layout_snapshot_matches_pending_forward_row_decisions(
-    pending_ids, current_ids, current_graph_count, expected_status
-):
-    controller = _make_controller_with_rows(
-        pending_ids, current_ids, current_graph_count=current_graph_count
-    )
-
-    assert controller._pending_async_forward_row_status() == expected_status
-    assert _async_layout_snapshot_status(controller) == expected_status
-
-
-@pytest.mark.internal
-def test_async_pending_forward_decision_respects_row_map_policy():
-    pending = _make_async_layout_snapshot([10, 11, 12], cuda_graph_request_count=3)
-    current = _make_async_layout_snapshot([12, 10], cuda_graph_request_count=3)
-
-    reuse = resolve_async_pending_forward(
-        pending, current, row_map_policy=AsyncRowMapPolicy.REUSE
-    )
-    identity_only = resolve_async_pending_forward(
-        pending, current, row_map_policy=AsyncRowMapPolicy.IDENTITY_ONLY
-    )
-
-    assert reuse.reusable
-    assert reuse.row_mapped
-    assert reuse.row_map.tolist() == [2, 0]
-    assert reuse.diagnostics()["row_map_policy"] == "reuse"
-    assert not identity_only.reusable
-    assert identity_only.row_mapped
-    assert identity_only.reason == "row map policy rejected non-identity layout"
-    assert identity_only.diagnostics()["row_map_policy"] == "identity_only"
-
-
-@pytest.mark.internal
-def test_async_decode_plan_owns_pending_forward_layout_decision():
-    pending = _make_async_layout_snapshot([10, 11, 12], cuda_graph_request_count=3)
-    current = _make_async_layout_snapshot([12, 10], cuda_graph_request_count=3)
-    plan = AsyncDecodePlan.from_snapshot(pending)
-
-    decision = plan.resolve_pending_forward(current, row_map_policy=AsyncRowMapPolicy.REUSE)
-    resolved_plan = plan.with_pending_forward_decision(decision)
-
-    assert decision.reusable
-    assert resolved_plan.row_mapped
-    assert resolved_plan.row_map.tolist() == [2, 0]
-    assert resolved_plan.graph_compatible
-    assert resolved_plan.layout_compatible
-    assert resolved_plan.graph_shape.padded_active_request_count == 3
-
-
-@pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="row mapping returns CUDA tensors")
-def test_identity_only_row_map_policy_discards_row_mapped_pending_forward():
-    controller = _make_controller_with_rows([10, 11, 12], [12, 10])
-    controller._async_row_map_policy = AsyncRowMapPolicy.IDENTITY_ONLY
-
-    assert controller._pending_async_forward_row_status() == (False, False)
-    reused, row_indices, row_mapped = controller._resolve_pending_async_forward()
-
-    transaction = controller._async_step_transaction
-    assert not reused
-    assert row_indices is None
-    assert not row_mapped
-    assert transaction.discard_reason == "row map policy rejected non-identity layout"
-    assert transaction.plan.row_map.tolist() == [2, 0]
-    assert transaction.plan.row_mapped
-    assert not transaction.plan.layout_compatible
-    assert controller._async_discarded_forward_count == 1
-    assert controller._async_layout_mismatch_discard_count == 1
-    assert controller._async_row_mapped_forward_count == 0
+    for term in removed_runtime_terms:
+        assert term not in source
 
 
 @pytest.mark.internal
@@ -759,105 +605,6 @@ def test_record_pending_forward_uses_prepared_request_order():
 
     assert transaction.snapshot.request_ids.tolist() == [10, 12, 11]
     assert cleared == [True]
-
-
-@pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="row mapping returns CUDA tensors")
-def test_pending_async_forward_discards_when_planned_layout_mismatches_current():
-    controller = _make_controller_with_rows([10, 11], [10, 11])
-    context = controller.inference_wrapped_model.inference_context
-    context.request_query_lengths = torch.tensor([1, 1], dtype=torch.int32)
-    context.request_kv_length_offsets = torch.tensor([6, 11], dtype=torch.int64)
-    context.token_to_request_idx = torch.tensor([0, 1], dtype=torch.int32)
-    context.token_to_pos_ids = torch.tensor([6, 11], dtype=torch.int64)
-    context.token_to_block_idx = torch.tensor([100, 200], dtype=torch.int32)
-    context.token_to_local_position_within_kv_block = torch.tensor([6, 11], dtype=torch.int32)
-    pending_snapshot = _make_async_layout_snapshot(
-        [10, 11],
-        cuda_graph_request_count=2,
-        request_query_lengths=torch.tensor([1, 1], dtype=torch.int32),
-        request_kv_length_offsets=torch.tensor([6, 11], dtype=torch.int64),
-        token_to_request_idx=torch.tensor([[0], [1]], dtype=torch.int32),
-        token_to_pos_ids=torch.tensor([[6], [11]], dtype=torch.int64),
-        token_to_block_idx=torch.tensor([[100], [201]], dtype=torch.int32),
-        token_to_local_position_within_kv_block=torch.tensor(
-            [[6], [11]], dtype=torch.int32
-        ),
-    )
-    _install_pending_transaction(controller, pending_snapshot)
-    current_snapshot = AsyncLayoutSnapshot.from_context_current(context, tokens_per_request=1)
-    row_map = pending_snapshot.row_map_to_current(current_snapshot.request_ids)
-
-    assert controller._pending_async_forward_row_status() == (False, False)
-    assert row_map is not None
-    assert pending_snapshot.layout_compatible_with(current_snapshot, row_map=row_map) is False
-    assert controller._resolve_pending_async_forward() == (False, None, False)
-    assert controller._async_discarded_forward_count == 1
-
-
-@pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="row mapping returns CUDA tensors")
-def test_pending_async_forward_reuses_subset_when_finished_row_left():
-    controller = _make_controller_with_rows([10, 11, 12], [12, 10])
-    context = controller.inference_wrapped_model.inference_context
-    context.request_query_lengths = torch.tensor([1, 1], dtype=torch.int32)
-    context.request_kv_length_offsets = torch.tensor([21, 5], dtype=torch.int64)
-    context.token_to_request_idx = torch.tensor([0, 1], dtype=torch.int32)
-    context.token_to_pos_ids = torch.tensor([21, 5], dtype=torch.int64)
-    context.token_to_block_idx = torch.tensor([300, 100], dtype=torch.int32)
-    context.token_to_local_position_within_kv_block = torch.tensor([21, 5], dtype=torch.int32)
-    pending_snapshot = _make_async_layout_snapshot(
-        [10, 11, 12],
-        cuda_graph_request_count=3,
-        request_query_lengths=torch.tensor([1, 1, 1], dtype=torch.int32),
-        request_kv_length_offsets=torch.tensor([5, 13, 21], dtype=torch.int64),
-        token_to_request_idx=torch.tensor([[0], [1], [2]], dtype=torch.int32),
-        token_to_pos_ids=torch.tensor([[5], [13], [21]], dtype=torch.int64),
-        token_to_block_idx=torch.tensor([[100], [200], [300]], dtype=torch.int32),
-        token_to_local_position_within_kv_block=torch.tensor(
-            [[5], [13], [21]], dtype=torch.int32
-        ),
-    )
-    _install_pending_transaction(controller, pending_snapshot)
-    current_snapshot = AsyncLayoutSnapshot.from_context_current(context, tokens_per_request=1)
-    row_map = pending_snapshot.row_map_to_current(current_snapshot.request_ids)
-
-    reused, row_indices, row_mapped = controller._resolve_pending_async_forward()
-
-    assert reused
-    assert row_mapped
-    assert row_indices.tolist() == [2, 0]
-    assert row_map is not None
-    assert row_map.tolist() == [2, 0]
-    assert pending_snapshot.layout_compatible_with(current_snapshot, row_map=row_map)
-    transaction = controller._async_step_transaction
-    assert transaction.plan.row_map.tolist() == [2, 0]
-    assert transaction.plan.row_mapped
-    assert transaction.plan.graph_compatible
-    assert transaction.plan.layout_compatible
-    assert controller._async_discarded_forward_count == 0
-
-
-@pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="row mapping returns CUDA tensors")
-def test_pending_async_forward_discards_when_token_request_layout_mismatches():
-    controller = _make_controller_with_rows([10, 11], [10, 11])
-    context = controller.inference_wrapped_model.inference_context
-    context.request_query_lengths = torch.tensor([1, 1], dtype=torch.int32)
-    context.request_kv_length_offsets = torch.tensor([6, 11], dtype=torch.int64)
-    context.token_to_request_idx = torch.tensor([0, 1], dtype=torch.int32)
-    _install_pending_transaction(
-        controller,
-        _make_async_layout_snapshot(
-            [10, 11],
-            cuda_graph_request_count=2,
-            token_to_request_idx=torch.tensor([[0], [0]], dtype=torch.int32),
-        ),
-    )
-
-    assert controller._pending_async_forward_row_status() == (False, False)
-    assert controller._resolve_pending_async_forward() == (False, None, False)
-    assert controller._async_discarded_forward_count == 1
 
 
 @pytest.mark.internal
@@ -886,313 +633,6 @@ def test_pending_async_forward_discards_when_mamba_bank_layout_mismatches():
     assert controller._pending_async_forward_row_status() == (False, False)
     assert controller._resolve_pending_async_forward() == (False, None, False)
     assert controller._async_discarded_forward_count == 1
-
-
-@pytest.mark.internal
-@pytest.mark.asyncio
-async def test_reused_pending_forward_prepares_next_step_before_sampling(monkeypatch):
-    monkeypatch.setattr(tgc_module, "range_push", lambda _msg: None)
-    monkeypatch.setattr(tgc_module, "range_pop", lambda: None)
-    events = []
-    context = SimpleNamespace(
-        active_token_count=2,
-        total_request_count=2,
-        paused_request_count=0,
-        num_decode_requests=2,
-        is_hybrid_model=False,
-        config=SimpleNamespace(materialize_only_last_token_logits=True),
-        kv_block_allocator=SimpleNamespace(
-            store_routing_per_block=lambda _routing: events.append("routing")
-        ),
-        release_deferred_async_resources=lambda: events.append("release"),
-    )
-    controller = object.__new__(TextGenerationController)
-    controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
-    controller.num_speculative_tokens = 0
-    _install_pending_transaction(
-        controller, _make_async_layout_snapshot([10, 11], cuda_graph_request_count=2)
-    )
-    controller._async_prepare_deferred_until_after_sampling = False
-    controller._decide_ep_step_begin = lambda **_kwargs: EPStepBeginDecision(
-        step_id=0,
-        has_real_work=True,
-        reuse_pending_forward=True,
-        discard_pending_forward=False,
-        row_mapped_forward=False,
-    )
-    controller._resolve_pending_async_forward = lambda: (True, None, False)
-    controller._router_record_bookkeeping = lambda: None
-    controller._should_collect_dynamic_sampling_bookkeeping = lambda **_kwargs: False
-    controller._try_prepare_async_decode_before_sampling = lambda: events.append("precheck") or True
-    controller._dynamic_step_sample_logits_to_next_input_ids = (
-        lambda: events.extend(["sample", "copy"])
-    )
-    controller._try_prepare_async_decode_after_sampling = lambda: pytest.fail(
-        "reused non-row-mapped forward should prepare before sampling"
-    )
-    controller._transfer_async_samples_to_cpu = (
-        lambda count: events.append(("d2h", count)) or _sample_ticket([4, 5])
-    )
-    controller._confirm_prepared_ep_async_handoff = lambda: False
-    controller._ensure_ep_async_handoff_decided = lambda **_kwargs: events.append("ep_done")
-
-    result = await controller.async_generate_output_tokens_dynamic_batch(skip_bookkeeping=True)
-
-    ordering = [event for event in events if event in ("precheck", "sample", "copy")]
-    assert ordering == ["precheck", "sample", "copy"]
-    assert ("d2h", 2) in events
-    assert result["sample"].tolist() == [4, 5]
-
-
-@pytest.mark.internal
-@pytest.mark.asyncio
-async def test_reused_pending_forward_falls_back_after_sampling_when_presampling_declines(
-    monkeypatch,
-):
-    monkeypatch.setattr(tgc_module, "range_push", lambda _msg: None)
-    monkeypatch.setattr(tgc_module, "range_pop", lambda: None)
-    events = []
-    context = SimpleNamespace(
-        active_token_count=2,
-        total_request_count=2,
-        paused_request_count=0,
-        num_decode_requests=2,
-        is_hybrid_model=False,
-        config=SimpleNamespace(materialize_only_last_token_logits=True),
-        kv_block_allocator=SimpleNamespace(
-            store_routing_per_block=lambda _routing: events.append("routing")
-        ),
-        release_deferred_async_resources=lambda: events.append("release"),
-    )
-    controller = object.__new__(TextGenerationController)
-    controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
-    controller.num_speculative_tokens = 0
-    _install_pending_transaction(
-        controller, _make_async_layout_snapshot([10, 11], cuda_graph_request_count=2)
-    )
-    controller._async_prepare_deferred_until_after_sampling = False
-    controller._decide_ep_step_begin = lambda **_kwargs: EPStepBeginDecision(
-        step_id=0,
-        has_real_work=True,
-        reuse_pending_forward=True,
-        discard_pending_forward=False,
-        row_mapped_forward=False,
-    )
-    controller._resolve_pending_async_forward = lambda: (True, None, False)
-    controller._router_record_bookkeeping = lambda: None
-    controller._should_collect_dynamic_sampling_bookkeeping = lambda **_kwargs: False
-    controller._try_prepare_async_decode_before_sampling = lambda: events.append("precheck") or False
-    controller._dynamic_step_sample_logits = lambda **_kwargs: events.append("sample")
-    controller._try_prepare_async_decode_after_sampling = (
-        lambda: events.append("prepare_after") or True
-    )
-    controller._copy_sampled_decode_tokens_to_next_input_ids = lambda count: events.append(
-        "copy" if count == 2 else ("copy", count)
-    )
-    controller._transfer_async_samples_to_cpu = (
-        lambda count: events.append(("d2h", count)) or _sample_ticket([4, 5])
-    )
-    controller._confirm_prepared_ep_async_handoff = lambda: False
-    controller._ensure_ep_async_handoff_decided = lambda **_kwargs: events.append("ep_done")
-
-    result = await controller.async_generate_output_tokens_dynamic_batch(skip_bookkeeping=True)
-
-    ordering = [
-        event
-        for event in events
-        if event in ("precheck", "sample", "prepare_after", "copy")
-    ]
-    assert ordering == ["precheck", "sample", "prepare_after", "copy"]
-    assert ("d2h", 2) in events
-    assert result["sample"].tolist() == [4, 5]
-
-
-@pytest.mark.internal
-@pytest.mark.asyncio
-async def test_prepare_async_decode_before_sampling_steady_state_ordering(monkeypatch):
-    monkeypatch.setattr(tgc_module, "range_push", lambda _msg: None)
-    monkeypatch.setattr(tgc_module, "range_pop", lambda: None)
-    events = []
-    context = SimpleNamespace(
-        active_token_count=2,
-        total_request_count=2,
-        paused_request_count=0,
-        num_decode_requests=2,
-        padded_active_request_count=2,
-        is_hybrid_model=False,
-        config=SimpleNamespace(materialize_only_last_token_logits=True),
-        kv_block_allocator=SimpleNamespace(
-            store_routing_per_block=lambda _routing: events.append("routing")
-        ),
-        publish_async_prepared_decode_plan=lambda: events.append("publish"),
-        transfer_bookkeeping_to_gpu=lambda **_kwargs: events.append("h2d") or None,
-        current_input_and_position_ids=lambda: (
-            torch.tensor([[1, 2]], dtype=torch.int64),
-            torch.tensor([[0, 1]], dtype=torch.int64),
-        ),
-        using_cuda_graph_this_step=lambda: True,
-        mark_async_resources_in_flight=lambda: events.append("mark_in_flight") or "ledger",
-    )
-
-    def _prepare(**kwargs):
-        events.append("prepare" if kwargs.get("pre_sampling") else "prepare_after")
-        return True
-
-    context.prepare_async_decode_next_step = _prepare
-    controller = object.__new__(TextGenerationController)
-    controller.inference_wrapped_model = SimpleNamespace(
-        inference_context=context,
-        model=SimpleNamespace(config=SimpleNamespace(moe_enable_routing_replay=False)),
-    )
-    controller.num_speculative_tokens = 0
-    controller._async_step_transaction = None
-    controller._async_prepare_deferred_until_after_sampling = False
-    controller._async_forward_launch_count = 0
-    controller._decide_ep_step_begin = lambda **_kwargs: EPStepBeginDecision(
-        step_id=0,
-        has_real_work=True,
-        reuse_pending_forward=False,
-        discard_pending_forward=False,
-        row_mapped_forward=False,
-    )
-    controller._dynamic_step_context_init = lambda: (
-        torch.tensor([[1, 2]], dtype=torch.int64),
-        torch.tensor([[0, 1]], dtype=torch.int64),
-    )
-    controller._dynamic_step_forward_logits = lambda *_args: events.append("forward")
-    controller._router_record_bookkeeping = lambda: None
-    controller._async_scheduling_disabled_reason = lambda **_kwargs: None
-    controller._record_async_eligibility_result = lambda _reason: None
-    controller._record_async_disable_reason = lambda reason: events.append(("disable", reason))
-    controller._decide_ep_async_handoff = (
-        lambda **_kwargs: events.append("handoff")
-        or EPAsyncHandoffDecision(
-            step_id=0,
-            has_real_work=True,
-            launch_async_forward=True,
-            skip_async_forward=False,
-            any_launch_request=True,
-            any_skip_request=False,
-        )
-    )
-    controller._should_collect_dynamic_sampling_bookkeeping = lambda **_kwargs: False
-    controller._dynamic_step_sample_logits_to_next_input_ids = (
-        lambda: events.extend(["sample", "copy"])
-    )
-    controller._transfer_async_samples_to_cpu = (
-        lambda count: events.append(("d2h", count)) or _sample_ticket([4, 5])
-    )
-    controller._confirm_prepared_ep_async_handoff = lambda: True
-    controller._begin_async_step_transaction = lambda _count: events.append(
-        "record"
-    ) or SimpleNamespace(mark_launched=lambda **_kwargs: events.append("tx_launch"))
-    controller._ensure_ep_async_handoff_decided = lambda **_kwargs: events.append("ep_done")
-
-    result = await controller.async_generate_output_tokens_dynamic_batch(skip_bookkeeping=True)
-
-    ordering = [
-        event
-        for event in events
-        if event in ("prepare", "handoff", "sample", "copy", "publish", "h2d")
-    ]
-    assert ordering == ["prepare", "handoff", "sample", "copy", "publish", "h2d"]
-    assert result["sample"].tolist() == [4, 5]
-
-
-@pytest.mark.internal
-@pytest.mark.asyncio
-async def test_prepare_async_decode_before_sampling_unsafe_fallback_ordering(monkeypatch):
-    monkeypatch.setattr(tgc_module, "range_push", lambda _msg: None)
-    monkeypatch.setattr(tgc_module, "range_pop", lambda: None)
-    events = []
-    context = SimpleNamespace(
-        active_token_count=2,
-        total_request_count=2,
-        paused_request_count=0,
-        num_decode_requests=2,
-        padded_active_request_count=2,
-        is_hybrid_model=False,
-        config=SimpleNamespace(materialize_only_last_token_logits=True),
-        kv_block_allocator=SimpleNamespace(
-            store_routing_per_block=lambda _routing: events.append("routing")
-        ),
-        publish_async_prepared_decode_plan=lambda: events.append("publish"),
-        transfer_bookkeeping_to_gpu=lambda **_kwargs: events.append("h2d") or None,
-        current_input_and_position_ids=lambda: (
-            torch.tensor([[1, 2]], dtype=torch.int64),
-            torch.tensor([[0, 1]], dtype=torch.int64),
-        ),
-        using_cuda_graph_this_step=lambda: True,
-        mark_async_resources_in_flight=lambda: events.append("mark_in_flight") or "ledger",
-    )
-
-    def _prepare(**kwargs):
-        if kwargs.get("pre_sampling"):
-            events.append("prepare_pre")
-            return False
-        events.append("prepare_after")
-        return True
-
-    context.prepare_async_decode_next_step = _prepare
-    controller = object.__new__(TextGenerationController)
-    controller.inference_wrapped_model = SimpleNamespace(
-        inference_context=context,
-        model=SimpleNamespace(config=SimpleNamespace(moe_enable_routing_replay=False)),
-    )
-    controller.num_speculative_tokens = 0
-    controller._async_step_transaction = None
-    controller._async_prepare_deferred_until_after_sampling = False
-    controller._async_forward_launch_count = 0
-    controller._decide_ep_step_begin = lambda **_kwargs: EPStepBeginDecision(
-        step_id=0,
-        has_real_work=True,
-        reuse_pending_forward=False,
-        discard_pending_forward=False,
-        row_mapped_forward=False,
-    )
-    controller._dynamic_step_context_init = lambda: (
-        torch.tensor([[1, 2]], dtype=torch.int64),
-        torch.tensor([[0, 1]], dtype=torch.int64),
-    )
-    controller._dynamic_step_forward_logits = lambda *_args: events.append("forward")
-    controller._router_record_bookkeeping = lambda: None
-    controller._async_scheduling_disabled_reason = lambda **_kwargs: None
-    controller._record_async_eligibility_result = lambda _reason: None
-    controller._record_async_disable_reason = lambda reason: events.append(("disable", reason))
-    controller._decide_ep_async_handoff = (
-        lambda **_kwargs: EPAsyncHandoffDecision(
-            step_id=0,
-            has_real_work=True,
-            launch_async_forward=True,
-            skip_async_forward=False,
-            any_launch_request=True,
-            any_skip_request=False,
-        )
-    )
-    controller._should_collect_dynamic_sampling_bookkeeping = lambda **_kwargs: False
-    controller._dynamic_step_sample_logits = lambda **_kwargs: events.append("sample")
-    controller._copy_sampled_decode_tokens_to_next_input_ids = lambda count: events.append(
-        ("copy", count)
-    )
-    controller._transfer_async_samples_to_cpu = (
-        lambda count: events.append(("d2h", count)) or _sample_ticket([4, 5])
-    )
-    controller._confirm_prepared_ep_async_handoff = lambda: True
-    controller._begin_async_step_transaction = lambda _count: events.append(
-        "record"
-    ) or SimpleNamespace(mark_launched=lambda **_kwargs: events.append("tx_launch"))
-    controller._ensure_ep_async_handoff_decided = lambda **_kwargs: events.append("ep_done")
-
-    result = await controller.async_generate_output_tokens_dynamic_batch(skip_bookkeeping=True)
-
-    ordering = [
-        event
-        for event in events
-        if event in ("sample", "prepare_after", "publish", "h2d") or event == ("copy", 2)
-    ]
-    assert ordering == ["sample", "prepare_after", ("copy", 2), "publish", "h2d"]
-    assert not any(event[0] == "disable" for event in events if isinstance(event, tuple))
-    assert result["sample"].tolist() == [4, 5]
 
 
 @pytest.mark.internal
@@ -1237,11 +677,10 @@ def test_controller_handoff_decision_is_cached_and_skip_can_be_forced():
 @pytest.mark.parametrize(
     ("use_protocol", "pending_forward", "row_status", "expected"),
     [
-        (False, True, (True, False), (True, False, False)),
-        (False, True, (False, False), (False, True, False)),
-        (False, True, (True, True), (True, False, True)),
-        (False, False, (True, False), (False, False, False)),
-        (True, True, (True, True), (True, False, True)),
+        (False, True, (True, False), (True, False)),
+        (False, True, (False, False), (False, True)),
+        (False, False, (True, False), (False, False)),
+        (True, True, (True, False), (True, False)),
     ],
 )
 def test_controller_step_begin_bridges_local_and_ep_protocol_decisions(
@@ -1264,7 +703,6 @@ def test_controller_step_begin_bridges_local_and_ep_protocol_decisions(
                 has_real_work=kwargs["has_real_work"],
                 reuse_pending_forward=kwargs["pending_forward_reusable"],
                 discard_pending_forward=not kwargs["pending_forward_reusable"],
-                row_mapped_forward=kwargs["pending_forward_row_mapped"],
             )
 
     if use_protocol:
@@ -1282,19 +720,16 @@ def test_controller_step_begin_bridges_local_and_ep_protocol_decisions(
                 "has_real_work": True,
                 "has_pending_forward": pending_forward,
                 "pending_forward_reusable": row_status[0],
-                "pending_forward_row_mapped": row_status[1],
             }
         ]
         assert (
             decision.reuse_pending_forward,
             decision.discard_pending_forward,
-            decision.row_mapped_forward,
         ) == expected
     else:
         assert (
             decision.reuse_pending_forward,
             decision.discard_pending_forward,
-            decision.row_mapped_forward,
         ) == expected
 
 
@@ -1307,7 +742,7 @@ def test_controller_step_begin_records_ep_decision_on_transaction_participant():
     transaction = _install_pending_transaction(
         controller, _make_async_layout_snapshot([10, 11], cuda_graph_request_count=2)
     )
-    controller._pending_async_forward_row_status = lambda: (True, True)
+    controller._pending_async_forward_row_status = lambda: (True, False)
 
     decision = controller._decide_ep_step_begin(has_real_work=True)
 
@@ -1317,14 +752,12 @@ def test_controller_step_begin_records_ep_decision_on_transaction_participant():
         if isinstance(participant, AsyncEPParticipant)
     )
     diagnostics = participant.diagnostics()
-    assert decision.row_mapped_forward
     assert diagnostics["prepared"]
     assert diagnostics["step_begin"] == {
         "step_id": -1,
         "has_real_work": True,
         "reuse_pending_forward": True,
         "discard_pending_forward": False,
-        "row_mapped_forward": True,
     }
 
 
@@ -1344,7 +777,7 @@ def test_controller_ep_handoff_participant_attaches_to_launch_transaction():
         step_id=8,
         state=AsyncTxnState.PREPARED,
         snapshot=snapshot,
-        plan=AsyncDecodePlan.from_snapshot(snapshot),
+        plan=CommittedDecodePlan.from_snapshot(snapshot),
     )
 
     handoff = controller._decide_ep_async_handoff(
@@ -1575,48 +1008,6 @@ def _install_async_prepare_stubs(
 
 
 @pytest.mark.internal
-@pytest.mark.parametrize(
-    ("case", "expected_ok", "expected_deferred", "expected_disable_reason"),
-    [
-        ("disabled", False, False, None),
-        ("prepare_deferred", False, True, None),
-        ("handoff_skipped", False, False, "ep async handoff skipped"),
-        ("success", True, False, None),
-    ],
-)
-def test_prepare_async_decode_before_sampling_handoff_paths(
-    monkeypatch, case, expected_ok, expected_deferred, expected_disable_reason
-):
-    monkeypatch.setattr(tgc_module, "range_push", lambda _msg: None)
-    monkeypatch.setattr(tgc_module, "range_pop", lambda: None)
-    controller, _context = _make_async_gate_controller()
-    events = _install_async_prepare_stubs(
-        controller,
-        disabled_reason="blocked" if case == "disabled" else None,
-        prepare_result=case != "prepare_deferred",
-        launch_decision=case != "handoff_skipped",
-    )
-
-    ok = controller._try_prepare_async_decode_before_sampling()
-
-    assert ok is expected_ok
-    assert controller._async_prepare_deferred_until_after_sampling is expected_deferred
-    if case == "disabled":
-        assert ("handoff", True, False) in events
-        assert not any(event[0] == "prepare" for event in events if isinstance(event, tuple))
-    elif case == "prepare_deferred":
-        assert ("prepare", {"pre_sampling": True}) in events
-        assert not any(event[0] == "handoff" for event in events if isinstance(event, tuple))
-    else:
-        assert ("prepare", {"pre_sampling": True}) in events
-        assert ("handoff", True, True) in events
-    if expected_disable_reason is not None:
-        assert ("disable", expected_disable_reason) in events
-    if case == "prepare_deferred":
-        assert not any(event[0] == "disable" for event in events if isinstance(event, tuple))
-
-
-@pytest.mark.internal
 def test_presampling_async_prepare_is_disabled_for_committed_scheduling(monkeypatch):
     monkeypatch.setattr(tgc_module, "range_push", lambda _msg: None)
     monkeypatch.setattr(tgc_module, "range_pop", lambda: None)
@@ -1636,7 +1027,6 @@ def test_committed_async_launch_prepares_after_hard_commit_without_presampling(m
     events = []
     context = SimpleNamespace(
         prepare_async_decode_next_step=lambda **kwargs: events.append(("prepare", kwargs)) or True,
-        publish_async_prepared_decode_plan=lambda: events.append("publish"),
         transfer_bookkeeping_to_gpu=lambda **kwargs: events.append(("h2d", kwargs))
         or "h2d_event",
         current_input_and_position_ids=lambda: ("input_ids", "position_ids"),
@@ -1695,8 +1085,7 @@ def test_committed_async_launch_prepares_after_hard_commit_without_presampling(m
         for event in events
         if isinstance(event, tuple)
     )
-    assert events.index(("prepare", {})) < events.index("publish")
-    assert events.index("publish") < events.index(("forward", "input_ids", "position_ids"))
+    assert events.index(("prepare", {})) < events.index(("forward", "input_ids", "position_ids"))
     assert controller._async_forward_launch_count == 1
     assert controller._async_launched_forward_count == 1
 
@@ -1732,65 +1121,6 @@ def test_committed_async_launch_skips_when_hard_committed_state_is_not_decode_on
     assert graph_count is None
     assert "prepare" not in events
     assert ("handoff", {"has_real_work": True, "can_launch_async_handoff": False}) in events
-
-
-@pytest.mark.internal
-def test_prepare_async_decode_before_sampling_deferral_is_not_disable_reason(monkeypatch):
-    monkeypatch.setattr(tgc_module, "range_push", lambda _msg: None)
-    monkeypatch.setattr(tgc_module, "range_pop", lambda: None)
-    controller, context = _make_async_gate_controller()
-    controller._async_disable_reason = None
-    controller._async_disable_reason_counts = {}
-    controller._async_eligibility_check_count = 0
-    controller._async_eligibility_pass_count = 0
-    events = []
-    controller._async_scheduling_disabled_reason = lambda **_kwargs: None
-    controller._decide_ep_async_handoff = lambda **kwargs: events.append(
-        ("handoff", kwargs)
-    )
-    context.prepare_async_decode_next_step = (
-        lambda **kwargs: events.append(("prepare", kwargs)) or False
-    )
-
-    assert not controller._try_prepare_async_decode_before_sampling()
-
-    assert controller._async_prepare_deferred_until_after_sampling
-    assert controller._async_disable_reason_counts == {}
-    assert controller._async_eligibility_check_count == 1
-    assert controller._async_eligibility_pass_count == 1
-    assert events == [("prepare", {"pre_sampling": True})]
-
-
-@pytest.mark.internal
-def test_prepare_async_decode_before_sampling_keeps_hybrid_fast_path(monkeypatch):
-    monkeypatch.setattr(tgc_module, "range_push", lambda _msg: None)
-    monkeypatch.setattr(tgc_module, "range_pop", lambda: None)
-    controller, context = _make_async_gate_controller()
-    context.is_hybrid_model = True
-    events = []
-    controller._async_scheduling_disabled_reason = (
-        lambda **kwargs: events.append(("disabled", kwargs)) or None
-    )
-    controller._record_async_eligibility_result = lambda reason: events.append(
-        ("eligibility", reason)
-    )
-    controller._decide_ep_async_handoff = (
-        lambda **kwargs: events.append(("handoff", kwargs))
-        or SimpleNamespace(launch_async_forward=True)
-    )
-    context.prepare_async_decode_next_step = (
-        lambda **kwargs: events.append(("prepare", kwargs)) or True
-    )
-
-    assert controller._try_prepare_async_decode_before_sampling()
-
-    assert not controller._async_prepare_deferred_until_after_sampling
-    assert events == [
-        ("disabled", {}),
-        ("eligibility", None),
-        ("prepare", {"pre_sampling": True}),
-        ("handoff", {"has_real_work": True, "can_launch_async_handoff": True}),
-    ]
 
 
 @pytest.mark.internal
@@ -1909,31 +1239,6 @@ def test_wait_for_dummy_context_h2d_synchronizes_once():
 
 
 @pytest.mark.internal
-def test_pending_async_forward_cleanup_releases_only_when_needed():
-    context = SimpleNamespace(release_count=0)
-    context.release_deferred_async_resources = lambda: setattr(
-        context, "release_count", context.release_count + 1
-    )
-    controller = object.__new__(TextGenerationController)
-    controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
-    controller._async_step_transaction = None
-    controller._async_discarded_forward_count = 0
-
-    controller._discard_pending_async_forward()
-    assert context.release_count == 0
-    assert controller._async_discarded_forward_count == 0
-
-    transaction = _install_pending_transaction(
-        controller, _make_async_layout_snapshot([1, 2], cuda_graph_request_count=2)
-    )
-    controller._discard_pending_async_forward()
-    assert context.release_count == 1
-    assert controller._async_step_transaction is None
-    assert transaction.state == AsyncTxnState.DISCARDED
-    assert controller._async_discarded_forward_count == 1
-
-
-@pytest.mark.internal
 def test_pending_async_forward_row_discard_releases_without_accepting_mamba_bank():
     controller = _make_controller_with_rows([10, 11], [10, 12])
     context = controller.inference_wrapped_model.inference_context
@@ -1984,11 +1289,10 @@ def test_async_diagnostics_report_pending_forward_disable_counts_and_ep_protocol
     controller._async_committed_forward_count = 2
     controller._async_rolled_back_forward_count = 1
     controller._async_discarded_forward_count = 1
-    controller._async_row_mapped_forward_count = 1
     controller._async_identity_forward_count = 1
+    controller._async_overlap_opportunity_count = 3
     controller._async_graph_mismatch_discard_count = 1
     controller._async_layout_mismatch_discard_count = 0
-    controller._async_row_map_policy = AsyncRowMapPolicy.IDENTITY_ONLY
     controller._ep_async_protocol = SimpleNamespace(
         diagnostics=lambda: {"step_begin_reuses": 1, "handoff_launches": 2}
     )
@@ -1998,7 +1302,6 @@ def test_async_diagnostics_report_pending_forward_disable_counts_and_ep_protocol
     assert diagnostics == {
         "enabled": True,
         "pending_forward": True,
-        "row_map_policy": "identity_only",
         "step_barrier_reason": "logging step",
         "eligibility_checks": 4,
         "eligibility_passes": 2,
@@ -2007,29 +1310,16 @@ def test_async_diagnostics_report_pending_forward_disable_counts_and_ep_protocol
         "forward_launches": 3,
         "prepared_forwards": 4,
         "launched_forwards": 3,
+        "overlap_opportunities": 3,
         "reused_forwards": 2,
         "committed_forwards": 2,
         "rolled_back_forwards": 1,
         "discarded_forwards": 1,
-        "row_mapped_forwards": 1,
         "identity_reused_forwards": 1,
         "graph_mismatch_discards": 1,
         "layout_mismatch_discards": 0,
         "ep_protocol": {"step_begin_reuses": 1, "handoff_launches": 2},
     }
-
-
-@pytest.mark.internal
-def test_async_row_map_policy_setter_switches_exact_parity_mode():
-    controller = object.__new__(TextGenerationController)
-    controller._async_row_map_policy = AsyncRowMapPolicy.REUSE
-
-    resolved = controller.set_async_row_map_policy("identity_only")
-
-    assert resolved == AsyncRowMapPolicy.IDENTITY_ONLY
-    assert controller._async_row_map_policy == AsyncRowMapPolicy.IDENTITY_ONLY
-    with pytest.raises(ValueError, match="Unknown async row-map policy"):
-        controller.set_async_row_map_policy("invalid")
 
 
 @pytest.mark.internal
@@ -2047,7 +1337,6 @@ def test_async_transaction_and_resource_diagnostics_are_stable():
         state=AsyncTxnState.LAUNCHED,
         snapshot=snapshot,
         resources=ledger,
-        row_map=torch.tensor([1, 0], dtype=torch.long),
     )
 
     diagnostics = transaction.diagnostics()
@@ -2057,7 +1346,6 @@ def test_async_transaction_and_resource_diagnostics_are_stable():
             "step_id",
             "state",
             "request_ids",
-            "row_map",
             "discard_reason",
             "has_sample_ticket",
             "has_resources",
@@ -2070,7 +1358,6 @@ def test_async_transaction_and_resource_diagnostics_are_stable():
         "step_id": 7,
         "state": "launched",
         "request_ids": [10, 11],
-        "row_map": [1, 0],
         "discard_reason": None,
         "has_sample_ticket": False,
         "has_resources": True,
@@ -2115,7 +1402,7 @@ def test_async_decode_plan_and_transaction_participant_hooks_are_canonical():
 
     participant = _Participant()
     snapshot = _make_async_layout_snapshot([21, 22], cuda_graph_request_count=2)
-    plan = AsyncDecodePlan.from_snapshot(snapshot)
+    plan = CommittedDecodePlan.from_snapshot(snapshot)
     transaction = AsyncDecodeTransaction(
         step_id=3,
         state=AsyncTxnState.PLANNED,
@@ -2289,39 +1576,6 @@ def test_async_resource_participant_rolls_back_speculative_resources_once():
 
 
 @pytest.mark.internal
-def test_async_mamba_participant_commits_candidate_bank_once():
-    accepted_request_ids = []
-    context = SimpleNamespace(
-        is_hybrid_model=True,
-        accept_async_mamba_state=lambda request_ids: accepted_request_ids.append(
-            request_ids.clone()
-        ),
-    )
-    snapshot = _make_async_layout_snapshot([21, 22], cuda_graph_request_count=2)
-    plan = AsyncDecodePlan.from_snapshot(snapshot)
-    participant = AsyncMambaStateParticipant(context)
-    transaction = AsyncDecodeTransaction(
-        step_id=6,
-        state=AsyncTxnState.RESOLVED,
-        snapshot=snapshot,
-        plan=plan,
-        participants=(participant,),
-    )
-
-    transaction.mark_committed()
-    transaction.mark_committed()
-    transaction.rollback("late rollback")
-
-    assert [request_ids.tolist() for request_ids in accepted_request_ids] == [[21, 22]]
-    assert participant.diagnostics() == {
-        "has_snapshot": False,
-        "committed": True,
-        "rolled_back": False,
-    }
-    assert transaction.state == AsyncTxnState.COMMITTED
-
-
-@pytest.mark.internal
 def test_async_mamba_participant_accept_clears_snapshot_without_restore():
     events = []
     snapshot = _make_async_layout_snapshot([21], cuda_graph_request_count=1)
@@ -2433,13 +1687,17 @@ def test_async_resource_rollback_waits_for_forward_done_before_release():
 
 @pytest.mark.internal
 def test_controller_attaches_speculative_resource_participants_to_launch_transaction():
-    accepted_request_ids = []
+    mamba_events = []
+    mamba_snapshot = {"slot": 7}
     released_blocks = []
     context = SimpleNamespace(
         is_hybrid_model=True,
-        accept_async_mamba_state=lambda request_ids: accepted_request_ids.append(
-            request_ids.clone()
-        ),
+        snapshot_async_mamba_state=lambda request_ids: mamba_events.append(
+            ("snapshot", request_ids.tolist())
+        )
+        or mamba_snapshot,
+        clear_async_mamba_snapshot=lambda snapshot: mamba_events.append(("clear", snapshot)),
+        restore_async_mamba_state=lambda snapshot: mamba_events.append(("restore", snapshot)),
         async_kv_deferred_release_count=0,
         kv_block_allocator=SimpleNamespace(
             release_memory_blocks=lambda blocks: released_blocks.append(blocks.clone())
@@ -2454,7 +1712,7 @@ def test_controller_attaches_speculative_resource_participants_to_launch_transac
         step_id=7,
         state=AsyncTxnState.PREPARED,
         snapshot=snapshot,
-        plan=AsyncDecodePlan.from_snapshot(snapshot),
+        plan=CommittedDecodePlan.from_snapshot(snapshot),
     )
     ledger = AsyncResourceLedger(in_flight=True)
     ledger.defer_kv_blocks(torch.tensor([300], dtype=torch.int32))
@@ -2479,109 +1737,10 @@ def test_controller_attaches_speculative_resource_participants_to_launch_transac
 
     transaction.mark_committed()
 
-    assert [request_ids.tolist() for request_ids in accepted_request_ids] == [[31, 32]]
+    assert mamba_events == [("snapshot", [31, 32]), ("clear", mamba_snapshot)]
     assert [blocks.tolist() for blocks in released_blocks] == [[300]]
     assert context.async_kv_deferred_release_count == 1
     assert not ledger.in_flight
-
-
-@pytest.mark.internal
-@pytest.mark.asyncio
-async def test_async_h2d_and_forward_launch_before_cpu_bookkeeping_drains(monkeypatch):
-    monkeypatch.setattr(tgc_module, "range_push", lambda _msg: None)
-    monkeypatch.setattr(tgc_module, "range_pop", lambda: None)
-    events = []
-
-    class _Event:
-        def __init__(self, name):
-            self.name = name
-
-        def synchronize(self):
-            events.append(f"{self.name}_sync")
-
-    context = SimpleNamespace(
-        active_token_count=2,
-        total_request_count=2,
-        paused_request_count=0,
-        num_decode_requests=2,
-        padded_active_request_count=2,
-        is_hybrid_model=False,
-        config=SimpleNamespace(materialize_only_last_token_logits=True),
-        kv_block_allocator=SimpleNamespace(
-            store_routing_per_block=lambda _routing: events.append("routing")
-        ),
-        publish_async_prepared_decode_plan=lambda: events.append("publish"),
-        transfer_bookkeeping_to_gpu=lambda **_kwargs: events.append("h2d")
-        or _Event("h2d"),
-        current_input_and_position_ids=lambda: (
-            torch.tensor([[1, 2]], dtype=torch.int64),
-            torch.tensor([[0, 1]], dtype=torch.int64),
-        ),
-        using_cuda_graph_this_step=lambda: True,
-        mark_async_resources_in_flight=lambda: events.append("mark_in_flight") or "ledger",
-    )
-    controller = object.__new__(TextGenerationController)
-    controller.inference_wrapped_model = SimpleNamespace(
-        inference_context=context,
-        model=SimpleNamespace(config=SimpleNamespace(moe_enable_routing_replay=False)),
-    )
-    controller.num_speculative_tokens = 0
-    controller._async_step_transaction = None
-    controller._async_prepare_deferred_until_after_sampling = False
-    controller._async_forward_launch_count = 0
-    controller._decide_ep_step_begin = lambda **_kwargs: EPStepBeginDecision(
-        step_id=0,
-        has_real_work=True,
-        reuse_pending_forward=False,
-        discard_pending_forward=False,
-        row_mapped_forward=False,
-    )
-    controller._dynamic_step_context_init = lambda: (
-        torch.tensor([[1, 2]], dtype=torch.int64),
-        torch.tensor([[0, 1]], dtype=torch.int64),
-    )
-
-    def _forward(*_args):
-        events.append("async_forward" if "h2d" in events else "forward")
-
-    controller._dynamic_step_forward_logits = _forward
-    controller._router_record_bookkeeping = lambda: None
-    controller._async_scheduling_disabled_reason = lambda **_kwargs: None
-    controller._record_async_eligibility_result = lambda _reason: None
-    controller._record_async_disable_reason = lambda reason: events.append(("disable", reason))
-    controller._try_prepare_async_decode_before_sampling = lambda: events.append(
-        "prepare"
-    ) or True
-    controller._should_collect_dynamic_sampling_bookkeeping = lambda **_kwargs: False
-    controller._dynamic_step_sample_logits_to_next_input_ids = (
-        lambda: events.extend(["sample", "copy"])
-    )
-    controller._transfer_async_samples_to_cpu = lambda count: events.append(
-        ("d2h", count)
-    ) or _sample_ticket([4, 5])
-    controller._confirm_prepared_ep_async_handoff = lambda: True
-    controller._begin_async_step_transaction = lambda _count: events.append(
-        "record"
-    ) or SimpleNamespace(mark_launched=lambda **_kwargs: events.append("tx_launch"))
-    controller._ensure_ep_async_handoff_decided = lambda **_kwargs: events.append("ep_done")
-
-    def _bookkeeping(**kwargs):
-        events.append("bookkeeping_start")
-        kwargs["sample_ready_event"].synchronize()
-        kwargs["h2d_done_event"].synchronize()
-        events.append("bookkeeping_done")
-        return {"sample": torch.tensor([4, 5], dtype=torch.int64)}
-
-    controller._dynamic_step_context_bookkeeping = _bookkeeping
-
-    result = await controller.async_generate_output_tokens_dynamic_batch(skip_bookkeeping=False)
-
-    assert result["sample"].tolist() == [4, 5]
-    assert events.index("h2d") < events.index("async_forward") < events.index(
-        "bookkeeping_start"
-    )
-    assert events.index("async_forward") < events.index("h2d_sync")
-    assert "h2d_sync" not in events[: events.index("async_forward")]
 
 
 @pytest.mark.internal
@@ -2785,7 +1944,6 @@ def test_fast_overlap_prefill_or_mixed_steps_report_no_launch_opportunity():
 @pytest.mark.internal
 def test_late_cpu_invalidation_rejects_pending_transaction():
     controller = _make_controller_with_rows([10, 11], [10, 11])
-    controller._async_row_map_policy = AsyncRowMapPolicy.IDENTITY_ONLY
     transaction = controller._pending_async_transaction()
     assert transaction is not None
 
@@ -3428,14 +2586,13 @@ def test_inference_config_async_scheduling_flags_are_opt_in():
     default_config = InferenceConfig()
     enabled_config = InferenceConfig(
         enable_async_scheduling=True,
-        async_row_map_policy=AsyncRowMapPolicy.IDENTITY_ONLY.value,
         logging_step_interval=0,
     )
 
     assert not default_config.enable_async_scheduling
-    assert default_config.async_row_map_policy == AsyncRowMapPolicy.REUSE.value
+    assert not hasattr(default_config, "async_row_map_policy")
     assert enabled_config.enable_async_scheduling
-    assert enabled_config.async_row_map_policy == AsyncRowMapPolicy.IDENTITY_ONLY.value
+    assert not hasattr(enabled_config, "async_row_map_policy")
     assert enabled_config.logging_step_interval == 0
 
 

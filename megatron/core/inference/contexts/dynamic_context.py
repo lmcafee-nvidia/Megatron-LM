@@ -362,7 +362,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.num_attention_layers = len(attention_layer_map) + len(dsa_layer_map)
             self.num_mamba_layers = len(mamba_layer_map)
             self.layer_map = attention_layer_map | dsa_layer_map | mamba_layer_map
-            self.mamba_state_bank_count = 2 if inference_config.enable_async_scheduling else 1
+            self.mamba_state_bank_count = 1
         else:
             # The layer map is the identity function for pure Transformer models.
             # Use the same per-PP-rank layer count as TransformerBlock (handles
@@ -994,7 +994,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._async_prepared_paused_dest_rows_cuda = torch.empty(
             (self.max_requests,), dtype=torch.long, device=torch.cuda.current_device()
         )
-        self._async_pre_sampling_prepared_state: Optional[Dict[str, object]] = None
 
         # Track request metadata. Backed by pinned CPU memory: bookkeeping is
         # CPU-resident; GPU consumers read from the active-slice mirror in
@@ -1669,9 +1668,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return (conv_state, ssm_state)
 
-    def _mamba_flat_indices(
-        self, request_slice: slice, *, use_candidate_bank: bool = False
-    ) -> Tensor:
+    def _mamba_flat_indices(self, request_slice: slice) -> Tensor:
         """Return flattened Mamba state indices for the selected request rows."""
         assert self.is_hybrid_model, "Only hybrid models have Mamba state tensors"
         base_indices = self.mamba_metadata.request_to_mamba_state_idx[request_slice].to(
@@ -1680,13 +1677,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         bank_indices = self.mamba_metadata.request_to_mamba_state_bank[request_slice].to(
             dtype=torch.int32
         )
-        if use_candidate_bank and self.mamba_state_bank_count > 1:
-            bank_indices = 1 - bank_indices
         return base_indices * self.mamba_state_bank_count + bank_indices
 
-    def _mamba_flat_indices_from_request_idxs(
-        self, request_idxs: Tensor, *, use_candidate_bank: bool = False
-    ) -> Tensor:
+    def _mamba_flat_indices_from_request_idxs(self, request_idxs: Tensor) -> Tensor:
         """Return flattened Mamba state indices for explicit request rows."""
         assert self.is_hybrid_model, "Only hybrid models have Mamba state tensors"
         base_indices = self.mamba_metadata.request_to_mamba_state_idx[request_idxs].to(
@@ -1695,30 +1688,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         bank_indices = self.mamba_metadata.request_to_mamba_state_bank[request_idxs].to(
             dtype=torch.int32
         )
-        if use_candidate_bank and self.mamba_state_bank_count > 1:
-            bank_indices = 1 - bank_indices
         return base_indices * self.mamba_state_bank_count + bank_indices
 
     def _mamba_base_indices(self, request_slice: slice) -> Tensor:
         """Return unbanked Mamba request slots for intermediate-state buffers."""
         assert self.is_hybrid_model, "Only hybrid models have Mamba state tensors"
         return self.mamba_metadata.request_to_mamba_state_idx[request_slice].to(dtype=torch.int32)
-
-    def accept_async_mamba_state(self, request_ids: Tensor) -> None:
-        """Commit candidate Mamba banks for accepted async-forward requests."""
-        if not self.is_hybrid_model or self.mamba_state_bank_count == 1 or request_ids.numel() == 0:
-            return
-
-        active_slice = slice(self.paused_request_count, self.total_request_count)
-        active_request_ids = self.request_ids[active_slice]
-        for request_id in request_ids.tolist():
-            matches = torch.nonzero(active_request_ids == int(request_id), as_tuple=True)[0]
-            if matches.numel() == 0:
-                continue
-            request_idx = self.paused_request_count + int(matches[0].item())
-            self.mamba_metadata.request_to_mamba_state_bank[request_idx] = (
-                1 - self.mamba_metadata.request_to_mamba_state_bank[request_idx]
-            )
 
     def snapshot_async_mamba_state(self, request_ids: Tensor) -> Optional[Dict[str, Tensor]]:
         """Snapshot live Mamba slots before an async decode launch."""
@@ -2409,7 +2384,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         *,
         active_slice: slice,
         attn_dimensions: InferenceBatchDimensions,
-        use_async_candidate_bank: bool = False,
         active_request_idxs: Optional[Tensor] = None,
     ) -> None:
         """Prepare deferred Mamba metadata transfer for the active step."""
@@ -2424,13 +2398,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         if active_request_idxs is None:
             active_mamba_indices = self._mamba_flat_indices(active_slice)
-            active_mamba_write_indices = self._mamba_flat_indices(
-                active_slice, use_candidate_bank=use_async_candidate_bank
-            )
+            active_mamba_write_indices = self._mamba_flat_indices(active_slice)
         else:
             active_mamba_indices = self._mamba_flat_indices_from_request_idxs(active_request_idxs)
             active_mamba_write_indices = self._mamba_flat_indices_from_request_idxs(
-                active_request_idxs, use_candidate_bank=use_async_candidate_bank
+                active_request_idxs
             )
         self._pending_mamba_transfer = self.mamba_metadata.compute_cpu_metadata(
             active_mamba_indices=active_mamba_indices,
@@ -2813,7 +2785,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._async_prepared_sample_source_count = 0
         self._async_prepared_paused_source_count = 0
         self._async_prepared_decode_input_is_identity = False
-        self._async_pre_sampling_prepared_state = None
 
     def discard_async_prepared_decode_plan(self) -> None:
         """Release resources held only for a prepared async launch that will not run."""
@@ -2823,77 +2794,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
             self.clear_async_resource_reservations()
         self.clear_async_prepared_decode_plan()
-
-    def _snapshot_async_pre_sampling_state(self) -> Dict[str, object]:
-        """Snapshot the mutable context view used by sampling or a prepared forward."""
-        mha_metadata = None
-        mha_state_data = None
-        mha_max_seqlen_q = None
-        mha_max_seqlen_k = None
-        if self.active_attn_metadata is not None:
-            mha_metadata = self.active_attn_metadata.get("mha_metadata")
-            if mha_metadata is not None:
-                mha_state_data = dict(mha_metadata.state_data)
-                mha_max_seqlen_q = getattr(mha_metadata, "_max_seqlen_q", None)
-                mha_max_seqlen_k = getattr(mha_metadata, "_max_seqlen_k", None)
-
-        return {
-            "active_attn_metadata": self.active_attn_metadata,
-            "active_logit_idxs": self.active_logit_idxs.clone(),
-            "active_request_metadata": {
-                label: tensor.clone() for label, tensor in self.active_request_metadata.items()
-            },
-            "active_token_count": self.active_token_count,
-            "batch_dimensions": self.batch_dimensions,
-            "cpu_bookkeeping_buf": self._cpu_bookkeeping_buf.clone(),
-            "mha_metadata": mha_metadata,
-            "mha_state_data": mha_state_data,
-            "mha_max_seqlen_q": mha_max_seqlen_q,
-            "mha_max_seqlen_k": mha_max_seqlen_k,
-            "padded_active_request_count": self.padded_active_request_count,
-            "padded_active_token_count": self.padded_active_token_count,
-            "padded_batch_dimensions": self.padded_batch_dimensions,
-            "padding_slice": getattr(
-                self,
-                "padding_slice",
-                slice(self.active_token_count, self.padded_active_token_count),
-            ),
-            "pending_mamba_transfer": self._pending_mamba_transfer,
-            "using_cuda_graph_this_step": self._using_cuda_graph_this_step,
-        }
-
-    def _restore_async_pre_sampling_state(self, state: Dict[str, object]) -> None:
-        """Restore either the current-step state or a staged pre-sampling state."""
-        self.active_attn_metadata = state["active_attn_metadata"]
-        self.active_logit_idxs.copy_(state["active_logit_idxs"])
-        active_request_metadata = state["active_request_metadata"]
-        for label, tensor in active_request_metadata.items():
-            self.active_request_metadata[label].copy_(tensor)
-        self.active_token_count = state["active_token_count"]
-        self.batch_dimensions = state["batch_dimensions"]
-        self._cpu_bookkeeping_buf.copy_(state["cpu_bookkeeping_buf"])
-        mha_metadata = state.get("mha_metadata")
-        if mha_metadata is not None:
-            mha_metadata.state_data = state["mha_state_data"]
-            if state["mha_max_seqlen_q"] is not None:
-                mha_metadata._max_seqlen_q = state["mha_max_seqlen_q"]
-            if state["mha_max_seqlen_k"] is not None:
-                mha_metadata._max_seqlen_k = state["mha_max_seqlen_k"]
-        self.padded_active_request_count = state["padded_active_request_count"]
-        self.padded_active_token_count = state["padded_active_token_count"]
-        self.padded_batch_dimensions = state["padded_batch_dimensions"]
-        self.padding_slice = state["padding_slice"]
-        self._pending_mamba_transfer = state["pending_mamba_transfer"]
-        self._using_cuda_graph_this_step = state["using_cuda_graph_this_step"]
-        self._prepare_moe_metadata_recording()
-
-    def publish_async_prepared_decode_plan(self) -> None:
-        """Make a pre-sampling prepared decode state visible for H2D and forward launch."""
-        prepared_state = self._async_pre_sampling_prepared_state
-        if prepared_state is None:
-            return
-        self._restore_async_pre_sampling_state(prepared_state)
-        self._async_pre_sampling_prepared_state = None
 
     def async_prepared_request_ids_cpu(self) -> Optional[Tensor]:
         """Return the request order used by the prepared speculative forward."""
@@ -3095,29 +2995,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_ssm_states[:, indices] = 0.0
             self._pending_mamba_zeros.clear()
 
-    def _async_decode_plan_preserves_sampling_layout(
-        self, plan: AsyncDecodeLifecyclePlan
-    ) -> bool:
-        """Return whether a dry next-step plan is safe before sampling mutates CPU state."""
-        current_active_request_count = self.total_request_count - self.paused_request_count
-        if plan.active_request_count != current_active_request_count:
-            return False
-        if plan.finished_request_ids.numel() != 0:
-            return False
-
-        active_slice = slice(self.paused_request_count, self.total_request_count)
-        if not torch.equal(plan.request_ids, self.request_ids[active_slice]):
-            return False
-
-        active_source_idxs = torch.arange(
-            self.paused_request_count,
-            self.total_request_count,
-            dtype=plan.source_request_idxs.dtype,
-            device=plan.source_request_idxs.device,
-        )
-        return torch.equal(plan.source_request_idxs, active_source_idxs)
-
-    def prepare_async_decode_next_step(self, *, pre_sampling: bool = False) -> bool:
+    def prepare_async_decode_next_step(self) -> bool:
         """Prepare a decode-only GPU bookkeeping snapshot for a speculative next step.
 
         Persistent CPU request tensors are not updated here. Instead, this
@@ -3132,12 +3010,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         dry_plan = self._build_async_decode_lifecycle_plan(reserve_blocks=False)
         if dry_plan is None:
             return False
-        if pre_sampling and not self._async_decode_plan_preserves_sampling_layout(dry_plan):
-            return False
-
-        pre_sampling_current_state = (
-            self._snapshot_async_pre_sampling_state() if pre_sampling else None
-        )
 
         tokens_per_request = self.num_speculative_tokens + 1
         batch_dimensions = InferenceBatchDimensions(
@@ -3151,14 +3023,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         if not self._configure_step_batch_dimensions(
             batch_dimensions, best_graph, allow_eager_fallback=False
         ):
-            if pre_sampling_current_state is not None:
-                self._restore_async_pre_sampling_state(pre_sampling_current_state)
             return False
 
         plan = self._build_async_decode_lifecycle_plan(reserve_blocks=True)
         if plan is None:
-            if pre_sampling_current_state is not None:
-                self._restore_async_pre_sampling_state(pre_sampling_current_state)
             return False
 
         reserved_block_count = int(plan.reserved_block_ids.numel())
@@ -3174,8 +3042,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.kv_block_allocator.release_memory_blocks(plan.reserved_block_ids)
                 self.clear_async_resource_reservations()
             self.clear_async_prepared_decode_plan()
-            if pre_sampling_current_state is not None:
-                self._restore_async_pre_sampling_state(pre_sampling_current_state)
             return False
 
         self.active_token_count = plan.active_token_count
@@ -3229,13 +3095,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._prepare_mamba_metadata(
             active_slice=slice(previous_paused_request_count, previous_total_request_count),
             attn_dimensions=attn_dimensions,
-            use_async_candidate_bank=True,
             active_request_idxs=plan.source_request_idxs,
         )
         self._prepare_moe_metadata_recording()
-        if pre_sampling_current_state is not None:
-            self._async_pre_sampling_prepared_state = self._snapshot_async_pre_sampling_state()
-            self._restore_async_pre_sampling_state(pre_sampling_current_state)
         return True
 
     def transfer_bookkeeping_to_gpu(

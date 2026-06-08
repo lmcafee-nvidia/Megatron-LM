@@ -1810,7 +1810,7 @@ class TextGenerationController:
 
         decision = self._pending_async_forward_decision(transaction)
         assert transaction.plan is not None
-        transaction.plan = transaction.plan.with_pending_forward_decision(decision)
+        transaction.plan = transaction.plan.with_identity_decision(decision)
         if decision.reusable:
             self._increment_async_counter("_async_identity_forward_count")
             self._increment_async_counter("_async_reused_forward_count")
@@ -2109,7 +2109,6 @@ class TextGenerationController:
         if not self._confirm_prepared_ep_async_handoff():
             return False, None, None
 
-        context.publish_async_prepared_decode_plan()
         range_push("async_transfer_bookkeeping_to_gpu")
         async_h2d_done_event = context.transfer_bookkeeping_to_gpu(
             include_token_to_input_ids=True,
@@ -3006,14 +3005,6 @@ class TextGenerationController:
                     pending_forward_row_indices,
                     _,
                 ) = self._resolve_pending_async_forward()
-                if (
-                    pending_forward_reused
-                    and context.is_hybrid_model
-                    and not self._async_transaction_has_participant(
-                        transaction, AsyncMambaStateParticipant
-                    )
-                ):
-                    context.accept_async_mamba_state(self._active_request_ids_cpu())
                 if transaction is not None:
                     if pending_forward_reused:
                         transaction.mark_committed()

@@ -1,170 +1,137 @@
 # Async Scheduling
 
-Async scheduling for dynamic decode overlaps CPU bookkeeping for step `N + 1`
-with GPU work from step `N`. The architecture is transactional: one canonical
-plan describes the candidate forward, one transaction owns its speculative
-state, and participants own subsystem side effects.
+Async scheduling for dynamic decode is transactional. A pending async forward is
+launched only after the current decode step has committed its sampled tokens and
+request state. CPU-only work from the committed step can then overlap the
+already-launched next forward.
+
+The dynamic decode lifecycle is:
 
 ```text
-idle -> planned -> prepared -> launched -> resolved -> committed/rolled_back -> retired
+resolve forward(N)
+-> sample(N)
+-> hard-commit decode state(N)
+-> admit/schedule next work
+-> build CommittedDecodePlan(N+1)
+-> launch forward(N+1)
+-> overlap pure CPU post-launch work
 ```
 
-The text generation controller still calls model primitives, sampling, and
-context bookkeeping. Async policy and transaction state live in
-`AsyncDecodeCoordinator`, `AsyncDecodePlan`, `AsyncDecodeTransaction`, and
-`AsyncTransactionParticipant` implementations.
+Async launch is only eligible for committed decode-only state. Prefill,
+chunked prefill, mixed prefill/decode, MTP rewind/verification that has not
+settled, and admission that creates prefill work all skip async launch.
 
-## Canonical Plan
+## Committed Plan
 
-`AsyncDecodePlan` is the immutable description of a candidate decode step. It
-contains:
+`CommittedDecodePlan` is the only async launch descriptor. It is immutable and
+built from committed context state after hard commit and admission. It records:
 
-- request IDs and source rows for the planned active layout
-- query lengths, KV offsets, token positions, token-to-request rows, and KV
-  block indices
-- reserved KV block metadata and finished request IDs
-- CUDA graph shape, decode stride, and padded request count
-- the prepared `AsyncLayoutSnapshot`
-- row-map decision, graph compatibility, and layout compatibility
-- EP, Mamba, MTP, logprob, and expected resource requirements
+- request IDs and committed row order
+- active decode count and CUDA graph shape
+- decode stride and active token count
+- Mamba live slot IDs
+- KV/resource reservations
+- exact identity fingerprint
+- component requirements for Mamba, MTP, logprobs, EP, and resources
 
-The context builds this plan while preparing the speculative next-step layout.
-When the controller launches the async forward, the transaction keeps that plan
-and attaches the runtime layout snapshot used for pending-forward resolution.
+The plan contains no predicted future layout and no row map. Pending async
+logits can be accepted only when the pending and current committed plans match
+exactly. Request reorder, finish, pause, admission, CUDA graph shape changes,
+decode-stride changes, Mamba slot changes, or resource-identity changes force a
+transaction rollback and synchronous fallback.
 
 ## Transaction Lifecycle
 
-`AsyncDecodeTransaction` owns speculative async work for one pending forward:
-state, fences/events, sample tickets, resource ledger, row map, participant
-state, and diagnostics.
+The lifecycle for one pending async forward is:
 
-The coordinator owns transaction creation, pending detection, and retirement.
-Controller compatibility helpers delegate to the coordinator so legacy call
-sites can keep using `_pending_async_transaction`,
-`_has_pending_async_forward_state`, `_begin_async_step_transaction`, and
-`_retire_async_transaction`.
+```text
+prepare(plan) -> launch(plan) -> accept(plan) | rollback(plan) -> retire()
+```
 
-The lifecycle rules are:
+`AsyncDecodeTransaction` owns all launched-forward resources:
 
-- `planned` and `prepared`: a candidate plan and CPU layout exist, but the
-  pending forward has not been launched.
-- `launched`: H2D bookkeeping and the forward have been enqueued, and resources
-  that may still be visible to the forward are marked in flight.
-- `resolved`: the pending forward was matched against current rows and either
-  identity reuse or row-mapped reuse was selected.
-- `committed`: participant-owned side effects are accepted exactly once.
-- `rolled_back`: participant-owned side effects are released or discarded
-  exactly once.
-- `retired`: the transaction no longer owns active pending-forward state.
+- committed plan
+- H2D event
+- forward-done event
+- output/logit handle
+- Mamba snapshot participant
+- KV/resource participant
+- EP participant
+- diagnostics and invalidation reason
 
-## Central Eligibility
+The controller orchestrates lifecycle calls. It does not manually free
+transaction-owned resources. Commit, rollback, and retire paths are idempotent,
+and participant-owned resources are released exactly once.
 
-`classify_async_eligibility` returns a structured `AsyncEligibilityDecision`.
-It centralizes async scheduling gates such as enablement, step barriers, CUDA
-graph availability, graph scope, pipeline parallelism, unsupported sampling
-backends, MTP constraints, decode-only state, active request count, admission
-barriers, and graph stride compatibility.
+## Hard Commit And Post-Launch Work
 
-Pending-forward reuse is centralized separately in
-`resolve_async_pending_forward`. It returns `AsyncPendingForwardDecision` with
-the reusable flag, row map, row-mapped flag, discard reason, row-map policy, and
-layout/graph compatibility. Controller code consumes this decision instead of
-recomputing row-map or graph facts in multiple places.
+Dynamic decode bookkeeping is split into two phases.
 
-## Layout And Row Maps
+Hard commit happens before any async launch:
 
-`AsyncLayoutSnapshot` captures the prepared request IDs, graph shape, request
-lengths, KV offsets, token rows, token positions, KV block mapping, and optional
-Mamba read/write indices. A pending forward can be reused only when:
+- apply sampled tokens
+- update request state
+- finish, pause, and resume rows
+- advance offsets
+- update next-step context tensors
+- admit waiting requests
 
-- graph shape and decode stride match the current step
-- every current request ID can be mapped to a pending row
-- request, token, KV, and Mamba layout fields match after applying that row map
+Post-launch CPU work happens after the next forward is queued:
 
-`AsyncRowMapPolicy.REUSE` is the default. It preserves PR 5202 behavior and
-performance by allowing row-mapped pending-forward reuse when layouts are
-compatible.
+- detokenization
+- coordinator replies
+- output formatting
+- logging
+- CPU-only stop and logprob work
 
-`AsyncRowMapPolicy.IDENTITY_ONLY` rejects non-identity row maps. It is intended
-for exact async-off/async-on parity validation because it avoids inherited PR
-5202 row-mapped numeric drift where possible. The default remains `reuse` until
-Nano inference-bench data shows `identity_only` is within the configured
-performance threshold.
+Late CPU-discovered invalidation marks the in-flight transaction with a stable
+reason. It does not mutate the committed launch identity.
 
-## Participants
+## Mamba And KV
 
-Each subsystem that owns speculative state is represented as an
-`AsyncTransactionParticipant` with `prepare`, `validate`, `commit`, `rollback`,
-and `diagnostics` hooks.
+Hybrid Mamba models use one live state bank. Before an async launch, the Mamba
+participant snapshots the live slots named by the committed plan. Accepting a
+transaction discards the snapshot and keeps live-bank writes. Rolling back
+restores the snapshot before synchronous fallback.
 
-Current participants include:
-
-- `AsyncEPParticipant`: records EP step-begin and handoff launch/skip decisions.
-- `AsyncMambaStateParticipant`: accepts async Mamba candidate banks on commit.
-- `AsyncSampleReadbackParticipant`: tracks the sample readback ticket lifetime.
-- `AsyncLogprobMTPParticipant`: records generated-logprob and MTP requirements.
-- `AsyncResourceParticipant`: releases deferred resources on commit and drains
-  all speculative resources on rollback.
-
-Participant hooks are idempotent. A commit or rollback retry must not publish
-Mamba banks twice, release a KV block twice, or consume the same sample ticket
-twice.
-
-## Resource Ownership
-
-`AsyncResourceLedger` records KV reservations, deferred KV blocks, deferred
-Mamba slots, Mamba leases, in-flight state, and consumed reservations.
-
-When a speculative forward is launched, the context marks the ledger in flight
-and the transaction attaches an `AsyncResourceParticipant`. During CPU
-reconciliation, matching reserved KV blocks can be consumed by request ID and
-block column. Unused reservations are deferred. Request cleanup that overlaps an
-in-flight forward defers KV and Mamba releases through the same ledger.
-
-On commit, the resource participant releases deferred resources through the
-context allocators and clears in-flight state. On rollback, it first moves any
-unused reservations into the deferred list and then releases everything. This
-keeps prepare, commit, and rollback symmetric for speculative resources.
-
-## Mamba, MTP, And Logprobs
-
-Hybrid models include Mamba bank read/write indices in the layout snapshot.
-Pending forwards are reusable only when the current rows match the planned
-Mamba layout after row-map resolution. On commit, the Mamba participant accepts
-candidate banks for the transaction plan's request IDs. On rollback, candidate
-banks are not published.
-
-MTP uses pending base logits for verification, rewinds rejected KV cache
-entries, computes serial MTP logits for verified inputs, and may prepare the
-next async decode after sampling. Generated logprobs and top-n logprobs use the
-resolved row indices when row-mapped pending logits are consumed.
+KV and resource reservations are transaction participants. Async KV writes are
+not made visible by rollback. Unused reservations are released on rollback, and
+frees that could race an in-flight forward wait on the transaction
+forward-done fence.
 
 ## EP Coordination
 
-`EPAsyncStepProtocol` still owns tagged collectives for work consensus, step
-completion, graph-shape sync, step-begin reuse/discard decisions, and async
-handoff launch/skip decisions.
+Expert-parallel async scheduling uses one transaction consensus path:
 
-The transaction lifecycle records EP state through `AsyncEPParticipant`.
-Step-begin decisions are attached to the pending transaction. Handoff decisions
-are staged and attached to the transaction that is launched. If EP skips an
-async handoff, the prepared plan is discarded and the skip reason is counted
-without launching a transaction.
+- all ranks collectively accept or roll back the previous transaction
+- all ranks collectively launch or skip the next committed async forward
+- dummy ranks mirror active-rank forward cadence
+- graph-shape consensus is based on committed plan state
+- tagged collective diagnostics remain attached to the transaction
 
-## Diagnostics
+There is no reorder-based EP handoff protocol.
 
-Async diagnostics are intentionally cheap and deterministic:
+## Eligibility And Diagnostics
 
-- controller counters track eligibility, prepared/launched/reused/committed
-  forwards, rollback/discard, row-mapped reuse, identity reuse, graph mismatch,
-  layout mismatch, and row-map policy
-- transaction diagnostics include state, request IDs, row map, discard reason,
-  plan diagnostics, and participant diagnostics
-- resource diagnostics include reservations, deferred KV blocks, deferred
-  Mamba slots, Mamba leases, and consumed reservations
-- EP diagnostics include protocol counters and transaction-local EP decisions
+`classify_committed_async_launch` centralizes component gates. Decode-only state
+is mandatory, admission runs before plan build, CUDA graph shape is selected
+from committed state, and prefix/chunked prefill never enters async decode
+launch.
 
-The focused unit tests cover overlap ordering, no pre-launch host sync, reuse
-and commit counters, rollback and release-once behavior, graph mismatch
-discard, identity reuse, row-mapped reuse, Mamba state, MTP/logprob handling, EP
-launch/skip symmetry, and ZMQ protocol compatibility.
+Diagnostics are structured around committed launch attempts, overlap
+opportunities, exact-identity accept/fallback reasons, transaction state, and
+participant state. Fallback reasons are stable strings so tests and benchmark
+logs can compare behavior without depending on transient object details.
+
+## Focused Validation
+
+Useful focused checks:
+
+```bash
+uv run python -m pytest -q tests/unit_tests/inference/test_async_scheduling_compact.py -k "committed_plan or committed_pending_forward or committed_async_launch"
+uv run python -m pytest -q tests/unit_tests/inference/test_async_scheduling_compact.py -k "fast_overlap or transaction_commit_rollback"
+uv run python -m pytest -q tests/unit_tests/inference/test_async_scheduling_compact.py -k "static_cleanup"
+```
+
+Inference-bench and direct-coordinator validation are separate final validation
+steps and are not replaced by these unit/static checks.

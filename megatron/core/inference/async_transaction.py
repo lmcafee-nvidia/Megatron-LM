@@ -22,24 +22,6 @@ class AsyncTxnState(Enum):
     DISCARDED = "discarded"
 
 
-class AsyncRowMapPolicy(str, Enum):
-    """Policy for accepting pending-forward row maps."""
-
-    REUSE = "reuse"
-    IDENTITY_ONLY = "identity_only"
-
-    @classmethod
-    def from_value(cls, value: object) -> "AsyncRowMapPolicy":
-        """Normalize config strings and enum values into an async row-map policy."""
-        if isinstance(value, cls):
-            return value
-        try:
-            return cls(str(value))
-        except ValueError as exc:
-            allowed = ", ".join(policy.value for policy in cls)
-            raise ValueError(f"Unknown async row-map policy {value!r}; expected one of: {allowed}") from exc
-
-
 @dataclass(frozen=True)
 class AsyncGraphShape:
     """CUDA graph and decode-stride shape used by an async forward."""
@@ -147,9 +129,7 @@ class AsyncLayoutSnapshot:
         mamba_write_indices = None
         if getattr(context, "is_hybrid_model", False):
             mamba_read_indices = context._mamba_flat_indices(active_slice)[:request_count].clone()
-            mamba_write_indices = context._mamba_flat_indices(
-                active_slice, use_candidate_bank=True
-            )[:request_count].clone()
+            mamba_write_indices = context._mamba_flat_indices(active_slice)[:request_count].clone()
 
         return cls(
             request_ids=request_ids,
@@ -177,27 +157,6 @@ class AsyncLayoutSnapshot:
             mamba_write_indices=mamba_write_indices,
         )
 
-    def row_map_to_current(self, current_request_ids: Tensor) -> Tensor | None:
-        """Map current request rows to this snapshot's pending rows."""
-        current_request_ids = current_request_ids.to(device="cpu")
-        pending_request_ids = self.request_ids.to(device="cpu")
-        current_count = int(current_request_ids.numel())
-        if current_count == 0 or int(pending_request_ids.numel()) < current_count:
-            return None
-        if torch.equal(pending_request_ids, current_request_ids):
-            return torch.arange(current_count, dtype=torch.long, device="cpu")
-
-        pending_row_by_request_id = {
-            int(request_id): row for row, request_id in enumerate(pending_request_ids.tolist())
-        }
-        mapped_rows = []
-        for request_id in current_request_ids.tolist():
-            row = pending_row_by_request_id.get(int(request_id))
-            if row is None:
-                return None
-            mapped_rows.append(row)
-        return torch.tensor(mapped_rows, dtype=torch.long, device="cpu")
-
     def graph_compatible_with(self, current: "AsyncLayoutSnapshot") -> bool:
         """Return whether the pending graph execution shape can satisfy current rows."""
         return (
@@ -205,85 +164,6 @@ class AsyncLayoutSnapshot:
             and self.graph_shape.padded_active_request_count
             == current.graph_shape.padded_active_request_count
         )
-
-    def layout_compatible_with(
-        self, current: "AsyncLayoutSnapshot", *, row_map: Tensor | None = None
-    ) -> bool:
-        """Return whether current CPU bookkeeping matches this pending layout."""
-        planned_fields = (
-            self.request_query_lengths,
-            self.request_kv_length_offsets,
-            self.token_to_request_idx,
-            self.token_to_pos_ids,
-            self.token_to_block_idx,
-            self.token_to_local_position_within_kv_block,
-            self.mamba_read_indices,
-            self.mamba_write_indices,
-        )
-        if all(field is None for field in planned_fields):
-            return True
-
-        request_count = int(current.request_ids.numel())
-        pending_request_count = int(self.request_ids.numel())
-        if request_count == 0 or pending_request_count < request_count:
-            return False
-
-        row_map = self.row_map_to_current(current.request_ids) if row_map is None else row_map
-        if row_map is None:
-            return False
-        row_map = row_map.to(dtype=torch.long, device="cpu")
-        if int(row_map.numel()) != request_count:
-            return False
-        if bool((row_map < 0).any()) or bool((row_map >= pending_request_count).any()):
-            return False
-
-        if not _row_field_matches(self.request_query_lengths, current.request_query_lengths, row_map):
-            return False
-        if not _row_field_matches(
-            self.request_kv_length_offsets, current.request_kv_length_offsets, row_map
-        ):
-            return False
-
-        tokens_per_request = self.graph_shape.tokens_per_request
-        if current.graph_shape.active_token_count != request_count * tokens_per_request:
-            return False
-
-        if self.token_to_request_idx is not None:
-            if current.token_to_request_idx is None:
-                return False
-            current_token_rows = current.token_to_request_idx.to(dtype=torch.long, device="cpu")
-            planned_token_rows = self.token_to_request_idx.index_select(0, row_map).to(
-                dtype=torch.long, device="cpu"
-            )
-            if (
-                bool((current_token_rows < 0).any())
-                or bool((current_token_rows >= request_count).any())
-                or bool((planned_token_rows < 0).any())
-                or bool((planned_token_rows >= pending_request_count).any())
-            ):
-                return False
-            current_token_request_ids = current.request_ids.to(device="cpu").index_select(
-                0, current_token_rows.reshape(-1)
-            ).view_as(current_token_rows)
-            planned_token_request_ids = self.request_ids.to(device="cpu").index_select(
-                0, planned_token_rows.reshape(-1)
-            ).view_as(planned_token_rows)
-            if not torch.equal(current_token_request_ids, planned_token_request_ids):
-                return False
-
-        for planned, current_field in (
-            (self.token_to_pos_ids, current.token_to_pos_ids),
-            (self.token_to_block_idx, current.token_to_block_idx),
-            (
-                self.token_to_local_position_within_kv_block,
-                current.token_to_local_position_within_kv_block,
-            ),
-            (self.mamba_read_indices, current.mamba_read_indices),
-            (self.mamba_write_indices, current.mamba_write_indices),
-        ):
-            if not _row_field_matches(planned, current_field, row_map):
-                return False
-        return True
 
 
 @dataclass(frozen=True)
@@ -541,22 +421,10 @@ class CommittedDecodePlan:
             "finished_requests": int(self.finished_request_ids.numel()),
         }
 
-    def resolve_pending_forward(
-        self,
-        current: AsyncLayoutSnapshot,
-        *,
-        row_map_policy: AsyncRowMapPolicy | str = AsyncRowMapPolicy.REUSE,
-    ) -> "AsyncPendingForwardDecision":
-        """Resolve this plan's layout snapshot against the current context layout."""
-        current_plan = CommittedDecodePlan.from_snapshot(current)
-        return resolve_committed_plan_identity(
-            self, current_plan, row_map_policy=row_map_policy
-        )
-
-    def with_pending_forward_decision(
-        self, decision: "AsyncPendingForwardDecision"
+    def with_identity_decision(
+        self, decision: "CommittedPlanIdentityDecision"
     ) -> "CommittedDecodePlan":
-        """Return a copy of the plan annotated with a pending-forward decision."""
+        """Return a copy of the plan annotated with an exact identity decision."""
         return replace(
             self,
             graph_compatible=decision.graph_compatible,
@@ -592,109 +460,9 @@ class CommittedPlanIdentityDecision:
         }
 
 
-@dataclass(frozen=True)
-class AsyncPendingForwardDecision:
-    """Structured decision for reusing or discarding one pending async forward."""
-
-    reusable: bool
-    row_map: Tensor | None
-    row_mapped: bool
-    reason: str | None
-    row_map_policy: AsyncRowMapPolicy
-    graph_compatible: bool
-    layout_compatible: bool
-
-    @property
-    def discard(self) -> bool:
-        """Whether a pending forward exists but must be discarded."""
-        return not self.reusable
-
-    def diagnostics(self) -> dict[str, Any]:
-        """Return a stable pending-forward decision snapshot."""
-        return {
-            "reusable": self.reusable,
-            "row_map": None if self.row_map is None else self.row_map.to(device="cpu").tolist(),
-            "row_mapped": self.row_mapped,
-            "reason": self.reason,
-            "row_map_policy": self.row_map_policy.value,
-            "graph_compatible": self.graph_compatible,
-            "layout_compatible": self.layout_compatible,
-        }
-
-
-def resolve_async_pending_forward(
-    pending: AsyncLayoutSnapshot,
-    current: AsyncLayoutSnapshot,
-    *,
-    row_map_policy: AsyncRowMapPolicy | str = AsyncRowMapPolicy.REUSE,
-) -> AsyncPendingForwardDecision:
-    """Return the centralized pending-forward reuse decision."""
-    policy = AsyncRowMapPolicy.from_value(row_map_policy)
-    graph_compatible = pending.graph_compatible_with(current)
-    if not graph_compatible:
-        return AsyncPendingForwardDecision(
-            reusable=False,
-            row_map=None,
-            row_mapped=False,
-            reason="graph shape mismatch",
-            row_map_policy=policy,
-            graph_compatible=False,
-            layout_compatible=False,
-        )
-
-    row_map = pending.row_map_to_current(current.request_ids)
-    if row_map is None:
-        return AsyncPendingForwardDecision(
-            reusable=False,
-            row_map=None,
-            row_mapped=False,
-            reason="request row mismatch",
-            row_map_policy=policy,
-            graph_compatible=True,
-            layout_compatible=False,
-        )
-
-    identity = torch.arange(int(row_map.numel()), dtype=torch.long, device="cpu")
-    row_mapped = not torch.equal(row_map.to(dtype=torch.long, device="cpu"), identity)
-    if policy == AsyncRowMapPolicy.IDENTITY_ONLY and row_mapped:
-        return AsyncPendingForwardDecision(
-            reusable=False,
-            row_map=row_map,
-            row_mapped=True,
-            reason="row map policy rejected non-identity layout",
-            row_map_policy=policy,
-            graph_compatible=True,
-            layout_compatible=False,
-        )
-
-    layout_compatible = pending.layout_compatible_with(current, row_map=row_map)
-    if not layout_compatible:
-        return AsyncPendingForwardDecision(
-            reusable=False,
-            row_map=row_map,
-            row_mapped=row_mapped,
-            reason="layout mismatch",
-            row_map_policy=policy,
-            graph_compatible=True,
-            layout_compatible=False,
-        )
-
-    return AsyncPendingForwardDecision(
-        reusable=True,
-        row_map=row_map,
-        row_mapped=row_mapped,
-        reason=None,
-        row_map_policy=policy,
-        graph_compatible=True,
-        layout_compatible=True,
-    )
-
-
 def resolve_committed_plan_identity(
     pending: CommittedDecodePlan,
     current: CommittedDecodePlan,
-    *,
-    row_map_policy: AsyncRowMapPolicy | str | None = None,
 ) -> CommittedPlanIdentityDecision:
     """Return an exact committed-identity reuse decision for a pending forward."""
     graph_compatible = pending.cuda_graph_shape == current.cuda_graph_shape
@@ -758,26 +526,23 @@ def resolve_committed_plan_identity(
     )
 
 
-AsyncDecodePlan = CommittedDecodePlan
-
-
 @runtime_checkable
 class AsyncTransactionParticipant(Protocol):
     """Hook protocol for subsystems participating in async transaction lifecycle."""
 
-    def prepare(self, plan: AsyncDecodePlan) -> object | None:
+    def prepare(self, plan: CommittedDecodePlan) -> object | None:
         """Prepare speculative state for ``plan``."""
         ...
 
-    def validate(self, plan: AsyncDecodePlan, current_state: object) -> bool:
+    def validate(self, plan: CommittedDecodePlan, current_state: object) -> bool:
         """Return whether prepared speculative state is still valid."""
         ...
 
-    def commit(self, plan: AsyncDecodePlan) -> None:
+    def commit(self, plan: CommittedDecodePlan) -> None:
         """Commit prepared speculative side effects."""
         ...
 
-    def rollback(self, plan: AsyncDecodePlan) -> None:
+    def rollback(self, plan: CommittedDecodePlan) -> None:
         """Rollback prepared speculative side effects."""
         ...
 
@@ -848,14 +613,6 @@ def _committed_mamba_slot_ids_from_context(context: Any, active_slice: slice) ->
     return torch.empty((0,), dtype=torch.int32, device="cpu")
 
 
-def _row_field_matches(planned: Tensor | None, current: Tensor | None, row_map: Tensor) -> bool:
-    if planned is None:
-        return True
-    if current is None:
-        return False
-    return torch.equal(current.to(device="cpu"), planned.index_select(0, row_map).to(device="cpu"))
-
-
 @dataclass
 class AsyncDecodeTransaction:
     """Owns one speculative async decode forward and all state tied to it."""
@@ -863,13 +620,12 @@ class AsyncDecodeTransaction:
     step_id: int
     state: AsyncTxnState
     snapshot: AsyncLayoutSnapshot
-    plan: AsyncDecodePlan | None = None
+    plan: CommittedDecodePlan | None = None
     sample_ticket: object | None = None
     resources: object | None = None
     h2d_done_event: object | None = None
     forward_done_event: object | None = None
     ep_decision: object | None = None
-    row_map: object | None = None
     discard_reason: str | None = None
     invalidation_reason: str | None = None
     participants: tuple[AsyncTransactionParticipant, ...] = ()
@@ -882,7 +638,7 @@ class AsyncDecodeTransaction:
 
     def __post_init__(self) -> None:
         if self.plan is None:
-            self.plan = AsyncDecodePlan.from_snapshot(self.snapshot)
+            self.plan = CommittedDecodePlan.from_snapshot(self.snapshot)
 
     def mark_launched(
         self,
@@ -905,7 +661,7 @@ class AsyncDecodeTransaction:
         self.output_handle = output_handle if output_handle is not None else self.output_handle
         self.state = AsyncTxnState.LAUNCHED
 
-    def prepare_participants(self, plan: AsyncDecodePlan | None = None) -> None:
+    def prepare_participants(self, plan: CommittedDecodePlan | None = None) -> None:
         """Prepare all transaction participants for the plan."""
         if self._participants_prepared:
             return
@@ -916,14 +672,14 @@ class AsyncDecodeTransaction:
         self._participants_prepared = True
 
     def validate_participants(
-        self, current_state: object, plan: AsyncDecodePlan | None = None
+        self, current_state: object, plan: CommittedDecodePlan | None = None
     ) -> bool:
         """Validate all prepared participants against current state."""
         plan = self.plan if plan is None else plan
         assert plan is not None
         return all(participant.validate(plan, current_state) for participant in self.participants)
 
-    def commit_participants(self, plan: AsyncDecodePlan | None = None) -> None:
+    def commit_participants(self, plan: CommittedDecodePlan | None = None) -> None:
         """Commit all participant-owned speculative side effects."""
         if self._participants_committed or self._participants_rolled_back:
             return
@@ -933,7 +689,7 @@ class AsyncDecodeTransaction:
             participant.commit(plan)
         self._participants_committed = True
 
-    def rollback_participants(self, plan: AsyncDecodePlan | None = None) -> None:
+    def rollback_participants(self, plan: CommittedDecodePlan | None = None) -> None:
         """Rollback all participant-owned speculative side effects."""
         if self._participants_committed or self._participants_rolled_back:
             return
@@ -943,7 +699,7 @@ class AsyncDecodeTransaction:
             participant.rollback(plan)
         self._participants_rolled_back = True
 
-    def retire_participants(self, plan: AsyncDecodePlan | None = None) -> None:
+    def retire_participants(self, plan: CommittedDecodePlan | None = None) -> None:
         """Retire participant-owned handles that expose an optional retire hook."""
         if self._participants_retired:
             return
@@ -957,22 +713,20 @@ class AsyncDecodeTransaction:
                     retire(plan)
         self._participants_retired = True
 
-    def resolve_against_current(self, context: object) -> Tensor | None:
-        """Resolve this transaction's pending rows against the current context."""
+    def resolve_against_current(self, context: object) -> bool:
+        """Resolve this transaction against the current committed context identity."""
         current = AsyncLayoutSnapshot.from_context_current(
             context, tokens_per_request=self.snapshot.graph_shape.tokens_per_request
         )
         assert self.plan is not None
-        decision = self.plan.resolve_pending_forward(current)
-        self.plan = self.plan.with_pending_forward_decision(decision)
+        current_plan = CommittedDecodePlan.from_snapshot(current)
+        decision = resolve_committed_plan_identity(self.plan, current_plan)
+        self.plan = self.plan.with_identity_decision(decision)
         if not decision.reusable:
             self.discard(decision.reason or "pending forward not reusable")
-            return None
-        row_map = decision.row_map
-        assert row_map is not None
-        self.row_map = row_map
+            return False
         self.state = AsyncTxnState.RESOLVED
-        return row_map
+        return True
 
     def mark_committed(self) -> None:
         """Mark transaction-owned side effects as committed."""
@@ -1023,16 +777,10 @@ class AsyncDecodeTransaction:
 
     def diagnostics(self) -> dict[str, Any]:
         """Return stable transaction diagnostics for tests and benchmark logs."""
-        row_map = None
-        if self.row_map is not None and hasattr(self.row_map, "tolist"):
-            row_map = self.row_map.tolist()
-        elif self.row_map is not None:
-            row_map = self.row_map
         return {
             "step_id": self.step_id,
             "state": self.state.value,
             "request_ids": self.snapshot.request_ids.to(device="cpu").tolist(),
-            "row_map": row_map,
             "discard_reason": self.discard_reason,
             "invalidation_reason": self.invalidation_reason,
             "has_sample_ticket": self.sample_ticket is not None,
@@ -1416,16 +1164,16 @@ class AsyncResourceParticipant:
     committed: bool = False
     rolled_back: bool = False
 
-    def prepare(self, plan: AsyncDecodePlan) -> dict[str, int | bool]:
+    def prepare(self, plan: CommittedDecodePlan) -> dict[str, int | bool]:
         """Capture resource diagnostics for the prepared transaction."""
         self.prepared = True
         return self.diagnostics()
 
-    def validate(self, plan: AsyncDecodePlan, current_state: object) -> bool:
+    def validate(self, plan: CommittedDecodePlan, current_state: object) -> bool:
         """Resource ledgers are valid as long as they are still in flight or empty."""
         return self.ledger.in_flight or self.ledger.reservation_count == 0
 
-    def commit(self, plan: AsyncDecodePlan) -> None:
+    def commit(self, plan: CommittedDecodePlan) -> None:
         """Mark resource side effects as accepted by the transaction."""
         if self.committed:
             return
@@ -1433,7 +1181,7 @@ class AsyncResourceParticipant:
             self.ledger.release_deferred(self.context)
         self.committed = True
 
-    def rollback(self, plan: AsyncDecodePlan) -> None:
+    def rollback(self, plan: CommittedDecodePlan) -> None:
         """Release every speculative resource exactly once."""
         if self.committed or self.rolled_back:
             return
@@ -1462,30 +1210,28 @@ class AsyncMambaStateParticipant:
     committed: bool = False
     rolled_back: bool = False
 
-    def prepare(self, plan: AsyncDecodePlan) -> dict[str, bool]:
+    def prepare(self, plan: CommittedDecodePlan) -> dict[str, bool]:
         """Snapshot live Mamba slots before the async launch can write them."""
         snapshot = getattr(self.context, "snapshot_async_mamba_state", None)
         if snapshot is not None:
             self.snapshot = snapshot(plan.request_ids)
         return self.diagnostics()
 
-    def validate(self, plan: AsyncDecodePlan, current_state: object) -> bool:
+    def validate(self, plan: CommittedDecodePlan, current_state: object) -> bool:
         """Mamba state validity is covered by the plan layout decision."""
         return True
 
-    def commit(self, plan: AsyncDecodePlan) -> None:
+    def commit(self, plan: CommittedDecodePlan) -> None:
         """Accept async Mamba writes and release snapshot ownership."""
         if self.committed:
             return
         clear_snapshot = getattr(self.context, "clear_async_mamba_snapshot", None)
         if clear_snapshot is not None:
             clear_snapshot(self.snapshot)
-        elif getattr(self.context, "is_hybrid_model", False):
-            self.context.accept_async_mamba_state(plan.request_ids)
         self.snapshot = None
         self.committed = True
 
-    def rollback(self, plan: AsyncDecodePlan) -> None:
+    def rollback(self, plan: CommittedDecodePlan) -> None:
         """Restore snapshotted Mamba slots before synchronous fallback."""
         if self.committed or self.rolled_back:
             return
@@ -1512,21 +1258,21 @@ class AsyncSampleReadbackParticipant:
     committed: bool = False
     rolled_back: bool = False
 
-    def prepare(self, plan: AsyncDecodePlan) -> dict[str, int | bool]:
+    def prepare(self, plan: CommittedDecodePlan) -> dict[str, int | bool]:
         """Sample copy is already queued; expose the ticket diagnostics."""
         return self.diagnostics()
 
-    def validate(self, plan: AsyncDecodePlan, current_state: object) -> bool:
+    def validate(self, plan: CommittedDecodePlan, current_state: object) -> bool:
         """Sample tickets remain valid until their owning transaction retires."""
         return True
 
-    def commit(self, plan: AsyncDecodePlan) -> None:
+    def commit(self, plan: CommittedDecodePlan) -> None:
         """Mark the sample ticket as consumed by a committed transaction."""
         if self.committed:
             return
         self.committed = True
 
-    def rollback(self, plan: AsyncDecodePlan) -> None:
+    def rollback(self, plan: CommittedDecodePlan) -> None:
         """Mark the sample ticket as discarded with the transaction."""
         if self.committed:
             return
@@ -1551,21 +1297,21 @@ class AsyncLogprobMTPParticipant:
     committed: bool = False
     rolled_back: bool = False
 
-    def prepare(self, plan: AsyncDecodePlan) -> dict[str, bool]:
+    def prepare(self, plan: CommittedDecodePlan) -> dict[str, bool]:
         """Logprob and MTP tensors are prepared by controller sampling paths."""
         return self.diagnostics()
 
-    def validate(self, plan: AsyncDecodePlan, current_state: object) -> bool:
+    def validate(self, plan: CommittedDecodePlan, current_state: object) -> bool:
         """Logprob and MTP state is valid when the pending forward itself is valid."""
         return True
 
-    def commit(self, plan: AsyncDecodePlan) -> None:
+    def commit(self, plan: CommittedDecodePlan) -> None:
         """Mark logprob/MTP participant state as accepted."""
         if self.committed:
             return
         self.committed = True
 
-    def rollback(self, plan: AsyncDecodePlan) -> None:
+    def rollback(self, plan: CommittedDecodePlan) -> None:
         """Mark logprob/MTP participant state as discarded."""
         if self.committed:
             return
@@ -1599,22 +1345,22 @@ class AsyncEPParticipant:
         """Attach the EP handoff launch or skip decision for a candidate transaction."""
         self.handoff_decision = decision
 
-    def prepare(self, plan: AsyncDecodePlan) -> dict[str, object]:
+    def prepare(self, plan: CommittedDecodePlan) -> dict[str, object]:
         """Record that EP state is prepared with the transaction plan."""
         self.prepared = True
         return self.diagnostics()
 
-    def validate(self, plan: AsyncDecodePlan, current_state: object) -> bool:
+    def validate(self, plan: CommittedDecodePlan, current_state: object) -> bool:
         """EP decisions are validated by their tagged collectives."""
         return True
 
-    def commit(self, plan: AsyncDecodePlan) -> None:
+    def commit(self, plan: CommittedDecodePlan) -> None:
         """Mark EP decision state as committed with the transaction."""
         if self.committed:
             return
         self.committed = True
 
-    def rollback(self, plan: AsyncDecodePlan) -> None:
+    def rollback(self, plan: CommittedDecodePlan) -> None:
         """Mark EP decision state as rolled back with the transaction."""
         if self.committed:
             return
