@@ -26,6 +26,7 @@ from megatron.core.inference.async_transaction import (
     AsyncTxnState,
     CommittedDecodePlan,
     classify_async_eligibility,
+    classify_committed_async_launch,
     resolve_async_pending_forward,
     resolve_committed_plan_identity,
 )
@@ -1470,6 +1471,34 @@ def test_async_scheduling_disabled_reason_matrix(case, expected):
     assert controller._async_scheduling_disabled_reason(allow_mtp=allow_mtp) == expected
     if case == "admission_barrier":
         assert not controller._async_admission_barrier_requested
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize(
+    ("case", "allow_mtp", "expected"),
+    [
+        ("mtp_accept_decode_only", True, None),
+        ("mtp_reject_without_allowance", False, "mtp pre-sampling graph is unsupported"),
+        ("waiting_admission_prefill", True, "not decode-only"),
+        ("cuda_graph_stride", True, "cuda graph shape does not match decode stride"),
+    ],
+)
+def test_classify_committed_async_launch_routes_component_gates(case, allow_mtp, expected):
+    controller, context = _make_async_gate_controller()
+    if case in ("mtp_accept_decode_only", "mtp_reject_without_allowance", "cuda_graph_stride"):
+        controller.num_speculative_tokens = 1
+        controller._num_mtp_depths = 1
+        context.padded_batch_dimensions = InferenceBatchDimensions(4, 0, 2)
+    if case == "waiting_admission_prefill":
+        context.is_decode_only = lambda: False
+        context.padded_batch_dimensions = InferenceBatchDimensions(8, 1, 2)
+    elif case == "cuda_graph_stride":
+        context.padded_batch_dimensions = InferenceBatchDimensions(3, 0, 2)
+
+    decision = classify_committed_async_launch(controller, context, allow_mtp=allow_mtp)
+
+    assert decision.reason == expected
+    assert decision.can_launch is (expected is None)
 
 
 @pytest.mark.internal

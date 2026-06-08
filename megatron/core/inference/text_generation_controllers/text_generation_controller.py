@@ -30,7 +30,7 @@ from megatron.core.inference.async_transaction import (
     AsyncTxnState,
     CommittedDecodePlan,
     CommittedPlanIdentityDecision,
-    classify_async_eligibility,
+    classify_committed_async_launch,
     resolve_committed_plan_identity,
 )
 from megatron.core.inference.communication_utils import (
@@ -2145,7 +2145,7 @@ class TextGenerationController:
     def _async_scheduling_global_disabled_reason(self, *, allow_mtp: bool = False) -> Optional[str]:
         """Return non-step-local reasons async scheduling is disabled, or None."""
         context = self.inference_wrapped_model.inference_context
-        return classify_async_eligibility(
+        return classify_committed_async_launch(
             self, context, allow_mtp=allow_mtp, check_context=False
         ).reason
 
@@ -2162,7 +2162,7 @@ class TextGenerationController:
     def _async_scheduling_disabled_reason(self, *, allow_mtp: bool = False) -> Optional[str]:
         """Return why async scheduling cannot be used for the current step, or None."""
         context = self.inference_wrapped_model.inference_context
-        return classify_async_eligibility(self, context, allow_mtp=allow_mtp).reason
+        return classify_committed_async_launch(self, context, allow_mtp=allow_mtp).reason
 
     def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
         """Perform bookkeeping necessary to compute log probs for dynamic batching.

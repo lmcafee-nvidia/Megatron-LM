@@ -1664,7 +1664,20 @@ def classify_async_eligibility(
     allow_mtp: bool = False,
     check_context: bool = True,
 ) -> AsyncEligibilityDecision:
-    """Return whether async decode can prepare and launch, preserving diagnostics."""
+    """Compatibility wrapper for committed async launch classification."""
+    return classify_committed_async_launch(
+        controller, context, allow_mtp=allow_mtp, check_context=check_context
+    )
+
+
+def classify_committed_async_launch(
+    controller: object,
+    context: object,
+    *,
+    allow_mtp: bool = False,
+    check_context: bool = True,
+) -> AsyncEligibilityDecision:
+    """Return whether a committed decode-only state may launch async work."""
     reason = _classify_async_disabled_reason(
         controller, context, allow_mtp=allow_mtp, check_context=check_context
     )
