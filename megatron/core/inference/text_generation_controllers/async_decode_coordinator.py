@@ -3,10 +3,10 @@
 from typing import Dict, Optional
 
 from megatron.core.inference.async_transaction import (
-    AsyncDecodePlan,
     AsyncDecodeTransaction,
     AsyncLayoutSnapshot,
     AsyncTxnState,
+    CommittedDecodePlan,
 )
 
 
@@ -31,7 +31,7 @@ class AsyncDecodeCoordinator:
         self,
         *,
         snapshot: AsyncLayoutSnapshot,
-        plan: AsyncDecodePlan | None = None,
+        plan: CommittedDecodePlan | None = None,
         state: AsyncTxnState = AsyncTxnState.PREPARED,
     ) -> AsyncDecodeTransaction:
         """Create and register the transaction for a just-prepared async forward."""

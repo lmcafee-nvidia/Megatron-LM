@@ -12,7 +12,7 @@ import torch.nn.functional as F  # type: ignore
 from torch import Tensor  # type: ignore
 
 from megatron.core import parallel_state
-from megatron.core.inference.async_transaction import AsyncDecodePlan, AsyncResourceLedger
+from megatron.core.inference.async_transaction import AsyncResourceLedger, CommittedDecodePlan
 from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
@@ -213,7 +213,7 @@ class ContextErrorFactory:
         return error
 
 
-AsyncDecodeLifecyclePlan = AsyncDecodePlan
+AsyncDecodeLifecyclePlan = CommittedDecodePlan
 
 
 def get_mem_size_str(n_bytes: int) -> str:
@@ -2756,6 +2756,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             active_token_count=planned_active_request_count * tokens_per_request,
             padded_active_request_count=self.padded_active_request_count,
             tokens_per_request=tokens_per_request,
+            mamba_slot_ids=(
+                self._mamba_flat_indices_from_request_idxs(planned_active_source_idxs)
+                if self.is_hybrid_model
+                else torch.empty((0,), dtype=torch.int32, device='cpu')
+            ),
             requires_mamba_state=self.is_hybrid_model,
             requires_mtp=self.num_speculative_tokens > 0,
             expected_kv_reservation_count=int(reserved_block_ids.numel()),

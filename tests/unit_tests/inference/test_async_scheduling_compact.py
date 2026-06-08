@@ -24,8 +24,10 @@ from megatron.core.inference.async_transaction import (
     AsyncStepTransaction,
     AsyncTransactionParticipant,
     AsyncTxnState,
+    CommittedDecodePlan,
     classify_async_eligibility,
     resolve_async_pending_forward,
+    resolve_committed_plan_identity,
 )
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.config import InferenceConfig
@@ -49,6 +51,10 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.transformer.enums import InferenceCudaGraphScope
+from tests.unit_tests.inference.async_transaction_test_helpers import (
+    assert_exact_plan_identity,
+    fake_committed_decode_context,
+)
 
 
 class _RecordingEPCommunicator:
@@ -414,6 +420,80 @@ def test_async_decode_coordinator_owns_transaction_state_machine():
     assert coordinator.pending_transaction() is None
     assert controller._async_step_transaction is None
     assert not controller._has_pending_async_forward_state()
+
+
+@pytest.mark.internal
+def test_committed_decode_only_plan_builds_from_context():
+    context = fake_committed_decode_context([10, 11], mamba_slots=[3, 5])
+
+    plan = CommittedDecodePlan.from_committed_context(context)
+
+    assert plan is not None
+    assert plan.request_ids.tolist() == [10, 11]
+    assert plan.row_order.tolist() == [0, 1]
+    assert plan.active_decode_count == 2
+    assert plan.cuda_graph_shape == AsyncGraphShape(2, 2, 2, 1)
+    assert plan.decode_stride == 1
+    assert plan.mamba_slot_ids.tolist() == [3, 5]
+    assert plan.identity_fingerprint == plan.diagnostics()["identity_fingerprint"]
+
+
+@pytest.mark.internal
+def test_committed_plan_rejects_prefill_or_mixed_state():
+    context = fake_committed_decode_context([10], decode_only=False)
+
+    assert CommittedDecodePlan.from_committed_context(context) is None
+
+
+@pytest.mark.internal
+def test_committed_plan_exact_identity_accepts():
+    context = fake_committed_decode_context([10, 11], mamba_slots=[3, 5])
+    pending = CommittedDecodePlan.from_committed_context(context)
+    current = CommittedDecodePlan.from_committed_context(context)
+
+    assert pending is not None
+    assert current is not None
+    assert_exact_plan_identity(pending, current)
+    decision = resolve_committed_plan_identity(pending, current)
+
+    assert decision.reusable
+    assert not decision.row_mapped
+    assert decision.row_map.tolist() == [0, 1]
+    assert pending.exact_identity_matches(current)
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize(
+    ("current_context", "reason"),
+    [
+        (
+            fake_committed_decode_context([11, 10], mamba_slots=[5, 3]),
+            "committed request identity mismatch",
+        ),
+        (
+            fake_committed_decode_context([10, 11], padded_active_request_count=4, mamba_slots=[3, 5]),
+            "committed graph shape mismatch",
+        ),
+        (
+            fake_committed_decode_context([10, 11], mamba_slots=[3, 6]),
+            "committed mamba slot mismatch",
+        ),
+    ],
+)
+def test_committed_plan_exact_identity_rejects_reorder_graph_or_mamba_mismatch(
+    current_context, reason
+):
+    pending = CommittedDecodePlan.from_committed_context(
+        fake_committed_decode_context([10, 11], mamba_slots=[3, 5])
+    )
+    current = CommittedDecodePlan.from_committed_context(current_context)
+
+    assert pending is not None
+    assert current is not None
+    decision = resolve_committed_plan_identity(pending, current)
+
+    assert not decision.reusable
+    assert decision.reason == reason
 
 
 def _async_layout_snapshot_status(controller):

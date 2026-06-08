@@ -29,7 +29,9 @@ from megatron.core.inference.async_transaction import (
     AsyncSampleReadbackParticipant,
     AsyncSampleTicket,
     AsyncTxnState,
+    CommittedDecodePlan,
     classify_async_eligibility,
+    resolve_committed_plan_identity,
 )
 from megatron.core.inference.communication_utils import (
     broadcast_from_last_pipeline_stage,
@@ -1759,12 +1761,26 @@ class TextGenerationController:
     ) -> AsyncPendingForwardDecision:
         """Return the centralized pending-forward reuse decision."""
         context = self.inference_wrapped_model.inference_context
-        current_snapshot = AsyncLayoutSnapshot.from_context_current(
+        current_plan = CommittedDecodePlan.from_committed_context(
             context, tokens_per_request=self.num_speculative_tokens + 1
         )
+        if current_plan is None:
+            policy = AsyncRowMapPolicy.from_value(
+                getattr(self, "_async_row_map_policy", AsyncRowMapPolicy.IDENTITY_ONLY)
+            )
+            return AsyncPendingForwardDecision(
+                reusable=False,
+                row_map=None,
+                row_mapped=False,
+                reason="current state is not committed decode-only",
+                row_map_policy=policy,
+                graph_compatible=False,
+                layout_compatible=False,
+            )
         assert transaction.plan is not None
-        return transaction.plan.resolve_pending_forward(
-            current_snapshot,
+        return resolve_committed_plan_identity(
+            transaction.plan,
+            current_plan,
             row_map_policy=getattr(self, "_async_row_map_policy", AsyncRowMapPolicy.REUSE),
         )
 

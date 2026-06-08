@@ -287,8 +287,8 @@ class AsyncLayoutSnapshot:
 
 
 @dataclass(frozen=True)
-class AsyncDecodePlan:
-    """Canonical immutable description of one candidate async decode step."""
+class CommittedDecodePlan:
+    """Immutable async launch descriptor built only from committed decode state."""
 
     request_ids: Tensor
     source_request_idxs: Tensor
@@ -308,9 +308,10 @@ class AsyncDecodePlan:
     active_token_count: int
     padded_active_request_count: int | None = None
     tokens_per_request: int = 1
+    mamba_slot_ids: Tensor = field(
+        default_factory=lambda: torch.empty((0,), dtype=torch.int32, device="cpu")
+    )
     layout_snapshot: AsyncLayoutSnapshot | None = None
-    row_map: Tensor | None = None
-    row_mapped: bool = False
     graph_compatible: bool = True
     layout_compatible: bool = True
     eligibility: object | None = None
@@ -322,7 +323,7 @@ class AsyncDecodePlan:
     expected_mamba_lease_count: int = 0
 
     @classmethod
-    def from_snapshot(cls, snapshot: AsyncLayoutSnapshot) -> "AsyncDecodePlan":
+    def from_snapshot(cls, snapshot: AsyncLayoutSnapshot) -> "CommittedDecodePlan":
         """Build a minimal canonical plan around an existing layout snapshot."""
         request_count = int(snapshot.request_ids.numel())
         tokens_per_request = snapshot.graph_shape.tokens_per_request
@@ -371,10 +372,94 @@ class AsyncDecodePlan:
             active_token_count=active_token_count,
             padded_active_request_count=snapshot.graph_shape.padded_active_request_count,
             tokens_per_request=tokens_per_request,
+            mamba_slot_ids=_committed_mamba_slot_ids_from_snapshot(snapshot),
             layout_snapshot=snapshot,
             requires_mamba_state=(
                 snapshot.mamba_read_indices is not None or snapshot.mamba_write_indices is not None
             ),
+        )
+
+    @classmethod
+    def from_committed_context(
+        cls,
+        context: Any,
+        *,
+        tokens_per_request: int = 1,
+        reserved_request_ids: Tensor | None = None,
+        reserved_block_ids: Tensor | None = None,
+        reserved_block_columns: Tensor | None = None,
+    ) -> "CommittedDecodePlan | None":
+        """Build a committed decode-only plan from the context's live CPU state."""
+        if not context.is_decode_only():
+            return None
+        active_slice = slice(context.paused_request_count, context.total_request_count)
+        request_ids = context.request_ids[active_slice].clone()
+        request_count = int(request_ids.numel())
+        if request_count <= 0:
+            return None
+        active_token_count = request_count * tokens_per_request
+        if int(getattr(context, "active_token_count", active_token_count)) != active_token_count:
+            return None
+
+        padded_active_request_count = (
+            context.padded_active_request_count
+            if context.using_cuda_graph_this_step()
+            else None
+        )
+        token_to_request_idx = _clone_token_prefix(
+            getattr(context, "token_to_request_idx", None), active_token_count
+        )
+        if token_to_request_idx is None:
+            token_to_request_idx = torch.arange(
+                request_count, dtype=torch.int32, device="cpu"
+            ).repeat_interleave(tokens_per_request)
+        mamba_slot_ids = _committed_mamba_slot_ids_from_context(context, active_slice)
+        empty_int = torch.empty((0,), dtype=torch.int32, device="cpu")
+        return cls(
+            request_ids=request_ids,
+            source_request_idxs=torch.arange(
+                context.paused_request_count,
+                context.total_request_count,
+                dtype=torch.long,
+                device="cpu",
+            ),
+            query_lengths=_clone_active(context, "request_query_lengths", active_slice),
+            kv_length_offsets=_clone_active(context, "request_kv_length_offsets", active_slice),
+            request_to_kv_block_ids=_clone_active(
+                context, "request_to_kv_block_ids", active_slice
+            ),
+            token_to_pos_ids=_clone_token_prefix(
+                getattr(context, "token_to_pos_ids", None), active_token_count
+            ),
+            token_to_request_idx=token_to_request_idx,
+            token_to_position_in_request=_clone_token_prefix(
+                getattr(context, "token_to_position_in_request", None), active_token_count
+            ),
+            token_to_local_position_within_kv_block=_clone_token_prefix(
+                getattr(context, "token_to_local_position_within_kv_block", None),
+                active_token_count,
+            ),
+            token_to_block_idx=_clone_token_prefix(
+                getattr(context, "token_to_block_idx", None), active_token_count
+            ),
+            reserved_request_ids=(
+                empty_int.clone() if reserved_request_ids is None else reserved_request_ids.clone()
+            ),
+            reserved_block_ids=(
+                empty_int.clone() if reserved_block_ids is None else reserved_block_ids.clone()
+            ),
+            reserved_block_columns=(
+                empty_int.clone()
+                if reserved_block_columns is None
+                else reserved_block_columns.clone()
+            ),
+            finished_request_ids=torch.empty((0,), dtype=request_ids.dtype, device="cpu"),
+            active_request_count=request_count,
+            active_token_count=active_token_count,
+            padded_active_request_count=padded_active_request_count,
+            tokens_per_request=tokens_per_request,
+            mamba_slot_ids=mamba_slot_ids,
+            requires_mamba_state=bool(mamba_slot_ids.numel() > 0),
         )
 
     @property
@@ -389,16 +474,62 @@ class AsyncDecodePlan:
             tokens_per_request=self.tokens_per_request,
         )
 
+    @property
+    def row_order(self) -> Tensor:
+        """Return the committed row order used by this launch."""
+        return self.source_request_idxs
+
+    @property
+    def active_decode_count(self) -> int:
+        """Return the number of committed decode rows."""
+        return self.active_request_count
+
+    @property
+    def cuda_graph_shape(self) -> AsyncGraphShape:
+        """Return the committed CUDA graph shape."""
+        return self.graph_shape
+
+    @property
+    def decode_stride(self) -> int:
+        """Return the committed number of decode tokens per request."""
+        return self.tokens_per_request
+
+    @property
+    def identity_fingerprint(self) -> tuple[object, ...]:
+        """Return the exact identity fingerprint for committed async reuse."""
+        graph_shape = self.cuda_graph_shape
+        return (
+            tuple(_tensor_ints(self.request_ids)),
+            tuple(_tensor_ints(self.row_order)),
+            self.active_decode_count,
+            graph_shape.active_request_count,
+            graph_shape.active_token_count,
+            graph_shape.padded_active_request_count,
+            graph_shape.tokens_per_request,
+            self.decode_stride,
+            tuple(_tensor_ints(self.mamba_slot_ids)),
+            tuple(_tensor_ints(self.reserved_request_ids)),
+            tuple(_tensor_ints(self.reserved_block_ids)),
+            tuple(_tensor_ints(self.reserved_block_columns)),
+        )
+
+    def exact_identity_matches(self, current: "CommittedDecodePlan") -> bool:
+        """Return whether ``current`` has the exact committed launch identity."""
+        return resolve_committed_plan_identity(self, current).reusable
+
     def diagnostics(self) -> dict[str, Any]:
         """Return a cheap immutable-plan diagnostic snapshot."""
         return {
             "request_ids": self.request_ids.to(device="cpu").tolist(),
+            "row_order": self.row_order.to(device="cpu").tolist(),
             "active_request_count": self.active_request_count,
+            "active_decode_count": self.active_decode_count,
             "active_token_count": self.active_token_count,
             "padded_active_request_count": self.padded_active_request_count,
             "tokens_per_request": self.tokens_per_request,
-            "row_map": None if self.row_map is None else self.row_map.to(device="cpu").tolist(),
-            "row_mapped": self.row_mapped,
+            "decode_stride": self.decode_stride,
+            "mamba_slot_ids": self.mamba_slot_ids.to(device="cpu").tolist(),
+            "identity_fingerprint": self.identity_fingerprint,
             "graph_compatible": self.graph_compatible,
             "layout_compatible": self.layout_compatible,
             "requires_mamba_state": self.requires_mamba_state,
@@ -417,25 +548,22 @@ class AsyncDecodePlan:
         row_map_policy: AsyncRowMapPolicy | str = AsyncRowMapPolicy.REUSE,
     ) -> "AsyncPendingForwardDecision":
         """Resolve this plan's layout snapshot against the current context layout."""
-        if self.layout_snapshot is None:
-            raise ValueError("AsyncDecodePlan requires a layout_snapshot to resolve row reuse")
-        return resolve_async_pending_forward(
-            self.layout_snapshot, current, row_map_policy=row_map_policy
+        current_plan = CommittedDecodePlan.from_snapshot(current)
+        return resolve_committed_plan_identity(
+            self, current_plan, row_map_policy=row_map_policy
         )
 
     def with_pending_forward_decision(
         self, decision: "AsyncPendingForwardDecision"
-    ) -> "AsyncDecodePlan":
+    ) -> "CommittedDecodePlan":
         """Return a copy of the plan annotated with a pending-forward decision."""
         return replace(
             self,
-            row_map=decision.row_map,
-            row_mapped=decision.row_mapped,
             graph_compatible=decision.graph_compatible,
             layout_compatible=decision.layout_compatible,
         )
 
-    def with_layout_snapshot(self, snapshot: AsyncLayoutSnapshot) -> "AsyncDecodePlan":
+    def with_layout_snapshot(self, snapshot: AsyncLayoutSnapshot) -> "CommittedDecodePlan":
         """Return a copy of the plan with the prepared runtime layout snapshot attached."""
         return replace(self, layout_snapshot=snapshot)
 
@@ -538,6 +666,104 @@ def resolve_async_pending_forward(
     )
 
 
+def resolve_committed_plan_identity(
+    pending: CommittedDecodePlan,
+    current: CommittedDecodePlan,
+    *,
+    row_map_policy: AsyncRowMapPolicy | str = AsyncRowMapPolicy.IDENTITY_ONLY,
+) -> AsyncPendingForwardDecision:
+    """Return an exact committed-identity reuse decision for a pending forward."""
+    policy = AsyncRowMapPolicy.from_value(row_map_policy)
+
+    graph_compatible = pending.cuda_graph_shape == current.cuda_graph_shape
+    if not graph_compatible:
+        return AsyncPendingForwardDecision(
+            reusable=False,
+            row_map=None,
+            row_mapped=False,
+            reason="committed graph shape mismatch",
+            row_map_policy=policy,
+            graph_compatible=False,
+            layout_compatible=False,
+        )
+    if pending.active_decode_count != current.active_decode_count:
+        return AsyncPendingForwardDecision(
+            reusable=False,
+            row_map=None,
+            row_mapped=False,
+            reason="committed active decode count mismatch",
+            row_map_policy=policy,
+            graph_compatible=True,
+            layout_compatible=False,
+        )
+    if pending.decode_stride != current.decode_stride:
+        return AsyncPendingForwardDecision(
+            reusable=False,
+            row_map=None,
+            row_mapped=False,
+            reason="committed decode stride mismatch",
+            row_map_policy=policy,
+            graph_compatible=True,
+            layout_compatible=False,
+        )
+    if not torch.equal(pending.request_ids.to(device="cpu"), current.request_ids.to(device="cpu")):
+        return AsyncPendingForwardDecision(
+            reusable=False,
+            row_map=None,
+            row_mapped=False,
+            reason="committed request identity mismatch",
+            row_map_policy=policy,
+            graph_compatible=True,
+            layout_compatible=False,
+        )
+    if not torch.equal(pending.row_order.to(device="cpu"), current.row_order.to(device="cpu")):
+        return AsyncPendingForwardDecision(
+            reusable=False,
+            row_map=None,
+            row_mapped=False,
+            reason="committed row order mismatch",
+            row_map_policy=policy,
+            graph_compatible=True,
+            layout_compatible=False,
+        )
+    if not torch.equal(
+        pending.mamba_slot_ids.to(device="cpu"), current.mamba_slot_ids.to(device="cpu")
+    ):
+        return AsyncPendingForwardDecision(
+            reusable=False,
+            row_map=None,
+            row_mapped=False,
+            reason="committed mamba slot mismatch",
+            row_map_policy=policy,
+            graph_compatible=True,
+            layout_compatible=False,
+        )
+    if pending.identity_fingerprint != current.identity_fingerprint:
+        return AsyncPendingForwardDecision(
+            reusable=False,
+            row_map=None,
+            row_mapped=False,
+            reason="committed resource identity mismatch",
+            row_map_policy=policy,
+            graph_compatible=True,
+            layout_compatible=False,
+        )
+
+    row_map = torch.arange(pending.active_decode_count, dtype=torch.long, device="cpu")
+    return AsyncPendingForwardDecision(
+        reusable=True,
+        row_map=row_map,
+        row_mapped=False,
+        reason=None,
+        row_map_policy=policy,
+        graph_compatible=True,
+        layout_compatible=True,
+    )
+
+
+AsyncDecodePlan = CommittedDecodePlan
+
+
 @runtime_checkable
 class AsyncTransactionParticipant(Protocol):
     """Hook protocol for subsystems participating in async transaction lifecycle."""
@@ -592,6 +818,37 @@ def _clone_token_rows(
     if token_count <= 0:
         return None
     return value[:token_count].view(request_count, tokens_per_request).clone()
+
+
+def _clone_token_prefix(value: Tensor | None, token_count: int) -> Tensor | None:
+    if value is None:
+        return None
+    return value[:token_count].clone()
+
+
+def _committed_mamba_slot_ids_from_snapshot(snapshot: AsyncLayoutSnapshot) -> Tensor:
+    if snapshot.mamba_read_indices is not None:
+        return snapshot.mamba_read_indices.to(dtype=torch.int32, device="cpu").clone()
+    if snapshot.mamba_write_indices is not None:
+        return snapshot.mamba_write_indices.to(dtype=torch.int32, device="cpu").clone()
+    return torch.empty((0,), dtype=torch.int32, device="cpu")
+
+
+def _committed_mamba_slot_ids_from_context(context: Any, active_slice: slice) -> Tensor:
+    explicit_slots = getattr(context, "mamba_slot_ids", None)
+    if explicit_slots is not None:
+        return explicit_slots[: active_slice.stop - active_slice.start].to(
+            dtype=torch.int32, device="cpu"
+        ).clone()
+    if getattr(context, "is_hybrid_model", False):
+        if hasattr(context, "_mamba_flat_indices"):
+            return context._mamba_flat_indices(active_slice).to(dtype=torch.int32, device="cpu")
+        metadata = getattr(context, "mamba_metadata", None)
+        if metadata is not None and hasattr(metadata, "request_to_mamba_state_idx"):
+            return metadata.request_to_mamba_state_idx[active_slice].to(
+                dtype=torch.int32, device="cpu"
+            ).clone()
+    return torch.empty((0,), dtype=torch.int32, device="cpu")
 
 
 def _row_field_matches(planned: Tensor | None, current: Tensor | None, row_map: Tensor) -> bool:

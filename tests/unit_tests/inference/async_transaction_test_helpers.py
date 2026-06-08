@@ -140,6 +140,7 @@ def fake_committed_decode_context(
         request_kv_length_offsets=kv_offsets.to(dtype=torch.int32),
         token_to_request_idx=token_to_request_idx,
         token_to_pos_ids=token_to_pos_ids,
+        token_to_position_in_request=token_to_pos_ids.clone(),
         token_to_block_idx=torch.arange(token_count, dtype=torch.int32, device="cpu"),
         token_to_local_position_within_kv_block=token_to_pos_ids.to(dtype=torch.int32),
         mamba_slot_ids=mamba_slots_tensor,
