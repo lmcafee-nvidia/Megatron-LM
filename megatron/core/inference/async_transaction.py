@@ -877,6 +877,11 @@ class AsyncDecodeTransaction:
     invalidation_reason: str | None = None
     participants: tuple[AsyncTransactionParticipant, ...] = ()
     participant_state: dict[str, object] = field(default_factory=dict)
+    output_handle: object | None = None
+    _participants_prepared: bool = False
+    _participants_committed: bool = False
+    _participants_rolled_back: bool = False
+    _participants_retired: bool = False
 
     def __post_init__(self) -> None:
         if self.plan is None:
@@ -890,6 +895,7 @@ class AsyncDecodeTransaction:
         h2d_done_event: object | None = None,
         forward_done_event: object | None = None,
         ep_decision: object | None = None,
+        output_handle: object | None = None,
     ) -> None:
         """Mark the async forward as launched and attach launch-owned state."""
         self.sample_ticket = sample_ticket if sample_ticket is not None else self.sample_ticket
@@ -899,14 +905,18 @@ class AsyncDecodeTransaction:
             forward_done_event if forward_done_event is not None else self.forward_done_event
         )
         self.ep_decision = ep_decision if ep_decision is not None else self.ep_decision
+        self.output_handle = output_handle if output_handle is not None else self.output_handle
         self.state = AsyncTxnState.LAUNCHED
 
     def prepare_participants(self, plan: AsyncDecodePlan | None = None) -> None:
         """Prepare all transaction participants for the plan."""
+        if self._participants_prepared:
+            return
         plan = self.plan if plan is None else plan
         assert plan is not None
         for participant in self.participants:
             self.participant_state[type(participant).__name__] = participant.prepare(plan)
+        self._participants_prepared = True
 
     def validate_participants(
         self, current_state: object, plan: AsyncDecodePlan | None = None
@@ -918,17 +928,37 @@ class AsyncDecodeTransaction:
 
     def commit_participants(self, plan: AsyncDecodePlan | None = None) -> None:
         """Commit all participant-owned speculative side effects."""
+        if self._participants_committed or self._participants_rolled_back:
+            return
         plan = self.plan if plan is None else plan
         assert plan is not None
         for participant in self.participants:
             participant.commit(plan)
+        self._participants_committed = True
 
     def rollback_participants(self, plan: AsyncDecodePlan | None = None) -> None:
         """Rollback all participant-owned speculative side effects."""
+        if self._participants_committed or self._participants_rolled_back:
+            return
         plan = self.plan if plan is None else plan
         assert plan is not None
         for participant in reversed(self.participants):
             participant.rollback(plan)
+        self._participants_rolled_back = True
+
+    def retire_participants(self, plan: AsyncDecodePlan | None = None) -> None:
+        """Retire participant-owned handles that expose an optional retire hook."""
+        if self._participants_retired:
+            return
+        plan = self.plan if plan is None else plan
+        for participant in self.participants:
+            retire = getattr(participant, "retire", None)
+            if retire is not None:
+                if plan is None:
+                    retire()
+                else:
+                    retire(plan)
+        self._participants_retired = True
 
     def resolve_against_current(self, context: object) -> Tensor | None:
         """Resolve this transaction's pending rows against the current context."""
@@ -949,18 +979,21 @@ class AsyncDecodeTransaction:
 
     def mark_committed(self) -> None:
         """Mark transaction-owned side effects as committed."""
-        if self.state == AsyncTxnState.COMMITTED:
+        if self.state in (AsyncTxnState.COMMITTED, AsyncTxnState.ROLLED_BACK, AsyncTxnState.RETIRED):
             return
         self.commit_participants()
         self.state = AsyncTxnState.COMMITTED
 
     def mark_retired(self) -> None:
         """Mark the transaction as no longer owning in-flight state."""
+        if self.state == AsyncTxnState.RETIRED:
+            return
+        self.retire_participants()
         self.state = AsyncTxnState.RETIRED
 
     def rollback(self, reason: str) -> None:
         """Rollback the transaction and remember why it could not commit."""
-        if self.state in (AsyncTxnState.COMMITTED, AsyncTxnState.ROLLED_BACK):
+        if self.state in (AsyncTxnState.COMMITTED, AsyncTxnState.ROLLED_BACK, AsyncTxnState.RETIRED):
             return
         self.discard_reason = reason
         self.invalidation_reason = self.invalidation_reason or reason
@@ -975,6 +1008,8 @@ class AsyncDecodeTransaction:
 
     def discard(self, reason: str) -> None:
         """Discard the transaction and remember why it could not commit."""
+        if self.state in (AsyncTxnState.DISCARDED, AsyncTxnState.RETIRED):
+            return
         self.discard_reason = reason
         self.state = AsyncTxnState.DISCARDED
 
@@ -997,6 +1032,11 @@ class AsyncDecodeTransaction:
             "has_h2d_done_event": self.h2d_done_event is not None,
             "has_forward_done_event": self.forward_done_event is not None,
             "has_ep_decision": self.ep_decision is not None,
+            "has_output_handle": self.output_handle is not None,
+            "participants_prepared": self._participants_prepared,
+            "participants_committed": self._participants_committed,
+            "participants_rolled_back": self._participants_rolled_back,
+            "participants_retired": self._participants_retired,
             "plan": None if self.plan is None else self.plan.diagnostics(),
             "participants": {
                 type(participant).__name__: participant.diagnostics()

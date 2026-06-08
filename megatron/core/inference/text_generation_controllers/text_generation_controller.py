@@ -1864,22 +1864,14 @@ class TextGenerationController:
             self._increment_async_counter("_async_layout_mismatch_discard_count")
         self._increment_async_counter("_async_discarded_forward_count")
         self._increment_async_counter("_async_rolled_back_forward_count")
-        if self._async_transaction_has_participant(transaction, AsyncResourceParticipant):
-            transaction.rollback(decision.reason or "pending forward not reusable")
-        else:
-            transaction.discard(decision.reason or "pending forward not reusable")
+        transaction.rollback(decision.reason or "pending forward not reusable")
         return False, None, False
 
     def _discard_pending_async_forward(self) -> None:
         """Discard a pending async forward and release resources reserved for it."""
-        context = self.inference_wrapped_model.inference_context
         transaction = self._pending_async_transaction()
         if transaction is not None:
-            if self._async_transaction_has_participant(transaction, AsyncResourceParticipant):
-                transaction.rollback("discarded before step begin")
-            else:
-                context.release_deferred_async_resources()
-                transaction.discard("discarded before step begin")
+            transaction.rollback("discarded before step begin")
             self._async_step_transaction = None
             self._increment_async_counter("_async_discarded_forward_count")
             self._increment_async_counter("_async_rolled_back_forward_count")
@@ -2188,6 +2180,7 @@ class TextGenerationController:
         transaction.mark_launched(
             resources=resources,
             h2d_done_event=async_h2d_done_event,
+            output_handle=getattr(self, "_all_logits_cuda", None),
         )
         range_pop()
         return True, async_h2d_done_event, cuda_graph_request_count
@@ -3070,12 +3063,7 @@ class TextGenerationController:
                     self._increment_async_counter("_async_discarded_forward_count")
                     self._increment_async_counter("_async_rolled_back_forward_count")
                     if transaction is not None:
-                        if self._async_transaction_has_participant(
-                            transaction, AsyncResourceParticipant
-                        ):
-                            transaction.rollback("row-mapped non-decode forward not reusable")
-                        else:
-                            transaction.discard("row-mapped non-decode forward not reusable")
+                        transaction.rollback("row-mapped non-decode forward not reusable")
                 if (
                     pending_forward_reused
                     and context.is_hybrid_model
@@ -3085,23 +3073,15 @@ class TextGenerationController:
                 ):
                     context.accept_async_mamba_state(self._active_request_ids_cpu())
                 if transaction is not None:
-                    resource_participant_owned = self._async_transaction_has_participant(
-                        transaction, AsyncResourceParticipant
-                    )
                     if pending_forward_reused:
-                        if not resource_participant_owned:
-                            context.release_deferred_async_resources()
                         transaction.mark_committed()
                         self._increment_async_counter("_async_committed_forward_count")
-                    else:
-                        if not resource_participant_owned:
-                            context.release_deferred_async_resources()
                     if (
                         not pending_forward_reused
                         and transaction.state
                         not in (AsyncTxnState.DISCARDED, AsyncTxnState.ROLLED_BACK)
                     ):
-                        transaction.discard("pending forward not reused")
+                        transaction.rollback("pending forward not reused")
                         self._increment_async_counter("_async_rolled_back_forward_count")
                     self._retire_async_transaction()
                 if pending_forward_reused and self.num_speculative_tokens > 0:

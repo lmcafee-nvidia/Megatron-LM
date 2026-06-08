@@ -2018,6 +2018,96 @@ def test_async_decode_plan_and_transaction_participant_hooks_are_canonical():
 
 
 @pytest.mark.internal
+def test_async_transaction_commit_rollback_and_retire_are_idempotent():
+    events = []
+
+    class _Participant:
+        def diagnostics(self):
+            return {"events": list(events)}
+
+        def prepare(self, plan):
+            events.append("prepare")
+            return "prepared"
+
+        def validate(self, plan, current_state):
+            events.append("validate")
+            return True
+
+        def commit(self, plan):
+            events.append("commit")
+
+        def rollback(self, plan):
+            events.append("rollback")
+
+        def retire(self, plan):
+            events.append("retire")
+
+    snapshot = _make_async_layout_snapshot([41], cuda_graph_request_count=1)
+    transaction = AsyncDecodeTransaction(
+        step_id=9,
+        state=AsyncTxnState.LAUNCHED,
+        snapshot=snapshot,
+        participants=(_Participant(),),
+    )
+
+    transaction.prepare_participants()
+    transaction.prepare_participants()
+    transaction.mark_committed()
+    transaction.mark_committed()
+    transaction.rollback("late rollback")
+    transaction.mark_retired()
+    transaction.mark_retired()
+
+    assert events == ["prepare", "commit", "retire"]
+    assert transaction.state == AsyncTxnState.RETIRED
+    diagnostics = transaction.diagnostics()
+    assert diagnostics["participants_prepared"]
+    assert diagnostics["participants_committed"]
+    assert not diagnostics["participants_rolled_back"]
+    assert diagnostics["participants_retired"]
+
+
+@pytest.mark.internal
+def test_async_transaction_launched_resource_diagnostics_include_output_handle():
+    snapshot = _make_async_layout_snapshot([51], cuda_graph_request_count=1)
+    transaction = AsyncDecodeTransaction(
+        step_id=10,
+        state=AsyncTxnState.PREPARED,
+        snapshot=snapshot,
+    )
+
+    transaction.mark_launched(
+        resources="ledger",
+        h2d_done_event="h2d",
+        forward_done_event="forward_done",
+        output_handle="logits",
+    )
+
+    diagnostics = transaction.diagnostics()
+    assert diagnostics["has_resources"]
+    assert diagnostics["has_h2d_done_event"]
+    assert diagnostics["has_forward_done_event"]
+    assert diagnostics["has_output_handle"]
+
+
+@pytest.mark.internal
+def test_controller_discards_pending_transaction_without_manual_resource_release():
+    controller = _make_controller_with_rows([10, 11], [10, 11])
+    context = controller.inference_wrapped_model.inference_context
+    context.release_deferred_async_resources = lambda: pytest.fail(
+        "controller must not manually release transaction resources"
+    )
+    transaction = controller._pending_async_transaction()
+    assert transaction is not None
+
+    controller._discard_pending_async_forward()
+
+    assert transaction.state == AsyncTxnState.ROLLED_BACK
+    assert transaction.discard_reason == "discarded before step begin"
+    assert controller._async_step_transaction is None
+
+
+@pytest.mark.internal
 def test_async_resource_participant_rolls_back_speculative_resources_once():
     released_blocks = []
     context = SimpleNamespace(
