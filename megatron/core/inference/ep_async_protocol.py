@@ -35,7 +35,6 @@ class EPStepBeginDecision:
     has_real_work: bool
     reuse_pending_forward: bool
     discard_pending_forward: bool
-    row_mapped_forward: bool
 
 
 @dataclass(frozen=True)
@@ -211,13 +210,11 @@ class EPAsyncStepProtocol:
         has_real_work: bool,
         has_pending_forward: bool,
         pending_forward_reusable: bool,
-        pending_forward_row_mapped: bool,
     ) -> EPStepBeginDecision:
         """Synchronize per-rank pending async state at the start of an EP work step."""
         local_real = int(has_real_work)
         local_pending_forward = int(has_pending_forward)
         local_reusable = int(has_pending_forward and pending_forward_reusable)
-        local_row_mapped = int(has_pending_forward and pending_forward_row_mapped)
         local_discard = int(has_pending_forward and not pending_forward_reusable)
         local_real_missing_forward = int(has_real_work and not has_pending_forward)
 
@@ -227,7 +224,6 @@ class EPAsyncStepProtocol:
                 any_real,
                 any_pending_forward,
                 any_reusable,
-                any_row_mapped,
                 any_discard,
                 any_real_missing_forward,
             ),
@@ -237,7 +233,6 @@ class EPAsyncStepProtocol:
             local_real,
             local_pending_forward,
             local_reusable,
-            local_row_mapped,
             local_discard,
             local_real_missing_forward,
         )
@@ -259,7 +254,6 @@ class EPAsyncStepProtocol:
             has_real_work=bool(any_real),
             reuse_pending_forward=reuse_pending_forward,
             discard_pending_forward=discard_pending_forward,
-            row_mapped_forward=bool(any_row_mapped and reuse_pending_forward),
         )
 
     def decide_step_begin(
@@ -268,14 +262,12 @@ class EPAsyncStepProtocol:
         has_real_work: bool,
         has_pending_forward: bool,
         pending_forward_reusable: bool,
-        pending_forward_row_mapped: bool,
     ) -> EPStepBeginDecision:
         """Compatibility wrapper for callers using the pre-coordinator API."""
         return self.begin_step(
             has_real_work=has_real_work,
             has_pending_forward=has_pending_forward,
             pending_forward_reusable=pending_forward_reusable,
-            pending_forward_row_mapped=pending_forward_row_mapped,
         )
 
     def decide_launch(

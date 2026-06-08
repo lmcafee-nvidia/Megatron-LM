@@ -178,6 +178,34 @@ async def test_ep_step_begin_reuses_or_discards_with_global_state(global_state, 
 
 @pytest.mark.internal
 @pytest.mark.parametrize(
+    ("global_state", "expected"),
+    [
+        ((1, 1, 1, 0, 0), (True, False)),
+        ((1, 1, 0, 1, 0), (False, True)),
+        ((1, 1, 1, 0, 1), (False, True)),
+    ],
+)
+def test_ep_step_begin_uses_transactional_accept_or_fallback_consensus(
+    global_state, expected
+):
+    communicator = _RecordingEPCommunicator(sync_results=[global_state, 1])
+    protocol = EPAsyncStepProtocol(communicator)
+
+    decision = protocol.begin_step(
+        has_real_work=True,
+        has_pending_forward=True,
+        pending_forward_reusable=True,
+    )
+
+    assert (decision.reuse_pending_forward, decision.discard_pending_forward) == expected
+    assert communicator.calls == [
+        ("sync", EPAsyncPhase.STEP_BEGIN, 0, (1, 1, 1, 0, 0)),
+        ("sync", EPAsyncPhase.STEP_BEGIN_ACK, 0, (1,)),
+    ]
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize(
     ("has_real_work", "can_launch", "global_state", "expected"),
     [
         (True, True, (1, 1, 0), (True, False, True, False)),

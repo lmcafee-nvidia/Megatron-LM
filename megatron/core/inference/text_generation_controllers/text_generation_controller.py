@@ -1846,12 +1846,9 @@ class TextGenerationController:
         self._ep_async_handoff_decision_this_step = None
         self._async_ep_participant_this_step = None
         pending_forward_reusable = True
-        pending_forward_row_mapped = False
         has_pending_forward = self._has_pending_async_forward_state()
         if has_pending_forward:
-            pending_forward_reusable, pending_forward_row_mapped = (
-                self._pending_async_forward_row_status()
-            )
+            pending_forward_reusable, _ = self._pending_async_forward_row_status()
 
         if self._ep_async_protocol is not None and self._ep_async_protocol.enabled:
             begin_step = getattr(self._ep_async_protocol, "begin_step", None)
@@ -1861,7 +1858,6 @@ class TextGenerationController:
                 has_real_work=has_real_work,
                 has_pending_forward=has_pending_forward,
                 pending_forward_reusable=pending_forward_reusable,
-                pending_forward_row_mapped=pending_forward_row_mapped,
             )
             self._record_ep_step_begin_decision(decision)
             return decision
@@ -1873,7 +1869,6 @@ class TextGenerationController:
             discard_pending_forward=bool(
                 has_pending_forward and not pending_forward_reusable
             ),
-            row_mapped_forward=bool(has_pending_forward and pending_forward_row_mapped),
         )
         self._record_ep_step_begin_decision(decision)
         return decision
@@ -3007,7 +3002,7 @@ class TextGenerationController:
                 (
                     pending_forward_reused,
                     pending_forward_row_indices,
-                    _pending_forward_row_mapped,
+                    _,
                 ) = self._resolve_pending_async_forward()
                 if (
                     pending_forward_reused
