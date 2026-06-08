@@ -219,6 +219,7 @@ class TextGenerationController:
         self._async_graph_mismatch_discard_count = 0
         self._async_layout_mismatch_discard_count = 0
         self._async_deferred_mtp_release_count = 0
+        self._async_overlap_opportunity_count = 0
         self._async_eligibility_check_count = 0
         self._async_eligibility_pass_count = 0
         self._async_disable_reason_counts: Dict[str, int] = {}
@@ -1553,6 +1554,7 @@ class TextGenerationController:
             "forward_launches": self._async_forward_launch_count,
             "prepared_forwards": getattr(self, "_async_prepared_forward_count", 0),
             "launched_forwards": getattr(self, "_async_launched_forward_count", 0),
+            "overlap_opportunities": getattr(self, "_async_overlap_opportunity_count", 0),
             "reused_forwards": getattr(self, "_async_reused_forward_count", 0),
             "committed_forwards": getattr(self, "_async_committed_forward_count", 0),
             "rolled_back_forwards": getattr(self, "_async_rolled_back_forward_count", 0),
@@ -3179,6 +3181,8 @@ class TextGenerationController:
                     ) = self._launch_committed_async_forward_after_hard_commit()
                     if launch_graph_request_count is not None:
                         cuda_graph_request_count = launch_graph_request_count
+                    if async_launched_after_commit:
+                        self._increment_async_counter("_async_overlap_opportunity_count")
 
                 if deferred_mtp_blocks_to_release is not None:
                     range_push("mtp_deferred_release_memory_blocks")

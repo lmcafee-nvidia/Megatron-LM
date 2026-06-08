@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import inspect
 from collections import deque
 from types import SimpleNamespace
 
@@ -2707,6 +2708,78 @@ def test_dynamic_bookkeeping_splits_hard_commit_from_post_launch_cpu_work(monkey
     assert result["sample"].tolist() == [4, 5]
     assert events == ["hard_commit", "launch", "post_launch_cpu"]
     probe.assert_launch_before_cpu()
+
+
+@pytest.mark.internal
+def test_fast_overlap_path_has_no_sync_between_launch_and_post_cpu_work():
+    launch_source = inspect.getsource(
+        TextGenerationController._launch_committed_async_forward_after_hard_commit
+    )
+    post_cpu_source = inspect.getsource(TextGenerationController._post_launch_dynamic_cpu_bookkeeping)
+    launch_tail = launch_source.split('range_push("async_forward_launch")', 1)[1]
+
+    assert ".synchronize(" not in launch_tail
+    assert ".synchronize(" not in post_cpu_source
+
+
+@pytest.mark.internal
+def test_fast_overlap_diagnostics_report_launch_opportunities():
+    controller = object.__new__(TextGenerationController)
+    controller._async_scheduling_enabled = True
+    controller._async_step_barrier_reason = None
+    controller._async_eligibility_check_count = 1
+    controller._async_eligibility_pass_count = 1
+    controller._async_disable_reason_counts = {}
+    controller._async_disable_reason = None
+    controller._async_forward_launch_count = 1
+    controller._async_prepared_forward_count = 1
+    controller._async_launched_forward_count = 1
+    controller._async_overlap_opportunity_count = 1
+    controller._async_reused_forward_count = 0
+    controller._async_committed_forward_count = 0
+    controller._async_rolled_back_forward_count = 0
+    controller._async_discarded_forward_count = 0
+    controller._async_identity_forward_count = 0
+    controller._ep_async_protocol = None
+    controller._async_step_transaction = None
+
+    diagnostics = controller.get_async_scheduling_diagnostics()
+
+    assert diagnostics["forward_launches"] == 1
+    assert diagnostics["launched_forwards"] == 1
+    assert diagnostics["overlap_opportunities"] == 1
+
+
+@pytest.mark.internal
+def test_fast_overlap_fallback_reasons_are_structured_and_stable():
+    pending = CommittedDecodePlan.from_committed_context(
+        fake_committed_decode_context([10, 11], mamba_slots=[3, 5])
+    )
+    current = CommittedDecodePlan.from_committed_context(
+        fake_committed_decode_context([11, 10], mamba_slots=[5, 3])
+    )
+    assert pending is not None
+    assert current is not None
+
+    decision = resolve_committed_plan_identity(pending, current)
+
+    assert decision.diagnostics() == {
+        "reusable": False,
+        "reason": "committed request identity mismatch",
+        "graph_compatible": True,
+        "layout_compatible": False,
+    }
+
+
+@pytest.mark.internal
+def test_fast_overlap_prefill_or_mixed_steps_report_no_launch_opportunity():
+    controller, context = _make_async_gate_controller()
+    context.is_decode_only = lambda: False
+
+    decision = classify_committed_async_launch(controller, context)
+
+    assert not decision.can_launch
+    assert decision.reason == "not decode-only"
 
 
 @pytest.mark.internal
