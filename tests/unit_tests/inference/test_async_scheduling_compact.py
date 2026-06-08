@@ -1480,6 +1480,124 @@ def test_prepare_async_decode_before_sampling_handoff_paths(
 
 
 @pytest.mark.internal
+def test_presampling_async_prepare_is_disabled_for_committed_scheduling(monkeypatch):
+    monkeypatch.setattr(tgc_module, "range_push", lambda _msg: None)
+    monkeypatch.setattr(tgc_module, "range_pop", lambda: None)
+    controller, context = _make_async_gate_controller()
+    context.prepare_async_decode_next_step = lambda **_kwargs: pytest.fail(
+        "pre-sampling prepare must not run"
+    )
+
+    assert not controller._try_prepare_async_decode_before_sampling()
+    assert controller._async_prepare_deferred_until_after_sampling
+
+
+@pytest.mark.internal
+def test_committed_async_launch_prepares_after_hard_commit_without_presampling(monkeypatch):
+    monkeypatch.setattr(tgc_module, "range_push", lambda msg: events.append(("push", msg)))
+    monkeypatch.setattr(tgc_module, "range_pop", lambda: events.append(("pop", None)))
+    events = []
+    context = SimpleNamespace(
+        prepare_async_decode_next_step=lambda **kwargs: events.append(("prepare", kwargs)) or True,
+        publish_async_prepared_decode_plan=lambda: events.append("publish"),
+        transfer_bookkeeping_to_gpu=lambda **kwargs: events.append(("h2d", kwargs))
+        or "h2d_event",
+        current_input_and_position_ids=lambda: ("input_ids", "position_ids"),
+        padded_active_request_count=2,
+        using_cuda_graph_this_step=lambda: True,
+        mark_async_resources_in_flight=lambda: events.append("resources") or AsyncResourceLedger(),
+    )
+    controller = object.__new__(TextGenerationController)
+    controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
+    controller.num_speculative_tokens = 0
+    controller._async_disable_reason = None
+    controller._async_disable_reason_counts = {}
+    controller._async_eligibility_check_count = 0
+    controller._async_eligibility_pass_count = 0
+    controller._async_forward_launch_count = 0
+    controller._async_launched_forward_count = 0
+    controller._async_scheduling_disabled_reason = (
+        lambda **kwargs: events.append(("disabled", kwargs)) or None
+    )
+    controller._record_async_eligibility_result = lambda reason: events.append(
+        ("eligibility", reason)
+    )
+    controller._record_async_disable_reason = lambda reason: events.append(("disable", reason))
+    controller._decide_ep_async_handoff = (
+        lambda **kwargs: events.append(("handoff", kwargs))
+        or SimpleNamespace(launch_async_forward=True)
+    )
+    controller._dynamic_step_forward_logits = lambda input_ids, position_ids: events.append(
+        ("forward", input_ids, position_ids)
+    )
+    transaction = SimpleNamespace(
+        participants=(),
+        plan=None,
+        mark_launched=lambda **kwargs: events.append(("tx_launch", kwargs)),
+    )
+    controller._begin_async_step_transaction = (
+        lambda count: events.append(("begin", count)) or transaction
+    )
+    controller._attach_async_transaction_participants = (
+        lambda transaction, **kwargs: events.append(("attach", kwargs))
+    )
+    controller._increment_async_counter = lambda name, value=1: setattr(
+        controller, name, getattr(controller, name, 0) + value
+    )
+
+    launched, h2d_event, graph_count = (
+        controller._launch_committed_async_forward_after_hard_commit()
+    )
+
+    assert launched
+    assert h2d_event == "h2d_event"
+    assert graph_count == 2
+    assert ("prepare", {}) in events
+    assert not any(
+        event == ("prepare", {"pre_sampling": True})
+        for event in events
+        if isinstance(event, tuple)
+    )
+    assert events.index(("prepare", {})) < events.index("publish")
+    assert events.index("publish") < events.index(("forward", "input_ids", "position_ids"))
+    assert controller._async_forward_launch_count == 1
+    assert controller._async_launched_forward_count == 1
+
+
+@pytest.mark.internal
+def test_committed_async_launch_skips_when_hard_committed_state_is_not_decode_only(monkeypatch):
+    monkeypatch.setattr(tgc_module, "range_push", lambda _msg: None)
+    monkeypatch.setattr(tgc_module, "range_pop", lambda: None)
+    events = []
+    context = SimpleNamespace(
+        prepare_async_decode_next_step=lambda **_kwargs: events.append("prepare") or True
+    )
+    controller = object.__new__(TextGenerationController)
+    controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
+    controller._async_disable_reason = None
+    controller._async_disable_reason_counts = {}
+    controller._async_eligibility_check_count = 0
+    controller._async_eligibility_pass_count = 0
+    controller._async_scheduling_disabled_reason = (
+        lambda **kwargs: events.append(("disabled", kwargs)) or "not decode-only"
+    )
+    controller._record_async_eligibility_result = lambda reason: events.append(
+        ("eligibility", reason)
+    )
+    controller._decide_ep_async_handoff = lambda **kwargs: events.append(("handoff", kwargs))
+
+    launched, h2d_event, graph_count = (
+        controller._launch_committed_async_forward_after_hard_commit()
+    )
+
+    assert not launched
+    assert h2d_event is None
+    assert graph_count is None
+    assert "prepare" not in events
+    assert ("handoff", {"has_real_work": True, "can_launch_async_handoff": False}) in events
+
+
+@pytest.mark.internal
 def test_prepare_async_decode_before_sampling_deferral_is_not_disable_reason(monkeypatch):
     monkeypatch.setattr(tgc_module, "range_push", lambda _msg: None)
     monkeypatch.setattr(tgc_module, "range_pop", lambda: None)

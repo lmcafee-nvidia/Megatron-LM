@@ -2113,31 +2113,8 @@ class TextGenerationController:
         return ticket
 
     def _try_prepare_async_decode_before_sampling(self) -> bool:
-        """Prepare steady-state next-step metadata before current-step sampling."""
-        context = self.inference_wrapped_model.inference_context
-        self._async_disable_reason = self._async_scheduling_disabled_reason()
-        self._record_async_eligibility_result(self._async_disable_reason)
-        if self._async_disable_reason is not None:
-            self._decide_ep_async_handoff(has_real_work=True, can_launch_async_handoff=False)
-            return False
-        range_push("async_prepare_next_step")
-        async_next_prepared = context.prepare_async_decode_next_step(pre_sampling=True)
-        range_pop()
-        if not async_next_prepared:
-            self._async_prepare_deferred_until_after_sampling = True
-            return False
-        self._increment_async_counter("_async_prepared_forward_count")
-
-        handoff_decision = self._decide_ep_async_handoff(
-            has_real_work=True, can_launch_async_handoff=True
-        )
-        if handoff_decision.launch_async_forward:
-            return True
-
-        context.discard_async_prepared_decode_plan()
-        self._async_disable_reason = "ep async handoff skipped"
-        self._record_async_disable_reason(self._async_disable_reason)
-        self._increment_async_counter("_async_rolled_back_forward_count")
+        """Pre-sampling async preparation is disabled by committed scheduling."""
+        self._async_prepare_deferred_until_after_sampling = True
         return False
 
     def _try_prepare_async_decode_after_sampling(self) -> bool:
@@ -2175,6 +2152,45 @@ class TextGenerationController:
         self._record_async_disable_reason(self._async_disable_reason)
         self._increment_async_counter("_async_rolled_back_forward_count")
         return False
+
+    def _launch_committed_async_forward_after_hard_commit(
+        self,
+    ) -> tuple[bool, Optional[torch.cuda.Event], Optional[int]]:
+        """Prepare and launch the next async forward from committed decode state."""
+        context = self.inference_wrapped_model.inference_context
+        if not self._try_prepare_async_decode_after_sampling():
+            return False, None, None
+        if not self._confirm_prepared_ep_async_handoff():
+            return False, None, None
+
+        context.publish_async_prepared_decode_plan()
+        range_push("async_transfer_bookkeeping_to_gpu")
+        async_h2d_done_event = context.transfer_bookkeeping_to_gpu(
+            include_token_to_input_ids=True,
+            refresh_request_staging=True,
+            record_done_event=True,
+        )
+        range_pop()
+
+        range_push("async_forward_launch")
+        next_input_ids, next_position_ids = context.current_input_and_position_ids()
+        self._dynamic_step_forward_logits(next_input_ids, next_position_ids)
+        self._async_forward_launch_count += 1
+        self._increment_async_counter("_async_launched_forward_count")
+        cuda_graph_request_count = (
+            context.padded_active_request_count if context.using_cuda_graph_this_step() else None
+        )
+        transaction = self._begin_async_step_transaction(cuda_graph_request_count)
+        resources = context.mark_async_resources_in_flight()
+        self._attach_async_transaction_participants(
+            transaction, resources=resources, sample_ticket=None
+        )
+        transaction.mark_launched(
+            resources=resources,
+            h2d_done_event=async_h2d_done_event,
+        )
+        range_pop()
+        return True, async_h2d_done_event, cuda_graph_request_count
 
     def _async_scheduling_global_disabled_reason(self, *, allow_mtp: bool = False) -> Optional[str]:
         """Return non-step-local reasons async scheduling is disabled, or None."""
@@ -3018,6 +3034,7 @@ class TextGenerationController:
         async_sampled_mtp_tokens_cpu = None
         deferred_mtp_blocks_to_release = None
         deferred_mtp_release_mask = None
+        async_launch_requested_after_hard_commit = False
         input_ids = None
         cuda_graph_request_count = None
         pending_forward_reused = False
@@ -3113,7 +3130,7 @@ class TextGenerationController:
                 self._retire_dynamic_forward_side_effects()
 
             if not pending_forward_row_mapped and self.num_speculative_tokens == 0:
-                async_next_prepared = self._try_prepare_async_decode_before_sampling()
+                self._async_prepare_deferred_until_after_sampling = True
 
         # This is the best place to yield control back to event loop.
         # At this point we have enqueued FW pass GPU kernels asynchronously.
@@ -3141,9 +3158,7 @@ class TextGenerationController:
                 self._dynamic_step_sample_logits_to_next_input_ids()
             elif pending_forward_reused and self.num_speculative_tokens == 0:
                 self._dynamic_step_sample_logits(row_indices=pending_forward_row_indices)
-                async_next_prepared = self._try_prepare_async_decode_after_sampling()
-                if async_next_prepared:
-                    self._copy_sampled_decode_tokens_to_next_input_ids(active_request_count)
+                async_launch_requested_after_hard_commit = True
             elif self.num_speculative_tokens > 0:
                 if pending_forward_reused:
                     self._dynamic_step_sample_bookkeeping()
@@ -3169,23 +3184,13 @@ class TextGenerationController:
                 self._compute_serial_mtp_and_sample()
                 nvtx_range_pop("mtp-spec-decoding/serial-mtp")
 
-                async_next_prepared = self._try_prepare_async_decode_after_sampling()
-                if async_next_prepared:
-                    self._copy_sampled_decode_tokens_to_next_input_ids(active_request_count)
-                    deferred_mtp_blocks_to_release = blocks_to_release
-                    deferred_mtp_release_mask = remove_mask
-                else:
-                    # No async forward will cover this CPU work, so release before
-                    # ordinary request bookkeeping runs.
-                    context.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
+                async_launch_requested_after_hard_commit = True
+                deferred_mtp_blocks_to_release = blocks_to_release
+                deferred_mtp_release_mask = remove_mask
             else:
                 self._dynamic_step_sample_logits()
                 if self._async_prepare_deferred_until_after_sampling:
-                    async_next_prepared = self._try_prepare_async_decode_after_sampling()
-                    if async_next_prepared:
-                        self._copy_sampled_decode_tokens_to_next_input_ids(
-                            active_request_count
-                        )
+                    async_launch_requested_after_hard_commit = True
 
             log_probs = None
             top_n_logprobs = None
@@ -3212,52 +3217,6 @@ class TextGenerationController:
                             log_probs_tensor
                         )
 
-            if async_next_prepared:
-                async_sample_ticket = self._transfer_async_samples_to_cpu(active_request_count)
-                async_sampled_tokens_cpu = async_sample_ticket.sampled_tokens_cpu
-                async_sampled_mtp_tokens_cpu = async_sample_ticket.sampled_mtp_tokens_cpu
-                async_sample_ready_event = async_sample_ticket.copy_done_event
-                if self._confirm_prepared_ep_async_handoff():
-                    context.publish_async_prepared_decode_plan()
-                    range_push("async_transfer_bookkeeping_to_gpu")
-                    async_h2d_done_event = context.transfer_bookkeeping_to_gpu(
-                        include_token_to_input_ids=False,
-                        refresh_request_staging=False,
-                        record_done_event=True,
-                    )
-                    range_pop()
-                    range_push("async_forward_launch")
-                    next_input_ids, next_position_ids = context.current_input_and_position_ids()
-                    self._dynamic_step_forward_logits(next_input_ids, next_position_ids)
-                    self._async_forward_launch_count += 1
-                    self._increment_async_counter("_async_launched_forward_count")
-                    cuda_graph_request_count = (
-                        context.padded_active_request_count
-                        if context.using_cuda_graph_this_step()
-                        else None
-                    )
-                    transaction = self._begin_async_step_transaction(cuda_graph_request_count)
-                    resources = context.mark_async_resources_in_flight()
-                    self._attach_async_transaction_participants(
-                        transaction, resources=resources, sample_ticket=async_sample_ticket
-                    )
-                    transaction.mark_launched(
-                        sample_ticket=async_sample_ticket,
-                        resources=resources,
-                        h2d_done_event=async_h2d_done_event,
-                    )
-                    range_pop()
-
-            if deferred_mtp_blocks_to_release is not None:
-                range_push("mtp_deferred_release_memory_blocks")
-                context.kv_block_allocator.release_memory_blocks(
-                    deferred_mtp_blocks_to_release[deferred_mtp_release_mask]
-                )
-                self._async_deferred_mtp_release_count += 1
-                range_pop()
-
-            self._ensure_ep_async_handoff_decided(has_real_work=True)
-
             range_pop()
 
             # Capture before update_requests (called by _dynamic_step_context_bookkeeping)
@@ -3280,33 +3239,44 @@ class TextGenerationController:
                         "sample": self._sampled_tokens_cuda[:active_request_count].cpu()
                     }
             else:
-                # request_bookkeeping supplies "sample" as the already-CPU
-                # tensor produced by _transfer_samples_to_cpu.
-                request_bookkeeping = self._dynamic_step_context_bookkeeping(
+                hard_commit = self._prepare_dynamic_decode_hard_commit(
                     sampled_tokens_cpu=async_sampled_tokens_cpu,
                     sampled_mtp_tokens_cpu=async_sampled_mtp_tokens_cpu,
                     sample_ready_event=async_sample_ready_event,
-                    h2d_done_event=async_h2d_done_event,
                 )
+                update_result = self._hard_commit_dynamic_decode_state(hard_commit)
 
                 next_active_request_count = (
                     context.total_request_count - context.paused_request_count
                 )
-                if self._has_pending_async_forward_state() and next_active_request_count == 0:
-                    transaction = self._pending_async_transaction()
-                    torch.cuda.current_stream().synchronize()
-                    if transaction is not None:
-                        if self._async_transaction_has_participant(
-                            transaction, AsyncResourceParticipant
-                        ):
-                            transaction.rollback("no active requests after bookkeeping")
-                        else:
-                            context.release_deferred_async_resources()
-                            transaction.discard("no active requests after bookkeeping")
-                        self._increment_async_counter("_async_discarded_forward_count")
-                        self._increment_async_counter("_async_rolled_back_forward_count")
-                        self._async_step_transaction = None
+                async_launched_after_commit = False
+                if (
+                    async_launch_requested_after_hard_commit
+                    and next_active_request_count > 0
+                    and context.is_decode_only()
+                ):
+                    (
+                        async_launched_after_commit,
+                        async_h2d_done_event,
+                        launch_graph_request_count,
+                    ) = self._launch_committed_async_forward_after_hard_commit()
+                    if launch_graph_request_count is not None:
+                        cuda_graph_request_count = launch_graph_request_count
 
+                if deferred_mtp_blocks_to_release is not None:
+                    range_push("mtp_deferred_release_memory_blocks")
+                    context.kv_block_allocator.release_memory_blocks(
+                        deferred_mtp_blocks_to_release[deferred_mtp_release_mask]
+                    )
+                    self._async_deferred_mtp_release_count += int(async_launched_after_commit)
+                    range_pop()
+
+                self._ensure_ep_async_handoff_decided(has_real_work=True)
+                request_bookkeeping = self._post_launch_dynamic_cpu_bookkeeping(
+                    hard_commit, update_result
+                )
+
+            self._ensure_ep_async_handoff_decided(has_real_work=True)
             ret = {
                 "accepted_tokens": (
                     # Clone needed: .fill_(-1) below would corrupt the returned value.
