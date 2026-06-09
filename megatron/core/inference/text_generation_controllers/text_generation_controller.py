@@ -212,9 +212,7 @@ class TextGenerationController:
         self._async_step_barrier_reason = None
         self._async_admission_barrier_requested = False
         self._async_logprob_requests_seen = False
-        self._async_row_map_policy = AsyncRowMapPolicy.from_value(
-            getattr(context.config, "async_row_map_policy", AsyncRowMapPolicy.REUSE.value)
-        )
+        self._async_row_map_policy = AsyncRowMapPolicy.IDENTITY_ONLY
         self._async_row_mapped_forward_count = 0
         self._async_discarded_forward_count = 0
         self._async_add_deferral_count = 0
