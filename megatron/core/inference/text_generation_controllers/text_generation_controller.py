@@ -2971,6 +2971,7 @@ class TextGenerationController:
                     range_pop()
                     range_push("async_forward_launch")
                     next_input_ids, next_position_ids = context.current_input_and_position_ids()
+                    torch.cuda.current_stream().synchronize()
                     self._dynamic_step_forward_logits(next_input_ids, next_position_ids)
                     self._async_forward_launch_count += 1
                     cuda_graph_request_count = (
