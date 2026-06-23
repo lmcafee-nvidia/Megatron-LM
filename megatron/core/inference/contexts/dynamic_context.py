@@ -5,6 +5,7 @@ import math
 import operator
 import warnings
 from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch  # type: ignore
@@ -212,6 +213,17 @@ class ContextErrorFactory:
         return error
 
 
+@dataclass
+class AsyncDecodePlan:
+    """Prepared next-step decode layout for a no-reject async forward."""
+
+    request_ids: Tensor
+    kv_length_offsets: Tensor
+    active_request_count: int
+    active_token_count: int
+    padded_active_request_count: int
+
+
 def get_mem_size_str(n_bytes: int) -> str:
     """Convert number of bytes to human-readable string."""
     if n_bytes == 0:
@@ -308,6 +320,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             f"num_speculative_tokens ({self.num_speculative_tokens}) must be < "
             f"block_size_tokens ({inference_config.block_size_tokens})"
         )
+        self.enable_async_scheduling = inference_config.enable_async_scheduling
+        self._async_prepared_decode_plan: Optional[AsyncDecodePlan] = None
 
         # Cache the PP group we should use for PP collectives inside the context.
         # If the model provides a pg_collection with a pp group, prefer it.
@@ -2278,6 +2292,249 @@ class DynamicInferenceContext(BaseInferenceContext):
         # explicitly; that second call is a cheap idempotent re-copy.
         self.transfer_bookkeeping_to_gpu()
 
+    def clear_async_prepared_decode_plan(self) -> None:
+        """Forget a prepared async decode plan after launch or fallback."""
+
+        self._async_prepared_decode_plan = None
+
+    def async_prepared_decode_plan(self) -> Optional[AsyncDecodePlan]:
+        """Return the currently prepared decode plan, if any."""
+
+        return self._async_prepared_decode_plan
+
+    def prepared_async_request_ids_match_live(self, plan: AsyncDecodePlan) -> bool:
+        """Return whether live CPU bookkeeping now matches a launched child plan."""
+
+        active_count = self.total_request_count - self.paused_request_count
+        if active_count != plan.active_request_count:
+            return False
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        if not torch.equal(self.request_ids[active_slice], plan.request_ids):
+            return False
+        return torch.equal(self.request_kv_length_offsets[active_slice], plan.kv_length_offsets)
+
+    def _prepare_decode_mha_metadata(
+        self,
+        *,
+        batch_dimensions: InferenceBatchDimensions,
+        query_lengths: Tensor,
+        kv_length_offsets: Tensor,
+        request_to_kv_block_ids: Tensor,
+    ) -> None:
+        """Prepare MHA metadata from already planned decode CPU tensors."""
+
+        attn_dimensions = batch_dimensions
+        real_bs = attn_dimensions.req_count
+        padded_bs = self.padded_batch_dimensions.req_count
+        mha = self.active_attn_metadata["mha_metadata"]
+
+        self._cpu_mha_query_lengths[:real_bs] = query_lengths[:real_bs]
+        if real_bs < padded_bs:
+            self._cpu_mha_query_lengths[real_bs:padded_bs] = 0
+
+        self._cpu_mha_cu_query_seq_lengths[0] = 0
+        if real_bs > 0:
+            self._cpu_mha_cu_query_seq_lengths[1 : real_bs + 1] = torch.cumsum(
+                query_lengths[:real_bs], dim=0
+            )
+        if real_bs < padded_bs:
+            self._cpu_mha_cu_query_seq_lengths[real_bs + 1 : padded_bs + 1] = (
+                self._cpu_mha_cu_query_seq_lengths[real_bs]
+            )
+
+        self._cpu_mha_kv_seq_lengths[:real_bs] = kv_length_offsets[:real_bs] + query_lengths[:real_bs]
+        if real_bs < padded_bs:
+            self._cpu_mha_kv_seq_lengths[real_bs:padded_bs] = 0
+
+        self._cpu_mha_cu_kv_seq_lengths[0] = 0
+        if real_bs > 0:
+            self._cpu_mha_cu_kv_seq_lengths[1 : real_bs + 1] = torch.cumsum(
+                self._cpu_mha_kv_seq_lengths[:real_bs], dim=0
+            )
+        if real_bs < padded_bs:
+            self._cpu_mha_cu_kv_seq_lengths[real_bs + 1 : padded_bs + 1] = (
+                self._cpu_mha_cu_kv_seq_lengths[real_bs]
+            )
+
+        self._cpu_mha_block_table[:real_bs] = request_to_kv_block_ids[:real_bs]
+        if real_bs < padded_bs:
+            self._cpu_mha_block_table[real_bs:padded_bs] = -1
+
+        if not self.using_cuda_graph_this_step() and real_bs > 0:
+            max_seqlen_q = self._cpu_mha_query_lengths[:real_bs].max().item()
+            max_seqlen_k = self._cpu_mha_kv_seq_lengths[:real_bs].max().item()
+        else:
+            max_seqlen_q = self.num_speculative_tokens + 1
+            max_seqlen_k = mha.max_seqlen
+
+        mha.set_state_data(
+            padded_active_request_count=padded_bs,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+        )
+
+    def prepare_async_decode_next_step(self) -> bool:
+        """Prepare next decode metadata before sampling without mutating request rows.
+
+        This first implementation is intentionally strict: it only launches when
+        the post-sampling survivor layout is already identical to the current
+        decode layout. Unsupported cases fall back before launch.
+        """
+
+        self.clear_async_prepared_decode_plan()
+        if not self.enable_async_scheduling:
+            return False
+        if self.num_speculative_tokens != 0:
+            return False
+        if not self.is_decode_only():
+            return False
+        if self.paused_request_count != 0:
+            return False
+        if self.get_index_of_chunked_prefill_request(safe=True) != -1:
+            return False
+
+        active_request_count = self.total_request_count - self.paused_request_count
+        if active_request_count <= 0:
+            return False
+
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        current_offsets = self.request_kv_length_offsets[active_slice]
+        current_query_lengths = self.request_query_lengths[active_slice]
+        next_offsets = current_offsets + current_query_lengths
+
+        # Max-length terminal rows would change the survivor layout. Do not
+        # launch a child until terminal-row retirement is implemented here.
+        if (next_offsets >= self.request_output_lengths[active_slice]).any():
+            return False
+
+        # Boundary rows need reserved/adopted blocks. Fall back before launch in
+        # this narrow pass instead of introducing a post-launch recovery path.
+        if (
+            self.request_last_kv_block_offset[active_slice] >= self.block_size_tokens - 1
+        ).any():
+            return False
+
+        batch_dimensions = InferenceBatchDimensions(
+            token_count=active_request_count,
+            prefill_req_count=0,
+            decode_req_count=active_request_count,
+        )
+        best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
+            batch_dimensions,
+            self.cuda_graph_batch_dimensions_list,
+            strict=self.is_hybrid_model,
+            ep_group=self.expert_model_parallel_group,
+            match_ep_token_counts=self._nccl_ep_dispatcher or self._training_ep_dispatcher,
+            ep_zmq_communicator=self._ep_zmq_communicator,
+        )
+        if best_graph is None:
+            return False
+
+        self.batch_dimensions = batch_dimensions
+        self._using_cuda_graph_this_step = True
+        self.padded_batch_dimensions = best_graph
+        self.padded_active_token_count = best_graph.token_count
+        self.padded_active_request_count = best_graph.req_count
+        self.padding_slice = slice(active_request_count, self.padded_active_token_count)
+
+        self.build_active_slices(
+            min(self.padded_active_request_count, self.max_requests - self.paused_request_count)
+        )
+        self.pad_active_slices()
+
+        self.active_attn_metadata = self.graph_attn_metadata
+        request_rows = torch.arange(
+            self.paused_request_count,
+            self.total_request_count,
+            dtype=torch.int32,
+            device='cpu',
+        )
+        self.token_to_pos_ids[:active_request_count] = next_offsets.to(dtype=torch.int64)
+        self.token_to_request_idx[:active_request_count] = request_rows
+        self.token_to_position_in_request[:active_request_count] = next_offsets
+        self.token_to_local_position_within_kv_block[:active_request_count] = (
+            next_offsets % self.block_size_tokens
+        )
+        self.token_to_block_idx[:active_request_count] = self.request_last_kv_block_id[active_slice]
+
+        if active_request_count < self.padded_active_token_count:
+            pad_slice = slice(active_request_count, self.padded_active_token_count)
+            self.token_to_pos_ids[pad_slice] = 0
+            self.token_to_request_idx[pad_slice] = -1
+            self.token_to_position_in_request[pad_slice] = 0
+            self.token_to_local_position_within_kv_block[pad_slice] = 0
+            self.token_to_block_idx[pad_slice] = self.kv_block_allocator.dummy_block_idx
+
+        padded_active = max(active_request_count, self.padded_active_request_count)
+        self._staging_request_in_prefill_status[:active_request_count] = 0
+        self._staging_request_query_lengths[:active_request_count] = 1
+        self._staging_request_kv_length_offsets[:active_request_count] = next_offsets
+        self._staging_temperature[:padded_active] = self.active_request_metadata["temperature"][
+            :padded_active
+        ]
+        self._staging_top_k[:padded_active] = self.active_request_metadata["top_k"][:padded_active]
+        self._staging_top_p[:padded_active] = self.active_request_metadata["top_p"][:padded_active]
+        if active_request_count < padded_active:
+            self._staging_request_in_prefill_status[active_request_count:padded_active] = 0
+            self._staging_request_query_lengths[active_request_count:padded_active] = 0
+            self._staging_request_kv_length_offsets[active_request_count:padded_active] = 0
+
+        query_lengths = torch.ones(
+            active_request_count, dtype=self.request_query_lengths.dtype, device='cpu'
+        )
+        self._prepare_decode_mha_metadata(
+            batch_dimensions=batch_dimensions,
+            query_lengths=query_lengths,
+            kv_length_offsets=next_offsets,
+            request_to_kv_block_ids=self.request_to_kv_block_ids[active_slice],
+        )
+
+        if self.is_hybrid_model:
+            intermediate_offsets_gpu = None
+            intermediate_counts_gpu = None
+            if self.mamba_slot_allocator is not None:
+                intermediate_offsets_gpu, intermediate_counts_gpu = (
+                    self.mamba_slot_allocator.get_intermediate_cpu_data()
+                )
+            self._pending_mamba_transfer = self.mamba_metadata.compute_cpu_metadata(
+                active_mamba_indices=self.mamba_metadata.request_to_mamba_state_idx[active_slice],
+                token_to_request_idx=self.token_to_request_idx[:active_request_count],
+                cpu_cu_query=self._cpu_mha_cu_query_seq_lengths,
+                batch_dimensions=batch_dimensions,
+                padded_batch_dimensions=self.padded_batch_dimensions,
+                enable_chunked_prefill=False,
+                intermediate_offsets_gpu=intermediate_offsets_gpu,
+                intermediate_counts_gpu=intermediate_counts_gpu,
+            )
+
+        if self.moe_enable_routing_replay:
+            self.moe_routing_metadata.enable_static_buffer_recording()
+        if self._nccl_ep_dispatcher:
+            NCCLAllGatherDispatcher._use_allgather_v = False
+
+        self.transfer_bookkeeping_to_gpu(
+            include_token_to_input_ids=False, refresh_request_staging=False
+        )
+        self._async_prepared_decode_plan = AsyncDecodePlan(
+            request_ids=self.request_ids[active_slice].clone(),
+            kv_length_offsets=next_offsets.clone(),
+            active_request_count=active_request_count,
+            active_token_count=active_request_count,
+            padded_active_request_count=self.padded_active_request_count,
+        )
+        return True
+
+    def copy_async_prepared_decode_input_ids_from_samples(self, sampled_tokens_cuda: Tensor) -> bool:
+        """Write sampled tokens into the prepared child input buffer."""
+
+        plan = self._async_prepared_decode_plan
+        if plan is None:
+            return False
+        self.gpu_view.token_to_input_ids[: plan.active_request_count].copy_(
+            sampled_tokens_cuda[: plan.active_request_count]
+        )
+        return True
+
     def _execute_pending_mamba_ops(self) -> None:
         """Execute Mamba GPU operations deferred from add_request() / update_requests().
 
@@ -2302,7 +2559,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_ssm_states[:, indices] = 0.0
             self._pending_mamba_zeros.clear()
 
-    def transfer_bookkeeping_to_gpu(self) -> None:
+    def transfer_bookkeeping_to_gpu(
+        self, *, include_token_to_input_ids: bool = True, refresh_request_staging: bool = True
+    ) -> None:
         """Batch transfer CPU bookkeeping state to GPU staging buffers.
 
         Called after initialize_attention_state() and before the forward pass.
@@ -2319,39 +2578,50 @@ class DynamicInferenceContext(BaseInferenceContext):
         active_slice = slice(self.paused_request_count, self.total_request_count)
         padded_active = max(n_active, self.padded_active_request_count)
 
-        # Refresh request-level staging slots from the persistent CPU source.
-        # CPU-to-CPU slice assignment on pinned memory (~15 KB total for 6
-        # 4-byte fields at max_requests=624). Negligible vs. the launch overhead
-        # we save by merging the H2D memcpys into 1.
-        self._staging_request_in_prefill_status[:n_active] = self.request_in_prefill_status_tensor[
-            active_slice
-        ]
-        self._staging_request_query_lengths[:n_active] = self.request_query_lengths[active_slice]
-        self._staging_request_kv_length_offsets[:n_active] = self.request_kv_length_offsets[
-            active_slice
-        ]
-        # Sampling-parameter staging slots: read from `active_request_metadata`,
-        # which `build_active_slices` + `pad_active_slices` already populated for
-        # `[:padded_active]` (active values + neutral padding defaults).
-        self._staging_temperature[:padded_active] = self.active_request_metadata["temperature"][
-            :padded_active
-        ]
-        self._staging_top_k[:padded_active] = self.active_request_metadata["top_k"][:padded_active]
-        self._staging_top_p[:padded_active] = self.active_request_metadata["top_p"][:padded_active]
+        if refresh_request_staging:
+            # Refresh request-level staging slots from the persistent CPU source.
+            # CPU-to-CPU slice assignment on pinned memory (~15 KB total for 6
+            # 4-byte fields at max_requests=624). Negligible vs. the launch overhead
+            # we save by merging the H2D memcpys into 1.
+            self._staging_request_in_prefill_status[
+                :n_active
+            ] = self.request_in_prefill_status_tensor[active_slice]
+            self._staging_request_query_lengths[:n_active] = self.request_query_lengths[active_slice]
+            self._staging_request_kv_length_offsets[:n_active] = self.request_kv_length_offsets[
+                active_slice
+            ]
+            # Sampling-parameter staging slots: read from `active_request_metadata`,
+            # which `build_active_slices` + `pad_active_slices` already populated for
+            # `[:padded_active]` (active values + neutral padding defaults).
+            self._staging_temperature[:padded_active] = self.active_request_metadata["temperature"][
+                :padded_active
+            ]
+            self._staging_top_k[:padded_active] = self.active_request_metadata["top_k"][
+                :padded_active
+            ]
+            self._staging_top_p[:padded_active] = self.active_request_metadata["top_p"][
+                :padded_active
+            ]
 
-        # Full-iteration CUDA graphs may have captured GPU consumers with the
-        # padded graph request count. Keep those padded staging rows bounded so
-        # graph replay never builds indices from stale request lengths.
-        if n_active < padded_active:
-            self._staging_request_in_prefill_status[n_active:padded_active] = 0
-            self._staging_request_query_lengths[n_active:padded_active] = 0
-            self._staging_request_kv_length_offsets[n_active:padded_active] = 0
+            # Full-iteration CUDA graphs may have captured GPU consumers with the
+            # padded graph request count. Keep those padded staging rows bounded so
+            # graph replay never builds indices from stale request lengths.
+            if n_active < padded_active:
+                self._staging_request_in_prefill_status[n_active:padded_active] = 0
+                self._staging_request_query_lengths[n_active:padded_active] = 0
+                self._staging_request_kv_length_offsets[n_active:padded_active] = 0
 
         # Coalesced H2D: one cudaMemcpyAsync for the entire bookkeeping buffer.
         # Copying the whole (max_tokens + max_requests)-sized buffer including
         # unused slots is cheap (~71 KB total, ~3-5 us on PCIe Gen4) and saves
         # 8 redundant launch overheads vs. the prior per-field copies.
-        self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
+        if include_token_to_input_ids:
+            self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
+        else:
+            input_ids_nbytes = self.max_tokens * self.token_to_input_ids.element_size()
+            self.gpu_view._buf[input_ids_nbytes:].copy_(
+                self._cpu_bookkeeping_buf[input_ids_nbytes:], non_blocking=True
+            )
 
         # MHA metadata GPU views were already bound to state_data in
         # initialize_attention_state(); the H2D above populates the underlying
