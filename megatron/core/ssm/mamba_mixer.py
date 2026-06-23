@@ -532,13 +532,18 @@ class MambaMixer(MegatronModule):
 
             # Reshape from [N*S, 1, d] to [N, S, d] for the 3D Triton kernels
             zxBCdt_decode = zxBCdt_decode.squeeze(1).view(decode_req_count, seq_len, -1)
+            mamba_write_indices = (
+                context.mamba_metadata.batch_indices_decode_write
+                if context.mamba_metadata.state_bank_count > 1
+                else None
+            )
 
             y_decode = self._ssm_decode(
                 zxBCdt_decode,
                 conv_state,
                 ssm_state,
                 batch_indices=context.mamba_metadata.batch_indices_decode,
-                write_batch_indices=context.mamba_metadata.batch_indices_decode_write,
+                write_batch_indices=mamba_write_indices,
                 intermediate_conv_state=int_conv_state,
                 intermediate_ssm_state=int_ssm_state,
                 state_bank_count=context.mamba_metadata.state_bank_count,

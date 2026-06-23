@@ -427,59 +427,90 @@ class DynamicInferenceEngine(AbstractEngine):
         if HAVE_TQDM:
             tbar = tqdm(tbar, total=len(context.cuda_graph_batch_dimensions_list))
         for tbar_idx, cuda_graph_batch_dimension in tbar:
-            input_ids, position_ids = self.controller._dynamic_step_context_init(
-                construct_graph_dimensions=cuda_graph_batch_dimension
+            capture_slots = (None,)
+            if (
+                context.async_scheduling
+                and context.async_decode_slot_ring is not None
+                and cuda_graph_batch_dimension.prefill_req_count == 0
+            ):
+                capture_slots = context.async_decode_slot_ring.slots
+
+            saved_slot_index = (
+                context.async_decode_slot_ring.current_index
+                if context.async_decode_slot_ring is not None
+                else None
             )
-            # Progress.
-            tbar_str = f"cuda graph warmup - {cuda_graph_batch_dimension}"
-            if HAVE_TQDM:
-                tbar.set_description(tbar_str)
-            else:
-                logging.info(
-                    f"{tbar_idx}/{len(context.cuda_graph_batch_dimensions_list)}. {tbar_str}"
-                )
+            try:
+                for capture_slot_index, capture_slot in enumerate(capture_slots):
+                    if capture_slot is not None:
+                        context.async_decode_slot_ring.current_index = capture_slot_index
+                        context.bind_decode_slot(capture_slot)
 
-            # Enable routing recording during warmup if routing replay is enabled.
-            # This ensures the record_indices copy operation is captured in the CUDA graph.
-            if model_config.moe_enable_routing_replay:
-                RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
-
-            # Forward pass -> logits.
-            with torch.inference_mode():
-                controller._dynamic_step_forward_logits(input_ids, position_ids)
-
-                if controller._sampling_backend == "flashinfer":
-                    if controller.num_speculative_tokens > 0:
-                        controller._dynamic_step_sample_logits_and_verify_tokens(input_ids)
+                    input_ids, position_ids = self.controller._dynamic_step_context_init(
+                        construct_graph_dimensions=cuda_graph_batch_dimension
+                    )
+                    # Progress.
+                    slot_suffix = (
+                        f" slot {capture_slot.slot_id}" if capture_slot is not None else ""
+                    )
+                    tbar_str = f"cuda graph warmup - {cuda_graph_batch_dimension}{slot_suffix}"
+                    if HAVE_TQDM:
+                        tbar.set_description(tbar_str)
                     else:
-                        controller._dynamic_step_sample_logits()
+                        logging.info(
+                            f"{tbar_idx}/{len(context.cuda_graph_batch_dimensions_list)}. "
+                            f"{tbar_str}"
+                        )
 
-                # MTP CUDA graph warmup for this batch dimension.
-                if mtp_warmup_enabled:
-                    n = cuda_graph_batch_dimension.req_count
-                    # pylint: disable-next=possibly-used-before-assignment
-                    if sp_enabled:
-                        n = round_up_to_nearest_multiple(n, tp_size)
-                    # pylint: disable-next=possibly-used-before-assignment
-                    if n > 0 and n not in mtp_seen_batch_sizes:
-                        mtp_seen_batch_sizes.add(n)
-                        device = torch.cuda.current_device()
-                        batch_dim = n // tp_size if sp_enabled else n
-                        # Use zeros (not empty) — garbage token IDs cause OOB embedding lookups during graph capture/replay.
-                        for depth in mtp_warmup_depths:
-                            unwrapped.compute_mtp_single_step(
-                                hidden_states=torch.zeros(
-                                    (batch_dim, 1, model_config.hidden_size),
-                                    device=device,
-                                    dtype=model_config.params_dtype,
-                                ),
-                                next_token_ids=torch.zeros((1, n), device=device, dtype=torch.long),
-                                position_ids=torch.zeros((1, n), device=device, dtype=torch.int64),
-                                depth=depth,
-                                cache_key=("mtp", n, depth),
-                            )
+                    # Enable routing recording during warmup if routing replay is enabled.
+                    # This ensures the record_indices copy operation is captured in the CUDA graph.
+                    if model_config.moe_enable_routing_replay:
+                        RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
-                context.reset()
+                    # Forward pass -> logits.
+                    with torch.inference_mode():
+                        controller._dynamic_step_forward_logits(input_ids, position_ids)
+
+                        if controller._sampling_backend == "flashinfer":
+                            if controller.num_speculative_tokens > 0:
+                                controller._dynamic_step_sample_logits_and_verify_tokens(input_ids)
+                            else:
+                                controller._dynamic_step_sample_logits()
+
+                        # MTP CUDA graph warmup for this batch dimension.
+                        if mtp_warmup_enabled:
+                            n = cuda_graph_batch_dimension.req_count
+                            # pylint: disable-next=possibly-used-before-assignment
+                            if sp_enabled:
+                                n = round_up_to_nearest_multiple(n, tp_size)
+                            # pylint: disable-next=possibly-used-before-assignment
+                            if n > 0 and n not in mtp_seen_batch_sizes:
+                                mtp_seen_batch_sizes.add(n)
+                                device = torch.cuda.current_device()
+                                batch_dim = n // tp_size if sp_enabled else n
+                                # Use zeros (not empty) — garbage token IDs cause OOB embedding lookups during graph capture/replay.
+                                for depth in mtp_warmup_depths:
+                                    unwrapped.compute_mtp_single_step(
+                                        hidden_states=torch.zeros(
+                                            (batch_dim, 1, model_config.hidden_size),
+                                            device=device,
+                                            dtype=model_config.params_dtype,
+                                        ),
+                                        next_token_ids=torch.zeros(
+                                            (1, n), device=device, dtype=torch.long
+                                        ),
+                                        position_ids=torch.zeros(
+                                            (1, n), device=device, dtype=torch.int64
+                                        ),
+                                        depth=depth,
+                                        cache_key=("mtp", n, depth),
+                                    )
+
+                        context.reset()
+            finally:
+                if saved_slot_index is not None:
+                    context.async_decode_slot_ring.current_index = saved_slot_index
+                    context.bind_decode_slot(context.async_decode_slot_ring.current)
 
             # Per-iteration memory accounting, scoped to the CUDA-graph mempool.
             # This isolates pool growth from process-wide scratch churn (KV cache,
@@ -1856,10 +1887,14 @@ class DynamicInferenceEngine(AbstractEngine):
                 step_time (float): How long this step took.
         """
 
+        async_txn_diagnostics = getattr(self.context, "async_txn_diagnostics", None)
+        async_txn_diagnostics_enabled = bool(
+            self.context.async_scheduling
+            and async_txn_diagnostics is not None
+            and async_txn_diagnostics.enabled
+        )
         forward_wall_started_at = (
-            time.perf_counter()
-            if self.context.async_scheduling and self.context.async_txn_diagnostics.enabled
-            else None
+            time.perf_counter() if async_txn_diagnostics_enabled else None
         )
 
         # If suspended, no stepping.
@@ -1950,7 +1985,7 @@ class DynamicInferenceEngine(AbstractEngine):
             context_state = {**pre_step_context_state, "kv_stats": None}
 
         if forward_wall_started_at is not None:
-            self.context.async_txn_diagnostics.record_engine_forward_wall_duration(
+            async_txn_diagnostics.record_engine_forward_wall_duration(
                 (time.perf_counter() - forward_wall_started_at) * 1_000_000
             )
 
@@ -2068,10 +2103,14 @@ class DynamicInferenceEngine(AbstractEngine):
                 step_time (float): The step time in seconds.
                 cuda_graph_request_count (int): The CUDA graph batch size matching this step.
         """
+        async_txn_diagnostics = getattr(self.context, "async_txn_diagnostics", None)
+        async_txn_diagnostics_enabled = bool(
+            self.context.async_scheduling
+            and async_txn_diagnostics is not None
+            and async_txn_diagnostics.enabled
+        )
         bookkeep_wall_started_at = (
-            time.perf_counter()
-            if self.context.async_scheduling and self.context.async_txn_diagnostics.enabled
-            else None
+            time.perf_counter() if async_txn_diagnostics_enabled else None
         )
         # Increment finished_request_count.
         nvtx_range_push("bookkeeping")
@@ -2103,9 +2142,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # Process finished requests (adds FINISH events and returns records).
             postprocess_started_at = (
-                time.perf_counter()
-                if self.context.async_scheduling and self.context.async_txn_diagnostics.enabled
-                else None
+                time.perf_counter() if async_txn_diagnostics_enabled else None
             )
             try:
                 (active_request_ids, finished_request_records) = self.post_process_requests(
@@ -2126,7 +2163,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 )
             finally:
                 if postprocess_started_at is not None:
-                    self.context.async_txn_diagnostics.record_engine_postprocess_duration(
+                    async_txn_diagnostics.record_engine_postprocess_duration(
                         (time.perf_counter() - postprocess_started_at) * 1_000_000
                     )
 
@@ -2305,8 +2342,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._prefix_cache_hits,
                     self._prefix_cache_blocks_matched,
                 )
-            if self.context.async_scheduling:
-                async_diag = self.context.async_txn_diagnostics.snapshot()
+            if async_txn_diagnostics_enabled:
+                async_diag = async_txn_diagnostics.snapshot()
                 output_str += (
                     " ... async txn: prepared %(prepared)d, launched %(launched)d, "
                     "adopted %(adopted)d, retired %(retired)d, sync %(sync_steps)d, "
@@ -2318,7 +2355,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     "prestage %(child_prestage_duration_us).1f us, "
                     "ep-handoff %(ep_handoff_duration_us).1f us, "
                     "child-graph %(child_graph_shape_duration_us).1f us, "
+                    "fwd-sample-gpu %(child_forward_to_sample_gpu_us).1f us, "
+                    "sample-child-gpu %(sample_to_child_forward_gpu_us).1f us, "
                     "child-fwd-gpu %(child_forward_gpu_us).1f us, "
+                    "child-mode %(child_graph_replay_launches)d/%(child_eager_launches)d graph/eager, "
                     "sample-block %(sampling_block_us).1f us, "
                     "eng-fwd %(engine_forward_wall_us).1f us, "
                     "eng-book %(engine_bookkeep_wall_us).1f us, "
@@ -2333,7 +2373,7 @@ class DynamicInferenceEngine(AbstractEngine):
         nvtx_range_pop("console_logging")
 
         if bookkeep_wall_started_at is not None:
-            self.context.async_txn_diagnostics.record_engine_bookkeep_wall_duration(
+            async_txn_diagnostics.record_engine_bookkeep_wall_duration(
                 (time.perf_counter() - bookkeep_wall_started_at) * 1_000_000
             )
 

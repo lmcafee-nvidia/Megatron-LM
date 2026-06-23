@@ -385,7 +385,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.num_attention_layers = len(attention_layer_map) + len(dsa_layer_map)
             self.num_mamba_layers = len(mamba_layer_map)
             self.layer_map = attention_layer_map | dsa_layer_map | mamba_layer_map
-            self.mamba_state_bank_count = 2 if self.async_scheduling else 1
+            # Plain async decode has a no-reject-after-launch contract: once a
+            # child forward is launched, survivor rows are accepted. Mamba can
+            # therefore update the live state in place; extra banks are only
+            # needed by speculative paths that may roll back token positions.
+            self.mamba_state_bank_count = 1
         else:
             # The layer map is the identity function for pure Transformer models.
             # Use the same per-PP-rank layer count as TransformerBlock (handles
@@ -1500,13 +1504,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             self._disable_cuda_graph_replay_this_scope = previous
 
     def cuda_graph_cache_key(self):
-        """Return the CUDA graph cache key for the active padded shape.
+        """Return the CUDA graph cache key for the active padded shape/slot."""
 
-        Async decode slots are transactional metadata owners, not graph-cache
-        dimensions. Keeping this shape-only matches the main inference path and
-        avoids opt-in async CUDA graph capture.
-        """
-
+        if (
+            self.async_scheduling
+            and self.async_decode_slot_ring is not None
+            and self.using_cuda_graph_this_step()
+            and self.is_decode_only()
+        ):
+            slot = self.active_decode_slot()
+            return slot.cuda_graph_key(
+                ("decode", self.padded_active_request_count, self.padded_active_token_count)
+            )
         return self.padded_batch_dimensions
 
     def async_launch_eligibility(self, **kwargs):
@@ -3729,6 +3738,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         if not defer_release:
             self.kv_block_allocator.release_memory_blocks(block_ids)
             return
+        if retire_event is None:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            self.kv_block_allocator.release_memory_blocks(block_ids)
+            return
 
         self.async_txn_retire_queue.enqueue(
             retire_event,
@@ -3766,6 +3780,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             return
         mamba_slot_ids = mamba_slot_ids.to(device='cpu', dtype=torch.int32).clone()
         if not defer_release:
+            self.mamba_metadata.free_slot_ids(mamba_slot_ids)
+            return
+        if retire_event is None:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             self.mamba_metadata.free_slot_ids(mamba_slot_ids)
             return
 

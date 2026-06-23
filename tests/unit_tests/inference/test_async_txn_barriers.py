@@ -59,7 +59,7 @@ class FakeController:
         self.barrier_reasons = []
 
     async def async_generate_output_tokens_dynamic_batch(
-        self, *, async_launch_barrier_reason=None
+        self, *, async_launch_barrier_reason=None, profile_async_child_forward=False
     ):
         self.barrier_reasons.append(async_launch_barrier_reason)
         return None

@@ -68,7 +68,11 @@ class AsyncTxnDiagnostics:
     child_prestage_duration_us: float = 0.0
     ep_handoff_duration_us: float = 0.0
     child_graph_shape_duration_us: float = 0.0
+    child_forward_to_sample_gpu_us: float = 0.0
+    sample_to_child_forward_gpu_us: float = 0.0
     child_forward_gpu_us: float = 0.0
+    child_graph_replay_launches: int = 0
+    child_eager_launches: int = 0
     controller_wall_us: float = 0.0
     sampling_block_us: float = 0.0
     engine_forward_wall_us: float = 0.0
@@ -118,9 +122,25 @@ class AsyncTxnDiagnostics:
         if self.enabled:
             self.child_graph_shape_duration_us = max(0.0, float(duration_us))
 
+    def record_child_forward_to_sample_gpu_duration(self, duration_us: float) -> None:
+        if self.enabled:
+            self.child_forward_to_sample_gpu_us = max(0.0, float(duration_us))
+
+    def record_sample_to_child_forward_gpu_duration(self, duration_us: float) -> None:
+        if self.enabled:
+            self.sample_to_child_forward_gpu_us = max(0.0, float(duration_us))
+
     def record_child_forward_gpu_duration(self, duration_us: float) -> None:
         if self.enabled:
             self.child_forward_gpu_us = max(0.0, float(duration_us))
+
+    def record_child_forward_launch_mode(self, *, graph_replay: bool) -> None:
+        if not self.enabled:
+            return
+        if graph_replay:
+            self.child_graph_replay_launches += 1
+        else:
+            self.child_eager_launches += 1
 
     def record_controller_wall_duration(self, duration_us: float) -> None:
         if self.enabled:
@@ -206,7 +226,11 @@ class AsyncTxnDiagnostics:
             "child_prestage_duration_us": self.child_prestage_duration_us,
             "ep_handoff_duration_us": self.ep_handoff_duration_us,
             "child_graph_shape_duration_us": self.child_graph_shape_duration_us,
+            "child_forward_to_sample_gpu_us": self.child_forward_to_sample_gpu_us,
+            "sample_to_child_forward_gpu_us": self.sample_to_child_forward_gpu_us,
             "child_forward_gpu_us": self.child_forward_gpu_us,
+            "child_graph_replay_launches": self.child_graph_replay_launches,
+            "child_eager_launches": self.child_eager_launches,
             "controller_wall_us": self.controller_wall_us,
             "sampling_block_us": self.sampling_block_us,
             "engine_forward_wall_us": self.engine_forward_wall_us,
@@ -456,6 +480,13 @@ class AsyncDecodeSlot:
         self.forward_done_event = self._record_event_if_cuda()
         return self.forward_done_event
 
+    def cuda_graph_key(self, base_key: Optional[tuple]) -> Optional[tuple]:
+        """Attach stable slot identity to a CUDA graph key."""
+
+        if base_key is None:
+            return None
+        return (*base_key, ("decode_slot", self.slot_id, self.pointer_signature()))
+
     def _record_event_if_cuda(self, stream: object = None) -> object:
         buf = getattr(self.gpu_view, "_buf", None)
         if buf is None or not getattr(buf, "is_cuda", False):
@@ -463,6 +494,22 @@ class AsyncDecodeSlot:
         event = torch.cuda.Event()
         event.record(stream or torch.cuda.current_stream(buf.device))
         return event
+
+    def pointer_signature(self) -> tuple[int, ...]:
+        """Return the GPU metadata addresses that make this slot graph-distinct."""
+
+        pointers = []
+        for name in (
+            "_buf",
+            "token_to_input_ids",
+            "token_to_pos_ids",
+            "token_to_block_idx",
+            "mha_block_table",
+        ):
+            tensor = getattr(self.gpu_view, name, None)
+            if tensor is not None and hasattr(tensor, "data_ptr"):
+                pointers.append(int(tensor.data_ptr()))
+        return tuple(pointers)
 
 
 class AsyncDecodeSlotRing:

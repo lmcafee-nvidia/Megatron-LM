@@ -115,7 +115,7 @@ class FakeContext:
         return slot
 
     def current_input_and_position_ids(self):
-        view = self.async_decode_slot_ring.current.gpu_view
+        view = self.async_decode_slot_ring.slots[self.active_decode_slot_id].gpu_view
         return view.token_to_input_ids[:1].unsqueeze(0), view.token_to_pos_ids[:1].unsqueeze(0)
 
     def sync_ep_child_graph_shape(self):
@@ -195,6 +195,7 @@ def _make_controller(context):
     controller._async_launched_child_txn = None
     controller._async_presampled_txn = None
     controller._async_presampled_cuda_graph_request_count = None
+    controller._async_last_adopted_child_forward_done_event = None
     controller._accepted_tokens_per_request = None
     controller._accepted_token_counts_per_request = None
     controller._sampled_tokens_cuda = torch.tensor([5], dtype=torch.int64)
@@ -226,7 +227,7 @@ def _make_controller(context):
         order.append("transfer")
         return controller._sampled_tokens_cuda[:active_request_count].cpu(), None
 
-    def record_sample_ready():
+    def record_sample_ready(*, enable_timing=False):
         order.append("sample_ready")
         return object()
 
@@ -330,11 +331,65 @@ def test_cpu_sample_transfer_starts_before_child_launch():
     assert order.index("transfer_start") < order.index("child_forward")
     assert order.index("child_forward") < order.index("transfer")
     assert context.async_txn_diagnostics.launched == 1
-    assert context.async_txn_diagnostics.prepared == 2
+    assert context.async_txn_diagnostics.prepared == 1
     assert context.async_txn_diagnostics.h2d_ready_before_sampling == 1
     assert context.async_txn_diagnostics.sample_to_launch_latency_us > 0.0
     assert context.async_txn_diagnostics.commit_duration_us > 0.0
     assert controller._async_launched_child_txn is not None
+
+
+def test_ep_child_handoff_is_decided_before_sampling():
+    context = FakeContext()
+    controller, order = _make_controller(context)
+
+    def sync_child_handoff(active_request_count, *, can_launch_real_child, phase=None):
+        order.append("ep_child_handoff")
+        return SimpleNamespace(
+            has_real_work=can_launch_real_child,
+            active_request_count=active_request_count if can_launch_real_child else 0,
+        )
+
+    controller._sync_ep_async_child_launch_plan = sync_child_handoff
+
+    asyncio.run(controller.async_generate_output_tokens_dynamic_batch())
+
+    assert order.index("ep_child_handoff") < order.index("sample")
+    assert order.index("sample") < order.index("child_forward")
+
+
+def test_blocked_chain_still_participates_in_ep_handoff():
+    context = FakeContext()
+    controller, _ = _make_controller(context)
+    handoffs = []
+    controller._sync_ep_chain_handoff = (
+        lambda active_request_count, can_chain: handoffs.append(
+            (active_request_count, can_chain)
+        )
+        or SimpleNamespace(has_real_work=False, active_request_count=0)
+    )
+
+    asyncio.run(controller.async_generate_output_tokens_dynamic_batch())
+
+    assert handoffs == [(1, False)]
+    assert context.async_txn_diagnostics.prepared == 1
+
+
+def test_disabled_chain_skips_ep_handoff_phase():
+    context = FakeContext()
+    context.async_chain_scheduling = False
+    controller, _ = _make_controller(context)
+    handoffs = []
+    controller._sync_ep_chain_handoff = (
+        lambda active_request_count, can_chain: handoffs.append(
+            (active_request_count, can_chain)
+        )
+        or SimpleNamespace(has_real_work=False, active_request_count=0)
+    )
+
+    asyncio.run(controller.async_generate_output_tokens_dynamic_batch())
+
+    assert handoffs == []
+    assert context.async_txn_diagnostics.prepared == 1
 
 
 def test_prepared_async_child_path_does_not_yield_before_launch(monkeypatch):
@@ -428,6 +483,54 @@ def test_consecutive_decode_steps_adopt_launched_children():
     assert context.async_txn_diagnostics.launched == 2
 
 
+def test_adopted_child_retires_forward_side_effects_before_sampling():
+    context = FakeContext()
+    controller, order = _make_controller(context)
+    context.kv_block_allocator = SimpleNamespace(
+        block_routing=False,
+        store_routing_per_block=lambda routing: order.append("retire_side_effects")
+    )
+    controller._router_record_bookkeeping = lambda: order.append("router_record") or None
+
+    asyncio.run(controller.async_generate_output_tokens_dynamic_batch())
+    order.clear()
+    asyncio.run(controller.async_generate_output_tokens_dynamic_batch())
+
+    assert "init" not in order
+    assert "forward" not in order
+    assert order.index("router_record") < order.index("retire_side_effects")
+    assert order.index("retire_side_effects") < order.index("sample")
+
+
+def test_steady_decode_child_skips_forward_done_event():
+    context = FakeContext()
+    controller, order = _make_controller(context)
+
+    asyncio.run(controller.async_generate_output_tokens_dynamic_batch())
+    order.clear()
+    for slot in context.async_decode_slot_ring.slots:
+        slot.record_forward_done = lambda: order.append("forward_done_event") or object()
+
+    asyncio.run(controller.async_generate_output_tokens_dynamic_batch())
+
+    assert "forward_done_event" not in order
+    assert controller._async_launched_child_txn.forward_done_event is None
+
+
+def test_child_forward_done_event_required_for_cleanup_boundaries():
+    context = FakeContext()
+    controller, _ = _make_controller(context)
+
+    steady_txn = StepTxn(step_id=1, request_ids=(17,))
+    leased_txn = StepTxn(step_id=2, request_ids=(17,), kv_block_leases=((17, 3, 101),))
+
+    assert not controller._async_child_forward_done_event_required(steady_txn, 1)
+    assert controller._async_child_forward_done_event_required(leased_txn, 1)
+
+    context.active_request_metadata["termination_id"][0] = 7
+    assert controller._async_child_forward_done_event_required(steady_txn, 1)
+
+
 def test_child_launch_allows_ordinary_terminal_rows():
     context = FakeContext(termination_id=7)
     controller, order = _make_controller(context)
@@ -441,7 +544,7 @@ def test_child_launch_allows_ordinary_terminal_rows():
     assert context.async_txn_diagnostics.launched == 1
 
 
-def test_cuda_graph_child_launch_replays_current_slot_after_deferred_h2d():
+def test_cuda_graph_child_launch_replays_child_slot_after_prestaged_h2d():
     context = FakeContext(use_cuda_graph=True)
     controller, order = _make_controller(context)
     controller._enable_cuda_graph = True
@@ -449,14 +552,14 @@ def test_cuda_graph_child_launch_replays_current_slot_after_deferred_h2d():
     asyncio.run(controller.async_generate_output_tokens_dynamic_batch())
 
     assert "child_forward" in order
-    assert context.active_decode_slot_id == 0
-    assert controller._async_launched_child_txn.slot_id == 0
+    assert context.active_decode_slot_id == 1
+    assert controller._async_launched_child_txn.slot_id == 1
     assert controller._async_launched_child_txn.cpu_bookkeeping_buf is None
     assert context.child_forward_graph_flags == [(True, True)]
     assert context.using_cuda_graph_this_step()
     assert context.replay_cuda_graph_this_step()
-    assert context.deferred_h2d_prepares == 2
-    assert context.async_txn_diagnostics.h2d_ready_before_sampling == 0
+    assert context.deferred_h2d_prepares == 0
+    assert context.async_txn_diagnostics.h2d_ready_before_sampling == 1
     assert context.async_txn_diagnostics.launched == 1
 
 

@@ -55,6 +55,14 @@ class FakeStepCommunicator:
         return values[0] if len(values) == 1 else values
 
 
+class FakeGraphSlot:
+    def __init__(self, slot_id):
+        self.slot_id = slot_id
+
+    def cuda_graph_key(self, base_key):
+        return (*base_key, ("decode_slot", self.slot_id))
+
+
 def _make_graph_key_context(*, async_scheduling=True, decode_only=True, active_slot_id=1):
     context = object.__new__(DynamicInferenceContext)
     context.async_scheduling = async_scheduling
@@ -67,26 +75,31 @@ def _make_graph_key_context(*, async_scheduling=True, decode_only=True, active_s
         decode_req_count=1,
     )
     context.async_decode_slot_ring = SimpleNamespace(
-        slots=(SimpleNamespace(slot_id=0), SimpleNamespace(slot_id=1))
+        slots=(FakeGraphSlot(0), FakeGraphSlot(1))
     )
     context.active_decode_slot_id = active_slot_id
     return context
 
 
-def test_cuda_graph_cache_key_stays_shape_only_for_async_decode():
+def test_cuda_graph_cache_key_is_slot_aware_for_async_decode():
     context = _make_graph_key_context(active_slot_id=1)
 
     key = DynamicInferenceContext.cuda_graph_cache_key(context)
 
-    assert key == context.padded_batch_dimensions
+    assert key == ("decode", 1, 1, ("decode_slot", 1))
 
 
-def test_async_decode_child_adoption_uses_current_slot_graph_key():
+def test_async_decode_child_key_can_target_prepared_child_slot():
     context = _make_graph_key_context(active_slot_id=1)
     controller = object.__new__(TextGenerationController)
     controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
 
-    assert controller._async_decode_cuda_graph_key() == context.padded_batch_dimensions
+    assert controller._async_decode_cuda_graph_key(context.async_decode_slot_ring.slots[0]) == (
+        "decode",
+        1,
+        1,
+        ("decode_slot", 0),
+    )
 
 
 def test_cuda_graph_cache_key_stays_shape_only_for_non_decode_or_non_async():
@@ -232,7 +245,10 @@ def _make_dummy_controller(*, num_speculative_tokens):
     controller.num_speculative_tokens = num_speculative_tokens
     controller.model_config = SimpleNamespace(moe_pad_experts_for_cuda_graph_inference=False)
     controller.inference_wrapped_model = SimpleNamespace(
-        inference_context=SimpleNamespace(reset=lambda: calls.append("reset"))
+        inference_context=SimpleNamespace(
+            async_scheduling=True,
+            reset=lambda: calls.append("reset"),
+        )
     )
     controller._decide_ep_step_begin = lambda has_real_work: SimpleNamespace(
         reuse_pending_forward=True
