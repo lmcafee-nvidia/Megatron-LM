@@ -1671,6 +1671,9 @@ class TextGenerationController:
             row_mapped = self._row_map_requires_gather(row_map)
             if row_mapped:
                 self._async_row_mapped_forward_count += 1
+                self._async_discarded_forward_count += 1
+                transaction.discard("row-mapped forward disabled for parity debug")
+                return False, None, False
             transaction.row_map = row_map
             transaction.state = AsyncTxnState.RESOLVED
             row_indices = (
