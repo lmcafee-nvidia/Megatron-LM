@@ -1915,6 +1915,8 @@ class TextGenerationController:
         if self._async_disable_reason is not None:
             self._decide_ep_async_handoff(has_real_work=True, can_launch_async_handoff=False)
             return False
+        self._async_prepare_deferred_until_after_sampling = True
+        return False
         range_push("async_prepare_next_step")
         async_next_prepared = context.prepare_async_decode_next_step(pre_sampling=True)
         range_pop()
