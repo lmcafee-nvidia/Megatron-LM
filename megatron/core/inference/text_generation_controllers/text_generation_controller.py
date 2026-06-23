@@ -1415,6 +1415,51 @@ class TextGenerationController:
         # Expose the active slice so downstream code sees the right length.
         self._last_accepted_seq_indices = self._last_accepted_seq_indices_buf[:active_request_count]
 
+    def _debug_dump_greedy_logits(
+        self,
+        required_token_logits: Tensor,
+        active_request_count: int,
+        row_indices: Optional[Tensor],
+    ) -> None:
+        """Print top-logit diagnostics for a configured step window."""
+        debug_window = __import__("os").environ.get("MEGATRON_DEBUG_GREEDY_LOGITS_WINDOW")
+        if not debug_window:
+            return
+        context = self.inference_wrapped_model.inference_context
+        try:
+            start_s, end_s = debug_window.split(":", 1)
+            step = int(getattr(context, "step_count", -1))
+            rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_available() and torch.distributed.is_initialized()
+                else 0
+            )
+            if not (int(start_s) <= step <= int(end_s)):
+                return
+            logits = required_token_logits[:active_request_count]
+            top_values, top_indices = torch.topk(logits, k=min(5, logits.shape[-1]), dim=-1)
+            active_slice = slice(context.paused_request_count, context.total_request_count)
+            margins = (
+                top_values[:, 0] - top_values[:, 1]
+                if top_values.shape[1] > 1
+                else torch.zeros_like(top_values[:, 0])
+            )
+            payload = {
+                "step": step,
+                "rank": rank,
+                "async_enabled": bool(self._async_scheduling_enabled),
+                "pending_forward": bool(self._has_pending_async_forward_state()),
+                "row_indices": None if row_indices is None else row_indices.detach().cpu().tolist(),
+                "request_ids": context.request_ids[active_slice].detach().cpu().tolist(),
+                "sampled": self._sampled_tokens_cuda[:active_request_count].detach().cpu().tolist(),
+                "top_indices": top_indices.detach().cpu().tolist(),
+                "top_values": top_values.detach().float().cpu().tolist(),
+                "top1_top2_margin": margins.detach().float().cpu().tolist(),
+            }
+            print("[greedy-logits] " + __import__("json").dumps(payload, sort_keys=True), flush=True)
+        except Exception as exc:  # pragma: no cover - diagnostic-only path
+            print(f"[greedy-logits-error] {exc}", flush=True)
+
     def _dynamic_step_sample_logits(
         self, sample_count: Optional[int] = None, row_indices: Optional[Tensor] = None
     ) -> None:
@@ -1458,8 +1503,16 @@ class TextGenerationController:
             sampled_indices = torch.cat(indices_list, dim=0)
 
             self._sampled_tokens_cuda[sampled_indices] = sampled_tokens
+            self._debug_dump_greedy_logits(
+                required_token_logits, active_request_count, row_indices
+            )
             return
 
+        required_token_logits_for_debug = None
+        if __import__("os").environ.get("MEGATRON_DEBUG_GREEDY_LOGITS_WINDOW"):
+            required_token_logits_for_debug = self._dynamic_step_required_token_logits(
+                row_indices=row_indices
+            )
         use_graph = self._enable_cuda_graph and context.using_cuda_graph_this_step()
         # Padded count when running a captured graph (cache key buckets); actual otherwise.
         n = context.padded_active_request_count if use_graph else active_request_count
@@ -1485,6 +1538,10 @@ class TextGenerationController:
         self._sampled_tokens_cuda[:active_request_count].copy_(
             sampled_tokens[:active_request_count]
         )
+        if required_token_logits_for_debug is not None:
+            self._debug_dump_greedy_logits(
+                required_token_logits_for_debug, active_request_count, row_indices
+            )
 
     def has_pending_async_forward(self) -> bool:
         """Whether a speculative async forward has already been launched for the next step."""
@@ -1836,6 +1893,40 @@ class TextGenerationController:
                 self._sampled_tokens_cuda[:active_request_count],
             ),
         )
+        debug_window = __import__("os").environ.get("MEGATRON_DEBUG_GREEDY_LOGITS_WINDOW")
+        if debug_window:
+            try:
+                start_s, end_s = debug_window.split(":", 1)
+                step = int(getattr(context, "step_count", -1))
+                rank = (
+                    torch.distributed.get_rank()
+                    if torch.distributed.is_available() and torch.distributed.is_initialized()
+                    else 0
+                )
+                if int(start_s) <= step <= int(end_s):
+                    logits = required_token_logits[:active_request_count]
+                    top_values, top_indices = torch.topk(logits, k=min(5, logits.shape[-1]), dim=-1)
+                    active_slice = slice(context.paused_request_count, context.total_request_count)
+                    margins = (
+                        top_values[:, 0] - top_values[:, 1]
+                        if top_values.shape[1] > 1
+                        else torch.zeros_like(top_values[:, 0])
+                    )
+                    payload = {
+                        "step": step,
+                        "rank": rank,
+                        "async_enabled": bool(self._async_scheduling_enabled),
+                        "pending_forward": bool(self._has_pending_async_forward_state()),
+                        "row_indices": None if row_indices is None else row_indices.detach().cpu().tolist(),
+                        "request_ids": context.request_ids[active_slice].detach().cpu().tolist(),
+                        "sampled": self._sampled_tokens_cuda[:active_request_count].detach().cpu().tolist(),
+                        "top_indices": top_indices.detach().cpu().tolist(),
+                        "top_values": top_values.detach().float().cpu().tolist(),
+                        "top1_top2_margin": margins.detach().float().cpu().tolist(),
+                    }
+                    print("[greedy-logits] " + __import__("json").dumps(payload, sort_keys=True), flush=True)
+            except Exception as exc:  # pragma: no cover - diagnostic-only path
+                print(f"[greedy-logits-error] {exc}", flush=True)
         self._copy_sampled_decode_tokens_to_next_input_ids(active_request_count)
 
     def _dynamic_step_sample_logits_to_next_input_ids(
