@@ -2806,6 +2806,8 @@ class TextGenerationController:
                     pending_forward_row_indices,
                     pending_forward_row_mapped,
                 ) = self._resolve_pending_async_forward()
+                if pending_forward_reused:
+                    torch.cuda.current_stream().synchronize()
                 pending_forward_row_mapped = (
                     pending_forward_row_mapped or ep_step_begin_decision.row_mapped_forward
                 )
