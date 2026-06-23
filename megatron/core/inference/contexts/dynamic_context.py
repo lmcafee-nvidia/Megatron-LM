@@ -3,6 +3,7 @@
 import logging
 import math
 import operator
+import os
 import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -382,7 +383,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.num_attention_layers = len(attention_layer_map) + len(dsa_layer_map)
             self.num_mamba_layers = len(mamba_layer_map)
             self.layer_map = attention_layer_map | dsa_layer_map | mamba_layer_map
-            self.mamba_state_bank_count = 2 if inference_config.enable_async_scheduling else 1
+            force_single_bank = os.environ.get("MEGATRON_DEBUG_ASYNC_SINGLE_MAMBA_BANK") == "1"
+            self.mamba_state_bank_count = (
+                1
+                if force_single_bank
+                else 2 if inference_config.enable_async_scheduling else 1
+            )
         else:
             # The layer map is the identity function for pure Transformer models.
             # Use the same per-PP-rank layer count as TransformerBlock (handles
