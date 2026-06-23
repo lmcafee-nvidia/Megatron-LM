@@ -440,7 +440,7 @@ def test_ep_async_step_protocol_consume_launched_forward_skips_dummy_base_forwar
     decision = protocol.decide_step_begin(
         has_real_work=True,
         has_launched_forward=True,
-        launched_forward_consumable=True,
+        launched_forward_ready=True,
     )
 
     assert decision.consume_launched_forward is True
@@ -467,11 +467,39 @@ def test_ep_async_step_protocol_reports_launched_forward_invariant_failure_if_re
     decision = protocol.decide_step_begin(
         has_real_work=True,
         has_launched_forward=False,
-        launched_forward_consumable=False,
+        launched_forward_ready=False,
     )
 
     assert decision.consume_launched_forward is False
     assert decision.launched_forward_invariant_failed is True
+
+
+def test_controller_step_begin_uses_local_child_state_without_ep_collective():
+    class Protocol:
+        enabled = True
+
+        def decide_step_begin(self, **kwargs):
+            raise AssertionError("step-begin should not run an EP collective")
+
+    controller = object.__new__(TextGenerationController)
+    controller._ep_async_protocol = Protocol()
+    controller._async_launched_child_txn = SimpleNamespace(launched=True)
+    controller._ep_dummy_launched_child_forward = True
+    controller.inference_wrapped_model = SimpleNamespace(
+        inference_context=SimpleNamespace(async_scheduling=True)
+    )
+
+    real_decision = TextGenerationController._decide_ep_step_begin(
+        controller, has_real_work=True
+    )
+    dummy_decision = TextGenerationController._decide_ep_step_begin(
+        controller, has_real_work=False
+    )
+
+    assert real_decision.consume_launched_forward is True
+    assert real_decision.launched_forward_invariant_failed is False
+    assert dummy_decision.consume_launched_forward is True
+    assert dummy_decision.launched_forward_invariant_failed is False
 
 
 def test_ep_work_step_sends_coordinator_reply_after_step_completion():

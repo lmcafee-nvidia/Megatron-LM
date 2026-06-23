@@ -1000,7 +1000,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # then int32 token fields, then int32/float32 request-staging fields.
         #   token_to_input_ids                         (int64,   max_tokens)
         #   token_to_pos_ids                           (int64,   max_tokens)
-        #   token_to_block_idx                         (int64,   max_tokens)
+        #   token_to_block_idx                         (int32,   max_tokens)
         #   token_to_local_position_within_kv_block    (int32,   max_tokens)
         #   token_to_request_idx                       (int32,   max_tokens)
         #   token_to_position_in_request               (int32,   max_tokens)
@@ -1030,26 +1030,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         _mha_kv_seq_lengths_bytes = self.max_requests * 4
         _mha_cu_kv_seq_lengths_bytes = (self.max_requests + 1) * 4
         _mha_block_table_bytes = self.max_requests * self.max_kv_block_count * 4
-        _pre_mamba_bytes = (
-            3 * _tok_int64_bytes
-            + 3 * _tok_int32_bytes
-            + 7 * _req_4byte_bytes
-            + _mha_query_lengths_bytes
-            + _mha_cu_query_seq_lengths_bytes
-            + _mha_kv_seq_lengths_bytes
-            + _mha_cu_kv_seq_lengths_bytes
-            + _mha_block_table_bytes
-        )
         # Mamba section (hybrid models only). Must match the MambaMetadata
         # shapes (mirrors the layout documented in ContextGPUView).
-        # batch_indices_decode and batch_indices_decode_write are int64;
-        # all other fields are int32.
+        # All coalesced Mamba metadata fields are int32.
         if self.is_hybrid_model:
-            # mamba_batch_indices_decode is int64; pad to 8-byte alignment.
-            _mamba_align_pad = (8 - _pre_mamba_bytes % 8) % 8
             self._max_mamba_chunks = self.max_tokens // self.mamba_chunk_size + self.max_requests
-            _mamba_batch_indices_decode_bytes = self.max_requests * 8
-            _mamba_batch_indices_decode_write_bytes = self.max_requests * 8
+            _mamba_batch_indices_decode_bytes = self.max_requests * 4
+            _mamba_batch_indices_decode_write_bytes = self.max_requests * 4
             _mamba_batch_indices_prefill_bytes = self.max_requests * 4
             _mamba_seq_idx_bytes = self.max_tokens * 4
             _mamba_cu_seqlens_bytes = (self.max_requests + 1) * 4
@@ -1059,7 +1046,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             _mamba_conv_seq_idx_bytes = self.max_tokens * 4
             _mamba_conv_seq_start_bytes = self.max_tokens * 4
         else:
-            _mamba_align_pad = 0
             self._max_mamba_chunks = 0
             _mamba_batch_indices_decode_bytes = 0
             _mamba_batch_indices_decode_write_bytes = 0
@@ -1072,8 +1058,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             _mamba_conv_seq_idx_bytes = 0
             _mamba_conv_seq_start_bytes = 0
         _total_bytes = (
-            _pre_mamba_bytes
-            + _mamba_align_pad
+            2 * _tok_int64_bytes
+            + 4 * _tok_int32_bytes
+            + 7 * _req_4byte_bytes
+            + _mha_query_lengths_bytes
+            + _mha_cu_query_seq_lengths_bytes
+            + _mha_kv_seq_lengths_bytes
+            + _mha_cu_kv_seq_lengths_bytes
+            + _mha_block_table_bytes
             + _mamba_batch_indices_decode_bytes
             + _mamba_batch_indices_decode_write_bytes
             + _mamba_batch_indices_prefill_bytes
@@ -1105,10 +1097,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             torch.long
         )
         _off += _tok_int64_bytes
-        self.token_to_block_idx = self._cpu_bookkeeping_buf[_off : _off + _tok_int64_bytes].view(
-            torch.int64
+        self.token_to_block_idx = self._cpu_bookkeeping_buf[_off : _off + _tok_int32_bytes].view(
+            torch.int32
         )
-        _off += _tok_int64_bytes
+        _off += _tok_int32_bytes
         # i.e For a set of tokens A B C D E F ..  and block_size 4:
         # token_to_position_in_request is  [0, 1, 2, 3, 4, 5]
         # token_to_local_position_within_kv_block is [0 , 1, 2, 3, 0, 1, 2]
@@ -1204,14 +1196,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         # by MambaMetadata.compute_cpu_metadata(); transferred as part of the
         # single coalesced H2D in transfer_bookkeeping_to_gpu().
         if self.is_hybrid_model:
-            _off += _mamba_align_pad
             self._cpu_mamba_batch_indices_decode = self._cpu_bookkeeping_buf[
                 _off : _off + _mamba_batch_indices_decode_bytes
-            ].view(torch.int64)
+            ].view(torch.int32)
             _off += _mamba_batch_indices_decode_bytes
             self._cpu_mamba_batch_indices_decode_write = self._cpu_bookkeeping_buf[
                 _off : _off + _mamba_batch_indices_decode_write_bytes
-            ].view(torch.int64)
+            ].view(torch.int32)
             _off += _mamba_batch_indices_decode_write_bytes
             self._cpu_mamba_batch_indices_prefill = self._cpu_bookkeeping_buf[
                 _off : _off + _mamba_batch_indices_prefill_bytes
@@ -1599,7 +1590,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         raise RuntimeError(f"active decode slot {self.active_decode_slot_id} is not in the ring")
 
     def plain_decode_child_needs_terminal_check(
-        self, active_request_count: Optional[int] = None
+        self, active_request_count: Optional[int] = None, *, lookahead_tokens: int = 1
     ) -> bool:
         """Return whether same-step finish detection could affect child consumption."""
 
@@ -1607,6 +1598,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             active_request_count = self.total_request_count - self.paused_request_count
         if active_request_count <= 0:
             return True
+        lookahead_tokens = int(lookahead_tokens)
+        if lookahead_tokens <= 0:
+            return False
 
         termination_ids = self.active_request_metadata["termination_id"][:active_request_count]
         if bool((termination_ids >= 0).any()):
@@ -1614,7 +1608,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         active_sequence_lengths = self.get_active_sequence_lengths()[:active_request_count]
         max_sequence_lengths = self.get_max_sequence_lengths()[:active_request_count]
-        return bool(torch.ge(active_sequence_lengths + 1, max_sequence_lengths).any())
+        return bool(torch.ge(active_sequence_lengths + lookahead_tokens, max_sequence_lengths).any())
 
     def prepare_child_from_committed_decode_state(
         self,
@@ -1688,6 +1682,116 @@ class DynamicInferenceContext(BaseInferenceContext):
             slot_id=child_slot.slot_id,
             h2d_done_event=h2d_done_event,
             cpu_bookkeeping_buf=child_cpu_buf if defer_h2d else None,
+            bookkeeping_source_buf=child_cpu_buf,
+            kv_block_leases=kv_block_leases,
+            mamba_slot_ids=mamba_slot_ids,
+            cuda_graph_key=None,
+        )
+
+    def prepare_child_from_transaction_decode_state(
+        self,
+        parent_txn: StepTxn,
+        *,
+        target_slot: Optional[AsyncDecodeSlot] = None,
+        defer_h2d: bool = False,
+    ) -> Optional[StepTxn]:
+        """Prestage the next plain-decode child from an accepted transaction snapshot."""
+
+        if not self.async_scheduling or self.async_decode_slot_ring is None:
+            return None
+        self.async_txn_retire_queue.drain_ready()
+
+        source_cpu_buf = (
+            parent_txn.bookkeeping_source_buf
+            if parent_txn.bookkeeping_source_buf is not None
+            else parent_txn.cpu_bookkeeping_buf
+        )
+        if source_cpu_buf is None:
+            self.async_txn_diagnostics.record_barrier_skip(AsyncTxnSkipReason.SERIAL_WRAPPED)
+            return None
+
+        child_slot = target_slot or self.async_decode_slot_ring.child
+        if child_slot is not self.async_decode_slot_ring.current and not child_slot.can_reuse():
+            self.async_txn_diagnostics.record_barrier_skip(AsyncTxnSkipReason.CHILD_SLOT_BUSY)
+            return None
+
+        active_request_count = self.total_request_count - self.paused_request_count
+        if (
+            active_request_count <= 0
+            or self.active_token_count != active_request_count
+            or active_request_count != len(parent_txn.request_ids)
+            or tuple(
+                int(request_id)
+                for request_id in self.request_ids[
+                    self.paused_request_count : self.total_request_count
+                ].tolist()
+            )
+            != tuple(parent_txn.request_ids)
+        ):
+            self.async_txn_diagnostics.record_barrier_skip(AsyncTxnSkipReason.ACTIVE_COUNT_CHANGED)
+            return None
+        if (
+            getattr(self, "num_speculative_tokens", 0) > 0
+            or not self.is_decode_only()
+            or getattr(self, "chunked_prefill_request_id", -1) != -1
+            or self.paused_request_count > 0
+        ):
+            self.async_txn_diagnostics.record_barrier_skip(AsyncTxnSkipReason.NOT_DECODE_ONLY)
+            return None
+        if self.plain_decode_child_needs_terminal_check(
+            active_request_count, lookahead_tokens=2
+        ):
+            self.async_txn_diagnostics.record_barrier_skip(
+                AsyncTxnSkipReason.TERMINAL_CHECK_REQUIRED
+            )
+            return None
+
+        kv_block_leases = self._reserve_async_boundary_blocks_from_source(
+            parent_txn, source_cpu_buf, active_request_count
+        )
+        if kv_block_leases is None:
+            self.async_txn_diagnostics.record_barrier_skip(
+                AsyncTxnSkipReason.KV_RESERVATION_UNAVAILABLE
+            )
+            return None
+
+        request_ids = tuple(parent_txn.request_ids)
+        mamba_slot_ids = ()
+        if self.is_hybrid_model:
+            assert self.mamba_metadata is not None
+            mamba_slot_ids = tuple(
+                int(slot)
+                for slot in self.mamba_metadata.request_to_mamba_state_idx[
+                    self.paused_request_count : self.total_request_count
+                ].tolist()
+            )
+
+        child_cpu_buf = self._async_child_cpu_bookkeeping_buf(child_slot)
+        self._build_plain_decode_child_bookkeeping(
+            child_cpu_buf,
+            active_request_count,
+            kv_block_leases=kv_block_leases,
+            source_cpu_buf=source_cpu_buf,
+            source_request_ids=request_ids,
+        )
+        h2d_done_event = None
+        if not defer_h2d:
+            h2d_stream = (
+                getattr(self, "_async_child_h2d_stream", None)
+                if child_slot is not self.async_decode_slot_ring.current
+                else None
+            )
+            h2d_done_event = child_slot.copy_bookkeeping_from_cpu(
+                child_cpu_buf, non_blocking=True, stream=h2d_stream
+            )
+        self.async_txn_diagnostics.record_prepared(under_forward=True)
+        return StepTxn(
+            step_id=parent_txn.step_id + 1,
+            request_ids=request_ids,
+            slot_id=child_slot.slot_id,
+            h2d_done_event=h2d_done_event,
+            cpu_bookkeeping_buf=child_cpu_buf if defer_h2d else None,
+            bookkeeping_source_buf=child_cpu_buf,
             kv_block_leases=kv_block_leases,
             mamba_slot_ids=mamba_slot_ids,
             cuda_graph_key=None,
@@ -1701,30 +1805,69 @@ class DynamicInferenceContext(BaseInferenceContext):
         if not boundary_request_ids:
             return ()
 
-        num_blocks = len(boundary_request_ids)
-        block_ids = self.kv_block_allocator.allocate_memory_blocks(num_blocks)
-        if block_ids is None or block_ids.numel() != num_blocks:
-            return None
-
         active_slice = slice(self.paused_request_count, self.total_request_count)
         active_request_ids = self.request_ids[active_slice].tolist()
         request_id_to_row = {
             int(request_id): row for row, request_id in enumerate(active_request_ids)
         }
-        leases = []
-        for request_id, block_id in zip(boundary_request_ids, block_ids.tolist()):
+        boundary_columns = []
+        for request_id in boundary_request_ids:
             row = request_id_to_row[int(request_id)]
             block_column = int(
                 self.request_kv_block_counts[self.paused_request_count + row].item()
             )
+            boundary_columns.append((int(request_id), block_column))
+        return self._reserve_async_boundary_blocks_for_columns(boundary_columns)
+
+    def _reserve_async_boundary_blocks_for_columns(
+        self, boundary_columns: Sequence[tuple[int, int]]
+    ) -> Optional[tuple[KVBlockLease, ...]]:
+        """Reserve concrete ``(request_id, block_column)`` KV leases."""
+
+        if not boundary_columns:
+            return ()
+
+        num_blocks = len(boundary_columns)
+        block_ids = self.kv_block_allocator.allocate_memory_blocks(num_blocks)
+        if block_ids is None or block_ids.numel() != num_blocks:
+            return None
+
+        leases = []
+        for (request_id, block_column), block_id in zip(boundary_columns, block_ids.tolist()):
             leases.append(
                 KVBlockLease(
                     request_id=int(request_id),
-                    block_column=block_column,
+                    block_column=int(block_column),
                     block_id=int(block_id),
                 )
             )
         return tuple(leases)
+
+    def _reserve_async_boundary_blocks_from_source(
+        self, parent_txn: StepTxn, source_cpu_buf: Tensor, active_request_count: int
+    ) -> Optional[tuple[KVBlockLease, ...]]:
+        """Reserve boundary blocks for a child derived from transaction metadata."""
+
+        source_token_to_pos_ids = self._cpu_bookkeeping_clone_view(
+            self.token_to_pos_ids, source_cpu_buf
+        )
+        source_token_to_local = self._cpu_bookkeeping_clone_view(
+            self.token_to_local_position_within_kv_block, source_cpu_buf
+        )
+        local_positions = source_token_to_local[:active_request_count]
+        if not bool(torch.ge(local_positions, self.block_size_tokens - 1).any()):
+            return ()
+
+        boundary_columns = []
+        for row, crosses in enumerate(
+            torch.ge(local_positions, self.block_size_tokens - 1).tolist()
+        ):
+            if not crosses:
+                continue
+            request_id = int(parent_txn.request_ids[row])
+            next_position = int(source_token_to_pos_ids[row].item()) + 1
+            boundary_columns.append((request_id, next_position // self.block_size_tokens))
+        return self._reserve_async_boundary_blocks_for_columns(boundary_columns)
 
     def _async_child_cpu_bookkeeping_buf(self, child_slot: AsyncDecodeSlot) -> Tensor:
         """Return this slot's pinned CPU staging buffer for child metadata."""
@@ -1746,6 +1889,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         active_request_count: int,
         *,
         kv_block_leases: Sequence[KVBlockLease] = (),
+        source_cpu_buf: Optional[Tensor] = None,
+        source_request_ids: Optional[Sequence[int]] = None,
     ) -> None:
         """Build the child CPU metadata snapshot by active slices only.
 
@@ -1759,6 +1904,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         padded_token_count = max(token_count, self.padded_active_token_count)
         padded_active = max(active_request_count, self.padded_active_request_count)
         active_slice = slice(self.paused_request_count, self.total_request_count)
+        source_buf = source_cpu_buf if source_cpu_buf is not None else self._cpu_bookkeeping_buf
 
         child_token_to_input_ids = self._cpu_bookkeeping_clone_view(
             self.token_to_input_ids, child_cpu_buf
@@ -1811,18 +1957,75 @@ class DynamicInferenceContext(BaseInferenceContext):
             self._cpu_mha_block_table, child_cpu_buf
         )
 
-        child_token_to_input_ids[:token_count].copy_(self.token_to_input_ids[:token_count])
-        child_token_to_pos_ids[:token_count].copy_(self.token_to_pos_ids[:token_count])
+        source_token_to_input_ids = self._cpu_bookkeeping_clone_view(
+            self.token_to_input_ids, source_buf
+        )
+        source_token_to_pos_ids = self._cpu_bookkeeping_clone_view(
+            self.token_to_pos_ids, source_buf
+        )
+        source_token_to_block_idx = self._cpu_bookkeeping_clone_view(
+            self.token_to_block_idx, source_buf
+        )
+        source_token_to_request_idx = self._cpu_bookkeeping_clone_view(
+            self.token_to_request_idx, source_buf
+        )
+        source_token_to_position = self._cpu_bookkeeping_clone_view(
+            self.token_to_position_in_request, source_buf
+        )
+        source_token_to_local = self._cpu_bookkeeping_clone_view(
+            self.token_to_local_position_within_kv_block, source_buf
+        )
+        source_staging_query_lengths = (
+            self._cpu_bookkeeping_clone_view(self._staging_request_query_lengths, source_buf)
+            if source_cpu_buf is not None
+            else self.request_query_lengths
+        )
+        source_staging_kv_offsets = (
+            self._cpu_bookkeeping_clone_view(self._staging_request_kv_length_offsets, source_buf)
+            if source_cpu_buf is not None
+            else self.request_kv_length_offsets
+        )
+        source_temperature = (
+            self._cpu_bookkeeping_clone_view(self._staging_temperature, source_buf)
+            if source_cpu_buf is not None
+            else self.active_request_metadata["temperature"]
+        )
+        source_top_k = (
+            self._cpu_bookkeeping_clone_view(self._staging_top_k, source_buf)
+            if source_cpu_buf is not None
+            else self.active_request_metadata["top_k"]
+        )
+        source_top_p = (
+            self._cpu_bookkeeping_clone_view(self._staging_top_p, source_buf)
+            if source_cpu_buf is not None
+            else self.active_request_metadata["top_p"]
+        )
+        source_last_token_idxs = (
+            self._cpu_bookkeeping_clone_view(self.active_request_last_token_idxs, source_buf)
+            if source_cpu_buf is not None
+            else self.active_request_last_token_idxs
+        )
+        source_mha_query_lengths = self._cpu_bookkeeping_clone_view(
+            self._cpu_mha_query_lengths, source_buf
+        )
+        source_mha_cu_query_lengths = self._cpu_bookkeeping_clone_view(
+            self._cpu_mha_cu_query_seq_lengths, source_buf
+        )
+        source_mha_kv_lengths = self._cpu_bookkeeping_clone_view(
+            self._cpu_mha_kv_seq_lengths, source_buf
+        )
+        source_mha_block_table = self._cpu_bookkeeping_clone_view(
+            self._cpu_mha_block_table, source_buf
+        )
+
+        child_token_to_input_ids[:token_count].copy_(source_token_to_input_ids[:token_count])
+        child_token_to_pos_ids[:token_count].copy_(source_token_to_pos_ids[:token_count])
         child_token_to_pos_ids[:token_count].add_(1)
-        child_token_to_block_idx[:token_count].copy_(self.token_to_block_idx[:token_count])
-        child_token_to_request_idx[:token_count].copy_(self.token_to_request_idx[:token_count])
-        child_token_to_position[:token_count].copy_(
-            self.token_to_position_in_request[:token_count]
-        )
+        child_token_to_block_idx[:token_count].copy_(source_token_to_block_idx[:token_count])
+        child_token_to_request_idx[:token_count].copy_(source_token_to_request_idx[:token_count])
+        child_token_to_position[:token_count].copy_(source_token_to_position[:token_count])
         child_token_to_position[:token_count].add_(1)
-        child_token_to_local[:token_count].copy_(
-            self.token_to_local_position_within_kv_block[:token_count]
-        )
+        child_token_to_local[:token_count].copy_(source_token_to_local[:token_count])
         child_token_to_local[:token_count].add_(1)
         child_token_to_local[:token_count].remainder_(self.block_size_tokens)
 
@@ -1837,20 +2040,16 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         child_staging_prefill[:active_request_count] = 0
         child_staging_query_lengths[:active_request_count].copy_(
-            self.request_query_lengths[active_slice]
+            source_staging_query_lengths[active_slice if source_cpu_buf is None else slice(0, active_request_count)]
         )
         child_staging_kv_offsets[:active_request_count].copy_(
-            self.request_kv_length_offsets[active_slice]
+            source_staging_kv_offsets[active_slice if source_cpu_buf is None else slice(0, active_request_count)]
         )
         child_staging_kv_offsets[:active_request_count].add_(1)
-        child_temperature[:padded_active].copy_(
-            self.active_request_metadata["temperature"][:padded_active]
-        )
-        child_top_k[:padded_active].copy_(self.active_request_metadata["top_k"][:padded_active])
-        child_top_p[:padded_active].copy_(self.active_request_metadata["top_p"][:padded_active])
-        child_last_token_idxs[:padded_active].copy_(
-            self.active_request_last_token_idxs[:padded_active]
-        )
+        child_temperature[:padded_active].copy_(source_temperature[:padded_active])
+        child_top_k[:padded_active].copy_(source_top_k[:padded_active])
+        child_top_p[:padded_active].copy_(source_top_p[:padded_active])
+        child_last_token_idxs[:padded_active].copy_(source_last_token_idxs[:padded_active])
         if active_request_count < padded_active:
             pad_slice = slice(active_request_count, padded_active)
             child_staging_prefill[pad_slice] = 0
@@ -1859,11 +2058,11 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         real_bs = self.batch_dimensions.req_count
         padded_bs = self.padded_batch_dimensions.req_count
-        child_mha_query_lengths[:padded_bs].copy_(self._cpu_mha_query_lengths[:padded_bs])
+        child_mha_query_lengths[:padded_bs].copy_(source_mha_query_lengths[:padded_bs])
         child_mha_cu_query_lengths[: padded_bs + 1].copy_(
-            self._cpu_mha_cu_query_seq_lengths[: padded_bs + 1]
+            source_mha_cu_query_lengths[: padded_bs + 1]
         )
-        child_mha_kv_lengths[:real_bs].copy_(self._cpu_mha_kv_seq_lengths[:real_bs])
+        child_mha_kv_lengths[:real_bs].copy_(source_mha_kv_lengths[:real_bs])
         child_mha_kv_lengths[:real_bs].add_(1)
         child_mha_cu_kv_lengths[0] = 0
         if real_bs > 0:
@@ -1875,14 +2074,16 @@ class DynamicInferenceContext(BaseInferenceContext):
                 real_bs
             ]
             child_mha_kv_lengths[real_bs:padded_bs] = 0
-        child_mha_block_table[:real_bs].copy_(self._cpu_mha_block_table[:real_bs])
+        child_mha_block_table[:real_bs].copy_(source_mha_block_table[:real_bs])
         if real_bs < padded_bs:
             child_mha_block_table[real_bs:padded_bs] = -1
 
         if kv_block_leases:
-            active_request_ids = self.request_ids[
-                self.paused_request_count : self.total_request_count
-            ].tolist()
+            active_request_ids = (
+                list(source_request_ids)
+                if source_request_ids is not None
+                else self.request_ids[self.paused_request_count : self.total_request_count].tolist()
+            )
             request_id_to_row = {
                 int(request_id): row for row, request_id in enumerate(active_request_ids)
             }
@@ -1898,13 +2099,27 @@ class DynamicInferenceContext(BaseInferenceContext):
             child_mamba_decode_write = self._cpu_bookkeeping_clone_view(
                 self._cpu_mamba_batch_indices_decode_write, child_cpu_buf
             )
-            active_slice = slice(self.paused_request_count, self.total_request_count)
-            child_mamba_decode[:active_request_count] = self._mamba_flat_indices(active_slice).to(
-                dtype=child_mamba_decode.dtype
-            )
-            child_mamba_decode_write[:active_request_count] = self._mamba_flat_indices(
-                active_slice, use_candidate_bank=True
-            ).to(dtype=child_mamba_decode_write.dtype)
+            if source_cpu_buf is not None:
+                source_mamba_decode = self._cpu_bookkeeping_clone_view(
+                    self._cpu_mamba_batch_indices_decode, source_cpu_buf
+                )
+                source_mamba_decode_write = self._cpu_bookkeeping_clone_view(
+                    self._cpu_mamba_batch_indices_decode_write, source_cpu_buf
+                )
+                child_mamba_decode[:active_request_count].copy_(
+                    source_mamba_decode_write[:active_request_count]
+                )
+                child_mamba_decode_write[:active_request_count].copy_(
+                    source_mamba_decode[:active_request_count]
+                )
+            else:
+                active_slice = slice(self.paused_request_count, self.total_request_count)
+                child_mamba_decode[:active_request_count] = self._mamba_flat_indices(
+                    active_slice
+                ).to(dtype=child_mamba_decode.dtype)
+                child_mamba_decode_write[:active_request_count] = self._mamba_flat_indices(
+                    active_slice, use_next_bank=True
+                ).to(dtype=child_mamba_decode_write.dtype)
             if active_request_count < padded_active:
                 child_mamba_decode[active_request_count:padded_active] = -1
                 child_mamba_decode_write[active_request_count:padded_active] = -1
@@ -2102,38 +2317,40 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return (conv_state, ssm_state)
 
-    def _mamba_flat_indices(
-        self, request_slice: slice, *, use_candidate_bank: bool = False
-    ) -> Tensor:
+    def _mamba_flat_indices(self, request_slice: slice, *, use_next_bank: bool = False) -> Tensor:
         """Return flattened Mamba state rows for the selected request rows."""
         assert self.is_hybrid_model, "Only hybrid models have Mamba state tensors"
         base_indices = self.mamba_metadata.request_to_mamba_state_idx[request_slice].to(
             dtype=torch.int32
         )
+        if self.mamba_state_bank_count == 1:
+            return base_indices
         bank_indices = self.mamba_metadata.request_to_mamba_state_bank[request_slice].to(
             dtype=torch.int32
         )
-        if use_candidate_bank and self.mamba_state_bank_count > 1:
+        if use_next_bank:
             bank_indices = 1 - bank_indices
         return base_indices * self.mamba_state_bank_count + bank_indices
 
     def _mamba_flat_indices_from_request_idxs(
-        self, request_idxs: Tensor, *, use_candidate_bank: bool = False
+        self, request_idxs: Tensor, *, use_next_bank: bool = False
     ) -> Tensor:
         """Return flattened Mamba state rows for explicit request rows."""
         assert self.is_hybrid_model, "Only hybrid models have Mamba state tensors"
         base_indices = self.mamba_metadata.request_to_mamba_state_idx[request_idxs].to(
             dtype=torch.int32
         )
+        if self.mamba_state_bank_count == 1:
+            return base_indices
         bank_indices = self.mamba_metadata.request_to_mamba_state_bank[request_idxs].to(
             dtype=torch.int32
         )
-        if use_candidate_bank and self.mamba_state_bank_count > 1:
+        if use_next_bank:
             bank_indices = 1 - bank_indices
         return base_indices * self.mamba_state_bank_count + bank_indices
 
-    def accept_async_mamba_state(self, request_ids: Sequence[int] | Tensor) -> None:
-        """Commit candidate Mamba banks for accepted async-forward requests."""
+    def advance_async_mamba_state(self, request_ids: Sequence[int] | Tensor) -> None:
+        """Advance consumed async decode requests to the bank written by their child forward."""
         if not self.is_hybrid_model or self.mamba_state_bank_count == 1:
             return
         if isinstance(request_ids, torch.Tensor):
@@ -2672,6 +2889,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         *,
         construct_graph_dimensions: Optional[InferenceBatchDimensions] = None,
         is_expert_parallel_dummy_cuda_graph_step: bool = False,
+        transfer_bookkeeping_to_gpu: bool = True,
     ) -> None:
         """Initialize attention state so that every layer can use it.
 
@@ -2680,6 +2898,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 The graph config to use for constructing the cuda graphs.
             is_expert_parallel_dummy_cuda_graph_step (bool):
                 Whether this is a dummy expert model parallel step.
+            transfer_bookkeeping_to_gpu (bool):
+                Whether to transfer the prepared CPU bookkeeping snapshot to GPU before returning.
         Return:
             None.
         """
@@ -2925,9 +3145,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Run the H2D transfer here so callers that bypass the controller
         # (e.g. unit tests that call `model.forward()` directly after
         # `initialize_attention_state()`) see populated GPU bookkeeping. The
-        # text-generation controller still calls `transfer_bookkeeping_to_gpu`
-        # explicitly; that second call is a cheap idempotent re-copy.
-        self.transfer_bookkeeping_to_gpu()
+        # text-generation controller passes transfer_bookkeeping_to_gpu=False
+        # and performs the single explicit H2D at the forward boundary.
+        if transfer_bookkeeping_to_gpu:
+            self.transfer_bookkeeping_to_gpu()
 
     def _execute_pending_mamba_ops(self) -> None:
         """Execute Mamba GPU operations deferred from add_request() / update_requests().
@@ -4085,8 +4306,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.total_request_count = 0
             self.active_token_count = 0
 
-            # Reset Mamba state.
-            self.reset_mamba_state()
+            # Reset Mamba state unless a launched async transaction owns the
+            # release. In that case release_memory_blocks_from_request_indexes()
+            # has already detached the finished request rows and enqueued the
+            # concrete Mamba slots for transaction retirement. Resetting the
+            # global free list here would make those later retire callbacks
+            # double-free the same slots.
+            if self.is_hybrid_model and defer_finished_release:
+                self.mamba_metadata.request_to_mamba_state_idx.fill_(-1)
+                self.mamba_metadata.request_to_mamba_state_bank.zero_()
+                self.mamba_metadata.reset_varlen_metadata()
+            else:
+                self.reset_mamba_state()
             return
 
         # 3. Concatenate the paused tokens to the active tokens if present.

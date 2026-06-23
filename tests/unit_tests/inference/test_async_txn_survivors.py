@@ -46,7 +46,7 @@ class FakeKVAllocator:
 
 
 class FakeLaunchContext:
-    def __init__(self, *, offsets=(3,), available_blocks=0):
+    def __init__(self, *, offsets=(3,), available_blocks=0, terminal_check=False):
         self.paused_request_count = 0
         self.total_request_count = len(offsets)
         self.request_last_kv_block_offset = torch.tensor(offsets, dtype=torch.int32)
@@ -55,9 +55,16 @@ class FakeLaunchContext:
         self.num_speculative_tokens = 0
         self.kv_block_allocator = FakeKVAllocator(available_blocks)
         self.chunked_prefill_request_id = -1
+        self.terminal_check = terminal_check
 
     def is_decode_only(self) -> bool:
         return True
+
+    def plain_decode_child_needs_terminal_check(
+        self, active_request_count=None, *, lookahead_tokens=1
+    ):
+        del active_request_count, lookahead_tokens
+        return self.terminal_check
 
 
 def _make_bookkeeping_context() -> DynamicInferenceContext:
@@ -104,7 +111,7 @@ def _make_bookkeeping_context() -> DynamicInferenceContext:
     context._cpu_mha_cu_query_seq_lengths = view(torch.int32, (3,))
     context._cpu_mha_kv_seq_lengths = view(torch.int32, (4,))
     context._cpu_mha_cu_kv_seq_lengths = view(torch.int32, (5,))
-    context.token_to_block_idx = view(torch.int64, (4,))
+    context.token_to_block_idx = view(torch.int32, (4,))
     context._cpu_mha_block_table = view(torch.int32, (2, 2))
 
     context.token_to_input_ids[:2] = torch.tensor([11, 22])
@@ -120,6 +127,11 @@ def _make_bookkeeping_context() -> DynamicInferenceContext:
         "top_k": torch.ones(4, dtype=torch.int32),
         "top_p": torch.zeros(4, dtype=torch.float32),
     }
+    context._staging_request_query_lengths[:2] = torch.ones(2, dtype=torch.int32)
+    context._staging_request_kv_length_offsets[:2] = torch.tensor([1, 3], dtype=torch.int32)
+    context._staging_temperature[:2] = torch.ones(2, dtype=torch.float32)
+    context._staging_top_k[:2] = torch.ones(2, dtype=torch.int32)
+    context._staging_top_p[:2] = torch.zeros(2, dtype=torch.float32)
     context.active_request_last_token_idxs[:2] = torch.tensor([0, 1])
     context._cpu_mha_query_lengths[:2] = torch.ones(2, dtype=torch.int32)
     context._cpu_mha_cu_query_seq_lengths[:3] = torch.tensor([0, 1, 2], dtype=torch.int32)
@@ -165,17 +177,18 @@ def _make_update_context() -> DynamicInferenceContext:
     context.token_to_request_idx = torch.zeros(8, dtype=torch.int32)
     context.token_to_position_in_request = torch.zeros(8, dtype=torch.int64)
     context.token_to_local_position_within_kv_block = torch.zeros(8, dtype=torch.int32)
-    context.token_to_block_idx = torch.zeros(8, dtype=torch.int64)
+    context.token_to_block_idx = torch.zeros(8, dtype=torch.int32)
     context.reset_attention_state = lambda: None
     return context
 
 
-def test_finish_in_middle_accepts_survivors():
-    txn = StepTxn(step_id=4, request_ids=[101, 102, 103])
-    txn.launched = True
-    txn.mark_committed([101, 103], terminal_request_ids=[102])
+def test_terminal_risk_prevents_launch_instead_of_post_launch_survivor_check():
+    context = FakeLaunchContext(offsets=(1,), available_blocks=1, terminal_check=True)
 
-    assert txn.is_consumable_after_commit([101, 103], terminal_request_ids=txn.terminal_request_ids)
+    result = classify_decode_child_launch(context, async_enabled=True)
+
+    assert not result.eligible
+    assert result.reason.value == "terminal_check_required"
 
 
 def test_compaction_changes_row_order_but_survivor_outputs_follow_request_ids():
@@ -241,14 +254,6 @@ def test_missing_reservation_ignores_same_step_terminal_free_headroom():
     assert result.required_boundary_blocks == 1
 
 
-def test_guard_failure_after_launch_does_not_accept_nonterminal_disappearance():
-    txn = StepTxn(step_id=4, request_ids=[101, 102])
-    txn.launched = True
-    txn.mark_committed([101], terminal_request_ids=[])
-
-    assert not txn.is_consumable_after_commit([101], terminal_request_ids=txn.terminal_request_ids)
-
-
 def test_patch_plain_decode_child_uses_reserved_boundary_block():
     context = _make_bookkeeping_context()
     child = context._cpu_bookkeeping_buf.clone()
@@ -270,3 +275,41 @@ def test_patch_plain_decode_child_uses_reserved_boundary_block():
     assert child_local[:2].tolist() == [2, 0]
     assert child_block_idx[:2].tolist() == [10, 77]
     assert child_block_table[1, 1].item() == 77
+
+
+def test_source_plain_decode_child_advances_from_transaction_snapshot():
+    context = _make_bookkeeping_context()
+    source = context._cpu_bookkeeping_buf.clone()
+    child = context._cpu_bookkeeping_buf.clone()
+    lease = KVBlockLease(request_id=102, block_column=1, block_id=77)
+
+    DynamicInferenceContext._build_plain_decode_child_bookkeeping(
+        context,
+        child,
+        2,
+        kv_block_leases=(lease,),
+        source_cpu_buf=source,
+        source_request_ids=(101, 102),
+    )
+
+    child_pos = DynamicInferenceContext._cpu_bookkeeping_clone_view(
+        context, context.token_to_pos_ids, child
+    )
+    child_local = DynamicInferenceContext._cpu_bookkeeping_clone_view(
+        context, context.token_to_local_position_within_kv_block, child
+    )
+    child_kv_offsets = DynamicInferenceContext._cpu_bookkeeping_clone_view(
+        context, context._staging_request_kv_length_offsets, child
+    )
+    child_mha_kv_lengths = DynamicInferenceContext._cpu_bookkeeping_clone_view(
+        context, context._cpu_mha_kv_seq_lengths, child
+    )
+    child_block_idx = DynamicInferenceContext._cpu_bookkeeping_clone_view(
+        context, context.token_to_block_idx, child
+    )
+
+    assert child_pos[:2].tolist() == [2, 4]
+    assert child_local[:2].tolist() == [2, 0]
+    assert child_kv_offsets[:2].tolist() == [2, 4]
+    assert child_mha_kv_lengths[:2].tolist() == [3, 5]
+    assert child_block_idx[:2].tolist() == [10, 77]

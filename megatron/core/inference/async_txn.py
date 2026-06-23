@@ -57,7 +57,7 @@ class AsyncTxnDiagnostics:
     sync_steps: int = 0
     barrier_skips: int = 0
     retired: int = 0
-    guard_failures: int = 0
+    invariant_failures: int = 0
     chain_attempts: int = 0
     chain_launches: int = 0
     deferred_sample_commits: int = 0
@@ -154,9 +154,9 @@ class AsyncTxnDiagnostics:
         self.barrier_skips += 1
         self.record_skip(reason)
 
-    def record_guard_failure(self) -> None:
+    def record_invariant_failure(self) -> None:
         if self.enabled:
-            self.guard_failures += 1
+            self.invariant_failures += 1
 
     def record_chain_attempt(self, *, launched: bool = False) -> None:
         if not self.enabled:
@@ -195,7 +195,7 @@ class AsyncTxnDiagnostics:
             "sync_steps": self.sync_steps,
             "barrier_skips": self.barrier_skips,
             "retired": self.retired,
-            "guard_failures": self.guard_failures,
+            "invariant_failures": self.invariant_failures,
             "chain_attempts": self.chain_attempts,
             "chain_launches": self.chain_launches,
             "deferred_sample_commits": self.deferred_sample_commits,
@@ -259,6 +259,7 @@ class StepTxn:
     forward_timing_done_event: object = None
     sample_done_event: object = None
     cpu_bookkeeping_buf: Optional[torch.Tensor] = None
+    bookkeeping_source_buf: Optional[torch.Tensor] = None
     kv_block_ids: tuple[int, ...] = ()
     kv_block_leases: tuple[KVBlockLease, ...] = ()
     mamba_slot_ids: tuple[int, ...] = ()
@@ -329,37 +330,6 @@ class StepTxn:
 
     def forward_done(self) -> bool:
         return _event_done(self.forward_done_event)
-
-    def is_consumable_after_commit(
-        self,
-        current_request_ids: Iterable[int],
-        *,
-        terminal_request_ids: Iterable[int] = (),
-        decode_only: bool = True,
-        cuda_graph_key: Optional[Any] = None,
-    ) -> bool:
-        """Check the no-reject-after-launch consumption invariant.
-
-        Survivors must be a subset of launched rows.  Any launched row that is
-        missing from the current committed set must be terminal; no non-terminal
-        survivor may disappear after child launch.
-        """
-
-        if not self.launched:
-            return False
-        if self.decode_only and not decode_only:
-            return False
-        if self.cuda_graph_key is not None and cuda_graph_key is not None:
-            if self.cuda_graph_key != cuda_graph_key:
-                return False
-
-        current = set(int(r) for r in current_request_ids)
-        terminal = set(int(r) for r in terminal_request_ids)
-        launched = self.request_id_set
-        if not current.issubset(launched):
-            return False
-        missing = launched - current
-        return missing.issubset(terminal)
 
 
 @dataclass
@@ -801,6 +771,9 @@ def classify_decode_child_launch(
         return AsyncLaunchEligibility(False, AsyncTxnSkipReason.EVICT_BARRIER)
     if force_pause_barrier:
         return AsyncLaunchEligibility(False, AsyncTxnSkipReason.FORCE_PAUSE_BARRIER)
+    terminal_check = getattr(context, "plain_decode_child_needs_terminal_check", None)
+    if terminal_check is not None and terminal_check():
+        return AsyncLaunchEligibility(False, AsyncTxnSkipReason.TERMINAL_CHECK_REQUIRED)
 
     boundary_ids = boundary_crossing_request_ids(context)
     required = len(boundary_ids)

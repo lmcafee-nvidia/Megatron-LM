@@ -64,7 +64,7 @@ def _append_kv_cache_kernel(
         return
 
     # --- Load destination indices for the current token ---
-    block_idx = tl.load(block_idx_ptr + token_idx)
+    block_idx = tl.load(block_idx_ptr + token_idx).to(tl.int64)
     local_pos = tl.load(local_kv_seq_idx_ptr + token_idx)
 
     # --- Load the key and value data for the current head of the current token ---

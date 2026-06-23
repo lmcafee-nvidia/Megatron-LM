@@ -30,15 +30,13 @@ def test_step_txn_owns_request_snapshot_and_events():
     assert txn.h2d_ready()
 
 
-def test_step_txn_guard_allows_only_terminal_disappearances():
+def test_step_txn_records_commit_snapshot_without_consumption_decision():
     txn = StepTxn(step_id=1, request_ids=[1, 2, 3], cuda_graph_key=("decode", 4))
     txn.launched = True
+    txn.mark_committed([1, 3], terminal_request_ids=[2])
 
-    assert txn.is_consumable_after_commit([1, 3], terminal_request_ids=[2], cuda_graph_key=("decode", 4))
-    assert not txn.is_consumable_after_commit([1, 3], terminal_request_ids=[], cuda_graph_key=("decode", 4))
-    assert not txn.is_consumable_after_commit([1, 4], terminal_request_ids=[2], cuda_graph_key=("decode", 4))
-    assert not txn.is_consumable_after_commit([1, 3], terminal_request_ids=[2], cuda_graph_key=("decode", 8))
-    assert not txn.is_consumable_after_commit([1, 3], terminal_request_ids=[2], decode_only=False)
+    assert txn.committed_request_ids == (1, 3)
+    assert txn.terminal_request_ids == (2,)
 
 
 def test_retire_queue_releases_only_after_event_completion():
@@ -69,7 +67,7 @@ def test_diagnostics_are_noop_when_disabled():
     diagnostics.record_sync_step("serial_wrapped")
     diagnostics.record_barrier_skip("not_decode_only")
     diagnostics.record_retired()
-    diagnostics.record_guard_failure()
+    diagnostics.record_invariant_failure()
     diagnostics.record_launched(sample_to_launch_latency_us=12.0)
     diagnostics.record_commit_duration(34.0)
 

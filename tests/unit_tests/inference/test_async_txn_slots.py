@@ -19,7 +19,7 @@ class FakeGPUView:
         self._buf = torch.zeros(16, dtype=torch.uint8)
         self.token_to_input_ids = torch.zeros(4, dtype=torch.int64)
         self.token_to_pos_ids = torch.zeros(4, dtype=torch.int64)
-        self.token_to_block_idx = torch.zeros(4, dtype=torch.int64)
+        self.token_to_block_idx = torch.zeros(4, dtype=torch.int32)
         self.mha_block_table = torch.zeros((2, 2), dtype=torch.int32)
 
 

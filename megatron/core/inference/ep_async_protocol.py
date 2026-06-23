@@ -188,21 +188,21 @@ class EPAsyncStepProtocol:
         *,
         has_real_work: bool,
         has_launched_forward: bool,
-        launched_forward_consumable: bool,
+        launched_forward_ready: bool,
     ) -> EPStepBeginDecision:
         """Synchronize whether this EP work step reuses a prior async child forward."""
 
         step_id = self._step_id_for_phase(EPAsyncPhase.STEP_BEGIN)
         local_real = int(has_real_work)
         local_launched_forward = int(has_launched_forward)
-        local_reusable = int(has_launched_forward and launched_forward_consumable)
-        local_invariant_failure = int(has_launched_forward and not launched_forward_consumable)
+        local_ready = int(has_launched_forward and launched_forward_ready)
+        local_invariant_failure = int(has_launched_forward and not launched_forward_ready)
         local_real_missing_forward = int(has_real_work and not has_launched_forward)
 
         (
             any_real,
             any_launched_forward,
-            any_reusable,
+            any_ready,
             any_invariant_failure,
             any_real_missing_forward,
         ) = self._sync_all_reduce_max_at_step(
@@ -210,7 +210,7 @@ class EPAsyncStepProtocol:
             step_id,
             local_real,
             local_launched_forward,
-            local_reusable,
+            local_ready,
             local_invariant_failure,
             local_real_missing_forward,
         )
@@ -218,7 +218,7 @@ class EPAsyncStepProtocol:
 
         consume_launched_forward = bool(
             any_launched_forward
-            and any_reusable
+            and any_ready
             and not any_invariant_failure
             and not any_real_missing_forward
         )

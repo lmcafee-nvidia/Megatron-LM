@@ -32,6 +32,9 @@ def _core_inference_source() -> str:
         "_AsyncPendingForwardView",
         "launched_forward_signature",
         "_validate_launched_forward",
+        "is_consumable_after_commit",
+        "accept_async_mamba_state",
+        "guard_failures",
         "_consume_previous_forward",
         "full_layout_signature",
         "row_map",
@@ -70,20 +73,19 @@ class _ConsumptionContext:
         return False
 
 
-def test_guard_failure_clears_launched_child_without_plain_decode_rerun():
+def test_launched_child_is_consumed_without_post_commit_reconciliation():
     context = _ConsumptionContext()
     controller = object.__new__(TextGenerationController)
     controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
     controller._async_launched_child_txn = StepTxn(
-        step_id=1, request_ids=(10,), launched=True
+        step_id=1, request_ids=(11,), launched=True
     )
 
-    with pytest.raises(RuntimeError, match="async decode child consumption invariant failed"):
-        controller._consume_async_child_logits()
+    assert controller._consume_async_child_logits()
 
     assert controller._async_launched_child_txn is None
-    assert context.async_txn_diagnostics.guard_failures == 1
-    assert context.async_txn_diagnostics.consumed == 0
+    assert context.async_txn_diagnostics.invariant_failures == 0
+    assert context.async_txn_diagnostics.consumed == 1
 
 
 def test_step_txn_tracks_logical_mamba_slots_without_bank_internals():

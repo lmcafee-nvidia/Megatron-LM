@@ -26,8 +26,8 @@ class TestKVAppendLargeBlockIdx:
 
         dest_offset = block_idx * stride_cache_block + ...
 
-    Triton performs this multiplication in the dtype of ``block_idx``, which is
-    loaded from ``token_to_block_idx``. ``ContextGPUView`` owns that tensor.
+    The kernel must widen ``block_idx`` before this multiplication. Keeping the
+    context metadata compact is fine as long as the address math is int64.
 
     With a typical stride of 2^15 (= 256 pos x 1 head x 128 dim) the product
     overflows **signed int32** the moment block_idx >= 2^16:
@@ -50,9 +50,8 @@ class TestKVAppendLargeBlockIdx:
         block_idx = 2^16 -> offset = 2**31  (overflows signed int32).
 
         The block_idx tensor is created with the same dtype that
-        ContextGPUView.token_to_block_idx uses. If that dtype is int32 the
-        offset wraps and the kernel writes to the wrong address; if int64 the
-        offset is computed correctly and the assertion passes.
+        ContextGPUView.token_to_block_idx uses. The kernel must compute the
+        destination offset in int64 even when that storage dtype is int32.
         """
         device = "cuda"
         total_blocks = 65_537
@@ -89,7 +88,7 @@ class TestKVAppendLargeBlockIdx:
             torch.cuda.synchronize()
         except RuntimeError as e:
             pytest.fail(
-                f"CUDA error during KV append — likely int32 offset overflow "
+                f"CUDA error during KV append - likely offset overflow "
                 f"(token_to_block_idx dtype is {block_idx_dtype}): {e}"
             )
 
@@ -103,7 +102,7 @@ class TestKVAppendLargeBlockIdx:
             f"token_to_block_idx dtype is {block_idx_dtype}; "
             f"stride_cache_block = {block_size * num_heads * h_dim}, "
             f"block_idx * stride = {target_block * block_size * num_heads * h_dim} "
-            f"(overflows int32 at 2**31 = {2**31})."
+            f"(requires int64 address arithmetic)."
         )
         assert torch.equal(
             actual_value, expected_value

@@ -5,7 +5,7 @@ import concurrent
 import copy
 import functools
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, OrderedDict, Tuple, Union
 
@@ -151,6 +151,7 @@ class TextGenerationController:
         self._ep_decode_broadcast_plan: Optional[EPDecodeBroadcastPlan] = None
         self._ep_async_protocol = None
         self._ep_step_begin_decision: Optional[EPStepBeginDecision] = None
+        self._ep_dummy_launched_child_forward = False
         self._ep_dummy_sampled_tokens_cuda: Optional[Tensor] = None
         self._ep_dummy_accepted_counts_cuda: Optional[Tensor] = None
         self._dummy_context_h2d_done_event = None
@@ -216,12 +217,22 @@ class TextGenerationController:
         self._greedy_sampled_tokens_cuda = torch.empty(
             max_requests, dtype=torch.int64, device=device
         )
-        self._async_sampled_tokens_cpu = (
-            torch.empty(max_requests, dtype=torch.int64, pin_memory=True)
+        self._async_sampled_tokens_cpu_buffers = (
+            (
+                torch.empty(max_requests, dtype=torch.int64, pin_memory=True),
+                torch.empty(max_requests, dtype=torch.int64, pin_memory=True),
+            )
             if context.async_scheduling
+            else ()
+        )
+        self._async_sampled_tokens_cpu = (
+            self._async_sampled_tokens_cpu_buffers[0]
+            if self._async_sampled_tokens_cpu_buffers
             else None
         )
         self._async_sample_transfer_stream = None
+        self._async_sample_transfer_records = deque()
+        self._async_sample_transfer_next_buffer = 0
         self._async_sample_transfer_done_event = None
         self._async_sample_transfer_count = 0
 
@@ -602,6 +613,7 @@ class TextGenerationController:
         context.initialize_attention_state(
             construct_graph_dimensions=construct_graph_dimensions,
             is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
+            transfer_bookkeeping_to_gpu=False,
         )
         range_pop()
 
@@ -742,42 +754,38 @@ class TextGenerationController:
         active_slice = slice(context.paused_request_count, context.total_request_count)
         return tuple(int(request_id) for request_id in context.request_ids[active_slice].tolist())
 
-    def _launched_async_child_consumable(self) -> bool:
-        """Return whether the launched child transaction can be this step's forward."""
+    def _launched_async_child_ready(self) -> bool:
+        """Return whether a previously launched child forward must be consumed."""
 
         child_txn = self._async_launched_child_txn
         if child_txn is None:
             return False
         context = self.inference_wrapped_model.inference_context
-        if not context.async_scheduling:
-            return False
-        return child_txn.is_consumable_after_commit(
-            self._async_active_request_ids(),
-            terminal_request_ids=child_txn.terminal_request_ids,
-            decode_only=context.is_decode_only(),
-            cuda_graph_key=self._async_decode_cuda_graph_key(),
-        )
+        return bool(context.async_scheduling and child_txn.launched)
 
     def _decide_ep_step_begin(self, *, has_real_work: bool) -> EPStepBeginDecision:
-        """Synchronize whether this EP step reuses the previous async child forward."""
+        """Return whether this rank should consume a child launched last step.
 
-        has_launched_forward = self._async_launched_child_txn is not None
-        launched_forward_consumable = (
-            self._launched_async_child_consumable() if has_launched_forward else False
-        )
-        if self._ep_async_protocol is not None and self._ep_async_protocol.enabled:
-            decision = self._ep_async_protocol.decide_step_begin(
-                has_real_work=has_real_work,
-                has_launched_forward=has_launched_forward,
-                launched_forward_consumable=launched_forward_consumable,
+        The child/chain handoff collectives already establish whether an async
+        child forward phase ran. Carry that local state into the next step
+        instead of doing another EP-wide start-of-step collective on the hot path.
+        """
+
+        if has_real_work:
+            has_launched_forward = self._async_launched_child_txn is not None
+            launched_forward_ready = (
+                self._launched_async_child_ready() if has_launched_forward else False
             )
         else:
-            decision = EPStepBeginDecision(
-                step_id=-1,
-                has_real_work=has_real_work,
-                consume_launched_forward=bool(has_launched_forward and launched_forward_consumable),
-                launched_forward_invariant_failed=bool(has_launched_forward and not launched_forward_consumable),
-            )
+            has_launched_forward = bool(getattr(self, "_ep_dummy_launched_child_forward", False))
+            launched_forward_ready = has_launched_forward
+
+        decision = EPStepBeginDecision(
+            step_id=-1,
+            has_real_work=has_real_work,
+            consume_launched_forward=bool(has_launched_forward and launched_forward_ready),
+            launched_forward_invariant_failed=bool(has_launched_forward and not launched_forward_ready),
+        )
         self._ep_step_begin_decision = decision
         return decision
 
@@ -798,18 +806,17 @@ class TextGenerationController:
 
         range_push("async_txn_consume_child")
         try:
-            if not child_txn.is_consumable_after_commit(
-                self._async_active_request_ids(),
-                terminal_request_ids=child_txn.terminal_request_ids,
-                decode_only=context.is_decode_only(),
-                cuda_graph_key=self._async_decode_cuda_graph_key(),
-            ):
-                context.async_txn_diagnostics.record_guard_failure()
-                self._async_launched_child_txn = None
-                raise RuntimeError("async decode child consumption invariant failed")
-
+            if not child_txn.launched:
+                context.async_txn_diagnostics.record_invariant_failure()
+                raise RuntimeError("async decode child was not launched before consumption")
+            if child_txn.decode_only and not context.is_decode_only():
+                context.async_txn_diagnostics.record_invariant_failure()
+                raise RuntimeError("async decode child cannot be consumed in a non-decode step")
+            if self._async_decode_cuda_graph_key() != child_txn.cuda_graph_key:
+                context.async_txn_diagnostics.record_invariant_failure()
+                raise RuntimeError("async decode child CUDA graph shape changed before consumption")
             if context.is_hybrid_model:
-                context.accept_async_mamba_state(child_txn.request_ids)
+                context.advance_async_mamba_state(child_txn.request_ids)
             child_txn.consumed = True
             self._async_launched_child_txn = None
             if (
@@ -878,6 +885,13 @@ class TextGenerationController:
             return AsyncTxnSkipReason.MTP_ACTIVE
         if active_request_count != len(child_txn.request_ids):
             return AsyncTxnSkipReason.ACTIVE_COUNT_CHANGED
+        if self._async_active_request_ids() != tuple(child_txn.request_ids):
+            return AsyncTxnSkipReason.ACTIVE_COUNT_CHANGED
+        if self._async_decode_cuda_graph_key() != child_txn.cuda_graph_key:
+            return AsyncTxnSkipReason.GRAPH_RECAPTURE_BARRIER
+        terminal_check = getattr(context, "plain_decode_child_needs_terminal_check", None)
+        if terminal_check is not None and terminal_check(active_request_count):
+            return AsyncTxnSkipReason.TERMINAL_CHECK_REQUIRED
         return None
 
     def _prepare_async_child_from_committed_decode_state(self) -> Optional[StepTxn]:
@@ -916,6 +930,42 @@ class TextGenerationController:
         if child_txn is not None:
             child_txn.cuda_graph_key = self._async_decode_cuda_graph_key()
         return child_txn
+
+    def _prepare_async_child_from_transaction_decode_state(
+        self, parent_txn: StepTxn
+    ) -> Optional[StepTxn]:
+        """Prepare the next child from an accepted launched-child transaction."""
+
+        context = self.inference_wrapped_model.inference_context
+        prepare_fn = getattr(context, "prepare_child_from_transaction_decode_state", None)
+        if prepare_fn is None:
+            return None
+        prepare_started_at = (
+            time.perf_counter()
+            if getattr(context, "async_txn_diagnostics", None) is not None
+            and context.async_txn_diagnostics.enabled
+            else None
+        )
+        try:
+            target_slot = None
+            defer_h2d = False
+            if context.using_cuda_graph_this_step() and context.replay_cuda_graph_this_step():
+                target_slot = context.async_decode_slot_ring.current
+                defer_h2d = True
+
+            child_txn = prepare_fn(
+                parent_txn,
+                target_slot=target_slot,
+                defer_h2d=defer_h2d,
+            )
+            if child_txn is not None:
+                child_txn.cuda_graph_key = self._async_decode_cuda_graph_key()
+            return child_txn
+        finally:
+            if prepare_started_at is not None:
+                context.async_txn_diagnostics.record_child_prestage_duration(
+                    (time.perf_counter() - prepare_started_at) * 1_000_000
+                )
 
     def _decode_slot_for_txn(self, child_txn: StepTxn):
         context = self.inference_wrapped_model.inference_context
@@ -983,6 +1033,7 @@ class TextGenerationController:
                     )
 
         if child_txn.cpu_bookkeeping_buf is not None:
+            child_txn.bookkeeping_source_buf = child_txn.cpu_bookkeeping_buf
             child_txn.h2d_done_event = child_slot.copy_bookkeeping_from_cpu(
                 child_txn.cpu_bookkeeping_buf, non_blocking=True
             )
@@ -1043,6 +1094,27 @@ class TextGenerationController:
             sample_to_launch_latency_us=sample_to_launch_latency_us,
         )
 
+    def _prepare_async_successor_from_launched_child(
+        self, launched_child_txn: Optional[StepTxn]
+    ) -> None:
+        """Prepare the next child while the just-launched child forward is running."""
+
+        context = self.inference_wrapped_model.inference_context
+        if (
+            launched_child_txn is None
+            or not context.async_scheduling
+            or self.num_speculative_tokens > 0
+        ):
+            return
+
+        range_push("async_txn_child_prestage")
+        try:
+            self._async_prepared_child_txn = (
+                self._prepare_async_child_from_transaction_decode_state(launched_child_txn)
+            )
+        finally:
+            range_pop()
+
     def _record_async_sample_ready_event(self):
         """Record an event immediately after sampling for side-stream D2H."""
 
@@ -1062,7 +1134,7 @@ class TextGenerationController:
 
         if (
             sample_ready_event is None
-            or self._async_sampled_tokens_cpu is None
+            or not self._async_sampled_tokens_cpu_buffers
             or self._sampled_tokens_cuda is None
             or not self._sampled_tokens_cuda.is_cuda
         ):
@@ -1070,33 +1142,61 @@ class TextGenerationController:
             self._async_sample_transfer_count = 0
             return
 
+        if len(self._async_sample_transfer_records) >= len(self._async_sampled_tokens_cpu_buffers):
+            return
+
         device = self._sampled_tokens_cuda.device
         if self._async_sample_transfer_stream is None:
             self._async_sample_transfer_stream = torch.cuda.Stream(device=device)
 
+        buffer_idx = self._async_sample_transfer_next_buffer
+        sampled_tokens_cpu = self._async_sampled_tokens_cpu_buffers[buffer_idx]
+        self._async_sample_transfer_next_buffer = (
+            buffer_idx + 1
+        ) % len(self._async_sampled_tokens_cpu_buffers)
+
         with torch.cuda.stream(self._async_sample_transfer_stream):
             self._async_sample_transfer_stream.wait_event(sample_ready_event)
-            self._async_sampled_tokens_cpu[:active_request_count].copy_(
+            sampled_tokens_cpu[:active_request_count].copy_(
                 self._sampled_tokens_cuda[:active_request_count], non_blocking=True
             )
-            self._async_sample_transfer_done_event = torch.cuda.Event()
-            self._async_sample_transfer_done_event.record(self._async_sample_transfer_stream)
+            done_event = torch.cuda.Event()
+            done_event.record(self._async_sample_transfer_stream)
             self._async_sample_transfer_count = active_request_count
+            self._async_sample_transfer_done_event = done_event
+            self._async_sample_transfer_records.append(
+                (done_event, active_request_count, sampled_tokens_cpu)
+            )
+
+    def _has_async_sample_transfer(self, active_request_count: int) -> bool:
+        if not self._async_sample_transfer_records:
+            return False
+        _, transfer_count, _ = self._async_sample_transfer_records[0]
+        return transfer_count == active_request_count
 
     def _consume_async_sample_transfer(self, active_request_count: int) -> Optional[Tensor]:
         """Return sampled tokens copied by the async side stream, if available."""
 
-        if (
-            self._async_sample_transfer_done_event is None
-            or self._async_sample_transfer_count != active_request_count
-            or self._async_sampled_tokens_cpu is None
-        ):
+        if not self._has_async_sample_transfer(active_request_count):
             return None
 
-        self._async_sample_transfer_done_event.synchronize()
-        sampled_tokens_cpu = self._async_sampled_tokens_cpu[:active_request_count].clone()
-        self._async_sample_transfer_done_event = None
-        self._async_sample_transfer_count = 0
+        done_event, _, sampled_tokens_cpu_buf = self._async_sample_transfer_records.popleft()
+        done_event.synchronize()
+        sampled_tokens_cpu = sampled_tokens_cpu_buf[:active_request_count].clone()
+        if self._async_sample_transfer_records:
+            (
+                self._async_sample_transfer_done_event,
+                self._async_sample_transfer_count,
+                self._async_sampled_tokens_cpu,
+            ) = self._async_sample_transfer_records[0]
+        else:
+            self._async_sample_transfer_done_event = None
+            self._async_sample_transfer_count = 0
+            self._async_sampled_tokens_cpu = (
+                self._async_sampled_tokens_cpu_buffers[self._async_sample_transfer_next_buffer]
+                if self._async_sampled_tokens_cpu_buffers
+                else None
+            )
         return sampled_tokens_cpu
 
     def _can_chain_plain_decode_child(
@@ -1132,6 +1232,12 @@ class TextGenerationController:
         if parent_txn.terminal_request_ids:
             return False
         if active_request_count != len(parent_txn.request_ids):
+            return False
+        if active_request_count != len(child_txn.request_ids):
+            return False
+        if self._async_active_request_ids() != tuple(child_txn.request_ids):
+            return False
+        if self._async_decode_cuda_graph_key() != child_txn.cuda_graph_key:
             return False
         if context.plain_decode_child_needs_terminal_check(active_request_count):
             return False
@@ -1203,6 +1309,7 @@ class TextGenerationController:
         self._async_deferred_sample_cuda_graph_request_count = (
             context.padded_active_request_count if context.using_cuda_graph_this_step() else None
         )
+        self._prepare_async_successor_from_launched_child(child_txn)
         return True
 
     def _expert_parallel_group(self):
@@ -2281,6 +2388,8 @@ class TextGenerationController:
 
         context = self.inference_wrapped_model.inference_context
         step_begin_decision = self._decide_ep_step_begin(has_real_work=False)
+        if step_begin_decision.consume_launched_forward:
+            self._ep_dummy_launched_child_forward = False
 
         if not step_begin_decision.consume_launched_forward:
             # attempt to use cuda-graph if possible
@@ -2301,7 +2410,8 @@ class TextGenerationController:
             if self._ep_decode_results_need_collectives():
                 self._dummy_decode_sample_collective()
             if self.num_speculative_tokens == 0:
-                self._dummy_decode_async_child_forward_if_planned()
+                if not step_begin_decision.consume_launched_forward:
+                    self._dummy_decode_async_child_forward_if_planned()
                 self._dummy_decode_async_child_forward_if_planned(
                     phase=EPAsyncPhase.ASYNC_CHAIN_HANDOFF
                 )
@@ -2334,6 +2444,7 @@ class TextGenerationController:
 
         input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
         self._dynamic_step_forward_logits(input_ids, position_ids)
+        self._ep_dummy_launched_child_forward = True
 
     @torch.inference_mode()
     def _dummy_serial_mtp_forward(self):
@@ -2621,27 +2732,63 @@ class TextGenerationController:
             raise RuntimeError(
                 "async decode launched-child invariant failed before deferred-sample commit"
             )
-        if context.async_scheduling and self.num_speculative_tokens == 0:
-            ep_child_launch_plan = self._sync_ep_async_child_launch_plan(
-                active_request_count,
-                can_launch_real_child=False,
-            )
-            if self._ep_async_child_launches(ep_child_launch_plan):
+        launched_child_txn = self._async_launched_child_txn
+        consumed_launched_child = False
+        if launched_child_txn is not None and ep_step_begin_decision.consume_launched_forward:
+            consumed_launched_child = self._consume_async_child_logits()
+            if not consumed_launched_child:
                 raise RuntimeError(
-                    "EP async child launch plan selected a normal child while this rank "
-                    "is consuming a deferred_sample decode step"
+                    "EP step-begin selected async child consumption before deferred-sample "
+                    "commit, but consumption failed"
                 )
-
         with torch.inference_mode():
-            sampled_tokens_cpu = self._consume_async_sample_transfer(active_request_count)
-            if sampled_tokens_cpu is None:
+            sampled_tokens_cpu = None
+            if not self._has_async_sample_transfer(active_request_count):
+                sampled_tokens_cpu = self._consume_async_sample_transfer(active_request_count)
+            if sampled_tokens_cpu is None and not self._has_async_sample_transfer(
+                active_request_count
+            ):
                 sampled_tokens_cpu = self._sampled_tokens_cuda[:active_request_count].cpu()
 
             if skip_bookkeeping:
+                if sampled_tokens_cpu is None:
+                    sampled_tokens_cpu = self._consume_async_sample_transfer(active_request_count)
                 request_bookkeeping = {"sample": sampled_tokens_cpu}
                 if context.async_scheduling and self.num_speculative_tokens == 0:
                     self._sync_ep_chain_handoff(active_request_count, False)
             else:
+                source_chained = False
+                source_chain_handoff_attempted = False
+                if (
+                    context.async_scheduling
+                    and self.num_speculative_tokens == 0
+                    and consumed_launched_child
+                    and launched_child_txn is not None
+                ):
+                    if self._async_prepared_child_txn is None:
+                        range_push("async_txn_child_prestage")
+                        try:
+                            self._async_prepared_child_txn = (
+                                self._prepare_async_child_from_transaction_decode_state(
+                                    launched_child_txn
+                                )
+                            )
+                        finally:
+                            range_pop()
+                    source_chain_handoff_attempted = True
+                    source_chained = self._try_chain_plain_decode_child(
+                        launched_child_txn,
+                        self._async_prepared_child_txn,
+                        active_request_count=active_request_count,
+                        skip_bookkeeping=skip_bookkeeping,
+                        profile_child_forward=profile_async_child_forward,
+                    )
+
+                if sampled_tokens_cpu is None:
+                    sampled_tokens_cpu = self._consume_async_sample_transfer(active_request_count)
+                if sampled_tokens_cpu is None:
+                    sampled_tokens_cpu = self._sampled_tokens_cuda[:active_request_count].cpu()
+
                 commit_started_at = (
                     time.perf_counter() if context.async_txn_diagnostics.enabled else None
                 )
@@ -2649,8 +2796,6 @@ class TextGenerationController:
                 if commit_range_active:
                     range_push("async_txn_cpu_commit")
                 try:
-                    if context.is_hybrid_model:
-                        context.accept_async_mamba_state(deferred_sample_txn.request_ids)
                     request_bookkeeping = self._dynamic_step_context_bookkeeping(
                         sampled_tokens_cpu=sampled_tokens_cpu,
                         async_txn=deferred_sample_txn,
@@ -2663,7 +2808,7 @@ class TextGenerationController:
                             (time.perf_counter() - commit_started_at) * 1_000_000
                         )
 
-                if self._async_launched_child_txn is not None:
+                if not source_chained and launched_child_txn is not None:
                     range_push("async_txn_child_prestage")
                     try:
                         self._async_prepared_child_txn = (
@@ -2672,12 +2817,17 @@ class TextGenerationController:
                     finally:
                         range_pop()
 
-                if context.async_scheduling and self.num_speculative_tokens == 0:
+                if (
+                    not source_chained
+                    and not source_chain_handoff_attempted
+                    and context.async_scheduling
+                    and self.num_speculative_tokens == 0
+                ):
                     next_active_request_count = (
                         context.total_request_count - context.paused_request_count
                     )
                     self._try_chain_plain_decode_child(
-                        self._async_launched_child_txn,
+                        launched_child_txn,
                         self._async_prepared_child_txn,
                         active_request_count=next_active_request_count,
                         skip_bookkeeping=skip_bookkeeping,
@@ -2926,6 +3076,25 @@ class TextGenerationController:
                     (time.perf_counter() - sampling_started_at) * 1_000_000
                 )
 
+            source_chained = False
+            source_chain_handoff_attempted = False
+            if (
+                context.async_scheduling
+                and self.num_speculative_tokens == 0
+                and launched_child_txn is not None
+            ):
+                self._prepare_async_successor_from_launched_child(launched_child_txn)
+                source_chain_handoff_attempted = True
+                source_chained = self._try_chain_plain_decode_child(
+                    launched_child_txn,
+                    self._async_prepared_child_txn,
+                    active_request_count=active_request_count,
+                    return_log_probs=return_log_probs,
+                    return_top_n_logprobs=return_top_n_logprobs,
+                    skip_bookkeeping=skip_bookkeeping,
+                    profile_child_forward=profile_async_child_forward,
+                )
+
             # Capture before update_requests (called by _dynamic_step_context_bookkeeping)
             # resets num_prefill_requests to 0, which would make num_decode_requests
             # always equal to the full active count.
@@ -2969,7 +3138,7 @@ class TextGenerationController:
                         context.async_txn_diagnostics.record_commit_duration(
                             (time.perf_counter() - commit_started_at) * 1_000_000
                         )
-                if launched_child_txn is not None:
+                if not source_chained and launched_child_txn is not None:
                     range_push("async_txn_child_prestage")
                     try:
                         self._async_prepared_child_txn = (
@@ -2977,7 +3146,12 @@ class TextGenerationController:
                         )
                     finally:
                         range_pop()
-                if context.async_scheduling and self.num_speculative_tokens == 0:
+                if (
+                    not source_chained
+                    and not source_chain_handoff_attempted
+                    and context.async_scheduling
+                    and self.num_speculative_tokens == 0
+                ):
                     next_active_request_count = (
                         context.total_request_count - context.paused_request_count
                     )

@@ -5,6 +5,7 @@ import concurrent.futures
 import logging
 import math
 import multiprocessing
+import os
 import socket
 import time
 import warnings
@@ -1912,6 +1913,8 @@ class DynamicInferenceEngine(AbstractEngine):
         if will_log_this_step:
             self.step_start_event.record()
         profile_async_child_forward = (
+            os.getenv("MCORE_ASYNC_PROFILE_CHILD_FORWARD", "0") == "1"
+            and
             self.logging_step_interval > 0
             and (self.context.step_count + 2) % self.logging_step_interval == 0
         )
