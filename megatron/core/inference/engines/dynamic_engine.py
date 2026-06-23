@@ -2,9 +2,12 @@
 
 import asyncio
 import concurrent.futures
+import faulthandler
 import logging
 import math
 import multiprocessing
+import os
+import signal
 import socket
 import time
 import warnings
@@ -262,6 +265,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.controller.set_stop_word_finished_ids_callback(
             self._get_and_clear_stop_word_finished_ids
         )
+        self.controller.set_stop_word_constraints_callback(self._has_stop_word_constraints)
 
         # Configure wandb to use separate step counter for inference metrics (only once)
         if self.logging_step_interval > 0 and self.metrics_writer is not None:
@@ -1480,6 +1484,23 @@ class DynamicInferenceEngine(AbstractEngine):
         self.stop_word_finished_request_ids -= result
         return result
 
+    def _has_stop_word_constraints(self, active_request_ids: list[int]) -> bool:
+        """Return whether active requests have stop-word state that can affect scheduling."""
+
+        active_ids = set(int(request_id) for request_id in active_request_ids)
+        if self.stop_word_finished_request_ids & active_ids:
+            return True
+        if self.stop_word_being_finished_ids & active_ids:
+            return True
+        for request_id in active_ids:
+            entry = self.requests.get(request_id)
+            if entry is None:
+                continue
+            request = entry.record[-1]
+            if request.stop_word_ids:
+                return True
+        return False
+
     def _check_stop_words_for_request_post_append(
         self, request: DynamicInferenceRequest
     ) -> Tuple[bool, int]:
@@ -2080,6 +2101,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._prefix_cache_hits,
                     self._prefix_cache_blocks_matched,
                 )
+            async_summary = self.context.async_scheduling_counters_summary()
+            if async_summary:
+                output_str += f" ... async (cumul): {async_summary}"
             if context_state["is_decode_only"]:
                 output_str = f"\033[94m{output_str}\033[0m"
             logging.info(output_str)
@@ -2397,7 +2421,10 @@ class DynamicInferenceEngine(AbstractEngine):
             # We have tried that and it blocks the event loop in megatron-rl.
             global_work, global_consensus = (
                 await self.expert_parallel_zmq_communicator.all_reduce_max(
-                    local_work, consensus_val, async_op=(not self.use_synchronous_zmq_collectives)
+                    local_work,
+                    consensus_val,
+                    async_op=(not self.use_synchronous_zmq_collectives),
+                    phase="ep_work_consensus",
                 )
             )
         else:
@@ -2422,6 +2449,33 @@ class DynamicInferenceEngine(AbstractEngine):
             )
         nvtx_range_pop("world_barrier")
 
+    async def _ep_work_step_barrier(self):
+        """Keep EP consensus from interleaving with in-step forward handoffs."""
+
+        if self.ep_world_size <= 1:
+            return
+        if os.environ.get("MCORE_ASYNC_PHASE_TRACE", "0") == "1":
+            logging.info(
+                "ASYNC_PHASE ep_step_barrier_enter rank=%s step=%s",
+                torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                self.context.step_count,
+            )
+        nvtx_range_push("_ep_work_step_barrier")
+        try:
+            await self.expert_parallel_zmq_communicator.all_reduce_max(
+                1,
+                async_op=(not self.use_synchronous_zmq_collectives),
+                phase="ep_step_complete",
+            )
+            if os.environ.get("MCORE_ASYNC_PHASE_TRACE", "0") == "1":
+                logging.info(
+                    "ASYNC_PHASE ep_step_barrier_exit rank=%s step=%s",
+                    torch.distributed.get_rank() if torch.distributed.is_initialized() else -1,
+                    self.context.step_count,
+                )
+        finally:
+            nvtx_range_pop("_ep_work_step_barrier")
+
     @trace_async_exceptions
     async def run_engine_with_coordinator(
         self, *, loop: Optional[asyncio.AbstractEventLoop] = None
@@ -2437,6 +2491,13 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         self._loop = get_asyncio_loop(loop)
         self.use_coordinator = True
+        if os.environ.get("MCORE_ASYNC_STACK_DUMP", "0") == "1":
+            try:
+                faulthandler.register(signal.SIGUSR1, all_threads=True)
+            except RuntimeError:
+                # The handler may already be installed when multiple engine
+                # instances are constructed in one process.
+                pass
 
         try:
             while True:
@@ -2459,6 +2520,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             self._state_events[EngineState.PAUSED].set()
                         elif local_pending > 0:
                             await self.async_step()
+                            await self._ep_work_step_barrier()
                         else:
                             self.step_start_event.record()
                             nvtx_range_push("EP-dummy-forward")
@@ -2471,6 +2533,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             # The consensus path yields via _ep_establish_consensus;
                             # without it we must still let other coroutines (signal
                             # delivery, request scheduling) run between steps.
+                            await self._ep_work_step_barrier()
                             await asyncio.sleep(0)
                         continue
                     global_work_from_last_consensus, _ = self._last_ep_consensus
@@ -2510,6 +2573,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             nvtx_range_pop("EP-dummy-forward")
                             self.context.step_count += 1
                             self.context.prefix_cache_lru_clock += 1
+                        await self._ep_work_step_barrier()
                     else:
                         # No work, but not all pausing: idle.
                         await asyncio.sleep(0.02)

@@ -4,6 +4,8 @@ import asyncio
 import concurrent
 import copy
 import functools
+import logging
+import os
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
 
@@ -86,6 +88,7 @@ class TextGenerationController:
         inference_config = self.inference_wrapped_model.inference_context.config
         self.tokenizer = tokenizer
         self.num_speculative_tokens = inference_config.num_speculative_tokens
+        self._async_debug_enabled = os.environ.get("MCORE_ASYNC_DEBUG", "0") == "1"
 
         pg_collection = inference_config.pg_collection
         if pg_collection is not None:
@@ -131,6 +134,135 @@ class TextGenerationController:
 
         if self.inference_wrapped_model.inference_context.is_dynamic_batching():
             self._init_dynamic_sampling_tensors()
+            self._async_pending_forward_plan = None
+            self._async_pending_cuda_graph_request_count = None
+            self._async_deferred_sample_plan = None
+            self._async_deferred_cuda_graph_request_count = None
+            self._dummy_context_h2d_done_event = None
+            self._ep_forward_phase_open = False
+
+    def _async_debug_log(self, event: str, **fields) -> None:
+        """Emit temporary async scheduling diagnostics when explicitly enabled."""
+
+        if not self._async_debug_enabled:
+            return
+        context = self.inference_wrapped_model.inference_context
+        try:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+        except RuntimeError:
+            rank = -1
+        active_count = context.total_request_count - context.paused_request_count
+        base_fields = {
+            "rank": rank,
+            "step": context.step_count,
+            "active": active_count,
+            "tokens": context.active_token_count,
+            "pending": self._async_pending_forward_plan is not None,
+            "deferred": self._async_deferred_sample_plan is not None,
+        }
+        base_fields.update(fields)
+        logging.info(
+            "ASYNC_DEBUG %s %s",
+            event,
+            " ".join(f"{key}={value}" for key, value in sorted(base_fields.items())),
+        )
+
+    def _async_phase_trace(self, event: str, **fields) -> None:
+        """Emit narrow EP phase diagnostics without enabling broad async debug logging."""
+
+        if os.environ.get("MCORE_ASYNC_PHASE_TRACE", "0") != "1":
+            return
+        context = self.inference_wrapped_model.inference_context
+        try:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+        except RuntimeError:
+            rank = -1
+        base_fields = {
+            "rank": rank,
+            "step": context.step_count,
+            "active": context.total_request_count - context.paused_request_count,
+        }
+        base_fields.update(fields)
+        logging.info(
+            "ASYNC_PHASE %s %s",
+            event,
+            " ".join(f"{key}={value}" for key, value in sorted(base_fields.items())),
+        )
+
+    def _ep_forward_handoff_enabled(self) -> bool:
+        """Return whether EP ranks must explicitly mirror async forward phases."""
+
+        context = self.inference_wrapped_model.inference_context
+        communicator = getattr(context, "_ep_zmq_communicator", None)
+        return bool(
+            context.enable_async_scheduling
+            and self.num_speculative_tokens == 0
+            and communicator is not None
+            and getattr(communicator, "world_size", 1) > 1
+        )
+
+    def _sync_ep_forward_phase(self, local_forward: bool, *, local_block: bool = False) -> bool:
+        """Synchronize one EP model-forward phase before graph-shape sync."""
+
+        if not self._ep_forward_handoff_enabled():
+            return bool(local_forward)
+
+        context = self.inference_wrapped_model.inference_context
+        self._async_phase_trace(
+            "ep_forward_phase_enter",
+            local_forward=bool(local_forward),
+            local_block=bool(local_block),
+        )
+        any_forward, any_block = context._ep_zmq_communicator.sync_all_reduce_max(
+            int(local_forward), int(local_block), phase="ep_forward_phase"
+        )
+        global_forward = bool(any_forward and not any_block)
+        self._ep_forward_phase_open = global_forward
+        self._async_phase_trace(
+            "ep_forward_phase_exit",
+            local_forward=bool(local_forward),
+            local_block=bool(local_block),
+            any_forward=any_forward,
+            any_block=any_block,
+            global_forward=global_forward,
+        )
+        self._async_debug_log(
+            "ep_forward_phase",
+            local_forward=bool(local_forward),
+            local_block=bool(local_block),
+            any_forward=any_forward,
+            any_block=any_block,
+            global_forward=global_forward,
+        )
+        return global_forward
+
+    def _close_ep_forward_phases(self) -> None:
+        """Send the no-more-forwards phase if this work step still has an open EP loop."""
+
+        if self._ep_forward_handoff_enabled() and self._ep_forward_phase_open:
+            self._sync_ep_forward_phase(False)
+
+    def _prepare_async_decode_next_step_with_ep_handoff(self) -> bool:
+        """Prepare an async child after EP ranks agree that the child will run."""
+
+        context = self.inference_wrapped_model.inference_context
+        if not self._ep_forward_handoff_enabled():
+            return context.prepare_async_decode_next_step()
+
+        local_skip_reason = context.async_decode_next_step_skip_reason()
+        local_can_forward = local_skip_reason is None
+        if not self._sync_ep_forward_phase(
+            local_can_forward, local_block=not local_can_forward
+        ):
+            context.clear_async_prepared_decode_plan()
+            context.record_async_scheduling_counter("prepare_attempt")
+            if local_can_forward:
+                context.record_async_scheduling_counter("skip_ep_peer_block")
+            else:
+                context.record_async_scheduling_counter(local_skip_reason)
+            return False
+
+        return context.prepare_async_decode_next_step()
 
     def set_stop_word_finished_ids_callback(self, callback):
         """Set a callback to get request IDs that should be marked as finished due to stop words.
@@ -142,6 +274,11 @@ class TextGenerationController:
             callback: Function that returns request IDs to mark as finished.
         """
         self._get_stop_word_finished_ids_callback = callback
+
+    def set_stop_word_constraints_callback(self, callback):
+        """Set a callback that reports whether stop-word state can affect active requests."""
+
+        self._has_stop_word_constraints_callback = callback
 
     def _init_dynamic_sampling_tensors(self):
         """Initialize tensors needed for dynamic sampling."""
@@ -155,6 +292,7 @@ class TextGenerationController:
 
         # Callback to get request IDs that should be marked as finished due to stop words
         self._get_stop_word_finished_ids_callback = None
+        self._has_stop_word_constraints_callback = None
 
         device = torch.cuda.current_device()
         logits_dtype = self.inference_wrapped_model.config.params_dtype
@@ -176,6 +314,12 @@ class TextGenerationController:
         #     - `self._sampled_tokens_cuda` is rebound to the output of `sample_kernel`,
         #     which uses CudaGraphManager syntactic sugar to keep it as a static tensor.
         self._sampled_tokens_cuda = None
+        self._greedy_sample_values_cuda = torch.empty(
+            max_requests, dtype=logits_dtype, device=device
+        )
+        self._greedy_sampled_tokens_cuda = torch.empty(
+            max_requests, dtype=torch.int64, device=device
+        )
 
         # Sampling backend: provides the sampling kernel.
         if self._sampling_backend == "flashinfer":
@@ -187,6 +331,13 @@ class TextGenerationController:
             )
         else:
             self._sampling: Sampling = TorchSampling(self.sampling_rng, self.vocab_size)
+
+        self._async_copy_stream = torch.cuda.Stream(device=device)
+        self._async_sample_ready_event = torch.cuda.Event()
+        self._async_sample_transfer_done_event = torch.cuda.Event()
+        self._async_sampled_tokens_cpu = torch.empty(
+            max_requests, dtype=torch.int64, device='cpu', pin_memory=True
+        )
 
         # Cache values that are constant across inference steps.
         self._unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
@@ -559,7 +710,9 @@ class TextGenerationController:
 
         # Single batch CPU-to-GPU transfer of bookkeeping state.
         range_push("transfer_bookkeeping_to_gpu")
-        context.transfer_bookkeeping_to_gpu()
+        h2d_done_event = context.transfer_bookkeeping_to_gpu(record_done_event=is_dummy_forward)
+        if is_dummy_forward:
+            self._dummy_context_h2d_done_event = h2d_done_event
         range_pop()
 
         set_moe_metadata_sync(unwrapped_model)
@@ -1035,6 +1188,57 @@ class TextGenerationController:
         # Expose the active slice so downstream code sees the right length.
         self._last_accepted_seq_indices = self._last_accepted_seq_indices_buf[:active_request_count]
 
+    def _active_requests_use_greedy_sampling(
+        self, active_request_count: Optional[int] = None
+    ) -> bool:
+        """Return whether active requests are deterministic greedy requests."""
+
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = (
+            context.total_request_count - context.paused_request_count
+            if active_request_count is None
+            else active_request_count
+        )
+        if active_request_count <= 0:
+            return True
+
+        active_metadata = context.active_request_metadata
+        active_slice = slice(0, active_request_count)
+        return bool(
+            (active_metadata["top_k"][active_slice] == 1).all()
+            and (active_metadata["top_p"][active_slice] == 0.0).all()
+        )
+
+    def _dynamic_step_required_token_logits(self) -> Tensor:
+        """Return the per-active-request logits consumed by normal decode sampling."""
+
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+        if context.config.materialize_only_last_token_logits:
+            return self._all_logits_cuda.squeeze(0)[:active_request_count, :]
+        return context.last_token_logits(
+            self._all_logits_cuda[:, : context.padded_active_token_count, :]
+        )
+
+    def _dynamic_step_sample_logits_greedy(self) -> None:
+        """Greedy-sample logits into the stable sampled-token buffer."""
+
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+        if active_request_count <= 0:
+            self._sampled_tokens_cuda = self._greedy_sampled_tokens_cuda
+            return
+        required_token_logits = self._dynamic_step_required_token_logits()
+        torch.max(
+            required_token_logits[:active_request_count],
+            dim=-1,
+            out=(
+                self._greedy_sample_values_cuda[:active_request_count],
+                self._greedy_sampled_tokens_cuda[:active_request_count],
+            ),
+        )
+        self._sampled_tokens_cuda = self._greedy_sampled_tokens_cuda
+
     def _dynamic_step_sample_logits(self):
         """Sample tokens from logits for dynamic batching."""
         # TODO(ksanthanam): Evaluate whether it makes more sense to sample on 1 rank
@@ -1042,6 +1246,10 @@ class TextGenerationController:
 
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
+        if self._active_requests_use_greedy_sampling(active_request_count):
+            self._dynamic_step_sample_logits_greedy()
+            return
+
         use_graph = (
             self._sampling_backend == "flashinfer"
             and self._enable_cuda_graph
@@ -1474,11 +1682,48 @@ class TextGenerationController:
         """Perform a dummy forward pass. This is used in expert model parallelism
         on ranks that do not have any real requests. It may run in eager mode."""
 
+        if self._ep_forward_handoff_enabled():
+            self._async_phase_trace("dummy_loop_enter")
+            while self._sync_ep_forward_phase(False):
+                self._async_phase_trace("dummy_loop_forward")
+                self._run_single_dummy_forward()
+            self._async_phase_trace("dummy_loop_exit")
+            return
+
+        self._run_single_dummy_forward()
+
+    def _wait_for_dummy_context_h2d(self) -> None:
+        """Wait for dummy metadata H2D before reusing its pinned CPU source buffer."""
+
+        h2d_done_event = self._dummy_context_h2d_done_event
+        if h2d_done_event is None:
+            return
+        h2d_done_event.synchronize()
+        self._dummy_context_h2d_done_event = None
+
+    def _run_single_dummy_forward(self):
+        """Run one dummy model forward for an announced EP forward phase."""
+
         context = self.inference_wrapped_model.inference_context
 
         # attempt to use cuda-graph if possible
+        self._async_phase_trace("dummy_forward_start")
+        self._async_debug_log("dummy_forward_start")
         input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
+        self._async_phase_trace(
+            "dummy_forward_after_context_init",
+            graph=context.using_cuda_graph_this_step(),
+            padded=context.padded_active_request_count,
+        )
+        self._async_debug_log(
+            "dummy_forward_after_context_init",
+            graph=context.using_cuda_graph_this_step(),
+            padded=context.padded_active_request_count,
+        )
+        self._async_phase_trace("dummy_forward_before_forward")
         self._dynamic_step_forward_logits(input_ids, position_ids)
+        self._async_phase_trace("dummy_forward_after_forward")
+        self._async_debug_log("dummy_forward_after_forward")
 
         # Disable MoE padding for MTP computation, unless CUDA graphs
         # are active (the graphs were captured with padding enabled).
@@ -1494,8 +1739,16 @@ class TextGenerationController:
         # collectives to avoid a hang.
         self._dummy_serial_mtp_forward()
 
-        # clear the context of any temporary state from the dummy forward
+        self._wait_for_dummy_context_h2d()
+
+        # Clear temporary dummy state without rewinding engine progress counters.
+        step_count = context.step_count
+        prefix_cache_lru_clock = context.prefix_cache_lru_clock
         context.reset()
+        context.step_count = step_count
+        context.prefix_cache_lru_clock = prefix_cache_lru_clock
+        self._async_phase_trace("dummy_forward_end")
+        self._async_debug_log("dummy_forward_end")
 
     @torch.inference_mode()
     def _dummy_serial_mtp_forward(self):
@@ -1600,7 +1853,82 @@ class TextGenerationController:
             sampled_mtp_tokens_cpu = None
         return sampled_tokens_cpu, sampled_mtp_tokens_cpu
 
-    def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
+    def _start_async_sample_transfer(self, active_request_count: int) -> None:
+        """Copy sampled tokens to pinned CPU memory on a side stream."""
+
+        self._async_sample_ready_event.record(torch.cuda.current_stream())
+        with torch.cuda.stream(self._async_copy_stream):
+            self._async_copy_stream.wait_event(self._async_sample_ready_event)
+            self._async_sampled_tokens_cpu[:active_request_count].copy_(
+                self._sampled_tokens_cuda[:active_request_count], non_blocking=True
+            )
+            self._async_sample_transfer_done_event.record(self._async_copy_stream)
+
+    def _finish_async_sample_transfer(self, active_request_count: int) -> Tensor:
+        """Return sampled tokens after the side-stream D2H copy is complete."""
+
+        self._async_sample_transfer_done_event.synchronize()
+        return self._async_sampled_tokens_cpu[:active_request_count]
+
+    def _async_sampled_tokens_preserve_current_rows(
+        self, sampled_tokens_cpu: Tensor, active_request_count: int
+    ) -> bool:
+        """Return whether sampled tokens keep the prepared child layout valid."""
+
+        context = self.inference_wrapped_model.inference_context
+        active_sequence_lengths = context.get_active_sequence_lengths() + 1
+        max_sequence_lengths = context.get_max_sequence_lengths()
+        active_request_mask = (
+            sampled_tokens_cpu[:active_request_count]
+            != context.active_request_metadata["termination_id"][:active_request_count]
+        ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
+
+        if self._get_stop_word_finished_ids_callback is not None:
+            active_request_slice = slice(context.paused_request_count, context.total_request_count)
+            request_ids_list = context.request_ids[active_request_slice].long().tolist()
+            stop_word_finished_ids = self._get_stop_word_finished_ids_callback(request_ids_list)
+            if stop_word_finished_ids:
+                for idx, request_id in enumerate(request_ids_list):
+                    if request_id in stop_word_finished_ids:
+                        active_request_mask[idx] = 0
+
+        return bool(active_request_mask.all().item())
+
+    def _async_prepared_decode_needs_sample_check(self, active_request_count: int) -> bool:
+        """Return whether a prepared child needs sampled-token CPU validation."""
+
+        context = self.inference_wrapped_model.inference_context
+        plan = context.async_prepared_decode_plan()
+        if plan is None:
+            return False
+        if plan.requires_sample_survivor_check:
+            return True
+        if self._has_stop_word_constraints_callback is None:
+            return self._get_stop_word_finished_ids_callback is not None
+        active_request_slice = slice(context.paused_request_count, context.total_request_count)
+        request_ids = context.request_ids[active_request_slice].long().tolist()
+        return bool(self._has_stop_word_constraints_callback(request_ids))
+
+    def _active_decode_sample_can_change_rows(self, active_request_count: int) -> bool:
+        """Return whether sampling may finish any active request this step."""
+
+        context = self.inference_wrapped_model.inference_context
+        if (
+            context.active_request_metadata["termination_id"][:active_request_count] >= 0
+        ).any():
+            return True
+        if self._has_stop_word_constraints_callback is None:
+            return self._get_stop_word_finished_ids_callback is not None
+        active_request_slice = slice(context.paused_request_count, context.total_request_count)
+        request_ids = context.request_ids[active_request_slice].long().tolist()
+        return bool(self._has_stop_word_constraints_callback(request_ids))
+
+    def _dynamic_step_context_bookkeeping(
+        self,
+        *,
+        sampled_tokens_cpu: Optional[Tensor] = None,
+        sampled_mtp_tokens_cpu: Optional[Tensor] = None,
+    ) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
 
         Args:
@@ -1619,12 +1947,13 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
-        # Batch GPU-to-CPU transfer of all sampled tokens.
-        range_push("transfer_samples_to_cpu")
-        sampled_tokens_cpu, sampled_mtp_tokens_cpu = self._transfer_samples_to_cpu(
-            active_request_count
-        )
-        range_pop()
+        if sampled_tokens_cpu is None:
+            # Batch GPU-to-CPU transfer of all sampled tokens.
+            range_push("transfer_samples_to_cpu")
+            sampled_tokens_cpu, sampled_mtp_tokens_cpu = self._transfer_samples_to_cpu(
+                active_request_count
+            )
+            range_pop()
 
         range_push("active_request_mask")
         # Everything below is 100% CPU.
@@ -1656,6 +1985,10 @@ class TextGenerationController:
                     if request_id in stop_word_finished_ids:
                         active_request_mask[idx] = 0
 
+        # The async pipeline reuses the pinned sample-transfer buffer for the
+        # next token before this return value is consumed.
+        sample_for_return = sampled_tokens_cpu.clone()
+
         finished_idxs = (
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
         )
@@ -1674,7 +2007,7 @@ class TextGenerationController:
 
         # Clone needed: update_requests mutates next_tokens in-place via tensor_swap,
         # which would corrupt the reused buffer.
-        new_sample_copy = sampled_tokens_cpu.clone()
+        new_sample_copy = sample_for_return.clone()
         range_pop()
 
         range_push("update_requests")
@@ -1690,10 +2023,274 @@ class TextGenerationController:
             # .cpu() in _transfer_samples_to_cpu; update_requests only mutates
             # the separate new_sample_copy). Returning the CPU copy avoids a
             # D2H sync when the engine later calls sample.tolist().
-            "sample": sampled_tokens_cpu,
+            "sample": sample_for_return,
             "finished_routing_block_ids": finished_routing_block_ids,
             **(update_result or {}),
         }
+
+    def _retire_dynamic_forward_side_effects(self) -> None:
+        """Commit side effects produced by the most recent dynamic forward pass."""
+
+        context = self.inference_wrapped_model.inference_context
+
+        # Commit Mamba intermediate states before update_requests, which may
+        # swap request indices. The Python lists tracking EOS block IDs and
+        # intermediate offsets are not swapped along with tensors, so commit
+        # must run while indices are still valid.
+        if context.is_hybrid_model and context.mamba_slot_allocator is not None:
+            context.mamba_slot_allocator.commit_intermediate_states()
+
+        # Collect flat routing indices and scatter them into per-block storage.
+        # Must be done before update_requests while token-to-block mappings are valid.
+        # Reconstruction happens from blocks at request completion.
+        context.kv_block_allocator.store_routing_per_block(self._router_record_bookkeeping())
+
+    def _try_use_async_pending_forward(self) -> bool:
+        """Use logits from a launched async child if the no-reject invariant holds."""
+
+        plan = self._async_pending_forward_plan
+        if plan is None:
+            return False
+
+        context = self.inference_wrapped_model.inference_context
+        self._async_debug_log(
+            "try_reuse_pending_start",
+            plan_active=plan.active_request_count,
+            plan_padded=plan.padded_active_request_count,
+        )
+        if not context.prepared_async_request_ids_match_live(plan):
+            self._async_pending_forward_plan = None
+            self._async_pending_cuda_graph_request_count = None
+            context.clear_async_prepared_decode_plan()
+            context.release_deferred_async_resources()
+            context.record_async_scheduling_counter("invariant_failure")
+            self._async_debug_log("try_reuse_pending_invariant_failure")
+            raise RuntimeError("async decode child invariant failed before reuse")
+
+        context.record_async_scheduling_counter("reuse")
+        self._retire_dynamic_forward_side_effects()
+        context.release_deferred_async_resources()
+        context.clear_async_prepared_decode_plan()
+        self._async_debug_log("try_reuse_pending_success")
+        return True
+
+    def _launch_async_prepared_decode_forward(self, *, active_request_count: int) -> bool:
+        """Launch the already-prepared child decode forward after sampling."""
+
+        context = self.inference_wrapped_model.inference_context
+        plan = context.async_prepared_decode_plan()
+        self._async_debug_log(
+            "launch_child_start",
+            requested_active=active_request_count,
+            has_plan=plan is not None,
+        )
+        if plan is None:
+            context.record_async_scheduling_counter("launch_missing_plan")
+            self._async_debug_log("launch_child_missing_plan")
+            return False
+        if not context.copy_async_prepared_decode_input_ids_from_samples(self._sampled_tokens_cuda):
+            context.record_async_scheduling_counter("launch_input_copy_failed")
+            self._async_debug_log("launch_child_input_copy_failed")
+            return False
+
+        range_push("async_transfer_bookkeeping_to_gpu")
+        context.transfer_bookkeeping_to_gpu(
+            include_token_to_input_ids=False,
+            refresh_request_staging=False,
+        )
+        range_pop()
+
+        input_ids, position_ids = context.current_input_and_position_ids()
+        self._async_phase_trace(
+            "launch_child_ready",
+            plan_active=plan.active_request_count,
+            plan_padded=plan.padded_active_request_count,
+        )
+        range_push("async_decode_child_forward")
+        try:
+            self._async_debug_log(
+                "launch_child_before_forward",
+                plan_active=plan.active_request_count,
+                plan_padded=plan.padded_active_request_count,
+            )
+            self._async_phase_trace("launch_child_before_forward")
+            self._dynamic_step_forward_logits(input_ids, position_ids)
+            self._async_phase_trace("launch_child_after_forward")
+            self._async_debug_log("launch_child_after_forward")
+        finally:
+            range_pop()
+
+        self._async_pending_forward_plan = plan
+        self._async_pending_cuda_graph_request_count = plan.padded_active_request_count
+        context.mark_async_forward_in_flight()
+        context.record_async_scheduling_counter("launch")
+        self._async_phase_trace("launch_child_done")
+        self._async_debug_log("launch_child_done")
+        return True
+
+    def _try_pipeline_committed_decode_step(
+        self,
+        *,
+        active_request_count: int,
+        return_log_probs: bool,
+        return_top_n_logprobs: bool,
+        skip_bookkeeping: bool,
+    ) -> bool:
+        """Sample a committed pending forward and launch its child before CPU commit.
+
+        This is not a rejectable prediction path: the pending forward is sampled
+        only after its parent CPU state has already been committed, and the child
+        launch is allowed only when the sampled token cannot change the active
+        row layout.
+        """
+
+        context = self.inference_wrapped_model.inference_context
+        self._async_debug_log(
+            "pipeline_start",
+            requested_active=active_request_count,
+            return_log_probs=return_log_probs,
+            return_top_n_logprobs=return_top_n_logprobs,
+            skip_bookkeeping=skip_bookkeeping,
+        )
+        if (
+            not context.config.enable_async_scheduling
+            or not context.config.enable_async_chain_scheduling
+            or self.num_speculative_tokens != 0
+            or return_log_probs
+            or return_top_n_logprobs
+            or skip_bookkeeping
+        ):
+            self._async_debug_log("pipeline_skip_gate")
+            return False
+
+        parent_plan = self._async_pending_forward_plan
+        if parent_plan is None:
+            self._async_debug_log("pipeline_skip_no_parent")
+            return False
+        if self._async_deferred_sample_plan is not None:
+            context.record_async_scheduling_counter("invariant_failure")
+            self._async_debug_log("pipeline_invariant_deferred_exists")
+            raise RuntimeError("async decode deferred sample already pending")
+        if not context.prepared_async_request_ids_match_live(parent_plan):
+            self._async_pending_forward_plan = None
+            self._async_pending_cuda_graph_request_count = None
+            context.clear_async_prepared_decode_plan()
+            context.record_async_scheduling_counter("invariant_failure")
+            self._async_debug_log("pipeline_invariant_parent_mismatch")
+            raise RuntimeError("async decode child invariant failed before pipeline sample")
+        if self._active_decode_sample_can_change_rows(active_request_count):
+            self._async_debug_log("pipeline_skip_sample_can_change_rows")
+            return False
+
+        range_push("async_prepare_pipeline_child")
+        try:
+            self._async_phase_trace("pipeline_before_prepare")
+            child_prepared = self._prepare_async_decode_next_step_with_ep_handoff()
+            self._async_phase_trace("pipeline_after_prepare", child_prepared=child_prepared)
+        finally:
+            range_pop()
+        self._async_debug_log("pipeline_after_prepare", child_prepared=child_prepared)
+        if not child_prepared:
+            return False
+        if self._async_prepared_decode_needs_sample_check(active_request_count):
+            context.clear_async_prepared_decode_plan()
+            self._async_debug_log("pipeline_skip_needs_sample_check")
+            return False
+
+        range_push("async_pipeline_sample")
+        try:
+            self._async_phase_trace("pipeline_before_sample")
+            self._async_debug_log("pipeline_before_sample")
+            self._dynamic_step_sample_logits()
+            self._async_phase_trace("pipeline_after_sample")
+            self._async_debug_log("pipeline_after_sample")
+        finally:
+            range_pop()
+        self._start_async_sample_transfer(active_request_count)
+        self._async_phase_trace("pipeline_after_start_transfer")
+        self._async_debug_log("pipeline_after_start_transfer")
+
+        self._async_pending_forward_plan = None
+        self._async_pending_cuda_graph_request_count = None
+        self._async_deferred_sample_plan = parent_plan
+        self._async_deferred_cuda_graph_request_count = parent_plan.padded_active_request_count
+        self._async_phase_trace("pipeline_before_launch")
+        if not self._launch_async_prepared_decode_forward(active_request_count=active_request_count):
+            context.clear_async_prepared_decode_plan()
+            context.record_async_scheduling_counter("invariant_failure")
+            self._async_debug_log("pipeline_launch_failed")
+            raise RuntimeError("async decode chain child launch failed after prepare")
+        self._async_phase_trace("pipeline_after_launch")
+        context.record_async_scheduling_counter("deferred_sample")
+        self._async_debug_log("pipeline_done")
+        return True
+
+    async def _async_commit_deferred_decode_step(
+        self, *, skip_bookkeeping: bool = False
+    ) -> Optional[Dict]:
+        """Commit a token whose sampling was already enqueued in the GPU pipeline."""
+
+        if skip_bookkeeping:
+            raise RuntimeError("skip_bookkeeping is not supported with async deferred decode")
+
+        context = self.inference_wrapped_model.inference_context
+        deferred_plan = self._async_deferred_sample_plan
+        if deferred_plan is None:
+            return None
+        self._async_debug_log(
+            "deferred_commit_start",
+            plan_active=deferred_plan.active_request_count,
+            plan_padded=deferred_plan.padded_active_request_count,
+        )
+        if not context.prepared_async_request_ids_match_live(deferred_plan):
+            self._async_deferred_sample_plan = None
+            self._async_deferred_cuda_graph_request_count = None
+            context.record_async_scheduling_counter("invariant_failure")
+            self._async_debug_log("deferred_commit_invariant_failure")
+            raise RuntimeError("async decode deferred sample invariant failed before commit")
+
+        active_request_count = context.total_request_count - context.paused_request_count
+        self._async_debug_log("deferred_before_finish_transfer")
+        sampled_tokens_cpu = self._finish_async_sample_transfer(active_request_count)
+        self._async_debug_log("deferred_after_finish_transfer")
+        cuda_graph_request_count = self._async_deferred_cuda_graph_request_count
+        self._async_deferred_sample_plan = None
+        self._async_deferred_cuda_graph_request_count = None
+
+        try:
+            with torch.inference_mode():
+                range_push("async_deferred_cpu_commit")
+                try:
+                    self._async_debug_log("deferred_before_bookkeeping")
+                    request_bookkeeping = self._dynamic_step_context_bookkeeping(
+                        sampled_tokens_cpu=sampled_tokens_cpu
+                    )
+                    self._async_debug_log("deferred_after_bookkeeping")
+                finally:
+                    range_pop()
+
+                next_active_request_count = context.total_request_count - context.paused_request_count
+                self._async_debug_log(
+                    "deferred_before_pipeline", next_active=next_active_request_count
+                )
+                self._try_pipeline_committed_decode_step(
+                    active_request_count=next_active_request_count,
+                    return_log_probs=False,
+                    return_top_n_logprobs=False,
+                    skip_bookkeeping=False,
+                )
+                self._async_debug_log("deferred_after_pipeline")
+
+                ret = {
+                    "accepted_tokens": None,
+                    "log_probs": None,
+                    "top_n_logprobs": None,
+                    "cuda_graph_request_count": cuda_graph_request_count,
+                }
+                ret.update(request_bookkeeping)
+                return ret
+        finally:
+            self._close_ep_forward_phases()
 
     async def async_generate_output_tokens_dynamic_batch(
         self, skip_bookkeeping: Optional[bool] = False
@@ -1719,37 +2316,66 @@ class TextGenerationController:
         if context.active_token_count == 0 and active_request_count == 0:
             return None
 
-        with torch.inference_mode():
-            input_ids, position_ids = self._dynamic_step_context_init()
-
-            cuda_graph_request_count = (
-                context.padded_active_request_count
-                if context.using_cuda_graph_this_step()
-                else None
+        if self._async_deferred_sample_plan is not None:
+            return await self._async_commit_deferred_decode_step(
+                skip_bookkeeping=bool(skip_bookkeeping)
             )
 
-            # Enable routing recording before forward pass if routing replay is enabled
-            config = self.inference_wrapped_model.model.config
-            if config.moe_enable_routing_replay:
-                RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+        async_next_prepared = False
+        pending_forward_reused = False
+        async_sampled_tokens_cpu = None
+        async_sample_transfer_started = False
+        with torch.inference_mode():
+            pending_forward_reused = self._try_use_async_pending_forward()
+            if pending_forward_reused:
+                cuda_graph_request_count = self._async_pending_cuda_graph_request_count
+                self._async_pending_forward_plan = None
+                self._async_pending_cuda_graph_request_count = None
+            else:
+                self._async_debug_log("main_before_context_init")
+                if not self._sync_ep_forward_phase(True):
+                    raise RuntimeError("EP forward phase unexpectedly blocked a real decode step")
+                input_ids, position_ids = self._dynamic_step_context_init()
+                self._async_debug_log(
+                    "main_after_context_init",
+                    graph=context.using_cuda_graph_this_step(),
+                    padded=context.padded_active_request_count,
+                )
 
-            # Forward pass produces only base logits. When speculative decoding is
-            # active, MTP logits are computed serially after verification.
-            range_push("forward_pass")
-            self._dynamic_step_forward_logits(input_ids, position_ids)
+                cuda_graph_request_count = (
+                    context.padded_active_request_count
+                    if context.using_cuda_graph_this_step()
+                    else None
+                )
 
-            # Commit Mamba intermediate states before update_requests, which
-            # may swap request indices. The Python lists tracking EOS block IDs
-            # and intermediate offsets are not swapped along with tensors, so
-            # commit must run while indices are still valid.
-            if context.is_hybrid_model and context.mamba_slot_allocator is not None:
-                context.mamba_slot_allocator.commit_intermediate_states()
+                # Enable routing recording before forward pass if routing replay is enabled
+                config = self.inference_wrapped_model.model.config
+                if config.moe_enable_routing_replay:
+                    RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
-            # Collect flat routing indices and scatter them into per-block storage.
-            # Must be done before update_requests while token-to-block mappings are valid.
-            # Reconstruction happens from blocks at request completion.
-            context.kv_block_allocator.store_routing_per_block(self._router_record_bookkeeping())
-            range_pop()
+                # Forward pass produces only base logits. When speculative decoding is
+                # active, MTP logits are computed serially after verification.
+                range_push("forward_pass")
+                self._async_debug_log("main_before_forward")
+                self._dynamic_step_forward_logits(input_ids, position_ids)
+                self._async_debug_log("main_after_forward")
+                self._retire_dynamic_forward_side_effects()
+                range_pop()
+
+            return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
+            if (
+                context.config.enable_async_scheduling
+                and self.num_speculative_tokens == 0
+                and not return_log_probs
+                and not return_top_n_logprobs
+                and not skip_bookkeeping
+            ):
+                range_push("async_prepare_next_step")
+                try:
+                    async_next_prepared = self._prepare_async_decode_next_step_with_ep_handoff()
+                finally:
+                    range_pop()
+                self._async_debug_log("main_after_prepare", prepared=async_next_prepared)
 
         # This is the best place to yield control back to event loop.
         # At this point we have enqueued FW pass GPU kernels asynchronously.
@@ -1758,11 +2384,11 @@ class TextGenerationController:
         # asynchronous.
         # Todo [Siddharth]: Can we condition the sleep on a cuda event?
         # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
-        await asyncio.sleep(0)
+        if not async_next_prepared:
+            await asyncio.sleep(0)
 
         with torch.inference_mode():
             range_push("sampling")
-            return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
 
             if self.num_speculative_tokens > 0:
                 # Phase 1: Verify speculative tokens using base logits only.
@@ -1790,6 +2416,29 @@ class TextGenerationController:
                 context.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
             else:
                 self._dynamic_step_sample_logits()
+                self._async_debug_log("main_after_sample")
+                if async_next_prepared:
+                    self._start_async_sample_transfer(active_request_count)
+                    async_sample_transfer_started = True
+                    self._async_debug_log("main_after_start_transfer")
+                    needs_sample_check = self._async_prepared_decode_needs_sample_check(
+                        active_request_count
+                    )
+                    if needs_sample_check:
+                        async_sampled_tokens_cpu = self._finish_async_sample_transfer(
+                            active_request_count
+                        )
+                        if not self._async_sampled_tokens_preserve_current_rows(
+                            async_sampled_tokens_cpu, active_request_count
+                        ):
+                            context.record_async_scheduling_counter("skip_sample_terminal")
+                            context.clear_async_prepared_decode_plan()
+                            async_next_prepared = False
+                    if async_next_prepared and not self._launch_async_prepared_decode_forward(
+                        active_request_count=active_request_count
+                    ):
+                        context.clear_async_prepared_decode_plan()
+                        async_next_prepared = False
 
             log_probs = None
             top_n_logprobs = None
@@ -1828,7 +2477,27 @@ class TextGenerationController:
             else:
                 # request_bookkeeping supplies "sample" as the already-CPU
                 # tensor produced by _transfer_samples_to_cpu.
-                request_bookkeeping = self._dynamic_step_context_bookkeeping()
+                if async_sampled_tokens_cpu is not None:
+                    request_bookkeeping = self._dynamic_step_context_bookkeeping(
+                        sampled_tokens_cpu=async_sampled_tokens_cpu
+                    )
+                elif async_sample_transfer_started:
+                    async_sampled_tokens_cpu = self._finish_async_sample_transfer(
+                        active_request_count
+                    )
+                    request_bookkeeping = self._dynamic_step_context_bookkeeping(
+                        sampled_tokens_cpu=async_sampled_tokens_cpu
+                    )
+                else:
+                    request_bookkeeping = self._dynamic_step_context_bookkeeping()
+
+            next_active_request_count = context.total_request_count - context.paused_request_count
+            self._try_pipeline_committed_decode_step(
+                active_request_count=next_active_request_count,
+                return_log_probs=return_log_probs,
+                return_top_n_logprobs=return_top_n_logprobs,
+                skip_bookkeeping=bool(skip_bookkeeping),
+            )
 
             ret = {
                 "accepted_tokens": (
@@ -1845,6 +2514,7 @@ class TextGenerationController:
                 self._accepted_tokens_per_request.fill_(-1)
                 self._accepted_token_counts_per_request.fill_(0)
             ret.update(request_bookkeeping)
+            self._close_ep_forward_phases()
             return ret
 
     @torch.inference_mode()
