@@ -351,7 +351,7 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(8)
-    def test_copy_deferred_input_tokens_to_gpu_populates_active_and_clears_padding(self):
+    def test_copy_async_sched_input_tokens_to_gpu_populates_active_and_clears_padding(self):
         ctx = self._get_dynamic_context(
             params_dtype=torch.float32,
             num_layers=2,
@@ -375,7 +375,7 @@ class TestDynamicContext:
         )
         sampled_tokens_cuda = torch.tensor([90, 91, 92], dtype=torch.int64, device=device)
 
-        ctx.copy_deferred_input_tokens_to_gpu(sampled_tokens_cuda)
+        ctx.copy_async_sched_input_tokens_to_gpu(sampled_tokens_cuda)
 
         assert torch.equal(ctx.gpu_view.token_to_input_ids[:3], sampled_tokens_cuda)
         assert torch.equal(
@@ -402,7 +402,7 @@ class TestDynamicContext:
         # Initialize all variables
         dynamic_context.total_request_count = 10
         dynamic_context.active_token_count = 10
-        dynamic_context.deferred_resolution_compaction_step_count = 7
+        dynamic_context.async_sched_compaction_step_count = 7
         dynamic_context.paused_request_count = 5
         dynamic_context.padded_active_token_count = 10
         dynamic_context.padded_active_request_count = 5
@@ -431,7 +431,7 @@ class TestDynamicContext:
         # Assert all variables are reset to zero or their default values
         assert dynamic_context.total_request_count == 0
         assert dynamic_context.active_token_count == 0
-        assert dynamic_context.deferred_resolution_compaction_step_count == 0
+        assert dynamic_context.async_sched_compaction_step_count == 0
         assert dynamic_context.paused_request_count == 0
         assert dynamic_context.padded_active_token_count == 0
         assert dynamic_context.padded_active_request_count == 0
@@ -938,8 +938,8 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(8)
-    def test_deferred_prepare_and_resolve_finished_requests(self):
-        """Deferred prepare advances decode rows and resolve compacts survivors."""
+    def test_async_sched_prepare_and_resolve_finished_requests(self):
+        """Async scheduling prepare advances decode rows and resolve compacts survivors."""
         ctx = self._get_dynamic_context(
             params_dtype=torch.float32,
             num_layers=2,

@@ -189,7 +189,7 @@ class TextGenerationControllerTestBase:
         InferenceMode.set_active()
 
 
-def test_deferred_resolution_logits_compaction():
+def test_async_sched_logits_compaction():
     controller = TextGenerationController.__new__(TextGenerationController)
     controller._enable_cuda_graph = False
     controller._decode_forward_primer = DecodeForwardPrimer(
@@ -198,23 +198,23 @@ def test_deferred_resolution_logits_compaction():
 
     logits = torch.arange(12).reshape(1, 4, 3)
     controller._all_logits_cuda = logits.clone()
-    controller._compact_deferred_resolution_logits(torch.tensor([0, 1, 2, 3]))
+    controller._compact_async_sched_logits(torch.tensor([0, 1, 2, 3]))
 
     assert torch.equal(controller._all_logits_cuda, logits)
     assert controller._decode_forward_primer.is_primed
 
     controller._all_logits_cuda = logits.clone()
-    controller._compact_deferred_resolution_logits(torch.tensor([0, 2]))
+    controller._compact_async_sched_logits(torch.tensor([0, 2]))
 
     assert torch.equal(controller._all_logits_cuda, logits[:, [0, 2], :])
     assert controller._decode_forward_primer.is_primed
 
-    controller._compact_deferred_resolution_logits(torch.empty(0, dtype=torch.int64))
+    controller._compact_async_sched_logits(torch.empty(0, dtype=torch.int64))
 
     assert not controller._decode_forward_primer.is_primed
 
 
-def test_deferred_resolution_step_counts_compaction_after_logits_compaction():
+def test_async_sched_step_counts_compaction_after_logits_compaction():
     controller = TextGenerationController.__new__(TextGenerationController)
     controller._decode_forward_primer = DecodeForwardPrimer(
         is_primed=True, cuda_graph_request_count=8
@@ -222,7 +222,7 @@ def test_deferred_resolution_step_counts_compaction_after_logits_compaction():
     controller._all_logits_cuda = torch.tensor(
         [[[0.0, 3.0, 1.0], [0.0, 1.0, 4.0], [0.0, 5.0, 2.0]]]
     )
-    controller._validate_deferred_resolution_support_for_step = mock.Mock()
+    controller._validate_async_sched_support_for_step = mock.Mock()
     input_ids = torch.tensor([[101, 102, 103]])
     position_ids = torch.tensor([[0, 1, 2]])
     call_order = []
@@ -238,7 +238,7 @@ def test_deferred_resolution_step_counts_compaction_after_logits_compaction():
         return 8
 
     controller._dynamic_step_context_init = mock.Mock(side_effect=initialize_step_context)
-    controller._run_deferred_resolution_forward = mock.Mock(side_effect=forward_step)
+    controller._run_async_sched_forward = mock.Mock(side_effect=forward_step)
 
     context = mock.Mock()
     context.total_request_count = 3
@@ -248,15 +248,15 @@ def test_deferred_resolution_step_counts_compaction_after_logits_compaction():
     context.request_metadata = {"termination_id": torch.tensor([2, 2, 2], dtype=torch.int64)}
     context.get_active_sequence_lengths.return_value = torch.tensor([4, 4, 4], dtype=torch.int32)
     context.get_max_sequence_lengths.return_value = torch.tensor([10, 10, 10])
-    context.deferred_resolution_compaction_step_count = 0
+    context.async_sched_compaction_step_count = 0
     controller.inference_wrapped_model = mock.Mock(inference_context=context)
 
     def prepare_requests(new_sample_copy):
         call_order.append("prepare")
         assert torch.equal(new_sample_copy, torch.tensor([1, 2, 1]))
 
-    def copy_deferred_input_tokens_to_gpu(sampled_tokens_cuda):
-        call_order.append("copy_deferred_input_tokens_to_gpu")
+    def copy_async_sched_input_tokens_to_gpu(sampled_tokens_cuda):
+        call_order.append("copy_async_sched_input_tokens_to_gpu")
         assert torch.equal(sampled_tokens_cuda, torch.tensor([1, 2, 1]))
 
     def resolve_requests(active_request_mask):
@@ -265,43 +265,43 @@ def test_deferred_resolution_step_counts_compaction_after_logits_compaction():
         return torch.tensor([11], dtype=torch.int32)
 
     context.prepare_requests = mock.Mock(side_effect=prepare_requests)
-    context.copy_deferred_input_tokens_to_gpu = mock.Mock(
-        side_effect=copy_deferred_input_tokens_to_gpu
+    context.copy_async_sched_input_tokens_to_gpu = mock.Mock(
+        side_effect=copy_async_sched_input_tokens_to_gpu
     )
     context.resolve_requests = mock.Mock(side_effect=resolve_requests)
 
     def compact_logits(survivor_idxs):
         assert torch.equal(survivor_idxs, torch.tensor([0, 2]))
-        assert context.deferred_resolution_compaction_step_count == 0
+        assert context.async_sched_compaction_step_count == 0
 
-    controller._compact_deferred_resolution_logits = mock.Mock(side_effect=compact_logits)
+    controller._compact_async_sched_logits = mock.Mock(side_effect=compact_logits)
 
-    result = asyncio.run(controller._run_deferred_resolution_step())
+    result = asyncio.run(controller._run_async_sched_serial_step())
 
-    controller._compact_deferred_resolution_logits.assert_called_once()
-    assert context.deferred_resolution_compaction_step_count == 1
+    controller._compact_async_sched_logits.assert_called_once()
+    assert context.async_sched_compaction_step_count == 1
     assert result["finished_request_ids"].tolist() == [11]
     assert result["sample"].tolist() == [1, 2, 1]
     controller._dynamic_step_context_init.assert_called_once_with(
         skip_token_input_ids_transfer=True
     )
-    context.copy_deferred_input_tokens_to_gpu.assert_called_once()
+    context.copy_async_sched_input_tokens_to_gpu.assert_called_once()
     assert call_order == [
         "prepare",
         "context_init:True",
-        "copy_deferred_input_tokens_to_gpu",
+        "copy_async_sched_input_tokens_to_gpu",
         "forward",
         "resolve",
     ]
 
 
-def test_deferred_resolution_primer_initializes_context_before_forward():
+def test_async_sched_primer_initializes_context_before_forward():
     controller = TextGenerationController.__new__(TextGenerationController)
     controller._decode_forward_primer = DecodeForwardPrimer(
         is_primed=False, cuda_graph_request_count=None
     )
     controller._all_logits_cuda = torch.tensor([[[0.0, 3.0, 1.0], [0.0, 5.0, 2.0]]])
-    controller._validate_deferred_resolution_support_for_step = mock.Mock()
+    controller._validate_async_sched_support_for_step = mock.Mock()
     input_ids = torch.tensor([[101, 102]])
     position_ids = torch.tensor([[0, 1]])
     call_order = []
@@ -318,7 +318,7 @@ def test_deferred_resolution_primer_initializes_context_before_forward():
         return None
 
     controller._dynamic_step_context_init = mock.Mock(side_effect=initialize_step_context)
-    controller._run_deferred_resolution_forward = mock.Mock(side_effect=forward_step)
+    controller._run_async_sched_forward = mock.Mock(side_effect=forward_step)
 
     context = mock.Mock()
     context.total_request_count = 2
@@ -328,15 +328,15 @@ def test_deferred_resolution_primer_initializes_context_before_forward():
     context.request_metadata = {"termination_id": torch.tensor([2, 2], dtype=torch.int64)}
     context.get_active_sequence_lengths.return_value = torch.tensor([4, 4], dtype=torch.int32)
     context.get_max_sequence_lengths.return_value = torch.tensor([10, 10])
-    context.deferred_resolution_compaction_step_count = 0
+    context.async_sched_compaction_step_count = 0
     controller.inference_wrapped_model = mock.Mock(inference_context=context)
 
     def prepare_requests(new_sample_copy):
         call_order.append("prepare")
         assert torch.equal(new_sample_copy, torch.tensor([1, 1]))
 
-    def copy_deferred_input_tokens_to_gpu(sampled_tokens_cuda):
-        call_order.append("copy_deferred_input_tokens_to_gpu")
+    def copy_async_sched_input_tokens_to_gpu(sampled_tokens_cuda):
+        call_order.append("copy_async_sched_input_tokens_to_gpu")
         assert torch.equal(sampled_tokens_cuda, torch.tensor([1, 1]))
 
     def resolve_requests(active_request_mask):
@@ -345,13 +345,13 @@ def test_deferred_resolution_primer_initializes_context_before_forward():
         return torch.empty(0, dtype=torch.int32)
 
     context.prepare_requests = mock.Mock(side_effect=prepare_requests)
-    context.copy_deferred_input_tokens_to_gpu = mock.Mock(
-        side_effect=copy_deferred_input_tokens_to_gpu
+    context.copy_async_sched_input_tokens_to_gpu = mock.Mock(
+        side_effect=copy_async_sched_input_tokens_to_gpu
     )
     context.resolve_requests = mock.Mock(side_effect=resolve_requests)
-    controller._compact_deferred_resolution_logits = mock.Mock()
+    controller._compact_async_sched_logits = mock.Mock()
 
-    result = asyncio.run(controller._run_deferred_resolution_step())
+    result = asyncio.run(controller._run_async_sched_serial_step())
 
     assert result["finished_request_ids"].tolist() == []
     assert result["sample"].tolist() == [1, 1]
@@ -360,15 +360,15 @@ def test_deferred_resolution_primer_initializes_context_before_forward():
         mock.call(),
         mock.call(skip_token_input_ids_transfer=True),
     ]
-    assert controller._run_deferred_resolution_forward.call_count == 2
+    assert controller._run_async_sched_forward.call_count == 2
     context.prepare_requests.assert_called_once()
-    context.copy_deferred_input_tokens_to_gpu.assert_called_once()
+    context.copy_async_sched_input_tokens_to_gpu.assert_called_once()
     assert call_order == [
         "context_init:False",
         "forward",
         "prepare",
         "context_init:True",
-        "copy_deferred_input_tokens_to_gpu",
+        "copy_async_sched_input_tokens_to_gpu",
         "forward",
         "resolve",
     ]
