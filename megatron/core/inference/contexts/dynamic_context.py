@@ -1086,6 +1086,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Per-token state (source-of-truth lives in the coalesced buffer since
         # the CPU-side bookkeeping and the GPU forward pass use the same
         # `[:n_tok]` slice).
+        self._token_to_input_ids_bytes = _tok_int64_bytes
         self.token_to_input_ids = self._cpu_bookkeeping_buf[_off : _off + _tok_int64_bytes].view(
             torch.long
         )
@@ -2129,6 +2130,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         *,
         construct_graph_dimensions: Optional[InferenceBatchDimensions] = None,
         is_expert_parallel_dummy_cuda_graph_step: bool = False,
+        skip_token_input_ids_transfer: bool = False,
     ) -> None:
         """Initialize attention state so that every layer can use it.
 
@@ -2137,6 +2139,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 The graph config to use for constructing the cuda graphs.
             is_expert_parallel_dummy_cuda_graph_step (bool):
                 Whether this is a dummy expert model parallel step.
+            skip_token_input_ids_transfer (bool): If true, leave the GPU
+                token_to_input_ids field unchanged during bookkeeping transfer.
         Return:
             None.
         """
@@ -2381,7 +2385,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # `initialize_attention_state()`) see populated GPU bookkeeping. The
         # text-generation controller still calls `transfer_bookkeeping_to_gpu`
         # explicitly; that second call is a cheap idempotent re-copy.
-        self.transfer_bookkeeping_to_gpu()
+        self.transfer_bookkeeping_to_gpu(
+            skip_token_input_ids=skip_token_input_ids_transfer
+        )
 
     def _execute_pending_mamba_ops(self) -> None:
         """Execute Mamba GPU operations deferred from add_request() / update_requests().
@@ -2407,7 +2413,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_ssm_states[:, indices] = 0.0
             self._pending_mamba_zeros.clear()
 
-    def transfer_bookkeeping_to_gpu(self) -> None:
+    def transfer_bookkeeping_to_gpu(self, skip_token_input_ids: bool = False) -> None:
         """Batch transfer CPU bookkeeping state to GPU staging buffers.
 
         Called after initialize_attention_state() and before the forward pass.
@@ -2419,6 +2425,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         Request-level staging slots are refreshed from the persistent CPU
         tensors immediately before the H2D (GPU reads them at `[:n_active]`
         while CPU bookkeeping keeps them at `[paused_count:total_count)`).
+
+        Args:
+            skip_token_input_ids (bool): If true, leave
+                `gpu_view.token_to_input_ids` unchanged while copying the rest
+                of the bookkeeping buffer.
         """
         n_active = self.total_request_count - self.paused_request_count
         active_slice = slice(self.paused_request_count, self.total_request_count)
@@ -2456,7 +2467,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Copying the whole (max_tokens + max_requests)-sized buffer including
         # unused slots is cheap (~71 KB total, ~3-5 us on PCIe Gen4) and saves
         # 8 redundant launch overheads vs. the prior per-field copies.
-        self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
+        if skip_token_input_ids:
+            self.gpu_view._buf[self._token_to_input_ids_bytes :].copy_(
+                self._cpu_bookkeeping_buf[self._token_to_input_ids_bytes :],
+                non_blocking=True,
+            )
+        else:
+            self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
 
         # MHA metadata GPU views were already bound to state_data in
         # initialize_attention_state(); the H2D above populates the underlying
@@ -2466,6 +2483,48 @@ class DynamicInferenceContext(BaseInferenceContext):
         if hasattr(self, '_pending_mamba_transfer') and self._pending_mamba_transfer is not None:
             self.mamba_metadata.load_from_cpu(self._pending_mamba_transfer)
             self._pending_mamba_transfer = None
+
+    def copy_deferred_input_tokens_to_gpu(self, sampled_tokens_cuda: Tensor) -> None:
+        """Populate GPU input token IDs from sampled CUDA tokens for deferred decode.
+
+        Deferred request resolution keeps sampled tokens GPU-resident for the
+        next decode forward. CPU bookkeeping is still prepared normally, but
+        forward input IDs are patched directly from the sampled CUDA tensor.
+
+        Args:
+            sampled_tokens_cuda (Tensor): 1D CUDA tensor containing one sampled
+                token per active decode request.
+        """
+        active_request_count = self.total_request_count - self.paused_request_count
+        if self.num_speculative_tokens != 0:
+            raise RuntimeError("Deferred request resolution does not support speculative tokens.")
+        if self.num_prefill_requests != 0:
+            raise RuntimeError("Deferred request resolution only supports decode-only steps.")
+        if self.paused_request_count != 0:
+            raise RuntimeError("Deferred request resolution does not support paused requests.")
+        if not sampled_tokens_cuda.is_cuda:
+            raise RuntimeError("Deferred input tokens must be CUDA-resident.")
+        if sampled_tokens_cuda.dim() != 1:
+            raise RuntimeError("Deferred input tokens must be a 1D tensor.")
+        if sampled_tokens_cuda.dtype != torch.int64:
+            raise RuntimeError("Deferred input tokens must have dtype torch.int64.")
+        if sampled_tokens_cuda.device != self.gpu_view.token_to_input_ids.device:
+            raise RuntimeError(
+                "Deferred input tokens must be on the same device as context GPU bookkeeping."
+            )
+        if sampled_tokens_cuda.numel() != active_request_count:
+            raise RuntimeError(
+                f"Expected {active_request_count} deferred input tokens, "
+                f"got {sampled_tokens_cuda.numel()}."
+            )
+
+        self.gpu_view.token_to_input_ids[:active_request_count].copy_(
+            sampled_tokens_cuda, non_blocking=True
+        )
+        if active_request_count < self.padded_active_token_count:
+            self.gpu_view.token_to_input_ids[
+                active_request_count : self.padded_active_token_count
+            ].zero_()
 
     def reset_tensors(self) -> None:
         """Fill all bookkeeping tensors with sentinel values."""

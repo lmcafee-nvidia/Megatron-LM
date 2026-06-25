@@ -227,8 +227,8 @@ def test_deferred_resolution_step_counts_compaction_after_logits_compaction():
     position_ids = torch.tensor([[0, 1, 2]])
     call_order = []
 
-    def initialize_step_context():
-        call_order.append("context_init")
+    def initialize_step_context(*, skip_token_input_ids_transfer=False):
+        call_order.append(f"context_init:{skip_token_input_ids_transfer}")
         return input_ids, position_ids
 
     def forward_step(forward_input_ids, forward_position_ids):
@@ -255,12 +255,19 @@ def test_deferred_resolution_step_counts_compaction_after_logits_compaction():
         call_order.append("prepare")
         assert torch.equal(new_sample_copy, torch.tensor([1, 2, 1]))
 
+    def copy_deferred_input_tokens_to_gpu(sampled_tokens_cuda):
+        call_order.append("copy_deferred_input_tokens_to_gpu")
+        assert torch.equal(sampled_tokens_cuda, torch.tensor([1, 2, 1]))
+
     def resolve_requests(active_request_mask):
         call_order.append("resolve")
         assert torch.equal(active_request_mask, torch.tensor([1, 0, 1], dtype=torch.uint8))
         return torch.tensor([11], dtype=torch.int32)
 
     context.prepare_requests = mock.Mock(side_effect=prepare_requests)
+    context.copy_deferred_input_tokens_to_gpu = mock.Mock(
+        side_effect=copy_deferred_input_tokens_to_gpu
+    )
     context.resolve_requests = mock.Mock(side_effect=resolve_requests)
 
     def compact_logits(survivor_idxs):
@@ -275,7 +282,17 @@ def test_deferred_resolution_step_counts_compaction_after_logits_compaction():
     assert context.deferred_resolution_compaction_step_count == 1
     assert result["finished_request_ids"].tolist() == [11]
     assert result["sample"].tolist() == [1, 2, 1]
-    assert call_order == ["prepare", "context_init", "forward", "resolve"]
+    controller._dynamic_step_context_init.assert_called_once_with(
+        skip_token_input_ids_transfer=True
+    )
+    context.copy_deferred_input_tokens_to_gpu.assert_called_once()
+    assert call_order == [
+        "prepare",
+        "context_init:True",
+        "copy_deferred_input_tokens_to_gpu",
+        "forward",
+        "resolve",
+    ]
 
 
 def test_deferred_resolution_primer_initializes_context_before_forward():
@@ -289,8 +306,8 @@ def test_deferred_resolution_primer_initializes_context_before_forward():
     position_ids = torch.tensor([[0, 1]])
     call_order = []
 
-    def initialize_step_context():
-        call_order.append("context_init")
+    def initialize_step_context(*, skip_token_input_ids_transfer=False):
+        call_order.append(f"context_init:{skip_token_input_ids_transfer}")
         return input_ids, position_ids
 
     def forward_step(forward_input_ids, forward_position_ids):
@@ -318,12 +335,19 @@ def test_deferred_resolution_primer_initializes_context_before_forward():
         call_order.append("prepare")
         assert torch.equal(new_sample_copy, torch.tensor([1, 1]))
 
+    def copy_deferred_input_tokens_to_gpu(sampled_tokens_cuda):
+        call_order.append("copy_deferred_input_tokens_to_gpu")
+        assert torch.equal(sampled_tokens_cuda, torch.tensor([1, 1]))
+
     def resolve_requests(active_request_mask):
         call_order.append("resolve")
         assert torch.equal(active_request_mask, torch.tensor([1, 1], dtype=torch.uint8))
         return torch.empty(0, dtype=torch.int32)
 
     context.prepare_requests = mock.Mock(side_effect=prepare_requests)
+    context.copy_deferred_input_tokens_to_gpu = mock.Mock(
+        side_effect=copy_deferred_input_tokens_to_gpu
+    )
     context.resolve_requests = mock.Mock(side_effect=resolve_requests)
     controller._compact_deferred_resolution_logits = mock.Mock()
 
@@ -332,13 +356,19 @@ def test_deferred_resolution_primer_initializes_context_before_forward():
     assert result["finished_request_ids"].tolist() == []
     assert result["sample"].tolist() == [1, 1]
     assert controller._dynamic_step_context_init.call_count == 2
+    assert controller._dynamic_step_context_init.call_args_list == [
+        mock.call(),
+        mock.call(skip_token_input_ids_transfer=True),
+    ]
     assert controller._run_deferred_resolution_forward.call_count == 2
     context.prepare_requests.assert_called_once()
+    context.copy_deferred_input_tokens_to_gpu.assert_called_once()
     assert call_order == [
-        "context_init",
+        "context_init:False",
         "forward",
         "prepare",
-        "context_init",
+        "context_init:True",
+        "copy_deferred_input_tokens_to_gpu",
         "forward",
         "resolve",
     ]

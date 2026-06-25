@@ -627,6 +627,7 @@ class TextGenerationController:
         self,
         construct_graph_dimensions: Optional[InferenceBatchDimensions] = None,
         is_dummy_forward: bool = False,
+        skip_token_input_ids_transfer: bool = False,
     ):
         """Initializes the inference context for dynamic batching.
 
@@ -634,6 +635,9 @@ class TextGenerationController:
             construct_graph_dimensions (Optional[InferenceBatchDimensions]): The graph config to use
                 for constructing the cuda graphs.
             is_dummy_forward (bool): Whether we are running an expert parallel dummy forward pass
+            skip_token_input_ids_transfer (bool): If true, do not copy CPU
+                token_to_input_ids into GPU bookkeeping. The caller must
+                populate GPU input token IDs before forward.
 
         Return:
             input_ids (Tensor): The active input IDs.
@@ -650,12 +654,15 @@ class TextGenerationController:
         context.initialize_attention_state(
             construct_graph_dimensions=construct_graph_dimensions,
             is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
+            skip_token_input_ids_transfer=skip_token_input_ids_transfer,
         )
         range_pop()
 
         # Single batch CPU-to-GPU transfer of bookkeeping state.
         range_push("transfer_bookkeeping_to_gpu")
-        context.transfer_bookkeeping_to_gpu()
+        context.transfer_bookkeeping_to_gpu(
+            skip_token_input_ids=skip_token_input_ids_transfer
+        )
         range_pop()
 
         set_moe_metadata_sync(unwrapped_model)
@@ -763,18 +770,26 @@ class TextGenerationController:
         else:
             self._all_logits_cuda = logits
 
-    def _run_deferred_resolution_prepare(self, new_sample_copy: Tensor) -> Tuple[Tensor, Tensor]:
+    def _run_deferred_resolution_prepare(
+        self, new_sample_copy: Tensor, sampled_tokens_cuda: Tensor
+    ) -> Tuple[Tensor, Tensor]:
         """Prepare deferred decode requests and GPU-visible forward state.
 
         Args:
             new_sample_copy (Tensor): CPU copy of sampled tokens for active requests.
+            sampled_tokens_cuda (Tensor): GPU-resident sampled tokens to use as
+                input IDs for the speculative forward.
 
         Returns:
             Tuple[Tensor, Tensor]: Input token IDs and position IDs for the speculative forward.
         """
         context = self.inference_wrapped_model.inference_context
         context.prepare_requests(new_sample_copy)
-        return self._dynamic_step_context_init()
+        input_ids, position_ids = self._dynamic_step_context_init(
+            skip_token_input_ids_transfer=True
+        )
+        context.copy_deferred_input_tokens_to_gpu(sampled_tokens_cuda)
+        return input_ids, position_ids
 
     def _run_deferred_resolution_forward(
         self, input_ids: Tensor, position_ids: Tensor
@@ -2036,7 +2051,9 @@ class TextGenerationController:
             range_pop()
 
             range_push("prepare_requests")
-            input_ids, position_ids = self._run_deferred_resolution_prepare(new_sample_copy)
+            input_ids, position_ids = self._run_deferred_resolution_prepare(
+                new_sample_copy, sampled_tokens_cuda
+            )
             range_pop()
 
             range_push("deferred_forward_pass")
