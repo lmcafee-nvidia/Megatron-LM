@@ -2464,15 +2464,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         # unused slots is cheap (~71 KB total, ~3-5 us on PCIe Gen4) and saves
         # 8 redundant launch overheads vs. the prior per-field copies.
         if skip_token_input_ids:
-            token_to_input_ids_bytes = (
+            token_to_input_ids_offset = (
                 self.token_to_input_ids.numel() * self.token_to_input_ids.element_size()
             )
-            self.gpu_view._buf[token_to_input_ids_bytes:].copy_(
-                self._cpu_bookkeeping_buf[token_to_input_ids_bytes:],
-                non_blocking=True,
-            )
         else:
-            self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
+            token_to_input_ids_offset = 0
+        self.gpu_view._buf[token_to_input_ids_offset:].copy_(
+            self._cpu_bookkeeping_buf[token_to_input_ids_offset:],
+            non_blocking=True,
+        )
 
         # MHA metadata GPU views were already bound to state_data in
         # initialize_attention_state(); the H2D above populates the underlying
