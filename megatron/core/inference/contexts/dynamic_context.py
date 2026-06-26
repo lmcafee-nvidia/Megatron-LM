@@ -2495,28 +2495,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 token per active decode request.
         """
         active_request_count = self.total_request_count - self.paused_request_count
-        if self.num_speculative_tokens != 0:
-            raise RuntimeError("Async scheduling does not support speculative tokens.")
-        if self.num_prefill_requests != 0:
-            raise RuntimeError("Async scheduling only supports decode-only steps.")
-        if self.paused_request_count != 0:
-            raise RuntimeError("Async scheduling does not support paused requests.")
-        if not sampled_tokens_cuda.is_cuda:
-            raise RuntimeError("Async scheduling input tokens must be CUDA-resident.")
-        if sampled_tokens_cuda.dim() != 1:
-            raise RuntimeError("Async scheduling input tokens must be a 1D tensor.")
-        if sampled_tokens_cuda.dtype != torch.int64:
-            raise RuntimeError("Async scheduling input tokens must have dtype torch.int64.")
-        if sampled_tokens_cuda.device != self.gpu_view.token_to_input_ids.device:
-            raise RuntimeError(
-                "Async scheduling input tokens must be on the same device as context GPU "
-                "bookkeeping."
-            )
-        if sampled_tokens_cuda.numel() != active_request_count:
-            raise RuntimeError(
-                f"Expected {active_request_count} async scheduling input tokens, "
-                f"got {sampled_tokens_cuda.numel()}."
-            )
 
         self.gpu_view.token_to_input_ids[:active_request_count].copy_(
             sampled_tokens_cuda, non_blocking=True
