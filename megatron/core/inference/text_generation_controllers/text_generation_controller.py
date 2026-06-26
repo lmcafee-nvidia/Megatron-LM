@@ -647,19 +647,12 @@ class TextGenerationController:
         unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
         model_config = get_model_config(unwrapped_model)
 
-        # Initialize attention state (100% CPU computation).
+        # Initialize attention state and publish CPU bookkeeping to GPU.
         range_push("initialize_attention_state")
         context.initialize_attention_state(
             construct_graph_dimensions=construct_graph_dimensions,
             is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
             skip_token_input_ids_transfer=skip_token_input_ids_transfer,
-        )
-        range_pop()
-
-        # Single batch CPU-to-GPU transfer of bookkeeping state.
-        range_push("transfer_bookkeeping_to_gpu")
-        context.transfer_bookkeeping_to_gpu(
-            skip_token_input_ids=skip_token_input_ids_transfer
         )
         range_pop()
 

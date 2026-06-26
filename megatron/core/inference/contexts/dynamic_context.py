@@ -2380,11 +2380,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         # No-op when the queue is already empty (regular non-warmup steps).
         self._execute_pending_mamba_ops()
 
-        # Run the H2D transfer here so callers that bypass the controller
-        # (e.g. unit tests that call `model.forward()` directly after
-        # `initialize_attention_state()`) see populated GPU bookkeeping. The
-        # text-generation controller still calls `transfer_bookkeeping_to_gpu`
-        # explicitly; that second call is a cheap idempotent re-copy.
+        # Run the H2D transfer here so every caller sees populated GPU
+        # bookkeeping immediately after initialize_attention_state().
         self.transfer_bookkeeping_to_gpu(
             skip_token_input_ids=skip_token_input_ids_transfer
         )
