@@ -1086,7 +1086,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Per-token state (source-of-truth lives in the coalesced buffer since
         # the CPU-side bookkeeping and the GPU forward pass use the same
         # `[:n_tok]` slice).
-        self._token_to_input_ids_bytes = _tok_int64_bytes
         self.token_to_input_ids = self._cpu_bookkeeping_buf[_off : _off + _tok_int64_bytes].view(
             torch.long
         )
@@ -2465,8 +2464,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         # unused slots is cheap (~71 KB total, ~3-5 us on PCIe Gen4) and saves
         # 8 redundant launch overheads vs. the prior per-field copies.
         if skip_token_input_ids:
-            self.gpu_view._buf[self._token_to_input_ids_bytes :].copy_(
-                self._cpu_bookkeeping_buf[self._token_to_input_ids_bytes :],
+            token_to_input_ids_bytes = (
+                self.token_to_input_ids.numel() * self.token_to_input_ids.element_size()
+            )
+            self.gpu_view._buf[token_to_input_ids_bytes:].copy_(
+                self._cpu_bookkeeping_buf[token_to_input_ids_bytes:],
                 non_blocking=True,
             )
         else:
