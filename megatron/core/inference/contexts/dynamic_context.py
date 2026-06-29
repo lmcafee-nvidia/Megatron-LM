@@ -2463,7 +2463,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Coalesced H2D: one cudaMemcpyAsync for the entire bookkeeping buffer.
         # Copying the whole (max_tokens + max_requests)-sized buffer including
         # unused slots is cheap (~71 KB total, ~3-5 us on PCIe Gen4) and saves
-        # 8 redundant launch overheads vs. the prior per-field copies.
+        # redundant launch overheads vs. per-field copies. Async scheduling
+        # decode steps skip token_to_input_ids here because sampled tokens are
+        # already GPU-resident and copied directly into the GPU input buffer.
         if skip_token_input_ids:
             token_to_input_ids_offset = (
                 self.token_to_input_ids.numel() * self.token_to_input_ids.element_size()
