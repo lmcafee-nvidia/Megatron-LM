@@ -1889,6 +1889,17 @@ class TextGenerationController:
         return event
 
     @staticmethod
+    def _wait_async_sched_event_on_current_stream(event: Optional[torch.cuda.Event]) -> None:
+        """Order current-stream CUDA work after an event without blocking the host.
+
+        Args:
+            event (Optional[torch.cuda.Event]): CUDA event for the current stream
+                to wait on, or `None` when no CUDA work was recorded.
+        """
+        if event is not None:
+            torch.cuda.current_stream().wait_event(event)
+
+    @staticmethod
     def _synchronize_async_sched_event(event: Optional[torch.cuda.Event]) -> None:
         """Block the host until an async-scheduling CUDA event completes.
 
@@ -2136,8 +2147,9 @@ class TextGenerationController:
         stream-ordered copies before forward execution. CPU resolution cannot
         mutate bookkeeping until its H2D completes, and finished-request
         resources cannot be released until the forward using them completes.
-        Hybrid models also complete a candidate forward before promoting its
-        Mamba state bank for the next preparation.
+        Hybrid models promote the candidate bank on the CPU without waiting for
+        the candidate forward. A CUDA stream dependency orders sampling and the
+        next forward after the candidate state writes.
 
         Args:
             overlap (bool): Whether to submit the next forward before waiting
@@ -2164,21 +2176,22 @@ class TextGenerationController:
         # Launch the forward primer if no existing logits state can be reused.
         primer_launched, primer_bookkeeping_done_event = self._run_async_sched_forward_primer()
 
-        # Mamba candidate state must be complete before its bank becomes the next read source.
-        if overlap and context.is_hybrid_model:
-            self._synchronize_async_sched_event(self._async_sched_logits.ready_event)
+        current_logits_ready_event = self._async_sched_logits.ready_event
 
-        # Consume the pending forward and promote its candidate Mamba state.
+        # Order GPU consumers after pending logits without blocking CPU preparation.
+        if overlap:
+            self._wait_async_sched_event_on_current_stream(current_logits_ready_event)
+        else:
+            self._synchronize_async_sched_event(current_logits_ready_event)
+
+        # Promote the candidate bank; the pending forward uses its immutable GPU metadata.
         self._accept_async_sched_mamba_state()
 
         with torch.inference_mode():
-            current_logits_ready_event = self._async_sched_logits.ready_event
             cuda_graph_request_count = self._async_sched_logits.cuda_graph_request_count
 
-            # Serial mode waits for logits; overlap only waits for a new primer's H2D source read.
-            if not overlap:
-                self._synchronize_async_sched_event(current_logits_ready_event)
-            elif primer_launched and not context.is_hybrid_model:
+            # A new primer must finish reading the reusable pinned bookkeeping source.
+            if overlap and primer_launched:
                 self._synchronize_async_sched_event(primer_bookkeeping_done_event)
 
             # -------------------------------------------------------------------------

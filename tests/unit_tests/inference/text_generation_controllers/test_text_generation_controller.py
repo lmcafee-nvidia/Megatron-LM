@@ -619,6 +619,7 @@ def test_async_sched_event_records_and_synchronizes_cuda_work():
     assert controller._record_fresh_async_sched_event(torch.empty(1)) is None
 
     event = controller._record_fresh_async_sched_event(torch.empty(1, device="cuda"))
+    controller._wait_async_sched_event_on_current_stream(event)
     controller._synchronize_async_sched_event(event)
     controller._synchronize_async_sched_event(None)
 
@@ -697,8 +698,8 @@ def test_run_async_sched_resolve_waits_only_for_finish_boundary(
             True,
             False,
             [
-                "accept",
                 "wait:current",
+                "accept",
                 "prepare",
                 "sample",
                 "copy_input",
@@ -718,6 +719,7 @@ def test_run_async_sched_resolve_waits_only_for_finish_boundary(
             True,
             False,
             [
+                "stream_wait:current",
                 "accept",
                 "prepare",
                 "sample",
@@ -737,6 +739,7 @@ def test_run_async_sched_resolve_waits_only_for_finish_boundary(
             False,
             [
                 "primer",
+                "stream_wait:current",
                 "accept",
                 "wait:primer_bookkeeping",
                 "prepare",
@@ -756,7 +759,7 @@ def test_run_async_sched_resolve_waits_only_for_finish_boundary(
             True,
             True,
             [
-                "wait:current",
+                "stream_wait:current",
                 "accept",
                 "prepare",
                 "sample",
@@ -801,6 +804,9 @@ def test_async_sched_step_order(overlap, has_valid_logits, is_hybrid_model, expe
     )
     controller._synchronize_async_sched_event = mock.Mock(
         side_effect=lambda event: call_order.append(f"wait:{event}")
+    )
+    controller._wait_async_sched_event_on_current_stream = mock.Mock(
+        side_effect=lambda event: call_order.append(f"stream_wait:{event}")
     )
     controller._run_async_sched_prepare = mock.Mock(
         side_effect=lambda: call_order.append("prepare") or (input_ids, position_ids)
