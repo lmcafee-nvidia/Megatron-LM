@@ -253,6 +253,9 @@ def _make_async_sched_controller(context=None, model_config=None):
     controller._enable_cuda_graph = False
     controller._async_sched_logits = AsyncScheduleLogitsState(is_valid=True)
     controller._sampled_tokens_cuda = torch.empty(context.max_requests, dtype=torch.int64)
+    controller._async_sched_sample_values_cuda = torch.empty(
+        context.max_requests, dtype=model_config.params_dtype
+    )
     controller._async_sched_sampled_tokens_cpu_buffer = torch.empty(
         context.max_requests, dtype=torch.int64
     )
@@ -269,67 +272,35 @@ def test_validate_async_sched_support_for_step_success(total_request_count):
     controller._validate_async_sched_support_for_step()
 
 
-def test_validate_async_sched_support_for_step_accepts_dual_bank_mamba():
+def test_validate_async_sched_support_for_step_ignores_immutable_restrictions():
     context = _make_async_sched_context(total_request_count=2)
+    context.config.materialize_only_last_token_logits = False
     context.is_hybrid_model = True
-    context.mamba_state_bank_count = 2
-
-    _make_async_sched_controller(context)._validate_async_sched_support_for_step()
-
-
-@pytest.mark.parametrize(
-    "unsupported_case",
-    [
-        "materialize_all_logits",
-        "speculative_tokens",
-        "single_mamba_bank",
-        "prefix_caching",
-        "paused_request",
-        "chunked_prefill",
-        "expert_parallelism",
-        "moe_model",
-        "routing_replay",
-        "non_greedy_top_k",
-        "non_greedy_top_p",
-        "log_probs",
-        "top_n_logprobs",
-    ],
-)
-def test_validate_async_sched_support_for_step_errors(unsupported_case):
-    context = _make_async_sched_context(total_request_count=2)
+    context.enable_prefix_caching = True
+    context.request_metadata["top_k"] = torch.tensor([0, 0])
+    context.request_metadata["top_p"] = torch.tensor([0.5, 0.5])
+    context.request_metadata["return_log_probs"] = torch.tensor([True, True])
+    context.request_metadata["top_n_logprobs"] = torch.tensor([1, 1])
     model_config = SimpleNamespace(
         params_dtype=torch.float32,
-        expert_model_parallel_size=1,
-        num_moe_experts=None,
-        moe_enable_routing_replay=False,
+        expert_model_parallel_size=2,
+        num_moe_experts=4,
+        moe_enable_routing_replay=True,
     )
     controller = _make_async_sched_controller(context, model_config)
-    if unsupported_case == "materialize_all_logits":
-        context.config.materialize_only_last_token_logits = False
-    elif unsupported_case == "speculative_tokens":
-        controller.num_speculative_tokens = 1
-    elif unsupported_case == "single_mamba_bank":
-        context.is_hybrid_model = True
-    elif unsupported_case == "prefix_caching":
-        context.enable_prefix_caching = True
-    elif unsupported_case == "paused_request":
+    controller.num_speculative_tokens = 1
+
+    controller._validate_async_sched_support_for_step()
+
+
+@pytest.mark.parametrize("unsupported_case", ["paused_request", "chunked_prefill"])
+def test_validate_async_sched_support_for_step_errors(unsupported_case):
+    context = _make_async_sched_context(total_request_count=2)
+    controller = _make_async_sched_controller(context)
+    if unsupported_case == "paused_request":
         context.paused_request_count = 1
     elif unsupported_case == "chunked_prefill":
         context.chunked_prefill_request_id = 0
-    elif unsupported_case == "expert_parallelism":
-        model_config.expert_model_parallel_size = 2
-    elif unsupported_case == "moe_model":
-        model_config.num_moe_experts = 4
-    elif unsupported_case == "routing_replay":
-        model_config.moe_enable_routing_replay = True
-    elif unsupported_case == "non_greedy_top_k":
-        context.request_metadata["top_k"] = torch.tensor([1, 0])
-    elif unsupported_case == "non_greedy_top_p":
-        context.request_metadata["top_p"] = torch.tensor([0.0, 0.5])
-    elif unsupported_case == "log_probs":
-        context.request_metadata["return_log_probs"] = torch.tensor([False, True])
-    elif unsupported_case == "top_n_logprobs":
-        context.request_metadata["top_n_logprobs"] = torch.tensor([0, 1])
 
     with pytest.raises(RuntimeError, match="Async scheduling"):
         controller._validate_async_sched_support_for_step()
@@ -603,6 +574,7 @@ def test_run_async_sched_sample_records_gpu_ready_event():
     controller = _make_async_sched_controller(context)
     controller._all_logits_cuda = torch.zeros(1, 3, 5, device="cuda")
     controller._sampled_tokens_cuda = torch.empty(3, dtype=torch.int64, device="cuda")
+    controller._async_sched_sample_values_cuda = torch.empty(3, device="cuda")
     controller._async_sched_sample_gpu_ready_event = mock.Mock()
 
     controller._run_async_sched_sample()

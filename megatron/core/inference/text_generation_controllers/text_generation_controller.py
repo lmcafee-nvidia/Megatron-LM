@@ -41,6 +41,8 @@ from megatron.core.tensor_parallel.mappings import (
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
+from megatron.core.transformer.moe.router_trace import get_moe_router_tracer
+from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
 from megatron.core.utils import (
     accepts_parameter,
@@ -228,6 +230,9 @@ class TextGenerationController:
         # This buffer has a stable address across legacy-prefill, async-decode,
         # and MTP routing. Sampling producers must copy into it rather than rebind it.
         self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
+        self._async_sched_sample_values_cuda = torch.empty(
+            max_requests, dtype=logits_dtype, device=device
+        )
         self._async_sched_sampled_tokens_cpu_buffer = torch.empty(
             max_requests, dtype=torch.int64, device="cpu", pin_memory=True
         )
@@ -901,6 +906,14 @@ class TextGenerationController:
         position_ids_buf[0, active_request_count:] = 0
 
         nvtx_range_pop("mtp-spec-decoding/serial-mtp-init")
+
+        # MTP MoE forwards are request-count shaped: the routing map holds
+        # active_request_count real rows followed by padding up to padded_count.
+        # The NVLS routing mask defaults to the main step's token count, so point
+        # it at the MTP row count instead, else padding rows route to experts.
+        if context._nvls_dispatcher:
+            NVLSAllGatherVDispatcher.modify_real_token_count_for_mtp(active_request_count)
+
         for depth in range(self.num_mtp_depths):
             nvtx_range_push(f"mtp-spec-decoding/depth-{depth}")
 
@@ -1778,38 +1791,10 @@ class TextGenerationController:
         if context.active_token_count == 0 and active_request_count == 0:
             return
 
-        if not context.config.materialize_only_last_token_logits:
-            raise RuntimeError("Async scheduling requires materialize_only_last_token_logits=True.")
-        if self.num_speculative_tokens != 0:
-            raise RuntimeError("Async scheduling does not support speculative tokens.")
-        if context.is_hybrid_model and context.mamba_state_bank_count != 2:
-            raise RuntimeError("Async scheduling requires dual Mamba state banks.")
-        if context.enable_prefix_caching:
-            raise RuntimeError("Async scheduling does not support prefix caching.")
         if context.paused_request_count != 0:
             raise RuntimeError("Async scheduling does not support paused requests.")
         if context.chunked_prefill_request_id != -1:
             raise RuntimeError("Async scheduling does not support chunked prefill.")
-        if self.model_config.expert_model_parallel_size > 1:
-            raise RuntimeError("Async scheduling does not support expert parallelism.")
-        if self.model_config.num_moe_experts is not None:
-            raise RuntimeError("Async scheduling does not support MoE models.")
-        if self.model_config.moe_enable_routing_replay:
-            raise RuntimeError("Async scheduling does not support routing replay.")
-
-        active_slice = slice(context.paused_request_count, context.total_request_count)
-        if not torch.all(context.request_metadata["top_k"][active_slice] == 1):
-            raise RuntimeError(
-                "Async scheduling only supports greedy sampling " "(SamplingParams.top_k == 1)."
-            )
-        if not torch.all(context.request_metadata["top_p"][active_slice] == 0.0):
-            raise RuntimeError(
-                "Async scheduling only supports greedy sampling " "(SamplingParams.top_p == 0.0)."
-            )
-        if torch.any(context.request_metadata["return_log_probs"][active_slice]):
-            raise RuntimeError("Async scheduling does not support log probabilities.")
-        if torch.any(context.request_metadata["top_n_logprobs"][active_slice] > 0):
-            raise RuntimeError("Async scheduling does not support top-n log probabilities.")
 
     def _accept_async_sched_mamba_state(self) -> None:
         """Promote Mamba candidate state when pending async logits are consumed."""
@@ -1979,10 +1964,10 @@ class TextGenerationController:
         # Sample.
         range_push("sampling")
         sampled_tokens_gpu = self._sampled_tokens_cuda[:active_request_count]
-        torch.argmax(
-            self._all_logits_cuda.squeeze(0)[:active_request_count].float(),
+        torch.max(
+            self._all_logits_cuda.squeeze(0)[:active_request_count],
             dim=-1,
-            out=sampled_tokens_gpu,
+            out=(self._async_sched_sample_values_cuda[:active_request_count], sampled_tokens_gpu),
         )
         if sampled_tokens_gpu.is_cuda:
             current_stream = torch.cuda.current_stream(sampled_tokens_gpu.device)
@@ -2340,7 +2325,19 @@ class TextGenerationController:
             # Collect flat routing indices and scatter them into per-block storage.
             # Must be done before update_requests while token-to-block mappings are valid.
             # Reconstruction happens from blocks at request completion.
-            context.kv_block_allocator.store_routing_per_block(self._router_record_bookkeeping())
+            routing_indices = self._router_record_bookkeeping()
+            context.kv_block_allocator.store_routing_per_block(routing_indices)
+
+            # Save routing indices.
+            tracer = get_moe_router_tracer()
+            if tracer is not None and routing_indices is not None:
+                layer_ids = [
+                    r.layer_number
+                    for r in RouterReplay.global_router_replay_instances
+                    if r.layer_number is not None
+                ] or None
+                tracer.record_indices(torch.from_numpy(routing_indices), layer_ids=layer_ids)
+                tracer.advance_step()
             range_pop()
 
         # This is the best place to yield control back to event loop.
