@@ -8,7 +8,11 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
+from megatron.core.inference.config import (
+    AsyncScheduleMode,
+    InferenceConfig,
+    MambaInferenceStateConfig,
+)
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     RequestOverflowError,
@@ -78,6 +82,7 @@ class TestDynamicContext:
         num_speculative_tokens=0,
         enable_chunked_prefill: bool = False,
         max_requests: int = None,
+        async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.LEGACY,
     ):
         if is_hybrid_model:
             if layer_type_list is None:
@@ -118,6 +123,7 @@ class TestDynamicContext:
                 unified_memory_level=0,  # unit tests currently broken with UVM
                 enable_chunked_prefill=enable_chunked_prefill,
                 max_requests=max_requests,
+                async_sched_mode=async_sched_mode,
             ),
         )
         return dynamic_context
@@ -466,6 +472,7 @@ class TestDynamicContext:
         if is_hybrid_model:
             dynamic_context.mamba_conv_states.fill_(1)
             dynamic_context.mamba_ssm_states.fill_(1)
+            dynamic_context.mamba_metadata.request_to_mamba_state_bank.fill_(1)
 
         # Call reset
         dynamic_context.reset()
@@ -500,6 +507,7 @@ class TestDynamicContext:
         assert torch.all(dynamic_context.request_to_kv_block_ids == -1)
         if is_hybrid_model:
             assert torch.all(dynamic_context.mamba_metadata.request_to_mamba_state_idx == -1)
+            assert torch.all(dynamic_context.mamba_metadata.request_to_mamba_state_bank == 0)
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -979,7 +987,7 @@ class TestDynamicContext:
                 )
             )
 
-    def _get_async_sched_context(self):
+    def _get_async_sched_context(self, *, is_hybrid_model=False):
         return self._get_dynamic_context(
             params_dtype=torch.float32,
             num_layers=2,
@@ -990,6 +998,9 @@ class TestDynamicContext:
             block_size_tokens=4,
             max_tokens=32,
             max_requests=8,
+            is_hybrid_model=is_hybrid_model,
+            layer_type_list=[Symbols.MAMBA, Symbols.ATTENTION] if is_hybrid_model else None,
+            async_sched_mode=AsyncScheduleMode.SERIAL,
         )
 
     @staticmethod
@@ -1032,6 +1043,39 @@ class TestDynamicContext:
         ctx.token_to_local_position_within_kv_block[active_slice] = (
             ctx.token_to_pos_ids[active_slice] % ctx.block_size_tokens
         )
+        if ctx.is_hybrid_model:
+            ctx.mamba_metadata.request_to_mamba_state_idx[active_slice] = (
+                ctx.mamba_metadata.batch_allocate_slots(active_request_count)
+            )
+
+    @pytest.mark.internal
+    @rounder_override(8)
+    def test_async_sched_mamba_state_banks_and_acceptance(self):
+        """Async Mamba forwards alternate committed and candidate state banks."""
+        ctx = self._get_async_sched_context(is_hybrid_model=True)
+        self._setup_async_sched_decode_rows(ctx, active_request_count=3)
+        metadata = ctx.mamba_metadata
+        metadata.request_to_mamba_state_bank[:3] = torch.tensor([0, 1, 0], dtype=torch.int32)
+        base_indices = metadata.request_to_mamba_state_idx[:3]
+
+        assert ctx.mamba_state_bank_count == 2
+        assert ctx.mamba_conv_states.shape[1] == 2 * ctx.max_requests
+        assert ctx.mamba_ssm_states.shape[1] == 2 * ctx.max_requests
+        assert torch.equal(
+            ctx._mamba_flat_indices(slice(0, 3)), base_indices * 2 + torch.tensor([0, 1, 0])
+        )
+        assert torch.equal(
+            ctx._mamba_flat_indices(slice(0, 3), use_candidate_bank=True),
+            base_indices * 2 + torch.tensor([1, 0, 1]),
+        )
+
+        ctx.accept_async_mamba_state(torch.tensor([10, 11, 12], dtype=torch.int32))
+
+        assert torch.equal(
+            metadata.request_to_mamba_state_bank[:3], torch.tensor([1, 0, 1], dtype=torch.int32)
+        )
+        with pytest.raises(RuntimeError, match="do not match active request order"):
+            ctx.accept_async_mamba_state(torch.tensor([99], dtype=torch.int32))
 
     @pytest.mark.internal
     @rounder_override(8)
@@ -1140,13 +1184,20 @@ class TestDynamicContext:
     @rounder_override(8)
     @pytest.mark.parametrize(
         "mask, expected_finished_ids, expected_request_ids",
-        [([1, 1, 1], [], [10, 11, 12]), ([1, 0, 1], [11], [10, 12]), ([0, 0, 0], [10, 11, 12], [])],
+        [
+            ([1, 1, 1], [], [10, 11, 12]),
+            ([0, 1, 1], [10], [11, 12]),
+            ([1, 0, 1], [11], [10, 12]),
+            ([1, 1, 0], [12], [10, 11]),
+            ([0, 0, 0], [10, 11, 12], []),
+        ],
     )
+    @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_async_sched_resolve_requests_success(
-        self, mask, expected_finished_ids, expected_request_ids
+        self, mask, expected_finished_ids, expected_request_ids, is_hybrid_model
     ):
         """Async scheduling resolve compacts survivors and releases finished rows."""
-        ctx = self._get_async_sched_context()
+        ctx = self._get_async_sched_context(is_hybrid_model=is_hybrid_model)
         self._setup_async_sched_decode_rows(
             ctx,
             active_request_count=len(mask),
@@ -1154,6 +1205,16 @@ class TestDynamicContext:
             kv_offsets=[4, 5, 6],
             last_block_offsets=[0, 1, 2],
         )
+        if is_hybrid_model:
+            ctx.mamba_metadata.request_to_mamba_state_bank[: len(mask)] = torch.tensor(
+                [0, 1, 0], dtype=torch.int32
+            )
+            original_mamba_indices = ctx.mamba_metadata.request_to_mamba_state_idx[
+                : len(mask)
+            ].clone()
+            original_mamba_banks = ctx.mamba_metadata.request_to_mamba_state_bank[
+                : len(mask)
+            ].clone()
         active_mask = torch.tensor(mask, dtype=torch.int32)
         if torch.cuda.is_available():
             active_mask = active_mask.cuda()
@@ -1175,6 +1236,19 @@ class TestDynamicContext:
         )
         if not expected_request_ids:
             assert torch.all(ctx.request_to_kv_block_ids == -1)
+        if is_hybrid_model:
+            survivor_idxs = torch.nonzero(torch.tensor(mask), as_tuple=True)[0]
+            survivor_count = survivor_idxs.numel()
+            assert torch.equal(
+                ctx.mamba_metadata.request_to_mamba_state_idx[:survivor_count],
+                original_mamba_indices[survivor_idxs],
+            )
+            assert torch.equal(
+                ctx.mamba_metadata.request_to_mamba_state_bank[:survivor_count],
+                original_mamba_banks[survivor_idxs],
+            )
+            assert torch.all(ctx.mamba_metadata.request_to_mamba_state_idx[survivor_count:] == -1)
+            assert torch.all(ctx.mamba_metadata.request_to_mamba_state_bank[survivor_count:] == 0)
 
     @pytest.mark.internal
     @rounder_override(8)
@@ -1819,8 +1893,12 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @pytest.mark.parametrize("ratio", [0.2, 0.4, 0.6, 0.8])
+    @pytest.mark.parametrize(
+        "async_sched_mode, state_bank_count",
+        [(AsyncScheduleMode.LEGACY, 1), (AsyncScheduleMode.SERIAL, 2)],
+    )
     @rounder_override(64)
-    def test_mamba_memory_ratio_allocation(self, ratio):
+    def test_mamba_memory_ratio_allocation(self, ratio, async_sched_mode, state_bank_count):
         """
         Test that max_requests and block counts are partitioned correctly by mamba_memory_ratio.
         """
@@ -1859,13 +1937,14 @@ class TestDynamicContext:
                 mamba_inference_state_config=mamba_config,
                 mamba_memory_ratio=ratio,
                 unified_memory_level=0,
+                async_sched_mode=async_sched_mode,
             ),
         )
 
         dtype_size = torch.tensor([], dtype=params_dtype).element_size()
 
         mamba_mem_per_req = math.prod(mamba_conv_states_shape) + math.prod(mamba_ssm_states_shape)
-        mamba_mem_per_req *= dtype_size
+        mamba_mem_per_req *= dtype_size * state_bank_count
 
         kv_buffer_bytes = int(buffer_gb * 1024**3)
         kv_paused_bytes = int(paused_gb * 1024**3)
@@ -1896,6 +1975,9 @@ class TestDynamicContext:
 
         assert context.max_requests == expected_max_requests
         assert context.is_hybrid_model is True
+        assert context.mamba_state_bank_count == state_bank_count
+        assert context.mamba_conv_states.shape[1] == state_bank_count * context.max_requests
+        assert context.mamba_ssm_states.shape[1] == state_bank_count * context.max_requests
 
     @pytest.mark.internal
     @rounder_override(1)

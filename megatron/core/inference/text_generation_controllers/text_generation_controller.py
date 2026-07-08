@@ -83,11 +83,13 @@ class AsyncScheduleLogitsState:
     is_valid: bool = False
     cuda_graph_request_count: Optional[int] = None
     ready_event: Optional[torch.cuda.Event] = None
+    request_ids: Optional[Tensor] = None
 
     def set_pending(
         self,
         cuda_graph_request_count: Optional[int],
         ready_event: Optional[torch.cuda.Event] = None,
+        request_ids: Optional[Tensor] = None,
     ) -> None:
         """Record logits that become sampleable when their event completes.
 
@@ -96,16 +98,19 @@ class AsyncScheduleLogitsState:
                 for the pending logits, or `None` when CUDA graphs were not used.
             ready_event (Optional[torch.cuda.Event]): Event marking completion
                 of the forward or survivor compaction producing the logits.
+            request_ids (Optional[Tensor]): Request IDs represented by the logits rows.
         """
         self.is_valid = True
         self.cuda_graph_request_count = cuda_graph_request_count
         self.ready_event = ready_event
+        self.request_ids = request_ids.clone() if request_ids is not None else None
 
     def clear(self) -> None:
         """Clear the pending logits state."""
         self.is_valid = False
         self.cuda_graph_request_count = None
         self.ready_event = None
+        self.request_ids = None
 
 
 @dataclass
@@ -585,6 +590,7 @@ class TextGenerationController:
         is_dummy_forward: bool = False,
         transfer_bookkeeping_to_gpu: bool = True,
         record_bookkeeping_done_event: bool = False,
+        use_async_mamba_candidate_state: bool = False,
     ) -> Tuple[Tensor, Tensor, Optional[torch.cuda.Event]]:
         """Initializes the inference context for dynamic batching.
 
@@ -596,6 +602,8 @@ class TextGenerationController:
                 CPU bookkeeping snapshot to GPU before returning.
             record_bookkeeping_done_event (bool): Whether to record an event
                 after the bookkeeping H2D transfer.
+            use_async_mamba_candidate_state (bool): Whether decode forwards should
+                write Mamba state to the candidate bank.
 
         Returns:
             Tuple[Tensor, Tensor, Optional[torch.cuda.Event]]: The active input
@@ -615,6 +623,7 @@ class TextGenerationController:
             is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
             transfer_bookkeeping_to_gpu=transfer_bookkeeping_to_gpu,
             record_bookkeeping_done_event=record_bookkeeping_done_event,
+            use_async_mamba_candidate_state=use_async_mamba_candidate_state,
         )
         range_pop()
 
@@ -1773,8 +1782,8 @@ class TextGenerationController:
             raise RuntimeError("Async scheduling requires materialize_only_last_token_logits=True.")
         if self.num_speculative_tokens != 0:
             raise RuntimeError("Async scheduling does not support speculative tokens.")
-        if context.is_hybrid_model:
-            raise RuntimeError("Async scheduling does not support hybrid/Mamba models.")
+        if context.is_hybrid_model and context.mamba_state_bank_count != 2:
+            raise RuntimeError("Async scheduling requires dual Mamba state banks.")
         if context.enable_prefix_caching:
             raise RuntimeError("Async scheduling does not support prefix caching.")
         if context.paused_request_count != 0:
@@ -1802,6 +1811,16 @@ class TextGenerationController:
         if torch.any(context.request_metadata["top_n_logprobs"][active_slice] > 0):
             raise RuntimeError("Async scheduling does not support top-n log probabilities.")
 
+    def _accept_async_sched_mamba_state(self) -> None:
+        """Promote Mamba candidate state when pending async logits are consumed."""
+        context = self.inference_wrapped_model.inference_context
+        if not context.is_hybrid_model:
+            return
+        request_ids = self._async_sched_logits.request_ids
+        if request_ids is None:
+            raise RuntimeError("Pending async Mamba logits are missing request IDs.")
+        context.accept_async_mamba_state(request_ids)
+
     def _compact_async_sched_logits(self, survivor_idxs: Tensor) -> Optional[torch.cuda.Event]:
         """Compact cached logits from old active-row order into survivor order.
 
@@ -1817,8 +1836,16 @@ class TextGenerationController:
             self._async_sched_logits.clear()
             return None
 
+        pending_request_ids = self._async_sched_logits.request_ids
+        survivor_request_ids = (
+            pending_request_ids[survivor_idxs] if pending_request_ids is not None else None
+        )
+
         identity_idxs = torch.arange(survivor_idxs.numel(), device=survivor_idxs.device)
         if torch.equal(survivor_idxs, identity_idxs):
+            self._async_sched_logits.request_ids = (
+                survivor_request_ids.clone() if survivor_request_ids is not None else None
+            )
             return None
 
         survivor_idxs_cuda = survivor_idxs.to(self._all_logits_cuda.device)
@@ -1830,7 +1857,9 @@ class TextGenerationController:
 
         compaction_done_event = self._record_fresh_async_sched_event(self._all_logits_cuda)
         self._async_sched_logits.set_pending(
-            self._async_sched_logits.cuda_graph_request_count, compaction_done_event
+            self._async_sched_logits.cuda_graph_request_count,
+            compaction_done_event,
+            survivor_request_ids,
         )
         return compaction_done_event
 
@@ -1966,7 +1995,7 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         context.prepare_requests()
         input_ids, position_ids, _ = self._dynamic_step_context_init(
-            transfer_bookkeeping_to_gpu=False
+            transfer_bookkeeping_to_gpu=False, use_async_mamba_candidate_state=True
         )
         return input_ids, position_ids
 
@@ -2008,7 +2037,10 @@ class TextGenerationController:
         forward_done_event = self._record_fresh_async_sched_event(self._all_logits_cuda)
 
         # Record the logits that this forward will produce.
-        self._async_sched_logits.set_pending(cuda_graph_request_count, forward_done_event)
+        active_slice = slice(context.paused_request_count, context.total_request_count)
+        self._async_sched_logits.set_pending(
+            cuda_graph_request_count, forward_done_event, context.request_ids[active_slice]
+        )
 
         # Return the forward-done event.
         return forward_done_event
@@ -2026,7 +2058,9 @@ class TextGenerationController:
         # Initialize, forward, and record the pending logits state.
         with torch.inference_mode():
             input_ids_gpu_view, position_ids_gpu_view, bookkeeping_done_event = (
-                self._dynamic_step_context_init(record_bookkeeping_done_event=True)
+                self._dynamic_step_context_init(
+                    record_bookkeeping_done_event=True, use_async_mamba_candidate_state=True
+                )
             )
             self._run_async_sched_forward(input_ids_gpu_view, position_ids_gpu_view)
 
@@ -2102,6 +2136,8 @@ class TextGenerationController:
         stream-ordered copies before forward execution. CPU resolution cannot
         mutate bookkeeping until its H2D completes, and finished-request
         resources cannot be released until the forward using them completes.
+        Hybrid models also complete a candidate forward before promoting its
+        Mamba state bank for the next preparation.
 
         Args:
             overlap (bool): Whether to submit the next forward before waiting
@@ -2128,6 +2164,13 @@ class TextGenerationController:
         # Launch the forward primer if no existing logits state can be reused.
         primer_launched, primer_bookkeeping_done_event = self._run_async_sched_forward_primer()
 
+        # Mamba candidate state must be complete before its bank becomes the next read source.
+        if overlap and context.is_hybrid_model:
+            self._synchronize_async_sched_event(self._async_sched_logits.ready_event)
+
+        # Consume the pending forward and promote its candidate Mamba state.
+        self._accept_async_sched_mamba_state()
+
         with torch.inference_mode():
             current_logits_ready_event = self._async_sched_logits.ready_event
             cuda_graph_request_count = self._async_sched_logits.cuda_graph_request_count
@@ -2135,7 +2178,7 @@ class TextGenerationController:
             # Serial mode waits for logits; overlap only waits for a new primer's H2D source read.
             if not overlap:
                 self._synchronize_async_sched_event(current_logits_ready_event)
-            elif primer_launched:
+            elif primer_launched and not context.is_hybrid_model:
                 self._synchronize_async_sched_event(primer_bookkeeping_done_event)
 
             # -------------------------------------------------------------------------
@@ -2247,6 +2290,7 @@ class TextGenerationController:
                 cuda_graph_request_count (Optional[int]): Size of cuda graph used for this step.
         """
         context = self.inference_wrapped_model.inference_context
+        # A legacy fallback discards pending logits without promoting Mamba candidates.
         self._async_sched_logits.clear()
         active_request_count = context.total_request_count - context.paused_request_count
 

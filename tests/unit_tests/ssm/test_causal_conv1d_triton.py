@@ -300,3 +300,45 @@ class TestCausalConv1dUpdate:
                 atol=1e-5,
                 rtol=1e-5,
             )
+
+    @pytest.mark.parametrize("width", [2, 4])
+    @pytest.mark.parametrize("state_len_equals_width", [False, True])
+    def test_write_indices_preserve_read_state_and_update_destination(
+        self, width, state_len_equals_width
+    ):
+        """Out-of-place updates read committed banks and write candidate banks."""
+        torch.manual_seed(42)
+        batch, seq_len, dim = 2, 3, 64
+        state_len = width if state_len_equals_width else 8
+        num_states = 6
+        x = torch.randn(batch, seq_len, dim, device="cuda", dtype=torch.float32)
+        conv_state = torch.randn(num_states, dim, state_len, device="cuda", dtype=torch.float32)
+        weight = torch.randn(dim, width, device="cuda", dtype=torch.float32)
+        read_indices = torch.tensor([0, 2], device="cuda", dtype=torch.int32)
+        write_indices = torch.tensor([1, 3], device="cuda", dtype=torch.int32)
+        intermediate = torch.zeros(
+            batch, seq_len, dim, state_len, device="cuda", dtype=torch.float32
+        )
+
+        state_triton = conv_state.clone()
+        result = causal_conv1d_update(
+            x,
+            state_triton,
+            weight,
+            bias=None,
+            silu_activation=False,
+            conv_state_indices=read_indices,
+            conv_state_write_indices=write_indices,
+            intermediate_conv_states=intermediate,
+            state_bank_count=2,
+        )
+
+        state_ref = conv_state[read_indices.long()].clone()
+        expected = causal_conv1d_update_ref(x, state_ref, weight, bias=None, silu_activation=False)
+
+        torch.testing.assert_close(result, expected, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(
+            state_triton[read_indices.long()], conv_state[read_indices.long()]
+        )
+        torch.testing.assert_close(state_triton[write_indices.long()], state_ref)
+        torch.testing.assert_close(intermediate[:, -1], state_ref)

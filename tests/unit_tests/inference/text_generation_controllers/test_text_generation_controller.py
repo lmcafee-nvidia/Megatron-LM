@@ -201,6 +201,7 @@ def _make_async_sched_context(total_request_count=2, paused_request_count=0):
             materialize_only_last_token_logits=True, async_sched_mode=AsyncScheduleMode.SERIAL
         ),
         is_hybrid_model=False,
+        mamba_state_bank_count=1,
         enable_prefix_caching=False,
         paused_request_count=paused_request_count,
         total_request_count=total_request_count,
@@ -227,6 +228,7 @@ def _make_async_sched_context(total_request_count=2, paused_request_count=0):
         prepare_requests=mock.Mock(),
         commit_sampled_tokens=mock.Mock(),
         resolve_requests=mock.Mock(return_value=torch.empty(0, dtype=torch.int32)),
+        accept_async_mamba_state=mock.Mock(),
         copy_async_sched_sample_to_forward=mock.Mock(),
         transfer_bookkeeping_to_gpu=mock.Mock(return_value="bookkeeping"),
         using_cuda_graph_this_step=mock.Mock(return_value=False),
@@ -267,12 +269,20 @@ def test_validate_async_sched_support_for_step_success(total_request_count):
     controller._validate_async_sched_support_for_step()
 
 
+def test_validate_async_sched_support_for_step_accepts_dual_bank_mamba():
+    context = _make_async_sched_context(total_request_count=2)
+    context.is_hybrid_model = True
+    context.mamba_state_bank_count = 2
+
+    _make_async_sched_controller(context)._validate_async_sched_support_for_step()
+
+
 @pytest.mark.parametrize(
     "unsupported_case",
     [
         "materialize_all_logits",
         "speculative_tokens",
-        "hybrid_model",
+        "single_mamba_bank",
         "prefix_caching",
         "paused_request",
         "chunked_prefill",
@@ -298,7 +308,7 @@ def test_validate_async_sched_support_for_step_errors(unsupported_case):
         context.config.materialize_only_last_token_logits = False
     elif unsupported_case == "speculative_tokens":
         controller.num_speculative_tokens = 1
-    elif unsupported_case == "hybrid_model":
+    elif unsupported_case == "single_mamba_bank":
         context.is_hybrid_model = True
     elif unsupported_case == "prefix_caching":
         context.enable_prefix_caching = True
@@ -337,8 +347,12 @@ def test_validate_async_sched_support_for_step_errors(unsupported_case):
 def test_async_sched_logits_compaction(enable_cuda_graph, survivor_idxs, expected_compaction):
     controller = _make_async_sched_controller()
     controller._enable_cuda_graph = enable_cuda_graph
+    pending_request_ids = torch.tensor([10, 11, 12, 13], dtype=torch.int32)
     controller._async_sched_logits = AsyncScheduleLogitsState(
-        is_valid=True, cuda_graph_request_count=8, ready_event="forward"
+        is_valid=True,
+        cuda_graph_request_count=8,
+        ready_event="forward",
+        request_ids=pending_request_ids,
     )
     controller._record_fresh_async_sched_event = mock.Mock(return_value="compaction")
     logits = torch.arange(12).reshape(1, 4, 3)
@@ -348,6 +362,7 @@ def test_async_sched_logits_compaction(enable_cuda_graph, survivor_idxs, expecte
 
     if survivor_idxs.numel() == 0:
         assert not controller._async_sched_logits.is_valid
+        assert controller._async_sched_logits.request_ids is None
         assert compaction_done_event is None
         controller._record_fresh_async_sched_event.assert_not_called()
         return
@@ -355,6 +370,9 @@ def test_async_sched_logits_compaction(enable_cuda_graph, survivor_idxs, expecte
     if not expected_compaction:
         assert torch.equal(controller._all_logits_cuda, logits)
         assert controller._async_sched_logits.ready_event == "forward"
+        assert torch.equal(
+            controller._async_sched_logits.request_ids, pending_request_ids[survivor_idxs]
+        )
         assert compaction_done_event is None
         controller._record_fresh_async_sched_event.assert_not_called()
         return
@@ -370,6 +388,9 @@ def test_async_sched_logits_compaction(enable_cuda_graph, survivor_idxs, expecte
     assert controller._async_sched_logits.is_valid
     assert controller._async_sched_logits.cuda_graph_request_count == 8
     assert controller._async_sched_logits.ready_event == "compaction"
+    assert torch.equal(
+        controller._async_sched_logits.request_ids, pending_request_ids[survivor_idxs]
+    )
     assert compaction_done_event == "compaction"
 
 
@@ -408,6 +429,7 @@ def test_dynamic_step_context_init_returns_bookkeeping_event():
         is_expert_parallel_dummy_cuda_graph_step=False,
         transfer_bookkeeping_to_gpu=True,
         record_bookkeeping_done_event=True,
+        use_async_mamba_candidate_state=False,
     )
     assert torch.equal(returned_input_ids, input_ids)
     assert torch.equal(returned_position_ids, position_ids)
@@ -423,8 +445,8 @@ def test_run_async_sched_prepare_stops_before_bookkeeping_h2d():
 
     context.prepare_requests = mock.Mock(side_effect=lambda: call_order.append("prepare"))
     controller._dynamic_step_context_init = mock.Mock(
-        side_effect=lambda *, transfer_bookkeeping_to_gpu=True: call_order.append(
-            f"context_init:{transfer_bookkeeping_to_gpu}"
+        side_effect=lambda *, transfer_bookkeeping_to_gpu=True, use_async_mamba_candidate_state=False: call_order.append(
+            f"context_init:{transfer_bookkeeping_to_gpu}:{use_async_mamba_candidate_state}"
         )
         or (input_ids, position_ids, None)
     )
@@ -432,10 +454,12 @@ def test_run_async_sched_prepare_stops_before_bookkeeping_h2d():
     returned_input_ids, returned_position_ids = controller._run_async_sched_prepare()
 
     context.prepare_requests.assert_called_once_with()
-    controller._dynamic_step_context_init.assert_called_once_with(transfer_bookkeeping_to_gpu=False)
+    controller._dynamic_step_context_init.assert_called_once_with(
+        transfer_bookkeeping_to_gpu=False, use_async_mamba_candidate_state=True
+    )
     assert torch.equal(returned_input_ids, input_ids)
     assert torch.equal(returned_position_ids, position_ids)
-    assert call_order == ["prepare", "context_init:False"]
+    assert call_order == ["prepare", "context_init:False:True"]
 
 
 def test_run_async_sched_publish_bookkeeping_skips_gpu_input_ids():
@@ -486,6 +510,7 @@ def test_run_async_sched_forward_records_primer_and_returns_event(
         controller._async_sched_logits.cuda_graph_request_count == expected_cuda_graph_request_count
     )
     assert controller._async_sched_logits.ready_event == "forward_done"
+    assert torch.equal(controller._async_sched_logits.request_ids, context.request_ids[:2])
 
 
 @pytest.mark.parametrize("is_valid", [False, True])
@@ -511,9 +536,33 @@ def test_run_async_sched_forward_primer(is_valid):
         controller._run_async_sched_forward.assert_not_called()
     else:
         controller._dynamic_step_context_init.assert_called_once_with(
-            record_bookkeeping_done_event=True
+            record_bookkeeping_done_event=True, use_async_mamba_candidate_state=True
         )
         controller._run_async_sched_forward.assert_called_once_with(input_ids, position_ids)
+
+
+def test_accept_async_sched_mamba_state_promotes_pending_requests():
+    context = _make_async_sched_context(total_request_count=2)
+    context.is_hybrid_model = True
+    context.mamba_state_bank_count = 2
+    controller = _make_async_sched_controller(context)
+    request_ids = torch.tensor([10, 11], dtype=torch.int32)
+    controller._async_sched_logits.set_pending(None, None, request_ids)
+
+    controller._accept_async_sched_mamba_state()
+
+    context.accept_async_mamba_state.assert_called_once()
+    assert torch.equal(context.accept_async_mamba_state.call_args.args[0], request_ids)
+
+
+def test_accept_async_sched_mamba_state_requires_pending_request_ids():
+    context = _make_async_sched_context(total_request_count=2)
+    context.is_hybrid_model = True
+    context.mamba_state_bank_count = 2
+    controller = _make_async_sched_controller(context)
+
+    with pytest.raises(RuntimeError, match="missing request IDs"):
+        controller._accept_async_sched_mamba_state()
 
 
 def test_async_sched_step_returns_none_without_active_requests():
@@ -641,12 +690,14 @@ def test_run_async_sched_resolve_waits_only_for_finish_boundary(
 
 
 @pytest.mark.parametrize(
-    "overlap, has_valid_logits, expected_call_order",
+    "overlap, has_valid_logits, is_hybrid_model, expected_call_order",
     [
         (
             False,
             True,
+            False,
             [
+                "accept",
                 "wait:current",
                 "prepare",
                 "sample",
@@ -665,7 +716,9 @@ def test_run_async_sched_resolve_waits_only_for_finish_boundary(
         (
             True,
             True,
+            False,
             [
+                "accept",
                 "prepare",
                 "sample",
                 "copy_input",
@@ -681,9 +734,30 @@ def test_run_async_sched_resolve_waits_only_for_finish_boundary(
         (
             True,
             False,
+            False,
             [
                 "primer",
+                "accept",
                 "wait:primer_bookkeeping",
+                "prepare",
+                "sample",
+                "copy_input",
+                "copy_sample",
+                "publish",
+                "forward",
+                "wait:sample",
+                "wait:bookkeeping",
+                "resolve",
+                "yield",
+            ],
+        ),
+        (
+            True,
+            True,
+            True,
+            [
+                "wait:current",
+                "accept",
                 "prepare",
                 "sample",
                 "copy_input",
@@ -698,12 +772,14 @@ def test_run_async_sched_resolve_waits_only_for_finish_boundary(
         ),
     ],
 )
-def test_async_sched_step_order(overlap, has_valid_logits, expected_call_order):
+def test_async_sched_step_order(overlap, has_valid_logits, is_hybrid_model, expected_call_order):
     sample_tokens = torch.tensor([1, 2, 3], dtype=torch.int64)
     sampled_tokens_cpu = sample_tokens.clone()
     input_ids = torch.tensor([[101, 102, 103]])
     position_ids = torch.tensor([[0, 1, 2]])
     context = _make_async_sched_context(total_request_count=3)
+    context.is_hybrid_model = is_hybrid_model
+    context.mamba_state_bank_count = 2 if is_hybrid_model else 1
     controller = _make_async_sched_controller(context)
     controller._async_sched_logits = AsyncScheduleLogitsState(
         is_valid=has_valid_logits,
@@ -720,6 +796,9 @@ def test_async_sched_step_order(overlap, has_valid_logits, expected_call_order):
         return not has_valid_logits, "primer_bookkeeping" if not has_valid_logits else None
 
     controller._run_async_sched_forward_primer = mock.Mock(side_effect=run_primer)
+    controller._accept_async_sched_mamba_state = mock.Mock(
+        side_effect=lambda: call_order.append("accept")
+    )
     controller._synchronize_async_sched_event = mock.Mock(
         side_effect=lambda event: call_order.append(f"wait:{event}")
     )

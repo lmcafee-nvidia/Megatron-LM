@@ -100,6 +100,7 @@ class TestMambaMetadata:
 
         expected_decode = torch.arange(4, dtype=torch.int32, device=metadata_context.device)
         assert torch.equal(metadata_context.batch_indices_decode, expected_decode)
+        assert torch.equal(metadata_context.batch_indices_decode_write, expected_decode)
 
         assert metadata_context.batch_indices_prefill is None
         assert metadata_context.device_decode_prefill is None
@@ -124,6 +125,7 @@ class TestMambaMetadata:
             [0, 1, -1, -1], dtype=torch.int32, device=metadata_context.device
         )
         assert torch.equal(metadata_context.batch_indices_decode, expected_decode)
+        assert torch.equal(metadata_context.batch_indices_decode_write, expected_decode)
 
         assert metadata_context.batch_indices_prefill is None
         assert metadata_context.device_decode_prefill is None
@@ -144,10 +146,36 @@ class TestMambaMetadata:
         # Should behave exactly like decode-only (chunked logic skipped if real_prefill == 0)
         expected_decode = torch.tensor([0, 1], dtype=torch.int32, device=metadata_context.device)
         assert torch.equal(metadata_context.batch_indices_decode, expected_decode)
+        assert torch.equal(metadata_context.batch_indices_decode_write, expected_decode)
 
         assert metadata_context.batch_indices_prefill is None
         assert metadata_context.cu_seqlens is None
         assert metadata_context.seq_idx is None
+
+    @pytest.mark.internal
+    def test_update_decode_uses_distinct_write_banks(self):
+        """Decode metadata can read committed state and write candidate state."""
+        metadata = MambaMetadata(max_requests=4, max_tokens=8, state_bank_count=2)
+        dims = InferenceBatchDimensions(token_count=4, prefill_req_count=0, decode_req_count=4)
+        read_indices = torch.tensor([0, 2], dtype=torch.int32, device=metadata.device)
+        write_indices = torch.tensor([1, 3], dtype=torch.int32, device=metadata.device)
+
+        metadata.update(
+            active_mamba_indices=read_indices,
+            active_mamba_write_indices=write_indices,
+            token_to_request_idx=torch.tensor([0, 1], dtype=torch.int32, device=metadata.device),
+            cu_seqlens=torch.tensor([0, 1, 2], dtype=torch.int32, device=metadata.device),
+            batch_dimensions=InferenceBatchDimensions(
+                token_count=2, prefill_req_count=0, decode_req_count=2
+            ),
+            padded_batch_dimensions=dims,
+            enable_chunked_prefill=False,
+        )
+
+        expected_read = torch.tensor([0, 2, -1, -1], dtype=torch.int64, device=metadata.device)
+        expected_write = torch.tensor([1, 3, -1, -1], dtype=torch.int64, device=metadata.device)
+        assert torch.equal(metadata.batch_indices_decode, expected_read)
+        assert torch.equal(metadata.batch_indices_decode_write, expected_write)
 
     # -------------------------------------------------------------------------
     # Scenario 2: Prefill Only

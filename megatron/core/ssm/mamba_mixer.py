@@ -552,8 +552,10 @@ class MambaMixer(MegatronModule):
                 conv_state,
                 ssm_state,
                 batch_indices=context.mamba_metadata.batch_indices_decode,
+                write_batch_indices=context.mamba_metadata.batch_indices_decode_write,
                 intermediate_conv_state=int_conv_state,
                 intermediate_ssm_state=int_ssm_state,
+                state_bank_count=context.mamba_metadata.state_bank_count,
             )
 
             # Flatten back to [N*S, 1, d] to match merge logic
@@ -1105,8 +1107,10 @@ class MambaMixer(MegatronModule):
         conv_state: torch.Tensor,
         ssm_state: torch.Tensor,
         batch_indices: Optional[torch.Tensor] = None,
+        write_batch_indices: Optional[torch.Tensor] = None,
         intermediate_conv_state: Optional[torch.Tensor] = None,
         intermediate_ssm_state: Optional[torch.Tensor] = None,
+        state_bank_count: int = 1,
     ) -> torch.Tensor:
         """
         Performs SSM computation for inference decode step.
@@ -1118,10 +1122,12 @@ class MambaMixer(MegatronModule):
             conv_state: The convolution state tensor for inference.
             ssm_state: The selective scan state tensor for inference.
             batch_indices: A map from batch id to position in the Mamba state tensors.
+            write_batch_indices: A map from batch id to destination Mamba state position.
             intermediate_conv_state: Optional buffer for storing conv state at each
                 sequence step (for speculative decoding rollback).
             intermediate_ssm_state: Optional buffer for storing SSM state at each
                 sequence step (for speculative decoding rollback).
+            state_bank_count: Number of physical state banks per logical request slot.
 
         Returns:
             The output tensor of shape (b, s, d).
@@ -1163,7 +1169,9 @@ class MambaMixer(MegatronModule):
                 self.conv1d_bias.to(conv_state.dtype),
                 self.activation,
                 conv_state_indices=batch_indices,
+                conv_state_write_indices=write_batch_indices,
                 intermediate_conv_states=intermediate_conv_state,
+                state_bank_count=state_bank_count,
             ).to(xBC_dtype)
 
         x, B, C = torch.split(
@@ -1260,7 +1268,9 @@ class MambaMixer(MegatronModule):
                 dt_bias=dt_bias,
                 dt_softplus=True,
                 state_batch_indices=batch_indices,
+                state_batch_write_indices=write_batch_indices,
                 intermediate_ssm_states=intermediate_ssm_state,  # SSM only
+                state_bank_count=state_bank_count,
             )
             y = rearrange(y, "b s h p -> b s (h p)")
 

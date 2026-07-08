@@ -1001,8 +1001,8 @@ class DynamicInferenceEngine(AbstractEngine):
         model_config = self.controller.inference_wrapped_model.model.config
         if self.num_speculative_tokens > 0:
             raise ValueError("Async scheduling does not support speculative tokens.")
-        if self.context.is_hybrid_model:
-            raise ValueError("Async scheduling does not support hybrid/Mamba models.")
+        if self.context.is_hybrid_model and self.context.mamba_state_bank_count != 2:
+            raise ValueError("Async scheduling requires dual Mamba state banks.")
         if self.context.enable_prefix_caching:
             raise ValueError("Async scheduling does not support prefix caching.")
         if not self.materialize_only_last_token_logits:

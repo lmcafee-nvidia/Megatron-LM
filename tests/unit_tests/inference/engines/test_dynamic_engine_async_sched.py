@@ -15,6 +15,7 @@ def _make_engine(async_sched_mode=AsyncScheduleMode.SERIAL, **overrides):
     context = SimpleNamespace(
         config=SimpleNamespace(async_sched_mode=async_sched_mode),
         is_hybrid_model=False,
+        mamba_state_bank_count=1,
         enable_prefix_caching=False,
     )
     model_config = SimpleNamespace(
@@ -45,7 +46,8 @@ def _make_engine(async_sched_mode=AsyncScheduleMode.SERIAL, **overrides):
         ({"async_sched_mode": AsyncScheduleMode.OVERLAP}, False),
         ({"num_speculative_tokens": 1}, True),
         ({"async_sched_mode": AsyncScheduleMode.OVERLAP, "num_speculative_tokens": 1}, True),
-        ({"context_is_hybrid_model": True}, True),
+        ({"context_is_hybrid_model": True, "context_mamba_state_bank_count": 2}, False),
+        ({"context_is_hybrid_model": True, "context_mamba_state_bank_count": 1}, True),
         ({"context_enable_prefix_caching": True}, True),
         ({"materialize_only_last_token_logits": False}, True),
         ({"model_config_expert_model_parallel_size": 2}, True),
