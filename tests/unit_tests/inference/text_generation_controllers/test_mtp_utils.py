@@ -539,10 +539,22 @@ class TestMambaStateSelectiveCopy:
         accepted_counts = torch.randint(0, S, (N,), device=DEVICE, dtype=torch.int64)
 
         mamba_state_selective_copy_pytorch(
-            intermediate, current_ref, prefill_status, state_idx, accepted_counts, num_layers
+            intermediate,
+            current_ref,
+            prefill_status,
+            state_idx,
+            state_idx,
+            accepted_counts,
+            num_layers,
         )
         mamba_state_selective_copy(
-            intermediate, current_tri, prefill_status, state_idx, accepted_counts, num_layers
+            intermediate,
+            current_tri,
+            prefill_status,
+            state_idx,
+            state_idx,
+            accepted_counts,
+            num_layers,
         )
 
         torch.testing.assert_close(current_tri, current_ref)
@@ -564,10 +576,22 @@ class TestMambaStateSelectiveCopy:
         accepted_counts = torch.tensor([1, 0, 2, 0], device=DEVICE, dtype=torch.int64)
 
         mamba_state_selective_copy_pytorch(
-            intermediate, current_ref, prefill_status, state_idx, accepted_counts, num_layers
+            intermediate,
+            current_ref,
+            prefill_status,
+            state_idx,
+            state_idx,
+            accepted_counts,
+            num_layers,
         )
         mamba_state_selective_copy(
-            intermediate, current_tri, prefill_status, state_idx, accepted_counts, num_layers
+            intermediate,
+            current_tri,
+            prefill_status,
+            state_idx,
+            state_idx,
+            accepted_counts,
+            num_layers,
         )
 
         # Prefill slots should be unchanged from original.
@@ -595,10 +619,55 @@ class TestMambaStateSelectiveCopy:
         accepted_counts = torch.tensor([2, 0, 1], device=DEVICE, dtype=torch.int64)
 
         mamba_state_selective_copy_pytorch(
-            intermediate, current_ref, prefill_status, state_idx, accepted_counts, num_layers
+            intermediate,
+            current_ref,
+            prefill_status,
+            state_idx,
+            state_idx,
+            accepted_counts,
+            num_layers,
         )
         mamba_state_selective_copy(
-            intermediate, current_tri, prefill_status, state_idx, accepted_counts, num_layers
+            intermediate,
+            current_tri,
+            prefill_status,
+            state_idx,
+            state_idx,
+            accepted_counts,
+            num_layers,
+        )
+
+        torch.testing.assert_close(current_tri, current_ref)
+
+    def test_distinct_source_and_destination_indices(self):
+        """Intermediate logical slots can repair different physical bank slots."""
+        num_requests = 3
+        num_layers = 2
+        intermediate = torch.randn(num_layers, 4, 3, 8, device=DEVICE)
+        current_ref = torch.randn(num_layers, 8, 8, device=DEVICE)
+        current_tri = current_ref.clone()
+        prefill_status = torch.zeros(num_requests, dtype=torch.int32, device=DEVICE)
+        source_state_idx = torch.tensor([0, 3, 1], dtype=torch.int64, device=DEVICE)
+        destination_state_idx = torch.tensor([5, 0, 7], dtype=torch.int64, device=DEVICE)
+        accepted_counts = torch.tensor([0, 2, 1], dtype=torch.int64, device=DEVICE)
+
+        mamba_state_selective_copy_pytorch(
+            intermediate,
+            current_ref,
+            prefill_status,
+            source_state_idx,
+            destination_state_idx,
+            accepted_counts,
+            num_layers,
+        )
+        mamba_state_selective_copy(
+            intermediate,
+            current_tri,
+            prefill_status,
+            source_state_idx,
+            destination_state_idx,
+            accepted_counts,
+            num_layers,
         )
 
         torch.testing.assert_close(current_tri, current_ref)
@@ -615,6 +684,7 @@ class TestMambaStateSelectiveCopy:
             intermediate,
             current,
             torch.empty(0, dtype=torch.int32, device=DEVICE),
+            torch.empty(0, dtype=torch.int64, device=DEVICE),
             torch.empty(0, dtype=torch.int64, device=DEVICE),
             torch.empty(0, dtype=torch.int64, device=DEVICE),
             num_layers,

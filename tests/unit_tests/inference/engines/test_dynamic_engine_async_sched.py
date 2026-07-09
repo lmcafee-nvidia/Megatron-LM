@@ -30,6 +30,7 @@ def _make_engine(async_sched_mode=AsyncScheduleMode.SERIAL, **overrides):
     engine.controller = SimpleNamespace(
         inference_wrapped_model=SimpleNamespace(model=SimpleNamespace(config=model_config)),
         has_pending_async_forward=mock.Mock(return_value=False),
+        num_mtp_depths=2,
     )
     engine.enable_chunked_prefill = False
     engine.num_speculative_tokens = 0
@@ -40,6 +41,8 @@ def _make_engine(async_sched_mode=AsyncScheduleMode.SERIAL, **overrides):
             setattr(context, name.removeprefix("context_"), value)
         elif name.startswith("model_config_"):
             setattr(model_config, name.removeprefix("model_config_"), value)
+        elif name.startswith("controller_"):
+            setattr(engine.controller, name.removeprefix("controller_"), value)
         else:
             setattr(engine, name, value)
     return engine
@@ -52,8 +55,9 @@ def _make_engine(async_sched_mode=AsyncScheduleMode.SERIAL, **overrides):
         ({}, False),
         ({"async_sched_mode": AsyncScheduleMode.OVERLAP}, False),
         ({"enable_chunked_prefill": True}, True),
-        ({"num_speculative_tokens": 1}, True),
-        ({"async_sched_mode": AsyncScheduleMode.OVERLAP, "num_speculative_tokens": 1}, True),
+        ({"num_speculative_tokens": 1}, False),
+        ({"async_sched_mode": AsyncScheduleMode.OVERLAP, "num_speculative_tokens": 1}, False),
+        ({"num_speculative_tokens": 2, "controller_num_mtp_depths": 1}, True),
         ({"context_is_hybrid_model": True}, False),
         ({"context_enable_prefix_caching": True}, True),
         ({"materialize_only_last_token_logits": False}, True),

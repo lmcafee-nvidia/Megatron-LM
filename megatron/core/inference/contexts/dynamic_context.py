@@ -290,6 +290,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.step_count = 0
         self.async_sched_step_count = 0
         self.async_sched_compaction_step_count = 0
+        self._async_sched_rewound_kv_block_count = 0
 
         self.cache_mla_latent = (
             isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
@@ -320,6 +321,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             f"num_speculative_tokens ({self.num_speculative_tokens}) must be < "
             f"block_size_tokens ({inference_config.block_size_tokens})"
         )
+        self._async_sched_token_offsets = None
 
         # Cache the PP group we should use for PP collectives inside the context.
         # If the model provides a pg_collection with a pp group, prefer it.
@@ -992,6 +994,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             dtype=torch.int,
             device='cpu',
             pin_memory=True,
+        )
+        self._async_sched_rewound_kv_blocks = torch.full(
+            (self.max_requests,), -1, dtype=torch.int32, device='cpu', pin_memory=True
+        )
+        self._async_sched_token_offsets = torch.arange(
+            self.num_speculative_tokens + 1, device='cpu'
         )
 
         # Track request metadata. Backed by pinned CPU memory: bookkeeping is
@@ -2562,7 +2570,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return done_event
 
-    def copy_async_sched_sample_to_forward(self, sampled_tokens_cuda: Tensor) -> None:
+    def copy_async_sched_sample_to_forward(
+        self, sampled_tokens_cuda: Tensor, sampled_mtp_tokens_cuda: Optional[Tensor] = None
+    ) -> None:
         """Populate GPU input token IDs from sampled CUDA tokens for async scheduled decode.
 
         Async scheduling keeps sampled tokens GPU-resident for the next decode
@@ -2573,15 +2583,41 @@ class DynamicInferenceContext(BaseInferenceContext):
         Args:
             sampled_tokens_cuda (Tensor): 1D CUDA tensor containing one sampled
                 token per active decode request.
+            sampled_mtp_tokens_cuda (Optional[Tensor]): MTP draft tokens with shape
+                ``[num_speculative_tokens, active_request_count]``.
         """
         active_request_count = self.total_request_count - self.paused_request_count
+        tokens_per_request = self.num_speculative_tokens + 1
+        grouped_input_ids = self.gpu_view.token_to_input_ids[
+            : active_request_count * tokens_per_request
+        ].view(active_request_count, tokens_per_request)
+        grouped_input_ids[:, 0].copy_(sampled_tokens_cuda, non_blocking=True)
 
-        self.gpu_view.token_to_input_ids[:active_request_count].copy_(
-            sampled_tokens_cuda, non_blocking=True
-        )
-        if active_request_count < self.padded_active_token_count:
+        if self.num_speculative_tokens == 0:
+            if sampled_mtp_tokens_cuda is not None and sampled_mtp_tokens_cuda.numel() != 0:
+                raise RuntimeError(
+                    "Received MTP draft tokens when speculative decoding is disabled."
+                )
+        else:
+            expected_shape = (self.num_speculative_tokens, active_request_count)
+            if (
+                sampled_mtp_tokens_cuda is None
+                or tuple(sampled_mtp_tokens_cuda.shape) != expected_shape
+            ):
+                actual_shape = (
+                    None if sampled_mtp_tokens_cuda is None else sampled_mtp_tokens_cuda.shape
+                )
+                raise RuntimeError(
+                    f"Expected MTP draft token shape {expected_shape}, got {actual_shape}."
+                )
+            grouped_input_ids[:, 1:].copy_(
+                sampled_mtp_tokens_cuda.transpose(0, 1), non_blocking=True
+            )
+
+        active_token_count = active_request_count * tokens_per_request
+        if active_token_count < self.padded_active_token_count:
             self.gpu_view.token_to_input_ids[
-                active_request_count : self.padded_active_token_count
+                active_token_count : self.padded_active_token_count
             ].zero_()
 
     def reset_tensors(self) -> None:
@@ -2596,6 +2632,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_last_kv_block_id.fill_(-1)
         self.request_last_kv_block_offset.fill_(0)
         self.request_to_kv_block_ids.fill_(-1)
+        self._async_sched_rewound_kv_blocks.fill_(-1)
+        self._async_sched_rewound_kv_block_count = 0
         self.request_in_prefill_status_tensor.fill_(-1)
 
         # Reset request metadata.
@@ -3505,17 +3543,64 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return evict_request_ids
 
+    def reserve_async_sched_rewound_kv_blocks(
+        self, block_ids: Tensor, reservation_mask: Tensor
+    ) -> None:
+        """Reserve KV blocks detached by async MTP rewind for the next prepare.
+
+        Args:
+            block_ids (Tensor): Candidate detached block IDs, one per active request.
+            reservation_mask (Tensor): Mask selecting block IDs that were detached.
+        """
+        if self._async_sched_rewound_kv_block_count != 0:
+            raise RuntimeError("Async scheduling already has reserved rewound KV blocks.")
+
+        reserved_block_ids = block_ids[reservation_mask]
+        reserved_count = reserved_block_ids.numel()
+        self._async_sched_rewound_kv_blocks[:reserved_count] = reserved_block_ids
+        self._async_sched_rewound_kv_block_count = reserved_count
+
+    def _consume_async_sched_rewound_kv_blocks(self, num_blocks: int) -> Tensor:
+        """Consume up to ``num_blocks`` from the rewound KV block reservation pool.
+
+        Args:
+            num_blocks (int): Maximum number of reserved blocks to consume.
+
+        Returns:
+            Tensor: Reserved block IDs transferred to prepared requests.
+        """
+        consumed_count = min(num_blocks, self._async_sched_rewound_kv_block_count)
+        consumed = self._async_sched_rewound_kv_blocks[:consumed_count].clone()
+        remaining_count = self._async_sched_rewound_kv_block_count - consumed_count
+        if remaining_count > 0:
+            self._async_sched_rewound_kv_blocks[:remaining_count] = (
+                self._async_sched_rewound_kv_blocks[
+                    consumed_count : self._async_sched_rewound_kv_block_count
+                ]
+            )
+        self._async_sched_rewound_kv_blocks[remaining_count:] = -1
+        self._async_sched_rewound_kv_block_count = remaining_count
+        return consumed
+
+    def release_async_sched_rewound_kv_blocks(self) -> None:
+        """Release all rewound KV blocks not consumed by async preparation."""
+        reserved_count = self._async_sched_rewound_kv_block_count
+        if reserved_count == 0:
+            return
+
+        block_ids = self._async_sched_rewound_kv_blocks[:reserved_count]
+        self.kv_block_allocator.release_memory_blocks(block_ids)
+        self._async_sched_rewound_kv_blocks[:reserved_count] = -1
+        self._async_sched_rewound_kv_block_count = 0
+
     def prepare_requests(self) -> None:
         """Speculatively prepare active decode requests for the next forward pass.
 
         Async scheduling only supports decode-only steps with no pause,
-        evict, or resume lifecycle changes. If preparing the next token would
-        require one of those lifecycle changes, this method raises and the caller
-        should treat async scheduling as unsupported for that workload.
+        evict, or resume lifecycle changes. If preparation cannot allocate the
+        required KV blocks without a lifecycle change, this method raises.
         """
         active_request_count = self.total_request_count - self.paused_request_count
-        if self.num_speculative_tokens != 0:
-            raise RuntimeError("Async scheduling does not support speculative tokens.")
         if self.num_prefill_requests != 0:
             raise RuntimeError("Async scheduling only supports decode-only steps.")
         if self.paused_request_count != 0:
@@ -3526,46 +3611,75 @@ class DynamicInferenceContext(BaseInferenceContext):
             return
 
         active_slice = slice(0, active_request_count)
-        rows_requiring_new_block = (
-            self.request_last_kv_block_offset[active_slice] >= self.block_size_tokens - 1
-        )
-        num_new_blocks = rows_requiring_new_block.sum().item()
+        tokens_per_request = self.num_speculative_tokens + 1
+        last_block_offsets = self.request_last_kv_block_offset[active_slice]
+        token_offsets = self._async_sched_token_offsets
+        rows_requiring_new_block = last_block_offsets + tokens_per_request >= self.block_size_tokens
+        num_new_blocks = int(rows_requiring_new_block.sum().item())
+
+        block_ids = None
         if num_new_blocks > 0:
+            reserved_count = min(num_new_blocks, self._async_sched_rewound_kv_block_count)
+            allocator_block_count = num_new_blocks - reserved_count
             active_block_count_avail = self.kv_block_allocator.get_active_avail()
             if num_new_blocks > active_block_count_avail:
+                self.release_async_sched_rewound_kv_blocks()
                 raise RuntimeError("Async scheduling cannot pause requests to allocate new blocks.")
 
-            block_ids = self.kv_block_allocator.allocate_memory_blocks(num_new_blocks)
-            if block_ids is None:
+            allocated_block_ids = self.kv_block_allocator.allocate_memory_blocks(
+                allocator_block_count
+            )
+            if allocated_block_ids is None:
+                self.release_async_sched_rewound_kv_blocks()
                 raise RuntimeError("Async scheduling cannot evict requests to allocate new blocks.")
 
+            reserved_block_ids = self._consume_async_sched_rewound_kv_blocks(reserved_count)
+            block_ids = torch.cat((reserved_block_ids, allocated_block_ids))
+
+        self.active_token_count = active_request_count * tokens_per_request
+        active_token_slice = slice(0, self.active_token_count)
+        grouped_token_block_ids = self.token_to_block_idx[active_token_slice].view(
+            active_request_count, tokens_per_request
+        )
+        grouped_token_block_ids.copy_(self.request_last_kv_block_id[active_slice, None])
+
+        if block_ids is not None:
             row_idx = torch.nonzero(rows_requiring_new_block, as_tuple=True)[0]
             col_idx = self.request_kv_block_counts[row_idx]
             self.request_to_kv_block_ids[row_idx, col_idx] = block_ids
             self.request_kv_block_counts[row_idx] += 1
             self.request_last_kv_block_id[row_idx] = block_ids
+            grouped_token_block_ids[row_idx] = torch.where(
+                last_block_offsets[row_idx, None] + 1 + token_offsets[None, :]
+                >= self.block_size_tokens,
+                block_ids[:, None],
+                grouped_token_block_ids[row_idx],
+            )
 
         self.request_kv_length_offsets[active_slice].add_(self.request_query_lengths[active_slice])
-        self.request_query_lengths[active_slice].fill_(1)
-
+        self.request_query_lengths[active_slice].fill_(tokens_per_request)
         self.request_last_kv_block_offset[active_slice] = (
-            self.request_last_kv_block_offset[active_slice] + 1
+            last_block_offsets + tokens_per_request
         ) % self.block_size_tokens
 
-        self.active_token_count = active_request_count
-        self.token_to_pos_ids[:active_request_count] = self.request_kv_length_offsets[active_slice]
-        self.token_to_request_idx[:active_request_count] = torch.arange(
-            active_request_count, device='cpu'
+        token_positions = (
+            self.request_kv_length_offsets[active_slice, None] + token_offsets[None, :]
         )
-        self.token_to_position_in_request[:active_request_count] = self.token_to_pos_ids[
-            :active_request_count
+        token_request_idxs = torch.arange(active_request_count, device='cpu').repeat_interleave(
+            tokens_per_request
+        )
+        self.token_to_pos_ids[active_token_slice] = token_positions.flatten()
+        self.token_to_request_idx[active_token_slice] = token_request_idxs
+        self.token_to_position_in_request[active_token_slice] = self.token_to_pos_ids[
+            active_token_slice
         ]
-        self.token_to_local_position_within_kv_block[:active_request_count] = (
-            self.token_to_pos_ids[:active_request_count] % self.block_size_tokens
+        self.token_to_local_position_within_kv_block[active_token_slice] = (
+            self.token_to_pos_ids[active_token_slice] % self.block_size_tokens
         )
-        self.token_to_block_idx[:active_request_count] = self.request_last_kv_block_id[active_slice]
 
-    def commit_sampled_tokens(self, sampled_tokens_cpu: Tensor) -> None:
+    def commit_sampled_tokens(
+        self, sampled_tokens_cpu: Tensor, sampled_mtp_tokens_cpu: Optional[Tensor] = None
+    ) -> None:
         """Commit sampled CPU token IDs to the prepared request state.
 
         This updates the CPU source of truth used by resolution. Async
@@ -3574,10 +3688,17 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         Args:
             sampled_tokens_cpu (Tensor): Sampled CPU token for each active request.
+            sampled_mtp_tokens_cpu (Optional[Tensor]): MTP draft tokens with shape
+                ``[num_speculative_tokens, active_request_count]``.
         """
         assert sampled_tokens_cpu.device == torch.device(
             'cpu'
         ), "Sampled tokens must be on the CPU before they are committed."
+
+        if sampled_mtp_tokens_cpu is not None:
+            assert sampled_mtp_tokens_cpu.device == torch.device(
+                'cpu'
+            ), "MTP draft tokens must be on the CPU before they are committed."
 
         active_request_count = self.total_request_count - self.paused_request_count
         if sampled_tokens_cpu.numel() != active_request_count:
@@ -3585,7 +3706,28 @@ class DynamicInferenceContext(BaseInferenceContext):
                 f"Expected {active_request_count} new tokens, got {sampled_tokens_cpu.numel()}."
             )
 
-        self.token_to_input_ids[:active_request_count] = sampled_tokens_cpu
+        expected_mtp_shape = (self.num_speculative_tokens, active_request_count)
+        if self.num_speculative_tokens == 0:
+            if sampled_mtp_tokens_cpu is not None and sampled_mtp_tokens_cpu.numel() != 0:
+                raise RuntimeError(
+                    "Received MTP draft tokens when speculative decoding is disabled."
+                )
+            grouped_tokens = sampled_tokens_cpu[:, None]
+        else:
+            if sampled_mtp_tokens_cpu is None or tuple(sampled_mtp_tokens_cpu.shape) != (
+                expected_mtp_shape
+            ):
+                actual_shape = (
+                    None if sampled_mtp_tokens_cpu is None else sampled_mtp_tokens_cpu.shape
+                )
+                raise RuntimeError(
+                    f"Expected MTP draft token shape {expected_mtp_shape}, got {actual_shape}."
+                )
+            grouped_tokens = torch.cat(
+                (sampled_tokens_cpu[None, :], sampled_mtp_tokens_cpu), dim=0
+            ).transpose(0, 1)
+
+        self.token_to_input_ids[: self.active_token_count] = grouped_tokens.flatten()
 
     def resolve_requests(self, active_requests_mask: Tensor) -> Tuple[Tensor, Tensor]:
         """Resolve finished requests after an async scheduling forward pass.
@@ -3606,8 +3748,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         if active_requests_mask.is_cuda:
             active_requests_mask = active_requests_mask.cpu()
 
-        if self.num_speculative_tokens != 0:
-            raise RuntimeError("Async scheduling does not support speculative tokens.")
         if self.paused_request_count != 0:
             raise RuntimeError("Async scheduling does not support paused requests.")
 
@@ -3649,7 +3789,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.reset_mamba_state()
             return finished_request_ids, survivor_idxs
 
+        tokens_per_request = self.num_speculative_tokens + 1
         dst_idxs = torch.arange(active_request_count, device='cpu')
+        token_offsets = self._async_sched_token_offsets
+        survivor_token_idxs = (
+            survivor_idxs[:, None] * tokens_per_request + token_offsets[None, :]
+        ).flatten()
+        dst_token_idxs = torch.arange(active_request_count * tokens_per_request, device='cpu')
         if not torch.equal(survivor_idxs, dst_idxs):
             self.request_kv_length_offsets[dst_idxs] = self.request_kv_length_offsets[survivor_idxs]
             self.request_in_prefill_status_tensor[dst_idxs] = self.request_in_prefill_status_tensor[
@@ -3672,24 +3818,32 @@ class DynamicInferenceContext(BaseInferenceContext):
                 metadata_tensor[dst_idxs] = metadata_tensor[survivor_idxs]
 
             if not had_prefill_requests:
-                self.token_to_input_ids[dst_idxs] = self.token_to_input_ids[survivor_idxs]
-                self.token_to_pos_ids[dst_idxs] = self.token_to_pos_ids[survivor_idxs]
-                self.token_to_block_idx[dst_idxs] = self.token_to_block_idx[survivor_idxs]
-                self.token_to_local_position_within_kv_block[dst_idxs] = (
-                    self.token_to_local_position_within_kv_block[survivor_idxs]
+                self.token_to_input_ids[dst_token_idxs] = self.token_to_input_ids[
+                    survivor_token_idxs
+                ]
+                self.token_to_pos_ids[dst_token_idxs] = self.token_to_pos_ids[survivor_token_idxs]
+                self.token_to_block_idx[dst_token_idxs] = self.token_to_block_idx[
+                    survivor_token_idxs
+                ]
+                self.token_to_local_position_within_kv_block[dst_token_idxs] = (
+                    self.token_to_local_position_within_kv_block[survivor_token_idxs]
                 )
-                self.token_to_position_in_request[dst_idxs] = self.token_to_position_in_request[
-                    survivor_idxs
+                self.token_to_position_in_request[dst_token_idxs] = self.token_to_position_in_request[
+                    survivor_token_idxs
                 ]
 
         if not had_prefill_requests:
-            self.token_to_request_idx[:active_request_count] = dst_idxs
+            self.token_to_request_idx[: active_request_count * tokens_per_request] = (
+                dst_idxs.repeat_interleave(tokens_per_request)
+            )
         stale_slice = slice(active_request_count, old_active_request_count)
         self.request_to_kv_block_ids[stale_slice] = -1
         if self.is_hybrid_model:
             self.mamba_metadata.request_to_mamba_state_idx[stale_slice] = -1
         self.total_request_count = active_request_count
-        self.active_token_count = 0 if had_prefill_requests else active_request_count
+        self.active_token_count = (
+            0 if had_prefill_requests else active_request_count * tokens_per_request
+        )
         return finished_request_ids, survivor_idxs
 
     def update_requests(

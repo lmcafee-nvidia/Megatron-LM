@@ -237,19 +237,37 @@ def prepare_next_forward_pass(
 
 
 def mamba_state_selective_copy(
-    intermediate_states, current_states, prefill_status, state_idx, accepted_counts, num_layers
+    intermediate_states,
+    current_states,
+    prefill_status,
+    source_state_idx,
+    destination_state_idx,
+    accepted_counts,
+    num_layers,
 ):
     """Mamba speculative rewind state update.
 
     For each decode request, copies
     `intermediate[layer, slot, accepted_count, ...]` →
     `current[layer, slot, ...]` for every Mamba layer.
+
+    Args:
+        intermediate_states (Tensor): Intermediate state after each speculative token.
+        current_states (Tensor): Live Mamba state updated in-place.
+        prefill_status (Tensor): Per-request prefill/decode status.
+        source_state_idx (Tensor): Logical intermediate-state slot per request.
+        destination_state_idx (Tensor): Physical live-state slot per request.
+        accepted_counts (Tensor): Accepted speculative-token count per request.
+        num_layers (int): Number of Mamba layers.
     """
     N = prefill_status.shape[0]
     for i in range(N):
         if prefill_status[i].item() == 1:
             continue
-        slot = state_idx[i].item()
+        source_slot = source_state_idx[i].item()
+        destination_slot = destination_state_idx[i].item()
         accepted = accepted_counts[i].item()
         for layer in range(num_layers):
-            current_states[layer, slot] = intermediate_states[layer, slot, accepted]
+            current_states[layer, destination_slot] = intermediate_states[
+                layer, source_slot, accepted
+            ]
