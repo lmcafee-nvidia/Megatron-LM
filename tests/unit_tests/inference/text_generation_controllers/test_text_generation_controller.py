@@ -289,6 +289,21 @@ def test_validate_async_sched_support_for_step_ignores_immutable_restrictions():
     controller._validate_async_sched_support_for_step()
 
 
+@pytest.mark.parametrize("expert_model_parallel_size, num_moe_experts", [(1, 4), (2, 4)])
+def test_validate_async_sched_support_for_step_accepts_moe(
+    expert_model_parallel_size, num_moe_experts
+):
+    context = _make_async_sched_context(total_request_count=2)
+    model_config = SimpleNamespace(
+        params_dtype=torch.float32,
+        expert_model_parallel_size=expert_model_parallel_size,
+        num_moe_experts=num_moe_experts,
+        moe_enable_routing_replay=False,
+    )
+
+    _make_async_sched_controller(context, model_config)._validate_async_sched_support_for_step()
+
+
 @pytest.mark.parametrize("unsupported_case", ["paused_request", "chunked_prefill"])
 def test_validate_async_sched_support_for_step_errors(unsupported_case):
     context = _make_async_sched_context(total_request_count=2)

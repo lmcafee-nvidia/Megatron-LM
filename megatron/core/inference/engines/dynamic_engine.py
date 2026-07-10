@@ -1010,10 +1010,6 @@ class DynamicInferenceEngine(AbstractEngine):
             raise ValueError("Async scheduling does not support prefix caching.")
         if not self.materialize_only_last_token_logits:
             raise ValueError("Async scheduling requires materialize_only_last_token_logits=True.")
-        if model_config.expert_model_parallel_size > 1:
-            raise ValueError("Async scheduling does not support expert parallelism.")
-        if model_config.num_moe_experts is not None:
-            raise ValueError("Async scheduling does not support MoE models.")
         if model_config.moe_enable_routing_replay:
             raise ValueError("Async scheduling does not support routing replay.")
 
@@ -1945,6 +1941,87 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 self.waiting_request_ids.extendleft(reversed(pending_request_ids))
 
+    async def _ep_establish_consensus(
+        self, local_work: int, signal_consensus: bool
+    ) -> tuple[int, bool]:
+        """EP all-reduce to share work counts and pause consensus.
+
+        All-reduces two integers at once:
+        - local_work: actual pending request count (always >= 0).
+        - consensus flag: -1 if this rank wants to pause, 0 otherwise.
+
+        Using max for both:
+        - max(work) > 0 means at least one EP peer has real work.
+        - max(consensus) == -1 means ALL peers signaled -1 (all PAUSING).
+          Any RUNNING peer contributes 0, pulling the max to 0.
+
+        Args:
+            local_work: Pending request count for this rank.
+            signal_consensus: True if this rank is ready to pause.
+
+        Returns:
+            (global_work, all_pausing): max work across EP, and whether
+                all peers signaled consensus.
+        """
+        nvtx_range_push("_ep_establish_consensus")
+
+        consensus_val = -1 if signal_consensus else 0
+
+        # Signals can be received asynchronously on EP ranks.
+        # We do not want a rank to pause prematurely if its peers have yet to receive the signal.
+        # So this is an *attempt* to process the signal. This rank has received the signal
+        # and passes -1 to the all-reduce. If any other rank in the EP group has not received
+        # the signal yet, it will pass a zero value to the all-reduce, hence the global consensus
+        # will be zero and we will defer processing the signal.
+        # When all ranks receive the signal, global consensus will be -1 and we can process.
+
+        if self.ep_world_size > 1:
+            # Note that it is important to use a non-blocking asyncio-friendly all-reduce here.
+            # The user may have other tasks running in the event loop that need to be serviced.
+            # Do not using a torch.distributed blocking all-reduce here using nccl/gloo.
+            # We have tried that and it blocks the event loop in megatron-rl.
+            global_work, global_consensus = (
+                await self.expert_parallel_zmq_communicator.all_reduce_max(
+                    local_work, consensus_val, async_op=(not self.use_synchronous_zmq_collectives)
+                )
+            )
+        else:
+            global_work, global_consensus = local_work, consensus_val
+
+        nvtx_range_pop("_ep_establish_consensus")
+        return global_work, global_consensus == -1
+
+    async def _advance_async_sched_primer(self) -> None:
+        """Advance the existing EP cadence before consuming primer logits.
+
+        Primer consumption is atomic with respect to local request admission,
+        but it still occupies another EP forward slot. This method mirrors the
+        coordinator's existing consensus cadence without adding a primer-specific
+        collective or waiting for the primer forward.
+        """
+        if not self.use_coordinator or self.ep_world_size <= 1:
+            return
+
+        if self.disable_ep_consensus:
+            await asyncio.sleep(0)
+            return
+
+        global_work_from_last_consensus, _ = self._last_ep_consensus
+        if (
+            global_work_from_last_consensus == 0
+            or self._ep_consensus_loop_counter % self.ep_consensus_interval == 0
+        ):
+            local_pending = self.context.get_active_request_count() + len(self.waiting_request_ids)
+            # Keep the primer and its consumption atomic. A pending pause is
+            # reconsidered by the normal coordinator loop after this slot.
+            self._last_ep_consensus = await self._ep_establish_consensus(
+                local_pending, signal_consensus=False
+            )
+
+        global_work, _ = self._last_ep_consensus
+        self._ep_consensus_loop_counter += 1
+        assert global_work > 0, "An async-scheduling primer requires active EP work."
+
     async def async_forward(self) -> Tuple[Dict, Dict, float]:
         """Uses `asyncio` for continuous generation.
         Sleeps when no requests are available, until new requests have been added.
@@ -2008,6 +2085,7 @@ class DynamicInferenceEngine(AbstractEngine):
             if not controller_result.primer_only:
                 result = controller_result.output
                 break
+            await self._advance_async_sched_primer()
 
         if admission_deferred:
             # Admit against the resolved batch, then leave its mixed forward pending.
@@ -2016,6 +2094,8 @@ class DynamicInferenceEngine(AbstractEngine):
             assert (
                 primer_result.primer_only or primer_result.output is None
             ), "Async admission may only launch a forward primer."
+            if primer_result.primer_only:
+                await self._advance_async_sched_primer()
         if will_log_this_step:
             self.step_end_event.record()
             self.step_end_event.synchronize()
@@ -2605,55 +2685,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 await self.async_step()
         except asyncio.CancelledError:
             pass
-
-    async def _ep_establish_consensus(
-        self, local_work: int, signal_consensus: bool
-    ) -> tuple[int, bool]:
-        """EP all-reduce to share work counts and pause consensus.
-
-        All-reduces two integers at once:
-        - local_work: actual pending request count (always >= 0).
-        - consensus flag: -1 if this rank wants to pause, 0 otherwise.
-
-        Using max for both:
-        - max(work) > 0 means at least one EP peer has real work.
-        - max(consensus) == -1 means ALL peers signaled -1 (all PAUSING).
-          Any RUNNING peer contributes 0, pulling the max to 0.
-
-        Args:
-            local_work: Pending request count for this rank.
-            signal_consensus: True if this rank is ready to pause.
-        Returns:
-            (global_work, all_pausing): max work across EP, and whether
-            all peers signaled consensus.
-        """
-        nvtx_range_push("_ep_establish_consensus")
-
-        consensus_val = -1 if signal_consensus else 0
-
-        # Signals can be received asynchronously on EP ranks.
-        # We do not want a rank to pause prematurely if its peers have yet to receive the signal.
-        # So this is an *attempt* to process the signal. This rank has received the signal
-        # and passes -1 to the all-reduce. If any other rank in the EP group has not received
-        # the signal yet, it will pass a zero value to the all-reduce, hence the global consensus
-        # will be zero and we will defer processing the signal.
-        # When all ranks receive the signal, global consensus will be -1 and we can process.
-
-        if self.ep_world_size > 1:
-            # Note that it is important to use a non-blocking asyncio-friendly all-reduce here.
-            # The user may have other tasks running in the event loop that need to be serviced.
-            # Do not using a torch.distributed blocking all-reduce here using nccl/gloo.
-            # We have tried that and it blocks the event loop in megatron-rl.
-            global_work, global_consensus = (
-                await self.expert_parallel_zmq_communicator.all_reduce_max(
-                    local_work, consensus_val, async_op=(not self.use_synchronous_zmq_collectives)
-                )
-            )
-        else:
-            global_work, global_consensus = local_work, consensus_val
-
-        nvtx_range_pop("_ep_establish_consensus")
-        return global_work, global_consensus == -1
 
     async def _world_barrier(self):
         """World-wide ZMQ all-reduce barrier for global rank consensus.

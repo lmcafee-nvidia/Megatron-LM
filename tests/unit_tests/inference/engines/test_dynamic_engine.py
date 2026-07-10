@@ -53,6 +53,7 @@ from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
+from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
@@ -246,6 +247,7 @@ class DynamicInferenceEngineTestBase:
                 termination_id=(
                     -1 if test_config.use_fixed_output_lengths else test_config.vocab_size - 1
                 ),
+                top_k=(1 if test_config.async_sched_mode != AsyncScheduleMode.LEGACY else 0),
                 return_log_probs=test_config.return_log_probs,
                 skip_prompt_log_probs=test_config.skip_prompt_log_probs,
             )
@@ -5008,6 +5010,7 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
     """
 
     def teardown_method(self, method):
+        NVLSAllGatherVDispatcher._delete_buffers()
         delete_cuda_graphs()
         Utils.destroy_model_parallel()
 
@@ -5079,6 +5082,31 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             sequence_parallel=sequence_parallel,
             materialize_only_last_token_logits=materialize_only_last_token_logits,
             transformer_impl=transformer_impl,
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize(
+        "async_sched_mode", [AsyncScheduleMode.SERIAL, AsyncScheduleMode.OVERLAP]
+    )
+    @pytest.mark.parametrize("inference_moe_token_dispatcher_type", ["nccl", "nvls"])
+    @torch.inference_mode()
+    def test_async_sched_moe_expert_parallel(
+        self, async_sched_mode, inference_moe_token_dispatcher_type
+    ):
+        """Run async scheduling end to end through an EP=2 MoE model."""
+        if Utils.world_size < 2:
+            pytest.skip("Test requires at least 2 GPUs")
+
+        self._run_test(
+            model_provider="gpt",
+            expert_model_parallel_size=2,
+            async_sched_mode=async_sched_mode,
+            inference_moe_token_dispatcher_type=inference_moe_token_dispatcher_type,
+            num_gap_steps=0,
+            num_tokens_to_generate=4,
         )
 
     @pytest.mark.internal

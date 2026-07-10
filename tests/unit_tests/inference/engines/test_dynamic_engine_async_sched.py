@@ -57,8 +57,9 @@ def _make_engine(async_sched_mode=AsyncScheduleMode.SERIAL, **overrides):
         ({"context_is_hybrid_model": True}, False),
         ({"context_enable_prefix_caching": True}, True),
         ({"materialize_only_last_token_logits": False}, True),
-        ({"model_config_expert_model_parallel_size": 2}, True),
-        ({"model_config_num_moe_experts": 4}, True),
+        ({"model_config_expert_model_parallel_size": 2}, False),
+        ({"model_config_num_moe_experts": 4}, False),
+        ({"model_config_expert_model_parallel_size": 2, "model_config_num_moe_experts": 4}, False),
         ({"model_config_moe_enable_routing_replay": True}, True),
     ],
 )
@@ -120,6 +121,7 @@ def test_async_forward_reenters_controller_after_primer_without_rescheduling():
     engine.logging_step_interval = 0
     engine.metrics_writer = None
     engine.schedule_waiting_requests = mock.Mock(return_value=False)
+    engine._advance_async_sched_primer = mock.AsyncMock()
     engine.context = SimpleNamespace(
         step_count=4,
         prefix_cache_lru_clock=7,
@@ -151,6 +153,7 @@ def test_async_forward_reenters_controller_after_primer_without_rescheduling():
     engine.controller.async_generate_output_tokens_dynamic_batch.assert_has_awaits(
         [mock.call(drain_pending_forward=False), mock.call(drain_pending_forward=False)]
     )
+    engine._advance_async_sched_primer.assert_awaited_once_with()
     range_push.assert_called_once_with("Decode")
     range_pop.assert_called_once_with("Decode")
 
@@ -219,3 +222,54 @@ def test_async_forward_drains_then_admits_and_primes():
     engine.controller.async_generate_output_tokens_dynamic_batch.assert_has_awaits(
         [mock.call(drain_pending_forward=True), mock.call()]
     )
+
+
+@pytest.mark.parametrize("consensus_due", [False, True])
+def test_advance_async_sched_primer_uses_existing_ep_consensus_cadence(consensus_due):
+    """Primer continuation adds no EP collective unless normal consensus is already due."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.use_coordinator = True
+    engine.ep_world_size = 2
+    engine.disable_ep_consensus = False
+    engine.ep_consensus_interval = 20
+    engine._ep_consensus_loop_counter = 20 if consensus_due else 1
+    engine._last_ep_consensus = (3, False)
+    engine.waiting_request_ids = deque([20])
+    engine.context = SimpleNamespace(get_active_request_count=mock.Mock(return_value=2))
+    engine._ep_establish_consensus = mock.AsyncMock(return_value=(3, False))
+
+    asyncio.run(engine._advance_async_sched_primer())
+
+    assert engine._ep_consensus_loop_counter == (21 if consensus_due else 2)
+    if consensus_due:
+        engine._ep_establish_consensus.assert_awaited_once_with(3, signal_consensus=False)
+    else:
+        engine._ep_establish_consensus.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "use_coordinator, ep_world_size, disable_ep_consensus, expected_yield",
+    [(False, 2, False, False), (True, 1, False, False), (True, 2, True, True)],
+)
+def test_advance_async_sched_primer_skips_unneeded_ep_cadence(
+    use_coordinator, ep_world_size, disable_ep_consensus, expected_yield
+):
+    """Primer continuation changes cadence only for coordinated EP execution."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.use_coordinator = use_coordinator
+    engine.ep_world_size = ep_world_size
+    engine.disable_ep_consensus = disable_ep_consensus
+    engine._ep_consensus_loop_counter = 3
+    engine._ep_establish_consensus = mock.AsyncMock()
+
+    with mock.patch(
+        "megatron.core.inference.engines.dynamic_engine.asyncio.sleep", new=mock.AsyncMock()
+    ) as sleep:
+        asyncio.run(engine._advance_async_sched_primer())
+
+    assert engine._ep_consensus_loop_counter == 3
+    engine._ep_establish_consensus.assert_not_awaited()
+    if expected_yield:
+        sleep.assert_awaited_once_with(0)
+    else:
+        sleep.assert_not_awaited()
