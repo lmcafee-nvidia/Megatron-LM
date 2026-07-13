@@ -18,15 +18,30 @@ class FlashInferSampling(Sampling):
     """Fused FlashInfer sampling, with optional CUDA graph capture/replay."""
 
     def __init__(
-        self, vocab_size: int, rng: torch.Generator, config=None, enable_cuda_graph: bool = False
+        self,
+        vocab_size: int,
+        rng: torch.Generator,
+        sampled_tokens_buffer: Optional[Tensor] = None,
+        config=None,
+        enable_cuda_graph: bool = False,
     ) -> None:
+        """Initialize FlashInfer sampling.
+
+        Args:
+            vocab_size: Model vocabulary size.
+            rng: Generator used by FlashInfer sampling.
+            sampled_tokens_buffer: Stable destination used by ordinary dynamic sampling.
+            config: Transformer configuration used for CUDA graph setup.
+            enable_cuda_graph: Whether sampling may use local CUDA graphs.
+        """
+        super().__init__(sampled_tokens_buffer)
         self._vocab_size = vocab_size
         self._rng = rng
         if enable_cuda_graph and config is not None and config.cuda_graph_impl == "local":
             CudaGraphManager(
                 config,
                 self,
-                function_name="sample_kernel",
+                function_name="sample_kernel_into",
                 need_backward=False,
                 inline_capture=True,
             )
@@ -46,10 +61,11 @@ class FlashInferSampling(Sampling):
         *,
         gather_indices: Optional[Tensor] = None,
         token_to_request_index: Optional[Tensor] = None,
+        output: Optional[Tensor] = None,
         eager: bool = False,
         cache_key: Any = None,
     ) -> Tensor:
-        """FlashInfer fused top-k / top-p sampling kernel.
+        """Run fused top-k/top-p sampling.
 
         Args:
             logits: Logits tensor of shape `[>=n, vocab_size]`.
@@ -58,10 +74,11 @@ class FlashInferSampling(Sampling):
             gather_indices: When set, sample from `logits[gather_indices[:n], :]`.
             token_to_request_index: When set, sampling parameters are gathered per-token
                 rather than per-request (used by the speculative path).
+            output: Optional caller-owned destination tensor of shape `[n]`.
             eager, cache_key: Consumed by `CudaGraphManager` when it wraps this kernel.
 
         Returns:
-            Sampled token ids of shape `[n]`. Under CUDA graph replay, this is a static buffer.
+            Sampled token IDs in `output`, or a newly allocated tensor when it is not provided.
         """
         # CudaGraphManager consumes these args, if it exists.
         del eager, cache_key
@@ -92,7 +109,8 @@ class FlashInferSampling(Sampling):
         # TODO: Consider changing the disable flags in the `InferenceRequest`.
         top_k_safe = top_k.masked_fill(top_k == 0, self._vocab_size)
         top_p_safe = top_p.masked_fill(top_p == 0.0, 1.0)
-        output = torch.empty(n, device=logits.device, dtype=torch.int64)
+        if output is None:
+            output = torch.empty(n, device=logits.device, dtype=torch.int64)
         output.copy_(
             flashinfer.sampling.top_k_top_p_sampling_from_probs(
                 probs, top_k_safe, top_p_safe, generator=self._rng

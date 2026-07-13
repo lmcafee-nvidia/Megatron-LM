@@ -263,15 +263,20 @@ def _make_async_sched_controller(context=None, model_config=None):
     controller.num_mtp_depths = 0
     controller._enable_cuda_graph = False
     controller._sampling_backend = "torch"
+    controller._sampled_tokens_cuda = torch.empty(context.max_requests, dtype=torch.int64)
     controller._sampling = SimpleNamespace(
         sample_kernel=mock.Mock(
             side_effect=lambda logits, n, _context, **_kwargs: torch.argmax(logits[:n], dim=-1)
-        )
+        ),
+        sample_kernel_into=mock.Mock(
+            side_effect=lambda logits, n, _context, **_kwargs: controller._sampled_tokens_cuda[
+                :n
+            ].copy_(torch.argmax(logits[:n], dim=-1))
+        ),
     )
     controller._async_sched_logits = AsyncScheduleLogitsState(is_valid=True)
     controller._async_sched_mtp_token_row_indices = None
     controller._async_sched_mamba_repair_done_event = mock.Mock()
-    controller._sampled_tokens_cuda = torch.empty(context.max_requests, dtype=torch.int64)
     controller._async_sched_sampled_tokens_cpu_buffer = torch.empty(
         context.max_requests, dtype=torch.int64
     )
@@ -672,12 +677,12 @@ def test_run_async_sched_sample_reuses_gpu_buffer(logits_dtype):
     assert sample_result.sampled_tokens_gpu.data_ptr() == controller._sampled_tokens_cuda.data_ptr()
     assert torch.equal(sample_result.sampled_tokens_gpu, expected_tokens)
     assert torch.equal(sample_result.sampled_tokens_cpu_view, expected_tokens)
-    controller._sampling.sample_kernel.assert_called_once()
-    logits, n, called_context = controller._sampling.sample_kernel.call_args.args
+    controller._sampling.sample_kernel_into.assert_called_once()
+    logits, n, called_context = controller._sampling.sample_kernel_into.call_args.args
     assert torch.equal(logits, controller._all_logits_cuda.squeeze(0))
     assert n == 3
     assert called_context is context
-    assert controller._sampling.sample_kernel.call_args.kwargs == {
+    assert controller._sampling.sample_kernel_into.call_args.kwargs == {
         "gather_indices": None,
         "eager": True,
         "cache_key": None,
@@ -696,23 +701,27 @@ def test_run_async_sched_sample_routes_backend_and_graph(
     backend, enable_cuda_graph, using_cuda_graph, expected_n, expected_eager, expected_cache_key
 ):
     context = _make_async_sched_context(total_request_count=3)
+    context.max_requests = context.padded_active_request_count
     context.using_cuda_graph_this_step.return_value = using_cuda_graph
     controller = _make_async_sched_controller(context)
     controller._sampling_backend = backend
     controller._enable_cuda_graph = enable_cuda_graph
     controller._all_logits_cuda = torch.zeros(1, 8, 5)
-    controller._sampling.sample_kernel.side_effect = None
-    controller._sampling.sample_kernel.return_value = torch.arange(expected_n)
+    controller._sampling.sample_kernel_into.side_effect = (
+        lambda _logits, n, _context, **_kwargs: controller._sampled_tokens_cuda[:n].copy_(
+            torch.arange(n)
+        )
+    )
 
     sample_result = controller._run_async_sched_sample()
 
     assert torch.equal(sample_result.sampled_tokens_gpu, torch.tensor([0, 1, 2]))
-    controller._sampling.sample_kernel.assert_called_once()
-    logits, n, called_context = controller._sampling.sample_kernel.call_args.args
+    controller._sampling.sample_kernel_into.assert_called_once()
+    logits, n, called_context = controller._sampling.sample_kernel_into.call_args.args
     assert torch.equal(logits, controller._all_logits_cuda.squeeze(0))
     assert n == expected_n
     assert called_context is context
-    assert controller._sampling.sample_kernel.call_args.kwargs == {
+    assert controller._sampling.sample_kernel_into.call_args.kwargs == {
         "gather_indices": None,
         "eager": expected_eager,
         "cache_key": expected_cache_key,

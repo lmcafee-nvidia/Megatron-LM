@@ -273,11 +273,14 @@ class TextGenerationController:
             self._sampling: Sampling = FlashInferSampling(
                 self.vocab_size,
                 self.sampling_rng,
+                sampled_tokens_buffer=self._sampled_tokens_cuda,
                 config=self.model_config,
                 enable_cuda_graph=self._enable_cuda_graph,
             )
         else:
-            self._sampling: Sampling = TorchSampling(self.sampling_rng, self.vocab_size)
+            self._sampling: Sampling = TorchSampling(
+                self.sampling_rng, self.vocab_size, sampled_tokens_buffer=self._sampled_tokens_cuda
+            )
 
         # Cache values that are constant across inference steps.
         self._unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
@@ -1215,16 +1218,13 @@ class TextGenerationController:
             if context.config.materialize_only_last_token_logits
             else context.gpu_view.active_request_last_token_idxs
         )
-        sampled_tokens_cuda = self._sampling.sample_kernel(
+        self._sampling.sample_kernel_into(
             self._all_logits_cuda.squeeze(0),
             n,
             context,
             gather_indices=gather_indices,
             eager=not use_graph,
             cache_key=("sample", n) if use_graph else None,
-        )
-        self._sampled_tokens_cuda[:active_request_count].copy_(
-            sampled_tokens_cuda[:active_request_count]
         )
 
     def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
