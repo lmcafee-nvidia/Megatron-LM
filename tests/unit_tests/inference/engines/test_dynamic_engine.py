@@ -127,6 +127,7 @@ class DynamicEngineTestConfig:
     fp8: bool = False
     model_provider: str = "gpt"
     return_log_probs: bool = False
+    logprobs_mode: str = "raw_logprobs"
     materialize_only_last_token_logits: bool = True
     skip_prompt_log_probs: bool = False
     enable_chunked_prefill: bool = False
@@ -317,6 +318,7 @@ class DynamicInferenceEngineTestBase:
                 num_speculative_tokens=test_config.num_speculative_tokens,
                 sampling_backend=test_config.sampling_backend,
                 async_sched_mode=test_config.async_sched_mode,
+                logprobs_mode=test_config.logprobs_mode,
             ),
         )
 
@@ -1262,6 +1264,68 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @pytest.mark.parametrize(
+        "sampling_backend, logprobs_mode, skip_prompt_log_probs, num_cuda_graphs",
+        [
+            pytest.param("torch", "raw_logprobs", False, None, id="torch-raw-prompt"),
+            pytest.param("torch", "processed_logprobs", True, 2, id="torch-processed-generated"),
+            pytest.param("flashinfer", "raw_logprobs", False, None, id="flashinfer-raw-prompt"),
+            pytest.param(
+                "flashinfer",
+                "processed_logprobs",
+                True,
+                2,
+                id="flashinfer-processed-generated-graph",
+            ),
+        ],
+    )
+    @torch.inference_mode()
+    def test_async_sched_log_probs_match_legacy(
+        self, sampling_backend, logprobs_mode, skip_prompt_log_probs, num_cuda_graphs
+    ):
+        """Require prompt and generated logprob parity across scheduling modes."""
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
+
+        common_config = dict(
+            num_requests=4,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=6,
+            num_gap_steps=0,
+            use_fixed_output_lengths=True,
+            model_provider="gpt",
+            sampling_backend=sampling_backend,
+            temperature=0.8,
+            top_k=8,
+            return_log_probs=True,
+            logprobs_mode=logprobs_mode,
+            materialize_only_last_token_logits=skip_prompt_log_probs,
+            skip_prompt_log_probs=skip_prompt_log_probs,
+            context_max_requests=8,
+            num_cuda_graphs=num_cuda_graphs,
+            force_build_cuda_graphs=num_cuda_graphs is not None,
+            use_cuda_graphs_for_non_decode_steps=False,
+        )
+        outputs = {}
+        for mode in (AsyncScheduleMode.LEGACY, AsyncScheduleMode.SERIAL, AsyncScheduleMode.OVERLAP):
+            env = self._run_test(async_sched_mode=mode, **common_config)
+            outputs[mode] = [
+                (request.generated_tokens, request.prompt_log_probs, request.generated_log_probs)
+                for request in env.requests
+            ]
+
+        legacy_outputs = outputs[AsyncScheduleMode.LEGACY]
+        for mode in (AsyncScheduleMode.SERIAL, AsyncScheduleMode.OVERLAP):
+            for legacy, actual in zip(legacy_outputs, outputs[mode]):
+                assert actual[0] == legacy[0]
+                assert (actual[1] or []) == pytest.approx(legacy[1] or [])
+                assert actual[2] == pytest.approx(legacy[2])
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @pytest.mark.skipif(not is_te_min_version("2.2.0"), reason="TE 2.2.0 is required")
     @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     def test_fp8_inference(self, model_provider: str):
@@ -1393,8 +1457,11 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @pytest.mark.parametrize("async_sched_mode", list(AsyncScheduleMode))
     @torch.inference_mode()
-    def test_return_prompt_log_probs_with_zero_tokens_to_generate(self):
+    def test_return_prompt_log_probs_with_zero_tokens_to_generate(
+        self, async_sched_mode: AsyncScheduleMode
+    ):
         """Prompt log probs must be returned when scoring only (num_tokens_to_generate=0).
 
         Regression test for a prefill-step trimming bug: when a request generates
@@ -1410,6 +1477,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             materialize_only_last_token_logits=False,
             skip_prompt_log_probs=False,
             num_tokens_to_generate=0,
+            async_sched_mode=async_sched_mode,
         )
 
         validated_any = False
@@ -2406,9 +2474,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @pytest.mark.parametrize("async_sched_mode", list(AsyncScheduleMode))
     @pytest.mark.parametrize("skip_prompt_log_probs", [True, False])
     @torch.inference_mode()
-    def test_top_n_logprobs_dynamic(self, skip_prompt_log_probs: bool):
+    def test_top_n_logprobs_dynamic(
+        self, skip_prompt_log_probs: bool, async_sched_mode: AsyncScheduleMode
+    ):
         """
         Test that top_n_logprobs are computed correctly in dynamic batching mode.
         Verifies:
@@ -2423,6 +2494,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             max_prompt_length=12,
             num_tokens_to_generate=4,
             materialize_only_last_token_logits=False,
+            async_sched_mode=async_sched_mode,
         )
         env = self._build_test_env(test_config)
 

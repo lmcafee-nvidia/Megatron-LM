@@ -2,6 +2,7 @@
 
 import contextlib
 import math
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -1712,18 +1713,27 @@ class TestDynamicContext:
             logits_2d = logits.squeeze(0).float()
             if logprobs_mode == "raw_logprobs":
                 return torch.nn.functional.log_softmax(logits_2d, dim=-1)
-            temperatures, top_ks, top_ps = [], [], []
+            temperatures, top_ks, top_ps, request_counts = [], [], [], []
             for active_id, count in active_id_and_counts:
                 sp = request_data[active_id]["sampling"]
-                temperatures += [sp["temperature"]] * count
-                top_ks += [sp["top_k"]] * count
-                top_ps += [sp["top_p"]] * count
-            device = logits_2d.device
+                temperatures.append(sp["temperature"])
+                top_ks.append(sp["top_k"])
+                top_ps.append(sp["top_p"])
+                request_counts.append(count)
+            expected_context = SimpleNamespace(
+                total_request_count=len(active_id_and_counts),
+                paused_request_count=0,
+                active_request_metadata={
+                    "temperature": torch.tensor(temperatures, dtype=torch.float32),
+                    "top_k": torch.tensor(top_ks, dtype=torch.long),
+                    "top_p": torch.tensor(top_ps, dtype=torch.float32),
+                },
+            )
+            row_to_request = torch.arange(len(request_counts)).repeat_interleave(
+                torch.tensor(request_counts)
+            )
             return sampling.log_probs_kernel(
-                logits_2d,
-                torch.tensor(temperatures, device=device, dtype=torch.float32),
-                torch.tensor(top_ks, device=device, dtype=torch.long),
-                torch.tensor(top_ps, device=device, dtype=torch.float32),
+                logits_2d, expected_context, token_to_request_index=row_to_request
             )
 
         # Populate gpu_view for calculate_log_probs (which reads from gpu_view).

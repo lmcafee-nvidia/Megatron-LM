@@ -1008,8 +1008,6 @@ class DynamicInferenceEngine(AbstractEngine):
             raise ValueError("Async scheduling requires one MTP depth per speculative token.")
         if self.context.enable_prefix_caching:
             raise ValueError("Async scheduling does not support prefix caching.")
-        if not self.materialize_only_last_token_logits:
-            raise ValueError("Async scheduling requires materialize_only_last_token_logits=True.")
         if model_config.moe_enable_routing_replay:
             raise ValueError("Async scheduling does not support routing replay.")
 
@@ -1022,10 +1020,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.context.config.async_sched_mode == AsyncScheduleMode.LEGACY:
             return
 
-        sampling_params = request.sampling_params
-        if sampling_params.return_log_probs or sampling_params.top_n_logprobs > 0:
-            raise ValueError("Async scheduling does not support log probabilities.")
-        if sampling_params.stop_words:
+        if request.sampling_params.stop_words:
             raise ValueError("Async scheduling does not support stop words.")
 
     def _add_request(
