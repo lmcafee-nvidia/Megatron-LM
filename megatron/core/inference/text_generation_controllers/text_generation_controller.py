@@ -303,6 +303,7 @@ class TextGenerationController:
             self._async_sched_accepted_counts_cpu_buffer = None
             self._async_sched_mtp_verification_gpu_ready_event = None
             self._async_sched_accepted_counts_cpu_ready_event = None
+            self._async_sched_mamba_repair_done_event = None
             return
 
         context = self.inference_wrapped_model.inference_context
@@ -348,6 +349,9 @@ class TextGenerationController:
         )
         self._async_sched_mtp_verification_gpu_ready_event = torch.cuda.Event()
         self._async_sched_accepted_counts_cpu_ready_event = torch.cuda.Event()
+        self._async_sched_mamba_repair_done_event = (
+            torch.cuda.Event() if context.is_hybrid_model else None
+        )
 
     @staticmethod
     def tokenize_prompt(tokenizer, prompt: str, add_BOS: bool = False) -> List[int]:
@@ -2205,10 +2209,17 @@ class TextGenerationController:
             return None
 
         self._rewind_mamba_state(accepted_counts_gpu)
-        return self._record_fresh_async_sched_event(context.mamba_conv_states)
+        repair_done_event = self._async_sched_mamba_repair_done_event
+        if repair_done_event is None:
+            raise RuntimeError("Async Mamba repair event was not initialized.")
+        repair_done_event.record(torch.cuda.current_stream(context.mamba_conv_states.device))
+        return repair_done_event
 
     def _run_async_sched_mtp_rewind(
-        self, sample_result: _AsyncScheduleSampleResult, *, overlap: bool
+        self,
+        sample_result: _AsyncScheduleSampleResult,
+        *,
+        overlap: bool,
     ) -> None:
         """Repair Mamba state and rewind CPU KV state after MTP verification.
 

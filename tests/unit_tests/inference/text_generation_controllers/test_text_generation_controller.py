@@ -255,6 +255,7 @@ def _make_async_sched_controller(context=None, model_config=None):
     controller._enable_cuda_graph = False
     controller._async_sched_logits = AsyncScheduleLogitsState(is_valid=True)
     controller._async_sched_mtp_token_row_indices = None
+    controller._async_sched_mamba_repair_done_event = mock.Mock()
     controller._sampled_tokens_cuda = torch.empty(context.max_requests, dtype=torch.int64)
     controller._async_sched_sampled_tokens_cpu_buffer = torch.empty(
         context.max_requests, dtype=torch.int64
@@ -701,6 +702,7 @@ def test_run_async_sched_mtp_rewind_orders_repairs_and_cpu_rewind(overlap, expec
     controller._run_async_sched_mtp_rewind(sample_result, overlap=overlap)
 
     assert controller._synchronize_async_sched_event.call_args_list == expected_waits
+    controller._repair_async_sched_mamba_state.assert_called_once_with(accepted_counts_gpu)
     controller._rewind_kv_cache.assert_called_once_with(accepted_counts_cpu)
     context.reserve_async_sched_rewound_kv_blocks.assert_called_once_with(
         blocks_to_reserve, reservation_mask
@@ -715,13 +717,15 @@ def test_repair_async_sched_mamba_state_updates_live_state():
     controller = _make_async_sched_controller(context)
     accepted_counts = torch.tensor([0, 1], dtype=torch.int64)
     controller._rewind_mamba_state = mock.Mock()
-    controller._record_fresh_async_sched_event = mock.Mock(return_value="repair")
+    repair_done_event = mock.Mock()
+    controller._async_sched_mamba_repair_done_event = repair_done_event
 
-    repair_done_event = controller._repair_async_sched_mamba_state(accepted_counts)
+    with mock.patch("torch.cuda.current_stream", return_value="stream"):
+        result = controller._repair_async_sched_mamba_state(accepted_counts)
 
     controller._rewind_mamba_state.assert_called_once_with(accepted_counts)
-    controller._record_fresh_async_sched_event.assert_called_once_with(context.mamba_conv_states)
-    assert repair_done_event == "repair"
+    repair_done_event.record.assert_called_once_with("stream")
+    assert result is repair_done_event
 
 
 @pytest.mark.parametrize("num_prefill_requests, expected_mask", [(0, [1, 1]), (1, [0, 0])])
