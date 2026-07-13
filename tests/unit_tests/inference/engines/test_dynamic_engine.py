@@ -730,6 +730,55 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @pytest.mark.parametrize("num_cuda_graphs", [None, 1])
+    @torch.inference_mode()
+    def test_async_sched_speculative_decoding_matches_legacy(self, num_cuda_graphs) -> None:
+        """Compare MTP output across legacy, serial, and overlap scheduling.
+
+        Args:
+            num_cuda_graphs: Number of local CUDA graphs to capture, or None for eager execution.
+        """
+        outputs = {}
+        for mode in AsyncScheduleMode:
+            delete_cuda_graphs()
+            env = self._run_test(
+                num_requests=2,
+                min_prompt_length=4,
+                max_prompt_length=8,
+                num_tokens_to_generate=6,
+                num_gap_steps=0,
+                num_speculative_tokens=2,
+                async_sched_mode=mode,
+                num_cuda_graphs=num_cuda_graphs,
+                force_build_cuda_graphs=num_cuda_graphs is not None,
+                context_max_requests=16,
+            )
+            outputs[mode] = [list(request.generated_tokens) for request in env.requests]
+
+        assert outputs[AsyncScheduleMode.SERIAL] == outputs[AsyncScheduleMode.LEGACY]
+        assert outputs[AsyncScheduleMode.OVERLAP] == outputs[AsyncScheduleMode.LEGACY]
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_async_sched_hybrid_speculative_decoding(self) -> None:
+        """Run overlap scheduling end to end through a hybrid MTP model."""
+        skip_if_mamba_sequence_packing_not_available("hybrid")
+        self._run_test(
+            model_provider="hybrid",
+            num_requests=2,
+            num_tokens_to_generate=6,
+            num_gap_steps=0,
+            num_speculative_tokens=2,
+            async_sched_mode=AsyncScheduleMode.OVERLAP,
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     def test_full_iteration_impl_does_not_setup_inference_cuda_graphs(self) -> None:
         """impl=full_iteration is training-only; inference graph setup follows inference scope."""
         env = self._build_test_env(
@@ -5107,6 +5156,26 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             inference_moe_token_dispatcher_type=inference_moe_token_dispatcher_type,
             num_gap_steps=0,
             num_tokens_to_generate=4,
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_async_sched_moe_speculative_decoding(self) -> None:
+        """Run overlap scheduling end to end through an EP=2 MTP model."""
+        if Utils.world_size < 2:
+            pytest.skip("Test requires at least 2 GPUs")
+
+        self._run_test(
+            model_provider="gpt",
+            expert_model_parallel_size=2,
+            num_requests=2,
+            num_tokens_to_generate=6,
+            num_gap_steps=0,
+            num_speculative_tokens=2,
+            async_sched_mode=AsyncScheduleMode.OVERLAP,
         )
 
     @pytest.mark.internal
