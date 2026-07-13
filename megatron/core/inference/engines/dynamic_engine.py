@@ -1991,6 +1991,31 @@ class DynamicInferenceEngine(AbstractEngine):
         nvtx_range_pop("_ep_establish_consensus")
         return global_work, global_consensus == -1
 
+    async def _advance_ep_consensus(
+        self, local_pending: int, signal_consensus: bool
+    ) -> tuple[int, bool]:
+        """Advance the cached EP consensus at its configured cadence.
+
+        Args:
+            local_pending (int): Local active and waiting request count.
+            signal_consensus (bool): Whether this rank is ready to pause.
+
+        Returns:
+            tuple[int, bool]: Cached global work and all-ranks-pausing state.
+        """
+        global_work_from_last_consensus, _ = self._last_ep_consensus
+        # Recheck immediately while idle and periodically while work remains.
+        if (
+            global_work_from_last_consensus == 0
+            or self._ep_consensus_loop_counter % self.ep_consensus_interval == 0
+        ):
+            self._last_ep_consensus = await self._ep_establish_consensus(
+                local_pending, signal_consensus=signal_consensus
+            )
+
+        self._ep_consensus_loop_counter += 1
+        return self._last_ep_consensus
+
     async def _advance_async_sched_primer(self) -> None:
         """Advance the existing EP cadence before consuming primer logits.
 
@@ -2006,20 +2031,10 @@ class DynamicInferenceEngine(AbstractEngine):
             await asyncio.sleep(0)
             return
 
-        global_work_from_last_consensus, _ = self._last_ep_consensus
-        if (
-            global_work_from_last_consensus == 0
-            or self._ep_consensus_loop_counter % self.ep_consensus_interval == 0
-        ):
-            local_pending = self.context.get_active_request_count() + len(self.waiting_request_ids)
-            # Keep the primer and its consumption atomic. A pending pause is
-            # reconsidered by the normal coordinator loop after this slot.
-            self._last_ep_consensus = await self._ep_establish_consensus(
-                local_pending, signal_consensus=False
-            )
-
-        global_work, _ = self._last_ep_consensus
-        self._ep_consensus_loop_counter += 1
+        local_pending = self.context.get_active_request_count() + len(self.waiting_request_ids)
+        # Keep the primer and its consumption atomic. A pending pause is
+        # reconsidered by the normal coordinator loop after this slot.
+        global_work, _ = await self._advance_ep_consensus(local_pending, signal_consensus=False)
         assert global_work > 0, "An async-scheduling primer requires active EP work."
 
     async def async_forward(self) -> Tuple[Dict, Dict, float]:
@@ -2753,23 +2768,9 @@ class DynamicInferenceEngine(AbstractEngine):
                             # delivery, request scheduling) run between steps.
                             await asyncio.sleep(0)
                         continue
-                    global_work_from_last_consensus, _ = self._last_ep_consensus
-                    if (
-                        global_work_from_last_consensus == 0
-                        or self._ep_consensus_loop_counter % self.ep_consensus_interval == 0
-                    ):
-                        # selectively enter ep_establish_consensus if
-                        # 1. there is no global work -> engine is idle. At any step in the future
-                        #    one of the ranks can receive work. So we should be eagerly checking for that
-                        # 2. it has been 20 steps since we last established consensus, and that consensus
-                        #    had some work.
-                        # In the worst case, this delays pausing by 20 steps which is around
-                        # 200-400 milliseconds.
-                        self._last_ep_consensus = await self._ep_establish_consensus(
-                            local_pending, signal_consensus=(self.state == EngineState.PAUSING)
-                        )
-                    global_work, all_pausing = self._last_ep_consensus
-                    self._ep_consensus_loop_counter += 1
+                    global_work, all_pausing = await self._advance_ep_consensus(
+                        local_pending, signal_consensus=(self.state == EngineState.PAUSING)
+                    )
 
                     if all_pausing:
                         # All EP peers are PAUSING: pause immediately.

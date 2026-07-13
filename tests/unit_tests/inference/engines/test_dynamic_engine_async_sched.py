@@ -199,6 +199,7 @@ def test_async_forward_drains_then_admits_and_primes():
     engine.logging_step_interval = 0
     engine.metrics_writer = None
     engine.schedule_waiting_requests = mock.Mock(side_effect=[True, False])
+    engine._advance_async_sched_primer = mock.AsyncMock()
     engine.context = SimpleNamespace(
         step_count=4,
         prefix_cache_lru_clock=7,
@@ -222,6 +223,7 @@ def test_async_forward_drains_then_admits_and_primes():
     engine.controller.async_generate_output_tokens_dynamic_batch.assert_has_awaits(
         [mock.call(drain_pending_forward=True), mock.call()]
     )
+    engine._advance_async_sched_primer.assert_awaited_once_with()
 
 
 @pytest.mark.parametrize("consensus_due", [False, True])
@@ -245,6 +247,22 @@ def test_advance_async_sched_primer_uses_existing_ep_consensus_cadence(consensus
         engine._ep_establish_consensus.assert_awaited_once_with(3, signal_consensus=False)
     else:
         engine._ep_establish_consensus.assert_not_awaited()
+
+
+def test_advance_ep_consensus_forwards_pause_signal():
+    """The shared cadence helper updates and returns a due pause consensus."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.ep_consensus_interval = 20
+    engine._ep_consensus_loop_counter = 20
+    engine._last_ep_consensus = (3, False)
+    engine._ep_establish_consensus = mock.AsyncMock(return_value=(4, True))
+
+    result = asyncio.run(engine._advance_ep_consensus(2, signal_consensus=True))
+
+    assert result == (4, True)
+    assert engine._last_ep_consensus == (4, True)
+    assert engine._ep_consensus_loop_counter == 21
+    engine._ep_establish_consensus.assert_awaited_once_with(2, signal_consensus=True)
 
 
 @pytest.mark.parametrize(
