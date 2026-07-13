@@ -1886,8 +1886,14 @@ class TextGenerationController:
         if context.chunked_prefill_request_id != -1:
             raise RuntimeError("Async scheduling does not support chunked prefill.")
 
+        active_slice = slice(context.paused_request_count, context.total_request_count)
+        if torch.any(context.request_metadata["return_log_probs"][active_slice]):
+            raise RuntimeError("Async scheduling does not support log probabilities.")
+        if torch.any(context.request_metadata["top_n_logprobs"][active_slice] > 0):
+            raise RuntimeError("Async scheduling does not support top-n log probabilities.")
+
     def _compact_async_sched_logits(self, survivor_idxs: Tensor) -> Optional[torch.cuda.Event]:
-        """Compact cached logits from old active-row order into survivor order.
+        """Compact cached logits and GPU sampling metadata into survivor order.
 
         Args:
             survivor_idxs (Tensor): Active-row indices for requests that remain
@@ -1934,6 +1940,17 @@ class TextGenerationController:
             self._all_logits_cuda[:, : survivor_token_idxs.numel(), :].copy_(compacted_logits)
         else:
             self._all_logits_cuda = compacted_logits
+
+        context = self.inference_wrapped_model.inference_context
+        gpu_view = context.gpu_view
+        survivor_count = survivor_idxs.numel()
+        survivor_idxs_cuda = survivor_idxs.to(gpu_view.temperature.device)
+        compacted_temperature = gpu_view.temperature[survivor_idxs_cuda].contiguous()
+        compacted_top_k = gpu_view.top_k[survivor_idxs_cuda].contiguous()
+        compacted_top_p = gpu_view.top_p[survivor_idxs_cuda].contiguous()
+        gpu_view.temperature[:survivor_count].copy_(compacted_temperature)
+        gpu_view.top_k[:survivor_count].copy_(compacted_top_k)
+        gpu_view.top_p[:survivor_count].copy_(compacted_top_p)
 
         compaction_done_event = self._record_fresh_async_sched_event(self._all_logits_cuda)
         self._async_sched_logits.set_pending(
@@ -2102,10 +2119,8 @@ class TextGenerationController:
 
         # Sample.
         range_push("sampling")
+        self._dynamic_step_sample_logits()
         sampled_tokens_gpu = self._sampled_tokens_cuda[:active_request_count]
-        torch.argmax(
-            self._all_logits_cuda.squeeze(0)[:active_request_count], dim=-1, out=sampled_tokens_gpu
-        )
         if sampled_tokens_gpu.is_cuda:
             current_stream = torch.cuda.current_stream(sampled_tokens_gpu.device)
             self._async_sched_sample_gpu_ready_event.record(current_stream)

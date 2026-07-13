@@ -197,6 +197,14 @@ class TextGenerationControllerTestBase:
 
 def _make_async_sched_context(total_request_count=2, paused_request_count=0):
     metadata_len = max(total_request_count, 1)
+    request_metadata = {
+        "temperature": torch.ones(metadata_len),
+        "top_k": torch.ones(metadata_len, dtype=torch.int64),
+        "top_p": torch.zeros(metadata_len),
+        "return_log_probs": torch.zeros(metadata_len, dtype=torch.bool),
+        "top_n_logprobs": torch.zeros(metadata_len, dtype=torch.int64),
+        "termination_id": torch.full((metadata_len,), 99, dtype=torch.int64),
+    }
     return SimpleNamespace(
         config=SimpleNamespace(
             materialize_only_last_token_logits=True, async_sched_mode=AsyncScheduleMode.SERIAL
@@ -210,13 +218,14 @@ def _make_async_sched_context(total_request_count=2, paused_request_count=0):
         num_prefill_requests=0,
         padded_active_request_count=8,
         request_ids=torch.arange(10, 10 + metadata_len, dtype=torch.int32),
-        request_metadata={
-            "top_k": torch.ones(metadata_len, dtype=torch.int64),
-            "top_p": torch.zeros(metadata_len),
-            "return_log_probs": torch.zeros(metadata_len, dtype=torch.bool),
-            "top_n_logprobs": torch.zeros(metadata_len, dtype=torch.int64),
-            "termination_id": torch.full((metadata_len,), 99, dtype=torch.int64),
-        },
+        request_metadata=request_metadata,
+        active_request_metadata=request_metadata,
+        gpu_view=SimpleNamespace(
+            temperature=request_metadata["temperature"].clone(),
+            top_k=request_metadata["top_k"].to(torch.int32).clone(),
+            top_p=request_metadata["top_p"].clone(),
+            active_request_last_token_idxs=torch.arange(metadata_len, dtype=torch.int32),
+        ),
         async_sched_step_count=0,
         async_sched_compaction_step_count=0,
         get_active_sequence_lengths=mock.Mock(
@@ -253,6 +262,12 @@ def _make_async_sched_controller(context=None, model_config=None):
     controller.num_speculative_tokens = 0
     controller.num_mtp_depths = 0
     controller._enable_cuda_graph = False
+    controller._sampling_backend = "torch"
+    controller._sampling = SimpleNamespace(
+        sample_kernel=mock.Mock(
+            side_effect=lambda logits, n, _context, **_kwargs: torch.argmax(logits[:n], dim=-1)
+        )
+    )
     controller._async_sched_logits = AsyncScheduleLogitsState(is_valid=True)
     controller._async_sched_mtp_token_row_indices = None
     controller._async_sched_mamba_repair_done_event = mock.Mock()
@@ -318,7 +333,22 @@ def test_validate_async_sched_support_for_step_accepts_mtp():
     controller._validate_async_sched_support_for_step()
 
 
-@pytest.mark.parametrize("unsupported_case", ["paused_request", "chunked_prefill"])
+@pytest.mark.parametrize(
+    "temperature, top_k, top_p",
+    [(1.0, 1, 0.0), (1.0, 0, 0.0), (0.7, 8, 0.0), (1.0, 0, 0.9), (0.8, 8, 0.9)],
+)
+def test_validate_async_sched_support_for_step_accepts_sampling_modes(temperature, top_k, top_p):
+    context = _make_async_sched_context(total_request_count=2)
+    context.request_metadata["temperature"].fill_(temperature)
+    context.request_metadata["top_k"].fill_(top_k)
+    context.request_metadata["top_p"].fill_(top_p)
+
+    _make_async_sched_controller(context)._validate_async_sched_support_for_step()
+
+
+@pytest.mark.parametrize(
+    "unsupported_case", ["paused_request", "chunked_prefill", "log_probs", "top_n_logprobs"]
+)
 def test_validate_async_sched_support_for_step_errors(unsupported_case):
     context = _make_async_sched_context(total_request_count=2)
     controller = _make_async_sched_controller(context)
@@ -326,6 +356,10 @@ def test_validate_async_sched_support_for_step_errors(unsupported_case):
         context.paused_request_count = 1
     elif unsupported_case == "chunked_prefill":
         context.chunked_prefill_request_id = 0
+    elif unsupported_case == "log_probs":
+        context.request_metadata["return_log_probs"] = torch.tensor([False, True])
+    elif unsupported_case == "top_n_logprobs":
+        context.request_metadata["top_n_logprobs"] = torch.tensor([0, 1])
 
     with pytest.raises(RuntimeError, match="Async scheduling"):
         controller._validate_async_sched_support_for_step()
@@ -341,7 +375,16 @@ def test_validate_async_sched_support_for_step_errors(unsupported_case):
     ],
 )
 def test_async_sched_logits_compaction(enable_cuda_graph, survivor_idxs, expected_compaction):
-    controller = _make_async_sched_controller()
+    context = _make_async_sched_context(total_request_count=4)
+    context.gpu_view.temperature.copy_(torch.tensor([0.1, 0.2, 0.3, 0.4]))
+    context.gpu_view.top_k.copy_(torch.tensor([1, 2, 3, 4], dtype=torch.int32))
+    context.gpu_view.top_p.copy_(torch.tensor([0.5, 0.6, 0.7, 0.8]))
+    original_sampling_metadata = (
+        context.gpu_view.temperature.clone(),
+        context.gpu_view.top_k.clone(),
+        context.gpu_view.top_p.clone(),
+    )
+    controller = _make_async_sched_controller(context)
     controller._enable_cuda_graph = enable_cuda_graph
     controller._async_sched_logits = AsyncScheduleLogitsState(
         is_valid=True, cuda_graph_request_count=8, ready_event="forward"
@@ -360,6 +403,9 @@ def test_async_sched_logits_compaction(enable_cuda_graph, survivor_idxs, expecte
 
     if not expected_compaction:
         assert torch.equal(controller._all_logits_cuda, logits)
+        assert torch.equal(context.gpu_view.temperature, original_sampling_metadata[0])
+        assert torch.equal(context.gpu_view.top_k, original_sampling_metadata[1])
+        assert torch.equal(context.gpu_view.top_p, original_sampling_metadata[2])
         assert controller._async_sched_logits.ready_event == "forward"
         assert compaction_done_event is None
         controller._record_fresh_async_sched_event.assert_not_called()
@@ -373,6 +419,16 @@ def test_async_sched_logits_compaction(enable_cuda_graph, survivor_idxs, expecte
         assert controller._all_logits_cuda.shape == logits.shape
     else:
         assert torch.equal(controller._all_logits_cuda, expected_logits)
+    survivor_count = survivor_idxs.numel()
+    assert torch.equal(
+        context.gpu_view.temperature[:survivor_count], original_sampling_metadata[0][survivor_idxs]
+    )
+    assert torch.equal(
+        context.gpu_view.top_k[:survivor_count], original_sampling_metadata[1][survivor_idxs]
+    )
+    assert torch.equal(
+        context.gpu_view.top_p[:survivor_count], original_sampling_metadata[2][survivor_idxs]
+    )
     assert controller._async_sched_logits.is_valid
     assert controller._async_sched_logits.cuda_graph_request_count == 8
     assert controller._async_sched_logits.ready_event == "compaction"
@@ -381,7 +437,7 @@ def test_async_sched_logits_compaction(enable_cuda_graph, survivor_idxs, expecte
 
 def test_async_sched_logits_compaction_moves_complete_mtp_groups():
     """MTP compaction preserves grouped logits and original forward-row mappings."""
-    controller = _make_async_sched_controller()
+    controller = _make_async_sched_controller(_make_async_sched_context(total_request_count=4))
     controller.num_speculative_tokens = 2
     controller.num_mtp_depths = 2
     token_row_indices = torch.arange(100, 112, dtype=torch.int64)
@@ -616,6 +672,51 @@ def test_run_async_sched_sample_reuses_gpu_buffer(logits_dtype):
     assert sample_result.sampled_tokens_gpu.data_ptr() == controller._sampled_tokens_cuda.data_ptr()
     assert torch.equal(sample_result.sampled_tokens_gpu, expected_tokens)
     assert torch.equal(sample_result.sampled_tokens_cpu_view, expected_tokens)
+    controller._sampling.sample_kernel.assert_called_once()
+    logits, n, called_context = controller._sampling.sample_kernel.call_args.args
+    assert torch.equal(logits, controller._all_logits_cuda.squeeze(0))
+    assert n == 3
+    assert called_context is context
+    assert controller._sampling.sample_kernel.call_args.kwargs == {
+        "gather_indices": None,
+        "eager": True,
+        "cache_key": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "backend, enable_cuda_graph, using_cuda_graph, expected_n, expected_eager, expected_cache_key",
+    [
+        ("torch", True, True, 3, True, None),
+        ("flashinfer", False, False, 3, True, None),
+        ("flashinfer", True, True, 8, False, ("sample", 8)),
+    ],
+)
+def test_run_async_sched_sample_routes_backend_and_graph(
+    backend, enable_cuda_graph, using_cuda_graph, expected_n, expected_eager, expected_cache_key
+):
+    context = _make_async_sched_context(total_request_count=3)
+    context.using_cuda_graph_this_step.return_value = using_cuda_graph
+    controller = _make_async_sched_controller(context)
+    controller._sampling_backend = backend
+    controller._enable_cuda_graph = enable_cuda_graph
+    controller._all_logits_cuda = torch.zeros(1, 8, 5)
+    controller._sampling.sample_kernel.side_effect = None
+    controller._sampling.sample_kernel.return_value = torch.arange(expected_n)
+
+    sample_result = controller._run_async_sched_sample()
+
+    assert torch.equal(sample_result.sampled_tokens_gpu, torch.tensor([0, 1, 2]))
+    controller._sampling.sample_kernel.assert_called_once()
+    logits, n, called_context = controller._sampling.sample_kernel.call_args.args
+    assert torch.equal(logits, controller._all_logits_cuda.squeeze(0))
+    assert n == expected_n
+    assert called_context is context
+    assert controller._sampling.sample_kernel.call_args.kwargs == {
+        "gather_indices": None,
+        "eager": expected_eager,
+        "cache_key": expected_cache_key,
+    }
 
 
 @pytest.mark.internal
@@ -1477,7 +1578,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
     ):
         if backend == "flashinfer":
             pytest.importorskip("flashinfer")
-        batch_size = 15
+        batch_size = 18
         self.setup_model(
             torch.float32,
             batch_size=batch_size,
@@ -1498,6 +1599,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             (SamplingParams(top_p=0.8), [4, 1, 7]),
             (SamplingParams(temperature=10.0, top_k=5), [11, 5, 8]),
             (SamplingParams(temperature=0.0, top_k=1), [12, 13, 14]),
+            (SamplingParams(temperature=1.2), [15, 16, 17]),
         ]
         # For non-torch backends, test simultaneous top_k and top_p sampling.
         if backend != "torch":

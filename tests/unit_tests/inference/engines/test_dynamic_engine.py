@@ -51,7 +51,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
+from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord, delete_cuda_graphs
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -150,6 +150,9 @@ class DynamicEngineTestConfig:
     num_speculative_tokens: int = 0
     position_embedding_type: str = "learned_absolute"
     sampling_backend: str = 'torch'
+    temperature: float = 1.0
+    top_k: int = 0
+    top_p: float = 0.0
     async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.LEGACY
     # Sliding-window attention config. When `window_size` is None, SWA is
     # disabled and all layers do full causal attention. When set to a
@@ -247,9 +250,11 @@ class DynamicInferenceEngineTestBase:
                 termination_id=(
                     -1 if test_config.use_fixed_output_lengths else test_config.vocab_size - 1
                 ),
-                top_k=(1 if test_config.async_sched_mode != AsyncScheduleMode.LEGACY else 0),
                 return_log_probs=test_config.return_log_probs,
                 skip_prompt_log_probs=test_config.skip_prompt_log_probs,
+                temperature=test_config.temperature,
+                top_k=test_config.top_k,
+                top_p=test_config.top_p,
             )
             if not hasattr(sampling_params, "num_tokens_total"):
                 # Remove this if statement branch in megatron-core 0.16
@@ -1181,6 +1186,77 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             finally:
                 engine_task.cancel()
                 await engine_task
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize(
+        "sampling_backend, temperature, top_k, top_p, num_cuda_graphs",
+        [
+            pytest.param("torch", 0.8, 10, 0.0, None, id="torch-eager-top-k"),
+            pytest.param("torch", 1.0, 0, 0.9, 2, id="torch-graphed-forward-top-p"),
+            pytest.param("flashinfer", 1.2, 0, 0.0, None, id="flashinfer-eager-unfiltered"),
+            pytest.param("flashinfer", 0.8, 10, 0.9, 2, id="flashinfer-sampling-graph-top-k-top-p"),
+        ],
+    )
+    @torch.inference_mode()
+    def test_async_sched_sampling_matches_legacy(
+        self, sampling_backend, temperature, top_k, top_p, num_cuda_graphs
+    ):
+        """Require seeded sampling parity across legacy and async scheduling modes.
+
+        Args:
+            sampling_backend (str): Sampling implementation under test.
+            temperature (float): Sampling temperature used by every request.
+            top_k (int): Top-k filter used by every request.
+            top_p (float): Top-p filter used by every request.
+            num_cuda_graphs (Optional[int]): Number of CUDA graph buckets, or
+                `None` for eager execution.
+        """
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
+
+        common_config = dict(
+            num_requests=4,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=6,
+            num_gap_steps=0,
+            use_fixed_output_lengths=True,
+            model_provider="gpt",
+            sampling_backend=sampling_backend,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            context_max_requests=8,
+            num_cuda_graphs=num_cuda_graphs,
+            force_build_cuda_graphs=num_cuda_graphs is not None,
+            use_cuda_graphs_for_non_decode_steps=False,
+        )
+        generated_tokens = {}
+        final_env = None
+        for mode in (AsyncScheduleMode.LEGACY, AsyncScheduleMode.SERIAL, AsyncScheduleMode.OVERLAP):
+            final_env = self._run_test(async_sched_mode=mode, **common_config)
+            assert all(request.status == Status.COMPLETED for request in final_env.requests)
+            generated_tokens[mode] = [request.generated_tokens for request in final_env.requests]
+
+        assert (
+            generated_tokens[AsyncScheduleMode.SERIAL] == generated_tokens[AsyncScheduleMode.LEGACY]
+        )
+        assert (
+            generated_tokens[AsyncScheduleMode.OVERLAP]
+            == generated_tokens[AsyncScheduleMode.LEGACY]
+        )
+
+        if sampling_backend == "flashinfer" and num_cuda_graphs is not None:
+            assert final_env is not None
+            assert any(
+                runner.base_module is final_env.engine.controller._sampling
+                for runner, _graph_type, _args, _kwargs in (
+                    _CudagraphGlobalRecord.cudagraph_inference_record
+                )
+            )
 
     @pytest.mark.internal
     @pytest.mark.skipif(
