@@ -2456,7 +2456,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             active_mamba_write_indices = (
                 self._mamba_flat_indices(active_slice, use_candidate_bank=True)
                 if use_async_mamba_candidate_state
-                else active_mamba_indices
+                else None
             )
             self._pending_mamba_transfer = self.mamba_metadata.compute_cpu_metadata(
                 active_mamba_indices=active_mamba_indices,

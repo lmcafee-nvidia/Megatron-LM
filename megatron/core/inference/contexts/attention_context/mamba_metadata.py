@@ -230,18 +230,22 @@ class MambaMetadata:
             self._batch_indices_decode_buffer[:real_decode_count].copy_(
                 active_mamba_indices[:real_decode_count]
             )
-            if active_mamba_write_indices is None:
-                active_mamba_write_indices = active_mamba_indices
-            self._batch_indices_decode_write_buffer[:real_decode_count].copy_(
-                active_mamba_write_indices[:real_decode_count]
-            )
             if padded_decode_count > real_decode_count:
                 self._batch_indices_decode_buffer[real_decode_count:padded_decode_count] = -1
-                self._batch_indices_decode_write_buffer[real_decode_count:padded_decode_count] = -1
             self.batch_indices_decode = self._batch_indices_decode_buffer[:padded_decode_count]
-            self.batch_indices_decode_write = self._batch_indices_decode_write_buffer[
-                :padded_decode_count
-            ]
+            if active_mamba_write_indices is None:
+                self.batch_indices_decode_write = None
+            else:
+                self._batch_indices_decode_write_buffer[:real_decode_count].copy_(
+                    active_mamba_write_indices[:real_decode_count]
+                )
+                if padded_decode_count > real_decode_count:
+                    self._batch_indices_decode_write_buffer[
+                        real_decode_count:padded_decode_count
+                    ] = -1
+                self.batch_indices_decode_write = self._batch_indices_decode_write_buffer[
+                    :padded_decode_count
+                ]
 
         if padded_prefill_count > 0:
             # Update prefill indices (all prefill requests go through varlen)
@@ -550,6 +554,7 @@ class MambaMetadata:
             "padded_token_count": padded_token_count,
             "real_decode_count": real_decode_count,
             "real_prefill_count": real_prefill_count,
+            "has_decode_write_indices": active_mamba_write_indices is not None,
         }
 
         # Decode batch indices (write into pinned view; padded slots = -1).
@@ -557,14 +562,14 @@ class MambaMetadata:
             bufs['batch_indices_decode'][:real_decode_count] = active_mamba_indices[
                 :real_decode_count
             ]
-            if active_mamba_write_indices is None:
-                active_mamba_write_indices = active_mamba_indices
-            bufs['batch_indices_decode_write'][:real_decode_count] = active_mamba_write_indices[
-                :real_decode_count
-            ]
+            if active_mamba_write_indices is not None:
+                bufs['batch_indices_decode_write'][:real_decode_count] = active_mamba_write_indices[
+                    :real_decode_count
+                ]
             if padded_decode_count > real_decode_count:
                 bufs['batch_indices_decode'][real_decode_count:padded_decode_count] = -1
-                bufs['batch_indices_decode_write'][real_decode_count:padded_decode_count] = -1
+                if active_mamba_write_indices is not None:
+                    bufs['batch_indices_decode_write'][real_decode_count:padded_decode_count] = -1
 
         # Prefill batch indices, seq_idx, cu_seqlens, chunk/conv metadata.
         if padded_prefill_count > 0:
@@ -699,9 +704,11 @@ class MambaMetadata:
 
         if padded_decode_count > 0:
             self.batch_indices_decode = v.mamba_batch_indices_decode[:padded_decode_count]
-            self.batch_indices_decode_write = v.mamba_batch_indices_decode_write[
-                :padded_decode_count
-            ]
+            self.batch_indices_decode_write = (
+                v.mamba_batch_indices_decode_write[:padded_decode_count]
+                if d["has_decode_write_indices"]
+                else None
+            )
 
         if padded_prefill_count > 0:
             self.batch_indices_prefill = v.mamba_batch_indices_prefill[:padded_prefill_count]
