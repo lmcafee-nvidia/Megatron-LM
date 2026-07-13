@@ -10,7 +10,6 @@ import pytest
 from megatron.core.inference.config import AsyncScheduleMode
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.engines.dynamic_engine import EngineState
-from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     DynamicBatchControllerStepResult,
 )
@@ -76,55 +75,6 @@ def test_validate_async_sched_support_for_config(overrides, should_raise):
             engine._validate_async_sched_support_for_config()
     else:
         engine._validate_async_sched_support_for_config()
-
-
-@pytest.mark.parametrize(
-    "async_sched_mode, sampling_params, should_raise",
-    [
-        (AsyncScheduleMode.LEGACY, SamplingParams(top_k=0, top_p=0.5), False),
-        (AsyncScheduleMode.SERIAL, SamplingParams(top_k=1, top_p=0.0), False),
-        (AsyncScheduleMode.OVERLAP, SamplingParams(top_k=1, top_p=0.0), False),
-        (AsyncScheduleMode.SERIAL, SamplingParams(top_k=0, top_p=0.0), False),
-        (AsyncScheduleMode.OVERLAP, SamplingParams(top_k=0, top_p=0.9), False),
-        (AsyncScheduleMode.SERIAL, SamplingParams(temperature=0.7, top_k=8), False),
-        (AsyncScheduleMode.OVERLAP, SamplingParams(top_k=8, top_p=0.9), False),
-        (
-            AsyncScheduleMode.SERIAL,
-            SamplingParams(top_k=1, top_p=0.0, return_log_probs=True),
-            False,
-        ),
-        (
-            AsyncScheduleMode.OVERLAP,
-            SamplingParams(top_k=1, top_p=0.0, return_log_probs=True, top_n_logprobs=1),
-            False,
-        ),
-        (AsyncScheduleMode.SERIAL, SamplingParams(top_k=1, top_p=0.0, stop_words=["END"]), True),
-    ],
-)
-def test_validate_async_sched_support_for_request(async_sched_mode, sampling_params, should_raise):
-    """Ensure engine request validation accepts only supported async scheduling requests."""
-    engine = _make_engine(async_sched_mode=async_sched_mode)
-    request = SimpleNamespace(sampling_params=sampling_params)
-
-    if should_raise:
-        with pytest.raises(ValueError, match="Async scheduling"):
-            engine._validate_async_sched_support_for_request(request)
-    else:
-        engine._validate_async_sched_support_for_request(request)
-
-
-def test_add_request_runs_async_sched_request_validation():
-    """Ensure request validation is called before mutating engine request state."""
-    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
-    engine._validate_async_sched_support_for_request = mock.Mock(
-        side_effect=RuntimeError("validated")
-    )
-    request = SimpleNamespace(request_id=10)
-
-    with pytest.raises(RuntimeError, match="validated"):
-        engine._add_request(request)
-
-    engine._validate_async_sched_support_for_request.assert_called_once_with(request)
 
 
 def test_async_forward_reenters_controller_after_primer_without_rescheduling():

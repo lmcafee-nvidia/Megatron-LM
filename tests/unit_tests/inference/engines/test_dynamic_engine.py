@@ -1322,6 +1322,122 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 assert (actual[1] or []) == pytest.approx(legacy[1] or [])
                 assert actual[2] == pytest.approx(legacy[2])
 
+    def _run_stop_word_schedule(
+        self,
+        test_config: DynamicEngineTestConfig,
+        stop_word: Optional[str] = None,
+        detokenize_stop_sequence: bool = False,
+    ) -> DynamicEngineTestEnv:
+        """Run a schedule where only the first request has a string stop word.
+
+        Args:
+            test_config (DynamicEngineTestConfig): Engine configuration for the run.
+            stop_word (Optional[str]): Whitespace-delimited token IDs used as the stop word.
+            detokenize_stop_sequence (bool): Whether the completed output retains the stop word.
+
+        Returns:
+            DynamicEngineTestEnv: Completed test environment.
+        """
+        env = self._build_test_env(test_config)
+        env.engine.controller.tokenizer.bos = None
+        env.engine.controller.tokenizer.tokenize = lambda text: [
+            int(token_id) for token_id in text.split()
+        ]
+
+        for request_idx, request in enumerate(env.requests):
+            request.sampling_params.termination_id = -1
+            request.sampling_params.detokenize_stop_sequence = detokenize_stop_sequence
+            if request_idx == 0 and stop_word is not None:
+                request.sampling_params.stop_words = [stop_word]
+            env.engine._add_request(request)
+
+        while env.engine.has_unfinished_requests():
+            env.engine.step_modern()
+
+        return env
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize(
+        "async_sched_mode,sampling_backend,num_cuda_graphs,detokenize_stop_sequence",
+        [
+            pytest.param(
+                AsyncScheduleMode.SERIAL, "torch", None, True, id="serial-torch-eager-keep"
+            ),
+            pytest.param(
+                AsyncScheduleMode.OVERLAP, "torch", 2, False, id="overlap-torch-graph-strip"
+            ),
+            pytest.param(
+                AsyncScheduleMode.SERIAL,
+                "flashinfer",
+                None,
+                False,
+                id="serial-flashinfer-eager-strip",
+            ),
+            pytest.param(
+                AsyncScheduleMode.OVERLAP, "flashinfer", 2, True, id="overlap-flashinfer-graph-keep"
+            ),
+        ],
+    )
+    @torch.inference_mode()
+    def test_async_sched_stop_words_match_legacy(
+        self, async_sched_mode, sampling_backend, num_cuda_graphs, detokenize_stop_sequence
+    ):
+        """Require string stop-word parity while survivor requests keep decoding.
+
+        Args:
+            async_sched_mode (AsyncScheduleMode): Async mode compared with legacy scheduling.
+            sampling_backend (str): Sampling backend under test.
+            num_cuda_graphs (Optional[int]): CUDA graph bucket count, or ``None`` for eager mode.
+            detokenize_stop_sequence (bool): Whether completed output retains the stop word.
+        """
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
+
+        common_config = dict(
+            num_requests=4,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=8,
+            num_gap_steps=0,
+            model_provider="gpt",
+            sampling_backend=sampling_backend,
+            temperature=1.0,
+            top_k=1,
+            context_max_requests=8,
+            num_cuda_graphs=num_cuda_graphs,
+            force_build_cuda_graphs=num_cuda_graphs is not None,
+            use_cuda_graphs_for_non_decode_steps=False,
+        )
+
+        probe_env = self._run_stop_word_schedule(
+            DynamicEngineTestConfig(async_sched_mode=AsyncScheduleMode.LEGACY, **common_config)
+        )
+        stop_word_ids = probe_env.requests[0].generated_tokens[2:4]
+        stop_word = " ".join(str(token_id) for token_id in stop_word_ids)
+
+        legacy_env = self._run_stop_word_schedule(
+            DynamicEngineTestConfig(async_sched_mode=AsyncScheduleMode.LEGACY, **common_config),
+            stop_word,
+            detokenize_stop_sequence,
+        )
+        async_env = self._run_stop_word_schedule(
+            DynamicEngineTestConfig(async_sched_mode=async_sched_mode, **common_config),
+            stop_word,
+            detokenize_stop_sequence,
+        )
+
+        legacy_tokens = [request.generated_tokens for request in legacy_env.requests]
+        async_tokens = [request.generated_tokens for request in async_env.requests]
+        assert async_tokens == legacy_tokens
+        assert len(async_tokens[0]) < common_config["num_tokens_to_generate"]
+        if detokenize_stop_sequence:
+            assert async_tokens[0][-len(stop_word_ids) :] == stop_word_ids
+        assert async_env.engine.context.async_sched_step_count > 0
+        assert async_env.engine.context.async_sched_compaction_step_count > 0
+
     @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
@@ -4582,7 +4698,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
-    def test_speculative_decoding_logprobs_with_stop_word_trim(self):
+    @pytest.mark.parametrize("async_sched_mode", list(AsyncScheduleMode))
+    def test_speculative_decoding_logprobs_with_stop_word_trim(self, async_sched_mode):
         """Test that log probs are correctly trimmed when a stop word lands
         in the middle of a speculative batch.
 
@@ -4600,6 +4717,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             num_speculative_tokens=2,
             materialize_only_last_token_logits=False,
             model_provider="gpt",
+            async_sched_mode=async_sched_mode,
         )
         env = self._build_test_env(test_config)
 
@@ -4642,6 +4760,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 detokenize_stop_sequence=True,
                 return_log_probs=True,
                 top_k=1,
+                top_n_logprobs=2,
             ),
         )
 
@@ -4656,6 +4775,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         finished_req = finished_records[0].merge()
 
         assert finished_req.status == Status.COMPLETED
+        assert finished_req.generated_tokens == [5, 6]
         assert finished_req.generated_tokens[-1] == 6, (
             f"Expected last token to be stop word 6, "
             f"got {finished_req.generated_tokens[-1]}. "
@@ -4674,6 +4794,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         for j, lp in enumerate(finished_req.generated_log_probs):
             assert isinstance(lp, float)
             assert lp <= 0.0, f"Token {j}: log prob {lp} > 0"
+
+        assert finished_req.generated_top_n_logprobs is not None
+        assert len(finished_req.generated_top_n_logprobs) == len(finished_req.generated_tokens)
 
     @pytest.mark.internal
     @pytest.mark.skipif(

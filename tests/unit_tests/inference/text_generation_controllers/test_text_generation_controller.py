@@ -282,6 +282,7 @@ def _make_async_sched_controller(context=None, model_config=None):
     controller._async_sched_logits = AsyncScheduleLogitsState(is_valid=True)
     controller._async_sched_mtp_token_row_indices = None
     controller._async_sched_mamba_repair_done_event = mock.Mock()
+    controller._get_stop_word_finished_ids_callback = None
     controller._async_sched_sampled_tokens_cpu_buffer = torch.empty(
         context.max_requests, dtype=torch.int64
     )
@@ -1037,23 +1038,35 @@ def test_copy_async_sched_log_probs_to_cpu_uses_reusable_buffers_and_copy_stream
 
 
 @pytest.mark.parametrize(
-    "overlap, termination_ids, expected_wait, expected_compaction_event",
+    "overlap, termination_ids, stop_word_finished_ids, next_forward_done_event, "
+    "expected_wait, expected_compaction_event",
     [
-        (True, [99, 99, 99], False, None),
-        (True, [99, 2, 99], True, "compaction"),
-        (False, [99, 2, 99], False, "compaction"),
+        (True, [99, 99, 99], set(), "forward", False, None),
+        (True, [99, 2, 99], set(), "forward", True, "compaction"),
+        (True, [99, 99, 99], {11}, "forward", True, "compaction"),
+        (False, [99, 99, 99], {11}, "forward", False, "compaction"),
+        (True, [99, 2, 99], set(), None, False, None),
     ],
 )
 def test_run_async_sched_resolve_waits_only_for_finish_boundary(
-    overlap, termination_ids, expected_wait, expected_compaction_event
+    overlap,
+    termination_ids,
+    stop_word_finished_ids,
+    next_forward_done_event,
+    expected_wait,
+    expected_compaction_event,
 ):
     sample_tokens = torch.tensor([1, 2, 3], dtype=torch.int64)
     context = _make_async_sched_context(total_request_count=3)
     context.request_metadata["termination_id"] = torch.tensor(termination_ids)
     controller = _make_async_sched_controller(context)
     controller._synchronize_async_sched_event = mock.Mock()
+    controller._get_stop_word_finished_ids_callback = mock.Mock(return_value=stop_word_finished_ids)
 
     expected_mask = (sample_tokens != context.request_metadata["termination_id"]).byte()
+    for request_idx, request_id in enumerate(context.request_ids.tolist()):
+        if request_id in stop_word_finished_ids:
+            expected_mask[request_idx] = 0
     expected_finished_ids = context.request_ids[expected_mask == 0].clone()
     expected_survivor_idxs = torch.nonzero(expected_mask, as_tuple=True)[0]
     context.resolve_requests = mock.Mock(
@@ -1072,7 +1085,7 @@ def test_run_async_sched_resolve_waits_only_for_finish_boundary(
         accepted_tokens_cpu_view=None,
     )
     result = controller._run_async_sched_resolve(
-        sample_result, context.get_active_sequence_lengths(), "forward", overlap
+        sample_result, context.get_active_sequence_lengths(), next_forward_done_event, overlap
     )
 
     assert torch.equal(result.sampled_tokens_cpu, sample_tokens)
@@ -1080,12 +1093,17 @@ def test_run_async_sched_resolve_waits_only_for_finish_boundary(
     assert result.compaction_done_event == expected_compaction_event
     assert torch.equal(result.survivor_idxs, expected_survivor_idxs)
     if expected_wait:
-        controller._synchronize_async_sched_event.assert_called_once_with("forward")
+        controller._synchronize_async_sched_event.assert_called_once_with(next_forward_done_event)
     else:
         controller._synchronize_async_sched_event.assert_not_called()
+    if next_forward_done_event is None:
+        controller._compact_async_sched_logits.assert_not_called()
+    else:
+        controller._compact_async_sched_logits.assert_called_once()
     context.commit_sampled_tokens.assert_not_called()
     context.resolve_requests.assert_called_once()
     assert torch.equal(context.resolve_requests.call_args.args[0], expected_mask)
+    controller._get_stop_word_finished_ids_callback.assert_called_once_with([10, 11, 12])
 
 
 @pytest.mark.parametrize(
