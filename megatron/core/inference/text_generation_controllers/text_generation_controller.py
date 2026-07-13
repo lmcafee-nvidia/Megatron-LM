@@ -2033,9 +2033,12 @@ class TextGenerationController:
         forward_done_event = self._record_fresh_async_sched_event(self._all_logits_cuda)
 
         # Record the logits that this forward will produce.
-        active_slice = slice(context.paused_request_count, context.total_request_count)
+        pending_request_ids = None
+        if context.is_hybrid_model:
+            active_slice = slice(context.paused_request_count, context.total_request_count)
+            pending_request_ids = context.request_ids[active_slice]
         self._async_sched_logits.set_pending(
-            cuda_graph_request_count, forward_done_event, context.request_ids[active_slice]
+            cuda_graph_request_count, forward_done_event, pending_request_ids
         )
 
         # Return the forward-done event.

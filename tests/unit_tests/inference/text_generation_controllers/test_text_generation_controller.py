@@ -448,10 +448,12 @@ def test_run_async_sched_publish_bookkeeping_skips_gpu_input_ids():
 @pytest.mark.parametrize(
     "using_cuda_graph, expected_cuda_graph_request_count", [(False, None), (True, 8)]
 )
+@pytest.mark.parametrize("is_hybrid_model", [False, True])
 def test_run_async_sched_forward_records_primer_and_returns_event(
-    using_cuda_graph, expected_cuda_graph_request_count
+    using_cuda_graph, expected_cuda_graph_request_count, is_hybrid_model
 ):
     context = _make_async_sched_context()
+    context.is_hybrid_model = is_hybrid_model
     context.using_cuda_graph_this_step.return_value = using_cuda_graph
     controller = _make_async_sched_controller(context)
     controller._async_sched_logits = AsyncScheduleLogitsState()
@@ -481,7 +483,10 @@ def test_run_async_sched_forward_records_primer_and_returns_event(
         controller._async_sched_logits.cuda_graph_request_count == expected_cuda_graph_request_count
     )
     assert controller._async_sched_logits.ready_event == "forward_done"
-    assert torch.equal(controller._async_sched_logits.request_ids, context.request_ids[:2])
+    if is_hybrid_model:
+        assert torch.equal(controller._async_sched_logits.request_ids, context.request_ids[:2])
+    else:
+        assert controller._async_sched_logits.request_ids is None
 
 
 @pytest.mark.parametrize("is_valid", [False, True])
