@@ -384,10 +384,9 @@ def test_async_sched_logits_compaction_moves_complete_mtp_groups():
     controller = _make_async_sched_controller()
     controller.num_speculative_tokens = 2
     controller.num_mtp_depths = 2
-    pending_request_ids = torch.tensor([10, 11, 12, 13], dtype=torch.int32)
     token_row_indices = torch.arange(100, 112, dtype=torch.int64)
     controller._async_sched_logits = AsyncScheduleLogitsState(
-        is_valid=True, request_ids=pending_request_ids, token_row_indices=token_row_indices
+        is_valid=True, token_row_indices=token_row_indices
     )
     controller._record_fresh_async_sched_event = mock.Mock(return_value="compaction")
     logits = torch.arange(24).reshape(1, 12, 2)
@@ -400,7 +399,6 @@ def test_async_sched_logits_compaction_moves_complete_mtp_groups():
     assert torch.equal(
         controller._async_sched_logits.token_row_indices, token_row_indices[expected_token_rows]
     )
-    assert controller._async_sched_logits.request_ids.tolist() == [10, 12]
 
 
 def test_dynamic_step_context_init_returns_bookkeeping_event():

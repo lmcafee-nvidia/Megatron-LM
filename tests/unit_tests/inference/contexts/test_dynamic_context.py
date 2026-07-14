@@ -8,7 +8,11 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
+from megatron.core.inference.config import (
+    AsyncScheduleMode,
+    InferenceConfig,
+    MambaInferenceStateConfig,
+)
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     RequestOverflowError,
@@ -78,6 +82,7 @@ class TestDynamicContext:
         num_speculative_tokens=0,
         enable_chunked_prefill: bool = False,
         max_requests: int = None,
+        async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.LEGACY,
     ):
         if is_hybrid_model:
             if layer_type_list is None:
@@ -118,6 +123,7 @@ class TestDynamicContext:
                 unified_memory_level=0,  # unit tests currently broken with UVM
                 enable_chunked_prefill=enable_chunked_prefill,
                 max_requests=max_requests,
+                async_sched_mode=async_sched_mode,
             ),
         )
         return dynamic_context
