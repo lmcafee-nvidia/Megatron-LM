@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+from collections import deque
 from types import SimpleNamespace
 from unittest import mock
 
@@ -27,7 +28,8 @@ def _make_engine(async_sched_mode=AsyncScheduleMode.SERIAL, **overrides):
     )
     engine.context = context
     engine.controller = SimpleNamespace(
-        inference_wrapped_model=SimpleNamespace(model=SimpleNamespace(config=model_config))
+        inference_wrapped_model=SimpleNamespace(model=SimpleNamespace(config=model_config)),
+        has_pending_async_forward=mock.Mock(return_value=False),
     )
     engine.num_speculative_tokens = 0
     engine.materialize_only_last_token_logits = True
@@ -50,7 +52,7 @@ def _make_engine(async_sched_mode=AsyncScheduleMode.SERIAL, **overrides):
         ({"async_sched_mode": AsyncScheduleMode.OVERLAP}, False),
         ({"num_speculative_tokens": 1}, True),
         ({"async_sched_mode": AsyncScheduleMode.OVERLAP, "num_speculative_tokens": 1}, True),
-        ({"context_is_hybrid_model": True}, True),
+        ({"context_is_hybrid_model": True}, False),
         ({"context_enable_prefix_caching": True}, True),
         ({"materialize_only_last_token_logits": False}, True),
         ({"model_config_expert_model_parallel_size": 2}, True),
@@ -115,7 +117,7 @@ def test_async_forward_reenters_controller_after_primer_without_rescheduling():
     engine.state = EngineState.RUNNING
     engine.logging_step_interval = 0
     engine.metrics_writer = None
-    engine.schedule_waiting_requests = mock.Mock()
+    engine.schedule_waiting_requests = mock.Mock(return_value=False)
     engine.context = SimpleNamespace(
         step_count=4,
         prefix_cache_lru_clock=7,
@@ -144,6 +146,96 @@ def test_async_forward_reenters_controller_after_primer_without_rescheduling():
     assert engine.context.step_count == 5
     assert engine.context.prefix_cache_lru_clock == 8
     engine.schedule_waiting_requests.assert_called_once_with()
-    assert engine.controller.async_generate_output_tokens_dynamic_batch.await_count == 2
+    engine.controller.async_generate_output_tokens_dynamic_batch.assert_has_awaits(
+        [
+            mock.call(drain_pending_forward=False),
+            mock.call(drain_pending_forward=False),
+        ]
+    )
     range_push.assert_called_once_with("Decode")
     range_pop.assert_called_once_with("Decode")
+
+
+@pytest.mark.parametrize(
+    "is_hybrid_model, async_sched_mode, has_pending_forward, expected",
+    [
+        (True, AsyncScheduleMode.OVERLAP, True, True),
+        (False, AsyncScheduleMode.OVERLAP, True, False),
+        (True, AsyncScheduleMode.LEGACY, True, False),
+        (True, AsyncScheduleMode.OVERLAP, False, False),
+    ],
+)
+def test_should_defer_async_mamba_admission(
+    is_hybrid_model, async_sched_mode, has_pending_forward, expected
+):
+    """Defer admission only for Mamba async scheduling with pending logits."""
+    engine = _make_engine(
+        async_sched_mode=async_sched_mode, context_is_hybrid_model=is_hybrid_model
+    )
+    engine.controller.has_pending_async_forward.return_value = has_pending_forward
+
+    assert engine._should_defer_async_mamba_admission() is expected
+
+
+@pytest.mark.parametrize("enable_chunked_prefill", [False, True])
+def test_ready_async_mamba_admission_stays_queued(enable_chunked_prefill):
+    """Leave a ready request queued until the pending Mamba forward is drained."""
+    engine = _make_engine(context_is_hybrid_model=True)
+    request = SimpleNamespace(remaining_prompt_tokens=[1, 2, 3])
+    engine.waiting_request_ids = deque([10])
+    engine.get_request = mock.Mock(return_value=request)
+    engine.context.check_availability = mock.Mock(return_value=(True, True, True))
+    engine.context.add_request = mock.Mock()
+    engine.context.active_token_count = 1
+    engine.context.max_tokens = 8
+    engine.context.chunked_prefill_request_id = -1
+    engine._cg_admission_gating_active = mock.Mock(return_value=False)
+    engine._should_defer_async_mamba_admission = mock.Mock(return_value=True)
+
+    if enable_chunked_prefill:
+        admission_deferred = engine.schedule_chunked_prefill()
+    else:
+        admission_deferred = engine.schedule_non_chunked_prefill()
+
+    assert admission_deferred is True
+    assert list(engine.waiting_request_ids) == [10]
+    engine.context.add_request.assert_not_called()
+
+
+@pytest.mark.parametrize("enable_chunked_prefill", [False, True])
+def test_schedule_waiting_requests_returns_admission_decision(enable_chunked_prefill):
+    """Propagate the selected scheduler's Mamba admission decision."""
+    engine = _make_engine()
+    engine.enable_chunked_prefill = enable_chunked_prefill
+    engine.waiting_request_ids = deque()
+    engine._generation_epoch = None
+    engine.schedule_non_chunked_prefill = mock.Mock(return_value=True)
+    engine.schedule_chunked_prefill = mock.Mock(return_value=True)
+
+    assert engine.schedule_waiting_requests() is True
+
+
+@pytest.mark.parametrize("admission_deferred", [False, True])
+def test_async_forward_routes_mamba_admission_drain(admission_deferred):
+    """Pass the scheduler's admission decision directly to the controller."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.state = object()
+    engine.logging_step_interval = 0
+    engine.schedule_waiting_requests = mock.Mock(return_value=admission_deferred)
+    engine.context = SimpleNamespace(
+        active_token_count=1,
+        step_count=0,
+        prefix_cache_lru_clock=0,
+        is_decode_only=mock.Mock(return_value=True),
+    )
+    engine.controller = SimpleNamespace(
+        async_generate_output_tokens_dynamic_batch=mock.AsyncMock(
+            return_value=DynamicBatchControllerStepResult(output={"sample": []})
+        )
+    )
+
+    asyncio.run(engine.async_forward())
+
+    engine.controller.async_generate_output_tokens_dynamic_batch.assert_awaited_once_with(
+        drain_pending_forward=admission_deferred
+    )

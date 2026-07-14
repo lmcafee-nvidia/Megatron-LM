@@ -1004,8 +1004,6 @@ class DynamicInferenceEngine(AbstractEngine):
         model_config = self.controller.inference_wrapped_model.model.config
         if self.num_speculative_tokens > 0:
             raise ValueError("Async scheduling does not support speculative tokens.")
-        if self.context.is_hybrid_model:
-            raise ValueError("Async scheduling does not support hybrid/Mamba models.")
         if self.context.enable_prefix_caching:
             raise ValueError("Async scheduling does not support prefix caching.")
         if not self.materialize_only_last_token_logits:
@@ -1608,14 +1606,30 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         return {"waits": self._prefix_coordination_waits}
 
-    def schedule_waiting_requests(self):
-        """Tries to schedule any requests in the waiting pool."""
+    def _should_defer_async_mamba_admission(self) -> bool:
+        """Return whether a ready admission must wait for pending Mamba logits.
+
+        Returns:
+            bool: Whether the current request admission must be deferred.
+        """
+        return (
+            self.context.is_hybrid_model
+            and self.context.config.async_sched_mode != AsyncScheduleMode.LEGACY
+            and self.controller.has_pending_async_forward()
+        )
+
+    def schedule_waiting_requests(self) -> bool:
+        """Try to schedule requests from the waiting pool.
+
+        Returns:
+            bool: Whether a ready request remained queued to drain a pending Mamba forward.
+        """
         # Keep track of which requests get scheduled.
         waiting_before = set(self.waiting_request_ids)
         if self.enable_chunked_prefill:
-            self.schedule_chunked_prefill()
+            admission_deferred = self.schedule_chunked_prefill()
         else:
-            self.schedule_non_chunked_prefill()
+            admission_deferred = self.schedule_non_chunked_prefill()
         waiting_after = set(self.waiting_request_ids)
 
         # Re-stamp kv_cache_epoch on requests that were just scheduled.
@@ -1625,11 +1639,16 @@ class DynamicInferenceEngine(AbstractEngine):
                 if req.kv_cache_epoch is None:
                     req.kv_cache_epoch = [(0, self._generation_epoch)]
 
-    def schedule_non_chunked_prefill(self):
-        """
-        Perform the same original scheduling logic for non-chunked runs
+        return admission_deferred
+
+    def schedule_non_chunked_prefill(self) -> bool:
+        """Schedule non-chunked prefill requests.
+
+        Returns:
+            bool: Whether a ready request remained queued to drain a pending Mamba forward.
         """
         prefix_caching_enabled = self.context.enable_prefix_caching
+        admission_deferred = False
         if prefix_caching_enabled:
             pending_block_hashes = set()
             pending_request_ids = []
@@ -1666,6 +1685,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     if not self._cg_admission_check(req, candidate):
                         break
 
+                if self._should_defer_async_mamba_admission():
+                    admission_deferred = True
+                    break
+
                 # Add these hashes to pending.
                 if prefix_caching_enabled:
                     for block_hash in req.precomputed_block_hashes:
@@ -1684,6 +1707,8 @@ class DynamicInferenceEngine(AbstractEngine):
         # Prepend pending request ids to waiting queue.
         if prefix_caching_enabled and pending_request_ids:
             self.waiting_request_ids.extendleft(reversed(pending_request_ids))
+
+        return admission_deferred
 
     def _cg_admission_gating_active(self) -> bool:
         """Cudagraph-aware admission gating is active when --inference-cuda-graph-all-prefills
@@ -1769,9 +1794,9 @@ class DynamicInferenceEngine(AbstractEngine):
         self._register_cg_wait(req)
         return False
 
-    def schedule_chunked_prefill(self):
-        """
-        This function schedules chunked prefill requests.
+    def schedule_chunked_prefill(self) -> bool:
+        """Schedule chunked prefill requests.
+
         Invariant:
             - There are at most one chunked prefill request in the waiting pool,
                 which should be the head
@@ -1783,8 +1808,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 that have been prefilled for this request, non-zero means
                 it is during a chunked prefill
             - For each request, remaining_prompt_tokens holds the **unprefilled** prompt tokens
+
+        Returns:
+            bool: Whether a ready request remained queued to drain a pending Mamba forward.
         """
         prefix_caching_enabled = self.context.enable_prefix_caching
+        admission_deferred = False
         if prefix_caching_enabled:
             pending_block_hashes = set()
             pending_request_ids = []
@@ -1882,6 +1911,10 @@ class DynamicInferenceEngine(AbstractEngine):
                         can_schedule = False
                         break
 
+                if self._should_defer_async_mamba_admission():
+                    admission_deferred = True
+                    break
+
                 # Add hashes to pending set (prefix-caching bookkeeping).
                 if prefix_caching_enabled:
                     for block_hash in req.precomputed_block_hashes:
@@ -1918,6 +1951,8 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 self.waiting_request_ids.extendleft(reversed(pending_request_ids))
 
+        return admission_deferred
+
     async def async_forward(self) -> Tuple[Dict, Dict, float]:
         """Uses `asyncio` for continuous generation.
         Sleeps when no requests are available, until new requests have been added.
@@ -1934,8 +1969,8 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             raise EngineSuspendedError(self.context.step_count)
 
-        # schedule requests
-        self.schedule_waiting_requests()
+        # Schedule requests, or leave a ready Mamba admission queued for one drain step.
+        admission_deferred = self.schedule_waiting_requests()
 
         # The print block (async_bookkeep) and metrics block both fire on this
         # condition after step_count is incremented. Predict it up-front so we
@@ -1974,7 +2009,9 @@ class DynamicInferenceEngine(AbstractEngine):
             self.step_start_event.record()
         while True:
             controller_result: DynamicBatchControllerStepResult = (
-                await self.controller.async_generate_output_tokens_dynamic_batch()
+                await self.controller.async_generate_output_tokens_dynamic_batch(
+                    drain_pending_forward=admission_deferred
+                )
             )
             if not controller_result.primer_only:
                 result = controller_result.output

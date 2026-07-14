@@ -979,7 +979,7 @@ class TestDynamicContext:
                 )
             )
 
-    def _get_async_sched_context(self):
+    def _get_async_sched_context(self, is_hybrid_model=False):
         return self._get_dynamic_context(
             params_dtype=torch.float32,
             num_layers=2,
@@ -990,6 +990,8 @@ class TestDynamicContext:
             block_size_tokens=4,
             max_tokens=32,
             max_requests=8,
+            is_hybrid_model=is_hybrid_model,
+            layer_type_list=[Symbols.MAMBA, Symbols.ATTENTION],
         )
 
     @staticmethod
@@ -1032,6 +1034,10 @@ class TestDynamicContext:
         ctx.token_to_local_position_within_kv_block[active_slice] = (
             ctx.token_to_pos_ids[active_slice] % ctx.block_size_tokens
         )
+        if ctx.is_hybrid_model:
+            mamba_slots = ctx.mamba_metadata.batch_allocate_slots(active_request_count)
+            assert mamba_slots is not None
+            ctx.mamba_metadata.request_to_mamba_state_idx[active_slice] = mamba_slots
 
     @pytest.mark.internal
     @rounder_override(8)
@@ -1138,15 +1144,16 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(8)
+    @pytest.mark.parametrize("is_hybrid_model", [False, True])
     @pytest.mark.parametrize(
         "mask, expected_finished_ids, expected_request_ids",
         [([1, 1, 1], [], [10, 11, 12]), ([1, 0, 1], [11], [10, 12]), ([0, 0, 0], [10, 11, 12], [])],
     )
     def test_async_sched_resolve_requests_success(
-        self, mask, expected_finished_ids, expected_request_ids
+        self, mask, expected_finished_ids, expected_request_ids, is_hybrid_model
     ):
         """Async scheduling resolve compacts survivors and releases finished rows."""
-        ctx = self._get_async_sched_context()
+        ctx = self._get_async_sched_context(is_hybrid_model=is_hybrid_model)
         self._setup_async_sched_decode_rows(
             ctx,
             active_request_count=len(mask),
@@ -1154,6 +1161,11 @@ class TestDynamicContext:
             kv_offsets=[4, 5, 6],
             last_block_offsets=[0, 1, 2],
         )
+        original_mamba_slots = None
+        if is_hybrid_model:
+            original_mamba_slots = ctx.mamba_metadata.request_to_mamba_state_idx[
+                : len(mask)
+            ].clone()
         active_mask = torch.tensor(mask, dtype=torch.int32)
         if torch.cuda.is_available():
             active_mask = active_mask.cuda()
@@ -1175,6 +1187,17 @@ class TestDynamicContext:
         )
         if not expected_request_ids:
             assert torch.all(ctx.request_to_kv_block_ids == -1)
+        if is_hybrid_model:
+            survivor_idxs = torch.nonzero(torch.tensor(mask), as_tuple=True)[0]
+            expected_mamba_slots = original_mamba_slots[survivor_idxs]
+            assert torch.equal(
+                ctx.mamba_metadata.request_to_mamba_state_idx[: len(expected_request_ids)],
+                expected_mamba_slots,
+            )
+            assert torch.all(
+                ctx.mamba_metadata.request_to_mamba_state_idx[len(expected_request_ids) : len(mask)]
+                == -1
+            )
 
     @pytest.mark.internal
     @rounder_override(8)

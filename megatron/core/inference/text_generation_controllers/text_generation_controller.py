@@ -238,9 +238,6 @@ class TextGenerationController:
         # This buffer has a stable address across legacy-prefill, async-decode,
         # and MTP routing. Sampling producers must copy into it rather than rebind it.
         self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
-        self._async_sched_sample_values_cuda = torch.empty(
-            max_requests, dtype=logits_dtype, device=device
-        )
         self._async_sched_sampled_tokens_cpu_buffer = torch.empty(
             max_requests, dtype=torch.int64, device="cpu", pin_memory=True
         )
@@ -1789,6 +1786,14 @@ class TextGenerationController:
     # Begin async scheduling methods
     # -------------------------------------------------------------------------
 
+    def has_pending_async_forward(self) -> bool:
+        """Return whether an async forward remains to be sampled.
+
+        Returns:
+            bool: Whether pending async logits are available.
+        """
+        return self._async_sched_logits.is_valid
+
     def _validate_async_sched_support_for_step(self) -> None:
         """Validate controller/context state for async scheduling.
 
@@ -1941,10 +1946,8 @@ class TextGenerationController:
         # Sample.
         range_push("sampling")
         sampled_tokens_gpu = self._sampled_tokens_cuda[:active_request_count]
-        torch.max(
-            self._all_logits_cuda.squeeze(0)[:active_request_count],
-            dim=-1,
-            out=(self._async_sched_sample_values_cuda[:active_request_count], sampled_tokens_gpu),
+        torch.argmax(
+            self._all_logits_cuda.squeeze(0)[:active_request_count], dim=-1, out=sampled_tokens_gpu
         )
         if sampled_tokens_gpu.is_cuda:
             current_stream = torch.cuda.current_stream(sampled_tokens_gpu.device)
@@ -2037,7 +2040,7 @@ class TextGenerationController:
     def _run_async_sched_resolve(
         self,
         sampled_tokens_cpu_view: Tensor,
-        forward_done_event: Optional[torch.cuda.Event],
+        next_forward_done_event: Optional[torch.cuda.Event],
         overlap: bool,
     ) -> _AsyncScheduleResolveResult:
         """Resolve request state and compact speculative forward logits.
@@ -2045,8 +2048,9 @@ class TextGenerationController:
         Args:
             sampled_tokens_cpu_view (Tensor): Transient view of sampled tokens
                 in the reusable pinned CPU buffer.
-            forward_done_event (Optional[torch.cuda.Event]): Event marking
-                speculative forward completion.
+            next_forward_done_event (Optional[torch.cuda.Event]): Event marking
+                successor forward completion, or `None` when the async chain
+                is drained.
             overlap (bool): Whether the speculative forward may still be running.
 
         Returns:
@@ -2064,9 +2068,13 @@ class TextGenerationController:
         )
         range_pop()
 
-        # Finish the speculative forward before releasing finished-request resources.
-        if overlap and survivor_idxs.numel() < active_request_ids.numel():
-            self._synchronize_async_sched_event(forward_done_event)
+        # Finish the successor forward before releasing resources that it still uses.
+        if (
+            overlap
+            and next_forward_done_event is not None
+            and survivor_idxs.numel() < active_request_ids.numel()
+        ):
+            self._synchronize_async_sched_event(next_forward_done_event)
 
         # Resolve CPU request lifecycle state.
         range_push("resolve_requests")
@@ -2075,8 +2083,12 @@ class TextGenerationController:
 
         assert torch.equal(finished_request_ids, resolved_finished_request_ids)
 
-        # Compact only when survivor rows moved.
-        compaction_done_event = self._compact_async_sched_logits(survivor_idxs)
+        # Compact successor logits only while the async forward chain continues.
+        compaction_done_event = (
+            self._compact_async_sched_logits(survivor_idxs)
+            if next_forward_done_event is not None
+            else None
+        )
 
         # Return the resolution result.
         return _AsyncScheduleResolveResult(
@@ -2086,7 +2098,9 @@ class TextGenerationController:
             compaction_done_event=compaction_done_event,
         )
 
-    async def _run_async_sched_step(self, *, overlap: bool) -> DynamicBatchControllerStepResult:
+    async def _run_async_sched_step(
+        self, *, overlap: bool, drain_pending_forward: bool = False
+    ) -> DynamicBatchControllerStepResult:
         """Run one decode-only step using the async scheduling path.
 
         A controller step launches at most one model forward. When no pending
@@ -2107,9 +2121,16 @@ class TextGenerationController:
         mutate bookkeeping until its H2D completes, and finished-request
         resources cannot be released until the forward using them completes.
 
+        A Mamba admission drain consumes the pending logits but does not launch
+        a successor forward. This leaves the recurrent state at the committed
+        token boundary so the queued prefill can be admitted by the next engine
+        iteration and processed through the legacy mixed-batch path.
+
         Args:
             overlap (bool): Whether to submit the next forward before waiting
                 for current-step GPU work.
+            drain_pending_forward (bool): Whether to consume pending logits
+                without launching a successor forward.
 
         Returns:
             DynamicBatchControllerStepResult: A primer-only indication or the
@@ -2129,8 +2150,14 @@ class TextGenerationController:
         # -------------------------------------------------------------------------
         # Primer
         # -------------------------------------------------------------------------
-        # Launch the forward primer if no existing logits state can be reused.
-        primer_launched, primer_bookkeeping_done_event = self._run_async_sched_forward_primer()
+        if drain_pending_forward:
+            assert (
+                self._async_sched_logits.is_valid
+            ), "Mamba admission requires pending async logits."
+            primer_launched, primer_bookkeeping_done_event = False, None
+        else:
+            # Launch the forward primer if no existing logits state can be reused.
+            primer_launched, primer_bookkeeping_done_event = self._run_async_sched_forward_primer()
 
         current_logits_ready_event = self._async_sched_logits.ready_event
 
@@ -2164,8 +2191,9 @@ class TextGenerationController:
             # Enqueue sampling behind the current logits-producing work.
             sampled_tokens_gpu = self._run_async_sched_sample()
 
-            # Populate the next forward's input-ID view directly from GPU samples.
-            context.copy_async_sched_sample_to_forward(sampled_tokens_gpu)
+            if not drain_pending_forward:
+                # Populate the next forward's input-ID view directly from GPU samples.
+                context.copy_async_sched_sample_to_forward(sampled_tokens_gpu)
 
             # Start D2H after sampling; it may overlap the GPU input-ID copy.
             sampled_tokens_cpu_view, sample_cpu_ready_event = self._copy_async_sched_sample_to_cpu(
@@ -2176,28 +2204,34 @@ class TextGenerationController:
             if not overlap:
                 self._synchronize_async_sched_event(sample_cpu_ready_event)
 
-            # -------------------------------------------------------------------------
-            # Forward
-            # -------------------------------------------------------------------------
-            # Publish positions and metadata without overwriting GPU-resident input IDs.
-            range_push("async_sched_transfer_bookkeeping_to_gpu")
-            bookkeeping_done_event = self._run_async_sched_publish_bookkeeping()
-            range_pop()
+            bookkeeping_done_event = None
+            next_forward_done_event = None
+            if drain_pending_forward:
+                # Stop the chain; the sample D2H wait completes the pending forward before resolve.
+                self._async_sched_logits.clear()
+            else:
+                # -------------------------------------------------------------------------
+                # Forward
+                # -------------------------------------------------------------------------
+                # Publish positions and metadata without overwriting GPU-resident input IDs.
+                range_push("async_sched_transfer_bookkeeping_to_gpu")
+                bookkeeping_done_event = self._run_async_sched_publish_bookkeeping()
+                range_pop()
 
-            # Serial mode completes publication before submitting the forward.
-            if not overlap:
-                self._synchronize_async_sched_event(bookkeeping_done_event)
+                # Serial mode completes publication before submitting the forward.
+                if not overlap:
+                    self._synchronize_async_sched_event(bookkeeping_done_event)
 
-            # The compute stream orders both input updates before forward N+1.
-            range_push("async_sched_forward_pass")
-            forward_done_event = self._run_async_sched_forward(
-                input_ids_gpu_view, position_ids_gpu_view
-            )
-            range_pop()
+                # The compute stream orders both input updates before forward N+1.
+                range_push("async_sched_forward_pass")
+                next_forward_done_event = self._run_async_sched_forward(
+                    input_ids_gpu_view, position_ids_gpu_view
+                )
+                range_pop()
 
-            # Serial mode completes forward N+1 before resolving N.
-            if not overlap:
-                self._synchronize_async_sched_event(forward_done_event)
+                # Serial mode completes forward N+1 before resolving N.
+                if not overlap:
+                    self._synchronize_async_sched_event(next_forward_done_event)
 
             # -------------------------------------------------------------------------
             # Resolve
@@ -2205,20 +2239,24 @@ class TextGenerationController:
             # Resolution reads the CPU sample and mutates the H2D source buffer.
             if overlap:
                 self._synchronize_async_sched_event(sample_cpu_ready_event)
-                self._synchronize_async_sched_event(bookkeeping_done_event)
+                if bookkeeping_done_event is not None:
+                    self._synchronize_async_sched_event(bookkeeping_done_event)
 
-            # Resolve N while forward N+1 continues unless finished resources are needed.
+            # Resolve N while forward N+1 continues, or finish the drained async chain.
             resolve_result = self._run_async_sched_resolve(
-                sampled_tokens_cpu_view, forward_done_event, overlap
+                sampled_tokens_cpu_view, next_forward_done_event, overlap
             )
 
             # Serial mode completes any survivor compaction before returning.
-            if not overlap:
+            if not overlap and resolve_result.compaction_done_event is not None:
                 self._synchronize_async_sched_event(resolve_result.compaction_done_event)
 
-            # Count async steps and steps that logically discarded speculative rows.
+            # Count async steps and successor-logit compaction steps.
             context.async_sched_step_count += 1
-            if resolve_result.finished_request_ids.numel() > 0:
+            if (
+                next_forward_done_event is not None
+                and resolve_result.finished_request_ids.numel() > 0
+            ):
                 context.async_sched_compaction_step_count += 1
 
             result = {
@@ -2234,7 +2272,7 @@ class TextGenerationController:
                 "cuda_graph_request_count": cuda_graph_request_count,
             }
 
-        # Yield only after resolution is complete and forward N+1 is already submitted.
+        # Yield after resolution, with either a successor forward pending or the chain drained.
         await asyncio.sleep(0)
 
         return DynamicBatchControllerStepResult(output=result)
@@ -2259,6 +2297,11 @@ class TextGenerationController:
                 cuda_graph_request_count (Optional[int]): Size of cuda graph used for this step.
         """
         context = self.inference_wrapped_model.inference_context
+        if context.is_hybrid_model and self._async_sched_logits.is_valid:
+            raise RuntimeError(
+                "Pending async Mamba logits must be drained before legacy execution."
+            )
+
         self._async_sched_logits.clear()
         active_request_count = context.total_request_count - context.paused_request_count
 
@@ -2407,13 +2450,15 @@ class TextGenerationController:
             return ret
 
     async def async_generate_output_tokens_dynamic_batch(
-        self, skip_bookkeeping: Optional[bool] = False
+        self, skip_bookkeeping: Optional[bool] = False, *, drain_pending_forward: bool = False
     ) -> DynamicBatchControllerStepResult:
         """Forward step the model and update the inference context.
 
         Args:
             skip_bookkeeping (Optional[bool]): If true, skip context bookkeeping
                 on the legacy path.
+            drain_pending_forward (bool): Whether to consume pending async logits
+                without launching a successor forward.
 
         Returns:
             DynamicBatchControllerStepResult: One controller-step result.
@@ -2422,15 +2467,20 @@ class TextGenerationController:
         mode = context.config.async_sched_mode
 
         if mode == AsyncScheduleMode.LEGACY or context.num_prefill_requests != 0:
+            assert not drain_pending_forward, "Mamba admission must drain before legacy execution."
             return DynamicBatchControllerStepResult(
                 output=await self._run_legacy_step(skip_bookkeeping)
             )
         if mode == AsyncScheduleMode.SERIAL:
             assert not skip_bookkeeping, "Async scheduling requires request bookkeeping."
-            return await self._run_async_sched_step(overlap=False)
+            return await self._run_async_sched_step(
+                overlap=False, drain_pending_forward=drain_pending_forward
+            )
         if mode == AsyncScheduleMode.OVERLAP:
             assert not skip_bookkeeping, "Async scheduling requires request bookkeeping."
-            return await self._run_async_sched_step(overlap=True)
+            return await self._run_async_sched_step(
+                overlap=True, drain_pending_forward=drain_pending_forward
+            )
         raise AssertionError(f"Unexpected async scheduling mode: {mode}")
 
     @torch.inference_mode()
