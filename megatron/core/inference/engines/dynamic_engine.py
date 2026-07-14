@@ -44,6 +44,7 @@ from megatron.core.inference.inference_request import (
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+    DynamicBatchControllerStepResult,
     TextGenerationController,
 )
 from megatron.core.inference.utils import Counter, InferenceMode, await_process_call
@@ -1971,7 +1972,13 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if will_log_this_step:
             self.step_start_event.record()
-        result = await self.controller.async_generate_output_tokens_dynamic_batch()
+        while True:
+            controller_result: DynamicBatchControllerStepResult = (
+                await self.controller.async_generate_output_tokens_dynamic_batch()
+            )
+            if not controller_result.primer_only:
+                result = controller_result.output
+                break
         if will_log_this_step:
             self.step_end_event.record()
             self.step_end_event.synchronize()

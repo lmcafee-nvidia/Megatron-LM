@@ -110,6 +110,19 @@ class AsyncScheduleLogitsState:
         self.ready_event = None
 
 
+@dataclass(frozen=True)
+class DynamicBatchControllerStepResult:
+    """Result of one dynamic-batching controller step.
+
+    Attributes:
+        output: Sampled-step output, or ``None`` when no output was produced.
+        primer_only: Whether the step launched only an async-scheduling primer.
+    """
+
+    output: Optional[Dict] = None
+    primer_only: bool = False
+
+
 @dataclass
 class _AsyncScheduleResolveResult:
     """State produced by async scheduling request resolution."""
@@ -2073,11 +2086,13 @@ class TextGenerationController:
             compaction_done_event=compaction_done_event,
         )
 
-    async def _run_async_sched_step(self, *, overlap: bool) -> Optional[Dict]:
+    async def _run_async_sched_step(self, *, overlap: bool) -> DynamicBatchControllerStepResult:
         """Run one decode-only step using the async scheduling path.
 
-        The first decode step launches and completes a forward primer so logits
-        exist. Steady-state overlap follows this schedule::
+        A controller step launches at most one model forward. When no pending
+        logits exist, this method launches only a forward primer and returns.
+        The engine immediately invokes the controller again to consume that
+        primer. Steady-state overlap follows this schedule::
 
             CPU:            prepare request state N+1
             compute stream: forward N -> sample N -> copy input N+1
@@ -2097,8 +2112,8 @@ class TextGenerationController:
                 for current-step GPU work.
 
         Returns:
-            Optional[Dict]: Step result for sampled and finished requests, or
-            `None` when no requests are active.
+            DynamicBatchControllerStepResult: A primer-only indication or the
+                sampled step output. The output is `None` when no work is active.
         """
         context = self.inference_wrapped_model.inference_context
 
@@ -2109,7 +2124,7 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
         if context.active_token_count == 0 and active_request_count == 0:
             self._async_sched_logits.clear()
-            return None
+            return DynamicBatchControllerStepResult()
 
         # -------------------------------------------------------------------------
         # Primer
@@ -2117,15 +2132,23 @@ class TextGenerationController:
         # Launch the forward primer if no existing logits state can be reused.
         primer_launched, primer_bookkeeping_done_event = self._run_async_sched_forward_primer()
 
+        current_logits_ready_event = self._async_sched_logits.ready_event
+
+        if primer_launched:
+            # Overlap only waits until preparation may safely reuse the pinned
+            # CPU bookkeeping source. Serial mode completes the primer forward.
+            if overlap:
+                self._synchronize_async_sched_event(primer_bookkeeping_done_event)
+            else:
+                self._synchronize_async_sched_event(current_logits_ready_event)
+            return DynamicBatchControllerStepResult(primer_only=True)
+
         with torch.inference_mode():
-            current_logits_ready_event = self._async_sched_logits.ready_event
             cuda_graph_request_count = self._async_sched_logits.cuda_graph_request_count
 
-            # Serial mode waits for logits; overlap only waits for a new primer's H2D source read.
+            # Serial mode waits for the pending logits before preparing the next step.
             if not overlap:
                 self._synchronize_async_sched_event(current_logits_ready_event)
-            elif primer_launched:
-                self._synchronize_async_sched_event(primer_bookkeeping_done_event)
 
             # -------------------------------------------------------------------------
             # Prepare
@@ -2214,7 +2237,7 @@ class TextGenerationController:
         # Yield only after resolution is complete and forward N+1 is already submitted.
         await asyncio.sleep(0)
 
-        return result
+        return DynamicBatchControllerStepResult(output=result)
 
     # -------------------------------------------------------------------------
     # End async scheduling methods
@@ -2385,7 +2408,7 @@ class TextGenerationController:
 
     async def async_generate_output_tokens_dynamic_batch(
         self, skip_bookkeeping: Optional[bool] = False
-    ) -> Optional[Dict]:
+    ) -> DynamicBatchControllerStepResult:
         """Forward step the model and update the inference context.
 
         Args:
@@ -2393,14 +2416,15 @@ class TextGenerationController:
                 on the legacy path.
 
         Returns:
-            Optional[Dict]: Step result for sampled and finished requests, or
-            `None` when no requests are active.
+            DynamicBatchControllerStepResult: One controller-step result.
         """
         context = self.inference_wrapped_model.inference_context
         mode = context.config.async_sched_mode
 
         if mode == AsyncScheduleMode.LEGACY or context.num_prefill_requests != 0:
-            return await self._run_legacy_step(skip_bookkeeping)
+            return DynamicBatchControllerStepResult(
+                output=await self._run_legacy_step(skip_bookkeeping)
+            )
         if mode == AsyncScheduleMode.SERIAL:
             assert not skip_bookkeeping, "Async scheduling requires request bookkeeping."
             return await self._run_async_sched_step(overlap=False)
@@ -2413,9 +2437,20 @@ class TextGenerationController:
     def generate_output_tokens_dynamic_batch(
         self, loop: Optional[asyncio.AbstractEventLoop] = None
     ) -> Optional[Dict]:
-        """Synchronous wrapper for `self.async_generate_output_tokens_dynamic_batch."""
+        """Synchronously run dynamic batching through any primer-only calls.
+
+        Args:
+            loop (Optional[asyncio.AbstractEventLoop]): Event loop used to run
+                the asynchronous controller.
+
+        Returns:
+            Optional[Dict]: Step output, or `None` when no work is active.
+        """
         loop = get_asyncio_loop(loop)
-        return loop.run_until_complete(self.async_generate_output_tokens_dynamic_batch())
+        while True:
+            result = loop.run_until_complete(self.async_generate_output_tokens_dynamic_batch())
+            if not result.primer_only:
+                return result.output
 
     def _update_top_n_logprobs_dict(
         self,

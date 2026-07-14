@@ -34,6 +34,7 @@ from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper 
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     AsyncScheduleLogitsState,
+    DynamicBatchControllerStepResult,
     TextGenerationController,
 )
 from megatron.core.inference.utils import InferenceMode
@@ -496,7 +497,7 @@ def test_run_async_sched_forward_primer(is_valid):
         controller._run_async_sched_forward.assert_called_once_with(input_ids, position_ids)
 
 
-def test_async_sched_step_returns_none_without_active_requests():
+def test_async_sched_step_returns_empty_result_without_active_requests():
     context = _make_async_sched_context(total_request_count=0)
     context.active_token_count = 0
     controller = _make_async_sched_controller(context)
@@ -507,11 +508,50 @@ def test_async_sched_step_returns_none_without_active_requests():
 
     result = asyncio.run(controller._run_async_sched_step(overlap=False))
 
-    assert result is None
+    assert result == DynamicBatchControllerStepResult()
     assert not controller._async_sched_logits.is_valid
     assert controller._async_sched_logits.cuda_graph_request_count is None
     assert controller._async_sched_logits.ready_event is None
     controller._validate_async_sched_support_for_step.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "overlap, expected_wait", [(False, "forward"), (True, "primer_bookkeeping")]
+)
+def test_async_sched_primer_step_returns_before_prepare(overlap, expected_wait):
+    """A primer-only call launches no other async-scheduling phase."""
+    context = _make_async_sched_context(total_request_count=3)
+    controller = _make_async_sched_controller(context)
+    controller._async_sched_logits = AsyncScheduleLogitsState()
+    controller._validate_async_sched_support_for_step = mock.Mock()
+
+    def run_primer():
+        controller._async_sched_logits.set_pending(7, "forward")
+        return True, "primer_bookkeeping"
+
+    controller._run_async_sched_forward_primer = mock.Mock(side_effect=run_primer)
+    controller._synchronize_async_sched_event = mock.Mock()
+    controller._run_async_sched_prepare = mock.Mock()
+    controller._run_async_sched_sample = mock.Mock()
+    controller._copy_async_sched_sample_to_cpu = mock.Mock()
+    context.copy_async_sched_sample_to_forward = mock.Mock()
+    controller._run_async_sched_publish_bookkeeping = mock.Mock()
+    controller._run_async_sched_forward = mock.Mock()
+    controller._run_async_sched_resolve = mock.Mock()
+
+    result = asyncio.run(controller._run_async_sched_step(overlap=overlap))
+
+    assert result == DynamicBatchControllerStepResult(primer_only=True)
+    controller._synchronize_async_sched_event.assert_called_once_with(expected_wait)
+    controller._run_async_sched_prepare.assert_not_called()
+    controller._run_async_sched_sample.assert_not_called()
+    controller._copy_async_sched_sample_to_cpu.assert_not_called()
+    context.copy_async_sched_sample_to_forward.assert_not_called()
+    controller._run_async_sched_publish_bookkeeping.assert_not_called()
+    controller._run_async_sched_forward.assert_not_called()
+    controller._run_async_sched_resolve.assert_not_called()
+    assert context.async_sched_step_count == 0
+    assert context.async_sched_compaction_step_count == 0
 
 
 def test_run_async_sched_sample_reuses_gpu_buffer():
@@ -622,11 +662,10 @@ def test_run_async_sched_resolve_waits_only_for_finish_boundary(
 
 
 @pytest.mark.parametrize(
-    "overlap, has_valid_logits, expected_call_order",
+    "overlap, expected_call_order",
     [
         (
             False,
-            True,
             [
                 "wait:current",
                 "prepare",
@@ -645,26 +684,7 @@ def test_run_async_sched_resolve_waits_only_for_finish_boundary(
         ),
         (
             True,
-            True,
             [
-                "prepare",
-                "sample",
-                "copy_input",
-                "copy_sample",
-                "publish",
-                "forward",
-                "wait:sample",
-                "wait:bookkeeping",
-                "resolve",
-                "yield",
-            ],
-        ),
-        (
-            True,
-            False,
-            [
-                "primer",
-                "wait:primer_bookkeeping",
                 "prepare",
                 "sample",
                 "copy_input",
@@ -679,7 +699,7 @@ def test_run_async_sched_resolve_waits_only_for_finish_boundary(
         ),
     ],
 )
-def test_async_sched_step_order(overlap, has_valid_logits, expected_call_order):
+def test_async_sched_step_order(overlap, expected_call_order):
     sample_tokens = torch.tensor([1, 2, 3], dtype=torch.int64)
     sampled_tokens_cpu = sample_tokens.clone()
     input_ids = torch.tensor([[101, 102, 103]])
@@ -687,20 +707,12 @@ def test_async_sched_step_order(overlap, has_valid_logits, expected_call_order):
     context = _make_async_sched_context(total_request_count=3)
     controller = _make_async_sched_controller(context)
     controller._async_sched_logits = AsyncScheduleLogitsState(
-        is_valid=has_valid_logits,
-        cuda_graph_request_count=7 if has_valid_logits else None,
-        ready_event="current" if has_valid_logits else None,
+        is_valid=True, cuda_graph_request_count=7, ready_event="current"
     )
     controller._validate_async_sched_support_for_step = mock.Mock()
     call_order = []
 
-    def run_primer():
-        if not has_valid_logits:
-            call_order.append("primer")
-            controller._async_sched_logits.set_pending(7, "current")
-        return not has_valid_logits, "primer_bookkeeping" if not has_valid_logits else None
-
-    controller._run_async_sched_forward_primer = mock.Mock(side_effect=run_primer)
+    controller._run_async_sched_forward_primer = mock.Mock(return_value=(False, None))
     controller._synchronize_async_sched_event = mock.Mock(
         side_effect=lambda event: call_order.append(f"wait:{event}")
     )
@@ -742,8 +754,9 @@ def test_async_sched_step_order(overlap, has_valid_logits, expected_call_order):
     ):
         result = asyncio.run(controller._run_async_sched_step(overlap=overlap))
 
-    assert result["sample"].tolist() == sample_tokens.tolist()
-    assert result["cuda_graph_request_count"] == 7
+    assert not result.primer_only
+    assert result.output["sample"].tolist() == sample_tokens.tolist()
+    assert result.output["cuda_graph_request_count"] == 7
     assert context.async_sched_step_count == 1
     assert context.async_sched_compaction_step_count == 1
     assert call_order == expected_call_order
@@ -784,8 +797,10 @@ def test_async_sched_step_wires_sampling_through_resolution(
 
     controller._run_async_sched_forward = mock.Mock(side_effect=run_forward)
 
-    result = asyncio.run(controller._run_async_sched_step(overlap=False))
+    step_result = asyncio.run(controller._run_async_sched_step(overlap=False))
+    result = step_result.output
 
+    assert not step_result.primer_only
     assert torch.equal(result["sample"], sampled_tokens)
     assert result["finished_request_ids"].tolist() == expected_finished_ids
     context.copy_async_sched_sample_to_forward.assert_called_once()
@@ -826,8 +841,10 @@ def test_async_sched_step_yields_after_resolution_outside_inference_mode():
         )
         return await controller._run_async_sched_step(overlap=True)
 
-    result = asyncio.run(run_step())
+    step_result = asyncio.run(run_step())
+    result = step_result.output
 
+    assert not step_result.primer_only
     assert result["sample"].tolist() == [1]
     assert observed == [(1, False)]
 
@@ -851,12 +868,36 @@ def test_async_generate_output_tokens_dynamic_batch_routes(
     controller = _make_async_sched_controller(context)
     controller._run_legacy_step = mock.AsyncMock(return_value="legacy")
     controller._run_async_sched_step = mock.AsyncMock(
-        side_effect=lambda *, overlap: "overlap" if overlap else "async"
+        side_effect=lambda *, overlap: DynamicBatchControllerStepResult(
+            output="overlap" if overlap else "async"
+        )
     )
 
     result = asyncio.run(controller.async_generate_output_tokens_dynamic_batch(skip_bookkeeping))
 
-    assert result == expected_result
+    assert not result.primer_only
+    assert result.output == expected_result
+
+
+def test_generate_output_tokens_dynamic_batch_consumes_primer_result():
+    """The synchronous API hides primer-only controller calls from its caller."""
+    controller = _make_async_sched_controller()
+    expected_output = {"sample": torch.tensor([1])}
+    controller.async_generate_output_tokens_dynamic_batch = mock.AsyncMock(
+        side_effect=[
+            DynamicBatchControllerStepResult(primer_only=True),
+            DynamicBatchControllerStepResult(output=expected_output),
+        ]
+    )
+    loop = asyncio.new_event_loop()
+
+    try:
+        result = controller.generate_output_tokens_dynamic_batch(loop=loop)
+    finally:
+        loop.close()
+
+    assert result is expected_output
+    assert controller.async_generate_output_tokens_dynamic_batch.await_count == 2
 
 
 @pytest.mark.parametrize(
