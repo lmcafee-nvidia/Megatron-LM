@@ -15,6 +15,11 @@ from torch import Tensor
 from torch.cuda.nvtx import range_pop, range_push
 
 from megatron.core import parallel_state
+from megatron.core.inference.async_sched_diagnostics import (
+    capture_async_sched_forward_state,
+    force_async_sched_sample,
+    install_async_sched_layer_hooks,
+)
 from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.communication_utils import (
     broadcast_from_last_pipeline_stage,
@@ -196,6 +201,9 @@ class TextGenerationController:
 
         if self.inference_wrapped_model.inference_context.is_dynamic_batching():
             self._init_dynamic_sampling_tensors()
+            install_async_sched_layer_hooks(
+                unwrapped_model, self.inference_wrapped_model.inference_context
+            )
 
     def set_stop_word_finished_ids_callback(self, callback):
         """Set a callback to get request IDs that should be marked as finished due to stop words.
@@ -697,6 +705,7 @@ class TextGenerationController:
             position_ids (Tensor): The position IDs.
         """
         context = self.inference_wrapped_model.inference_context
+        capture_async_sched_forward_state(context, input_ids, position_ids, "before")
         if context.config.materialize_only_last_token_logits:
             logits_seq_len = context.num_last_token_logits
         else:
@@ -732,6 +741,8 @@ class TextGenerationController:
                 tensor=logits,
                 pp_group=self.pp_group,
             )
+
+        capture_async_sched_forward_state(context, input_ids, position_ids, "after", logits)
 
         # Copy logits to contiguous buffer.
         if self._enable_cuda_graph:
@@ -1148,6 +1159,9 @@ class TextGenerationController:
         )
         self._sampled_tokens_cuda[:active_request_count].copy_(
             sampled_tokens_cuda[:active_request_count]
+        )
+        force_async_sched_sample(
+            context, self._sampled_tokens_cuda[:active_request_count]
         )
 
     def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
@@ -1949,6 +1963,7 @@ class TextGenerationController:
         torch.argmax(
             self._all_logits_cuda.squeeze(0)[:active_request_count], dim=-1, out=sampled_tokens_gpu
         )
+        force_async_sched_sample(context, sampled_tokens_gpu)
         if sampled_tokens_gpu.is_cuda:
             current_stream = torch.cuda.current_stream(sampled_tokens_gpu.device)
             self._async_sched_sample_gpu_ready_event.record(current_stream)
