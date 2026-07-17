@@ -2380,7 +2380,7 @@ class TextGenerationController:
         ].tolist()
         max_top_n = max(top_n_counts, default=0)
         if max_top_n > 0:
-            top_n_result = torch.topk(log_probs, k=max_top_n, dim=-1)
+            top_n_result = torch.topk(log_probs[: sum(row_counts)], k=max_top_n, dim=-1)
             top_n_log_probs = top_n_result.values
             top_n_token_ids = top_n_result.indices
         else:
