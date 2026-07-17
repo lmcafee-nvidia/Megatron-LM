@@ -312,9 +312,7 @@ class TextGenerationController:
         self._sampled_mtp_tokens_cuda = torch.empty(
             [self.num_speculative_tokens, max_requests], dtype=torch.int64, device=device
         )
-        self._async_sched_mtp_token_row_indices = torch.arange(
-            context.max_tokens, device=device
-        )
+        self._async_sched_mtp_token_row_indices = torch.arange(context.max_tokens, device=device)
         self._accepted_tokens_per_request = (
             torch.ones(
                 [max_requests, self.num_speculative_tokens], dtype=torch.int64, device=device
@@ -2216,10 +2214,7 @@ class TextGenerationController:
         return repair_done_event
 
     def _run_async_sched_mtp_rewind(
-        self,
-        sample_result: _AsyncScheduleSampleResult,
-        *,
-        overlap: bool,
+        self, sample_result: _AsyncScheduleSampleResult, *, overlap: bool
     ) -> None:
         """Repair Mamba state and rewind CPU KV state after MTP verification.
 
@@ -2305,9 +2300,7 @@ class TextGenerationController:
                 : context.active_token_count
             ]
         self._async_sched_logits.set_pending(
-            cuda_graph_request_count,
-            forward_done_event,
-            token_row_indices,
+            cuda_graph_request_count, forward_done_event, token_row_indices
         )
 
         # Return the forward-done event.
@@ -2370,11 +2363,7 @@ class TextGenerationController:
         range_pop()
 
         # Finish the successor forward before releasing resources that it still uses.
-        if (
-            overlap
-            and next_forward_done_event is not None
-            and finished_request_ids.numel() > 0
-        ):
+        if overlap and next_forward_done_event is not None and finished_request_ids.numel() > 0:
             self._synchronize_async_sched_event(next_forward_done_event)
 
         # Resolve CPU request lifecycle state.
@@ -2504,7 +2493,7 @@ class TextGenerationController:
 
         A prefill or mixed forward instead follows sample -> resolve -> prepare
         -> forward. Resolving first converts surviving prefill requests to
-        decode before prepare builds uniform one-token successor rows.
+        decode before prepare builds uniform successor rows.
 
         Draft generation and Mamba repair remain enqueued while CPU rewind and
         preparation run in overlap mode.
@@ -2661,8 +2650,7 @@ class TextGenerationController:
                     self._synchronize_async_sched_event(bookkeeping_done_event)
 
             context.commit_sampled_tokens(
-                sample_result.sampled_tokens_cpu_view,
-                sample_result.sampled_mtp_tokens_cpu_view,
+                sample_result.sampled_tokens_cpu_view, sample_result.sampled_mtp_tokens_cpu_view
             )
 
             # Resolve N while forward N+1 continues unless finished resources are needed.

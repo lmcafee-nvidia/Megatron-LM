@@ -1363,9 +1363,11 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(8)
-    def test_async_sched_resolve_prefill_then_prepare_decode_rows(self):
+    @pytest.mark.parametrize("num_speculative_tokens", [0, 2])
+    def test_async_sched_resolve_prefill_then_prepare_decode_rows(self, num_speculative_tokens):
         """Prefill resolution leaves request rows ready for decode preparation."""
-        ctx = self._get_async_sched_context()
+        ctx = self._get_async_sched_context(num_speculative_tokens=num_speculative_tokens)
+        tokens_per_request = num_speculative_tokens + 1
         self._setup_async_sched_decode_rows(
             ctx,
             active_request_count=2,
@@ -1376,18 +1378,25 @@ class TestDynamicContext:
         ctx.num_prefill_requests = 1
         ctx.request_in_prefill_status_tensor[1] = 1
         ctx.request_query_lengths[1] = 4
-        ctx.active_token_count = 5
+        ctx.active_token_count = tokens_per_request + 4
 
         ctx.resolve_requests(torch.tensor([1, 1], dtype=torch.int32))
         ctx.prepare_requests()
 
         assert ctx.num_prefill_requests == 0
-        assert ctx.active_token_count == 2
+        assert ctx.active_token_count == 2 * tokens_per_request
         assert torch.equal(
-            ctx.request_kv_length_offsets[:2], torch.tensor([5, 10], dtype=torch.int32)
+            ctx.request_kv_length_offsets[:2],
+            torch.tensor([4 + tokens_per_request, 10], dtype=torch.int32),
         )
-        assert torch.equal(ctx.request_query_lengths[:2], torch.tensor([1, 1], dtype=torch.int32))
-        assert torch.equal(ctx.token_to_request_idx[:2], torch.tensor([0, 1], dtype=torch.int32))
+        assert torch.equal(
+            ctx.request_query_lengths[:2],
+            torch.tensor([tokens_per_request, tokens_per_request], dtype=torch.int32),
+        )
+        assert torch.equal(
+            ctx.token_to_request_idx[: 2 * tokens_per_request],
+            torch.arange(2, dtype=torch.int32).repeat_interleave(tokens_per_request),
+        )
 
     @pytest.mark.internal
     @rounder_override(8)

@@ -726,18 +726,16 @@ def test_repair_async_sched_mamba_state_updates_live_state():
     assert result is repair_done_event
 
 
-@pytest.mark.parametrize("num_prefill_requests, expected_mask", [(0, [1, 1]), (1, [0, 0])])
-def test_build_async_sched_request_state_accounts_for_unprepared_sample(
-    num_prefill_requests, expected_mask
-):
-    """Count the sampled token when prefill resolves before prepare."""
+@pytest.mark.parametrize("resolved_lengths, expected_mask", [([3, 3], [1, 1]), ([4, 4], [0, 0])])
+def test_build_async_sched_request_state_uses_resolved_lengths(resolved_lengths, expected_mask):
+    """Use the accepted sequence lengths captured before speculative prepare."""
     context = _make_async_sched_context(total_request_count=2)
-    context.num_prefill_requests = num_prefill_requests
-    context.get_active_sequence_lengths.return_value = torch.tensor([3, 3])
     context.get_max_sequence_lengths.return_value = torch.tensor([4, 4])
     controller = _make_async_sched_controller(context)
 
-    _, _, active_request_mask = controller._build_async_sched_request_state(torch.tensor([1, 2]))
+    _, _, active_request_mask = controller._build_async_sched_request_state(
+        torch.tensor([1, 2]), torch.tensor(resolved_lengths)
+    )
 
     assert active_request_mask.tolist() == expected_mask
 
@@ -830,11 +828,7 @@ def test_run_async_sched_resolve_waits_only_for_finish_boundary(
                 "yield",
             ],
         ),
-        (
-            False,
-            True,
-            ["wait:current", "prepare", "sample", "wait:sample", "resolve", "yield"],
-        ),
+        (False, True, ["wait:current", "prepare", "sample", "wait:sample", "resolve", "yield"]),
         (True, True, ["prepare", "sample", "wait:sample", "resolve", "yield"]),
     ],
 )
@@ -913,29 +907,48 @@ def test_async_sched_step_order(overlap, drain_pending_forward, expected_call_or
     assert call_order == expected_call_order
 
 
+@pytest.mark.parametrize("is_mtp", [False, True])
 @pytest.mark.parametrize("drain_pending_forward", [False, True])
-def test_run_async_sched_prefill_transition_resolves_before_prepare(drain_pending_forward):
+def test_run_async_sched_prefill_transition_resolves_before_prepare(drain_pending_forward, is_mtp):
     """Prefill resolves lifecycle state before building survivor decode rows."""
     context = _make_async_sched_context(total_request_count=3)
     context.num_prefill_requests = 1
     controller = _make_async_sched_controller(context)
+    controller.num_speculative_tokens = 2 if is_mtp else 0
     controller._async_sched_logits = AsyncScheduleLogitsState(
         is_valid=True, cuda_graph_request_count=7, ready_event="current"
     )
     sampled_tokens = torch.tensor([1, 2, 3])
+    sampled_mtp_tokens = torch.tensor([[10, 20, 30], [11, 21, 31]]) if is_mtp else None
+    sample_result = SimpleNamespace(
+        sampled_tokens_gpu=sampled_tokens,
+        sampled_tokens_cpu_view=sampled_tokens.clone(),
+        sampled_mtp_tokens_gpu=sampled_mtp_tokens,
+        sampled_mtp_tokens_cpu_view=sampled_mtp_tokens.clone() if is_mtp else None,
+        accepted_tokens_cpu_view=None,
+        sample_cpu_ready_event="sample",
+    )
     input_ids = torch.empty(2, dtype=torch.int64)
     position_ids = torch.empty(2, dtype=torch.int64)
     call_order = []
     resolve_result = SimpleNamespace(
         sampled_tokens_cpu=sampled_tokens,
+        accepted_tokens_cpu=None,
         active_request_ids=context.request_ids.long(),
         finished_request_ids=torch.tensor([11]),
         survivor_idxs=torch.tensor([0, 2]),
         compaction_done_event=None,
     )
 
-    controller._run_async_sched_sample = mock.Mock(return_value=sampled_tokens)
-    controller._copy_async_sched_sample_to_cpu = mock.Mock(return_value=(sampled_tokens, "sample"))
+    controller._run_async_sched_sample = mock.Mock(
+        side_effect=lambda: call_order.append("sample") or sample_result
+    )
+    controller._run_async_sched_sample_mtp = mock.Mock(
+        side_effect=lambda: call_order.append("sample_mtp") or sample_result
+    )
+    controller._run_async_sched_mtp_rewind = mock.Mock(
+        side_effect=lambda *_args, **_kwargs: call_order.append("rewind")
+    )
     controller._synchronize_async_sched_event = mock.Mock()
     controller._run_async_sched_resolve = mock.Mock(
         side_effect=lambda *_: call_order.append("resolve") or resolve_result
@@ -953,9 +966,26 @@ def test_run_async_sched_prefill_transition_resolves_before_prepare(drain_pendin
 
     assert result is resolve_result
     assert cuda_graph_request_count == 7
-    assert call_order == ["resolve", "prepare"]
+    assert call_order == (
+        ["sample_mtp", "rewind", "resolve", "prepare"]
+        if is_mtp
+        else ["sample", "resolve", "prepare"]
+    )
+    selected_sample = (
+        controller._run_async_sched_sample_mtp if is_mtp else controller._run_async_sched_sample
+    )
+    unselected_sample = (
+        controller._run_async_sched_sample if is_mtp else controller._run_async_sched_sample_mtp
+    )
+    selected_sample.assert_called_once_with()
+    unselected_sample.assert_not_called()
     context.commit_sampled_tokens.assert_called_once()
     assert torch.equal(context.commit_sampled_tokens.call_args.args[0], torch.tensor([1, 3]))
+    expected_mtp_tokens = torch.tensor([[10, 30], [11, 31]]) if is_mtp else None
+    if is_mtp:
+        assert torch.equal(context.commit_sampled_tokens.call_args.args[1], expected_mtp_tokens)
+    else:
+        assert context.commit_sampled_tokens.call_args.args[1] is None
     if drain_pending_forward:
         context.prepare_requests.assert_called_once_with()
         controller._run_async_sched_prepare.assert_not_called()
@@ -967,6 +997,12 @@ def test_run_async_sched_prefill_transition_resolves_before_prepare(drain_pendin
         assert torch.equal(
             context.copy_async_sched_sample_to_forward.call_args.args[0], torch.tensor([1, 3])
         )
+        if is_mtp:
+            assert torch.equal(
+                context.copy_async_sched_sample_to_forward.call_args.args[1], expected_mtp_tokens
+            )
+        else:
+            assert context.copy_async_sched_sample_to_forward.call_args.args[1] is None
         controller._run_async_sched_forward.assert_called_once_with(input_ids, position_ids)
 
 
@@ -978,13 +1014,21 @@ def test_run_async_sched_prefill_transition_stops_when_all_requests_finish():
     sampled_tokens = torch.tensor([1, 2])
     resolve_result = SimpleNamespace(
         sampled_tokens_cpu=sampled_tokens,
+        accepted_tokens_cpu=None,
         active_request_ids=context.request_ids.long(),
         finished_request_ids=context.request_ids.clone(),
         survivor_idxs=torch.empty(0, dtype=torch.int64),
         compaction_done_event=None,
     )
-    controller._run_async_sched_sample = mock.Mock(return_value=sampled_tokens)
-    controller._copy_async_sched_sample_to_cpu = mock.Mock(return_value=(sampled_tokens, "sample"))
+    sample_result = SimpleNamespace(
+        sampled_tokens_gpu=sampled_tokens,
+        sampled_tokens_cpu_view=sampled_tokens.clone(),
+        sampled_mtp_tokens_gpu=None,
+        sampled_mtp_tokens_cpu_view=None,
+        accepted_tokens_cpu_view=None,
+        sample_cpu_ready_event="sample",
+    )
+    controller._run_async_sched_sample = mock.Mock(return_value=sample_result)
     controller._synchronize_async_sched_event = mock.Mock()
     controller._run_async_sched_resolve = mock.Mock(return_value=resolve_result)
     controller._run_async_sched_prepare = mock.Mock()
@@ -997,6 +1041,7 @@ def test_run_async_sched_prefill_transition_stops_when_all_requests_finish():
     controller._run_async_sched_prepare.assert_not_called()
     context.commit_sampled_tokens.assert_not_called()
     context.copy_async_sched_sample_to_forward.assert_not_called()
+    context.release_async_sched_rewound_kv_blocks.assert_called_once_with()
 
 
 def test_async_sched_step_routes_prefill_transition():
@@ -1008,6 +1053,7 @@ def test_async_sched_step_routes_prefill_transition():
     sampled_tokens = torch.tensor([1, 2])
     resolve_result = SimpleNamespace(
         sampled_tokens_cpu=sampled_tokens,
+        accepted_tokens_cpu=None,
         active_request_ids=context.request_ids.long(),
         finished_request_ids=torch.empty(0, dtype=torch.int32),
         survivor_idxs=torch.tensor([0, 1]),

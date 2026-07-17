@@ -3828,9 +3828,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.token_to_local_position_within_kv_block[dst_token_idxs] = (
                     self.token_to_local_position_within_kv_block[survivor_token_idxs]
                 )
-                self.token_to_position_in_request[dst_token_idxs] = self.token_to_position_in_request[
-                    survivor_token_idxs
-                ]
+                self.token_to_position_in_request[dst_token_idxs] = (
+                    self.token_to_position_in_request[survivor_token_idxs]
+                )
 
         if not had_prefill_requests:
             self.token_to_request_idx[: active_request_count * tokens_per_request] = (
