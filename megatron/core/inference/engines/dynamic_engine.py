@@ -1006,8 +1006,6 @@ class DynamicInferenceEngine(AbstractEngine):
             raise ValueError("Async scheduling does not support chunked prefill.")
         if self.num_speculative_tokens > 0:
             raise ValueError("Async scheduling does not support speculative tokens.")
-        if self.context.is_hybrid_model:
-            raise ValueError("Async scheduling does not support hybrid/Mamba models.")
         if self.context.enable_prefix_caching:
             raise ValueError("Async scheduling does not support prefix caching.")
         if not self.materialize_only_last_token_logits:

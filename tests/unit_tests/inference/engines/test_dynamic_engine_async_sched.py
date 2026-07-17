@@ -54,7 +54,7 @@ def _make_engine(async_sched_mode=AsyncScheduleMode.SERIAL, **overrides):
         ({"enable_chunked_prefill": True}, True),
         ({"num_speculative_tokens": 1}, True),
         ({"async_sched_mode": AsyncScheduleMode.OVERLAP, "num_speculative_tokens": 1}, True),
-        ({"context_is_hybrid_model": True}, True),
+        ({"context_is_hybrid_model": True}, False),
         ({"context_enable_prefix_caching": True}, True),
         ({"materialize_only_last_token_logits": False}, True),
         ({"model_config_expert_model_parallel_size": 2}, True),

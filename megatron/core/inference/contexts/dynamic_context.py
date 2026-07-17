@@ -3664,6 +3664,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.request_last_kv_block_offset[dst_idxs] = self.request_last_kv_block_offset[
                 survivor_idxs
             ]
+            if self.is_hybrid_model:
+                self.mamba_metadata.request_to_mamba_state_idx[dst_idxs] = (
+                    self.mamba_metadata.request_to_mamba_state_idx[survivor_idxs]
+                )
             for metadata_tensor in self.request_metadata.values():
                 metadata_tensor[dst_idxs] = metadata_tensor[survivor_idxs]
 
@@ -3682,6 +3686,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.token_to_request_idx[:active_request_count] = dst_idxs
         stale_slice = slice(active_request_count, old_active_request_count)
         self.request_to_kv_block_ids[stale_slice] = -1
+        if self.is_hybrid_model:
+            self.mamba_metadata.request_to_mamba_state_idx[stale_slice] = -1
         self.total_request_count = active_request_count
         self.active_token_count = 0 if had_prefill_requests else active_request_count
         return finished_request_ids, survivor_idxs

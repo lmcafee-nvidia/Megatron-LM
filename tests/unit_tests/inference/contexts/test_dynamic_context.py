@@ -979,7 +979,7 @@ class TestDynamicContext:
                 )
             )
 
-    def _get_async_sched_context(self):
+    def _get_async_sched_context(self, is_hybrid_model=False):
         return self._get_dynamic_context(
             params_dtype=torch.float32,
             num_layers=2,
@@ -990,6 +990,8 @@ class TestDynamicContext:
             block_size_tokens=4,
             max_tokens=32,
             max_requests=8,
+            is_hybrid_model=is_hybrid_model,
+            layer_type_list=[Symbols.MAMBA, Symbols.ATTENTION],
         )
 
     @staticmethod
@@ -1033,9 +1035,14 @@ class TestDynamicContext:
         ctx.token_to_local_position_within_kv_block[active_slice] = (
             ctx.token_to_pos_ids[active_slice] % ctx.block_size_tokens
         )
+        if ctx.is_hybrid_model:
+            mamba_slots = ctx.mamba_metadata.batch_allocate_slots(active_request_count)
+            assert mamba_slots is not None
+            ctx.mamba_metadata.request_to_mamba_state_idx[active_slice] = mamba_slots
 
     @pytest.mark.internal
     @rounder_override(8)
+    @pytest.mark.parametrize("is_hybrid_model", [False, True])
     @pytest.mark.parametrize(
         "active_request_count, kv_offsets, last_offsets, expected_kv_offsets, expected_last_offsets",
         [
@@ -1046,6 +1053,7 @@ class TestDynamicContext:
     )
     def test_async_sched_prepare_requests_success(
         self,
+        is_hybrid_model,
         active_request_count,
         kv_offsets,
         last_offsets,
@@ -1053,7 +1061,7 @@ class TestDynamicContext:
         expected_last_offsets,
     ):
         """Async scheduling prepare advances active decode rows without lifecycle changes."""
-        ctx = self._get_async_sched_context()
+        ctx = self._get_async_sched_context(is_hybrid_model=is_hybrid_model)
         self._setup_async_sched_decode_rows(
             ctx,
             active_request_count=active_request_count,
@@ -1139,6 +1147,7 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(8)
+    @pytest.mark.parametrize("is_hybrid_model", [False, True])
     @pytest.mark.parametrize(
         "mask, has_prefill, expected_finished_ids, expected_request_ids, expected_survivor_idxs",
         [
@@ -1156,9 +1165,10 @@ class TestDynamicContext:
         expected_finished_ids,
         expected_request_ids,
         expected_survivor_idxs,
+        is_hybrid_model,
     ):
         """Async scheduling resolve preserves legacy request movement and transitions prefill."""
-        ctx = self._get_async_sched_context()
+        ctx = self._get_async_sched_context(is_hybrid_model=is_hybrid_model)
         self._setup_async_sched_decode_rows(
             ctx,
             active_request_count=len(mask),
@@ -1175,6 +1185,11 @@ class TestDynamicContext:
             ctx.token_to_request_idx[: ctx.active_token_count] = torch.tensor(
                 list(range(prefill_idx)) + [prefill_idx] * 4
             )
+        original_mamba_slots = None
+        if is_hybrid_model:
+            original_mamba_slots = ctx.mamba_metadata.request_to_mamba_state_idx[
+                : len(mask)
+            ].clone()
         active_mask = torch.tensor(mask, dtype=torch.int32)
         if torch.cuda.is_available():
             active_mask = active_mask.cuda()
@@ -1201,6 +1216,16 @@ class TestDynamicContext:
             assert torch.all(ctx.request_in_prefill_status_tensor[: len(expected_request_ids)] == 0)
         if not expected_request_ids:
             assert torch.all(ctx.request_to_kv_block_ids == -1)
+        if is_hybrid_model:
+            expected_mamba_slots = original_mamba_slots[survivor_idxs]
+            assert torch.equal(
+                ctx.mamba_metadata.request_to_mamba_state_idx[: len(expected_request_ids)],
+                expected_mamba_slots,
+            )
+            assert torch.all(
+                ctx.mamba_metadata.request_to_mamba_state_idx[len(expected_request_ids) : len(mask)]
+                == -1
+            )
 
     @pytest.mark.internal
     @rounder_override(8)

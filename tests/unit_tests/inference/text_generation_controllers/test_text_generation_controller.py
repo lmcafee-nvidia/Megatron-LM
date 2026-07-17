@@ -252,9 +252,6 @@ def _make_async_sched_controller(context=None, model_config=None):
     controller._enable_cuda_graph = False
     controller._async_sched_logits = AsyncScheduleLogitsState(is_valid=True)
     controller._sampled_tokens_cuda = torch.empty(context.max_requests, dtype=torch.int64)
-    controller._async_sched_sample_values_cuda = torch.empty(
-        context.max_requests, dtype=model_config.params_dtype
-    )
     controller._async_sched_sampled_tokens_cpu_buffer = torch.empty(
         context.max_requests, dtype=torch.int64
     )
@@ -554,10 +551,11 @@ def test_async_sched_primer_step_returns_before_prepare(overlap, expected_wait):
     assert context.async_sched_compaction_step_count == 0
 
 
-def test_run_async_sched_sample_reuses_gpu_buffer():
+@pytest.mark.parametrize("logits_dtype", [torch.float32, torch.bfloat16])
+def test_run_async_sched_sample_reuses_gpu_buffer(logits_dtype):
     context = _make_async_sched_context(total_request_count=3)
     controller = _make_async_sched_controller(context)
-    controller._all_logits_cuda = torch.zeros(1, 3, 5)
+    controller._all_logits_cuda = torch.zeros(1, 3, 5, dtype=logits_dtype)
     expected_tokens = torch.tensor([1, 2, 3], dtype=torch.int64)
     for idx, token in enumerate(expected_tokens.tolist()):
         controller._all_logits_cuda[0, idx, token] = 10.0
@@ -574,7 +572,6 @@ def test_run_async_sched_sample_records_gpu_ready_event():
     controller = _make_async_sched_controller(context)
     controller._all_logits_cuda = torch.zeros(1, 3, 5, device="cuda")
     controller._sampled_tokens_cuda = torch.empty(3, dtype=torch.int64, device="cuda")
-    controller._async_sched_sample_values_cuda = torch.empty(3, device="cuda")
     controller._async_sched_sample_gpu_ready_event = mock.Mock()
 
     controller._run_async_sched_sample()
