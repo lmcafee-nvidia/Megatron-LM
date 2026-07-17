@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+from collections import deque
 from types import SimpleNamespace
 from unittest import mock
 
@@ -27,8 +28,10 @@ def _make_engine(async_sched_mode=AsyncScheduleMode.SERIAL, **overrides):
     )
     engine.context = context
     engine.controller = SimpleNamespace(
-        inference_wrapped_model=SimpleNamespace(model=SimpleNamespace(config=model_config))
+        inference_wrapped_model=SimpleNamespace(model=SimpleNamespace(config=model_config)),
+        has_pending_async_forward=mock.Mock(return_value=False),
     )
+    engine.enable_chunked_prefill = False
     engine.num_speculative_tokens = 0
     engine.materialize_only_last_token_logits = True
 
@@ -48,6 +51,7 @@ def _make_engine(async_sched_mode=AsyncScheduleMode.SERIAL, **overrides):
         ({"async_sched_mode": AsyncScheduleMode.LEGACY, "num_speculative_tokens": 1}, False),
         ({}, False),
         ({"async_sched_mode": AsyncScheduleMode.OVERLAP}, False),
+        ({"enable_chunked_prefill": True}, True),
         ({"num_speculative_tokens": 1}, True),
         ({"async_sched_mode": AsyncScheduleMode.OVERLAP, "num_speculative_tokens": 1}, True),
         ({"context_is_hybrid_model": True}, True),
@@ -115,7 +119,7 @@ def test_async_forward_reenters_controller_after_primer_without_rescheduling():
     engine.state = EngineState.RUNNING
     engine.logging_step_interval = 0
     engine.metrics_writer = None
-    engine.schedule_waiting_requests = mock.Mock()
+    engine.schedule_waiting_requests = mock.Mock(return_value=False)
     engine.context = SimpleNamespace(
         step_count=4,
         prefix_cache_lru_clock=7,
@@ -144,6 +148,74 @@ def test_async_forward_reenters_controller_after_primer_without_rescheduling():
     assert engine.context.step_count == 5
     assert engine.context.prefix_cache_lru_clock == 8
     engine.schedule_waiting_requests.assert_called_once_with()
-    assert engine.controller.async_generate_output_tokens_dynamic_batch.await_count == 2
+    engine.controller.async_generate_output_tokens_dynamic_batch.assert_has_awaits(
+        [mock.call(drain_pending_forward=False), mock.call(drain_pending_forward=False)]
+    )
     range_push.assert_called_once_with("Decode")
     range_pop.assert_called_once_with("Decode")
+
+
+@pytest.mark.parametrize(
+    "mode, has_pending_forward, expected",
+    [
+        (AsyncScheduleMode.LEGACY, True, False),
+        (AsyncScheduleMode.SERIAL, True, True),
+        (AsyncScheduleMode.OVERLAP, True, True),
+        (AsyncScheduleMode.OVERLAP, False, False),
+    ],
+)
+def test_should_defer_async_sched_admission(mode, has_pending_forward, expected):
+    """Defer async admission only while a forward is pending."""
+    engine = _make_engine(async_sched_mode=mode)
+    engine.controller.has_pending_async_forward.return_value = has_pending_forward
+
+    assert engine._should_defer_async_sched_admission() is expected
+
+
+def test_ready_async_admission_stays_queued():
+    """Leave a ready request queued until pending async logits are drained."""
+    engine = _make_engine()
+    request = SimpleNamespace(remaining_prompt_tokens=[1, 2, 3])
+    engine.waiting_request_ids = deque([10])
+    engine.get_request = mock.Mock(return_value=request)
+    engine.context.check_availability = mock.Mock(return_value=(True, True, True))
+    engine.context.add_request = mock.Mock()
+    engine.context.enable_prefix_caching = False
+    engine._cg_admission_gating_active = mock.Mock(return_value=False)
+    engine._should_defer_async_sched_admission = mock.Mock(return_value=True)
+
+    assert engine.schedule_non_chunked_prefill() is True
+    assert list(engine.waiting_request_ids) == [10]
+    engine.context.add_request.assert_not_called()
+
+
+def test_async_forward_drains_then_admits_and_primes():
+    """Drain pending logits, admit the queued request, and launch its primer."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.state = EngineState.RUNNING
+    engine.logging_step_interval = 0
+    engine.metrics_writer = None
+    engine.schedule_waiting_requests = mock.Mock(side_effect=[True, False])
+    engine.context = SimpleNamespace(
+        step_count=4,
+        prefix_cache_lru_clock=7,
+        active_token_count=2,
+        is_decode_only=mock.Mock(return_value=True),
+    )
+    expected_output = {"sample": "tokens"}
+    engine.controller = SimpleNamespace(
+        async_generate_output_tokens_dynamic_batch=mock.AsyncMock(
+            side_effect=[
+                DynamicBatchControllerStepResult(output=expected_output),
+                DynamicBatchControllerStepResult(primer_only=True),
+            ]
+        )
+    )
+
+    output, _, _ = asyncio.run(engine.async_forward())
+
+    assert output is expected_output
+    assert engine.schedule_waiting_requests.call_count == 2
+    engine.controller.async_generate_output_tokens_dynamic_batch.assert_has_awaits(
+        [mock.call(drain_pending_forward=True), mock.call()]
+    )

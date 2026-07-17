@@ -130,6 +130,7 @@ class _AsyncScheduleResolveResult:
     sampled_tokens_cpu: Tensor
     active_request_ids: Tensor
     finished_request_ids: Tensor
+    survivor_idxs: Tensor
     compaction_done_event: Optional[torch.cuda.Event]
 
 
@@ -1789,6 +1790,14 @@ class TextGenerationController:
     # Begin async scheduling methods
     # -------------------------------------------------------------------------
 
+    def has_pending_async_forward(self) -> bool:
+        """Return whether an async forward remains to be sampled.
+
+        Returns:
+            bool: Whether pending async logits are available.
+        """
+        return self._async_sched_logits.is_valid
+
     def _validate_async_sched_support_for_step(self) -> None:
         """Validate controller/context state for async scheduling.
 
@@ -1899,15 +1908,15 @@ class TextGenerationController:
 
     def _build_async_sched_request_state(
         self, sampled_tokens_cpu: Tensor
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Build request IDs and active/finished row sets after prepare.
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """Build request IDs and the active/finished mask after prepare.
 
         Args:
             sampled_tokens_cpu (Tensor): Sampled CPU token IDs for active requests.
 
         Returns:
-            Tuple[Tensor, Tensor, Tensor, Tensor]: Active request IDs, finished
-                request IDs, active-request mask, and survivor row indices.
+            Tuple[Tensor, Tensor, Tensor]: Active request IDs, finished request
+                IDs, and the active-request mask.
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
@@ -1915,6 +1924,8 @@ class TextGenerationController:
         active_request_ids = context.request_ids[active_request_slice].long()
 
         active_sequence_lengths = context.get_active_sequence_lengths()
+        if context.num_prefill_requests != 0:
+            active_sequence_lengths = active_sequence_lengths + 1
         max_sequence_lengths = context.get_max_sequence_lengths()
         active_request_mask = (
             sampled_tokens_cpu != context.request_metadata["termination_id"][active_request_slice]
@@ -1924,10 +1935,9 @@ class TextGenerationController:
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
         )
         finished_request_ids = context.request_ids[finished_idxs].clone()
-        survivor_idxs = torch.nonzero(active_request_mask == 1, as_tuple=True)[0]
         assert sampled_tokens_cpu.numel() == active_request_count
 
-        return active_request_ids, finished_request_ids, active_request_mask, survivor_idxs
+        return active_request_ids, finished_request_ids, active_request_mask
 
     def _run_async_sched_sample(self) -> Tensor:
         """Sample active requests and record when their GPU tokens are ready.
@@ -2058,36 +2068,101 @@ class TextGenerationController:
         # Clone the transient D2H view before the next step can reuse its buffer.
         range_push("active_request_mask")
         sampled_tokens_cpu = sampled_tokens_cpu_view.clone()
-        context.commit_sampled_tokens(sampled_tokens_cpu)
-        (active_request_ids, finished_request_ids, active_request_mask, survivor_idxs) = (
+        active_request_ids, finished_request_ids, active_request_mask = (
             self._build_async_sched_request_state(sampled_tokens_cpu)
         )
         range_pop()
 
         # Finish the speculative forward before releasing finished-request resources.
-        if overlap and survivor_idxs.numel() < active_request_ids.numel():
+        if overlap and finished_request_ids.numel() > 0:
             self._synchronize_async_sched_event(forward_done_event)
 
         # Resolve CPU request lifecycle state.
         range_push("resolve_requests")
-        resolved_finished_request_ids = context.resolve_requests(active_request_mask)
+        resolved_finished_request_ids, survivor_idxs = context.resolve_requests(active_request_mask)
         range_pop()
 
         assert torch.equal(finished_request_ids, resolved_finished_request_ids)
 
-        # Compact only when survivor rows moved.
-        compaction_done_event = self._compact_async_sched_logits(survivor_idxs)
+        # Compact a pending successor only when survivor rows moved.
+        compaction_done_event = (
+            self._compact_async_sched_logits(survivor_idxs)
+            if self._async_sched_logits.is_valid
+            else None
+        )
 
         # Return the resolution result.
         return _AsyncScheduleResolveResult(
             sampled_tokens_cpu=sampled_tokens_cpu,
             active_request_ids=active_request_ids,
             finished_request_ids=finished_request_ids,
+            survivor_idxs=survivor_idxs,
             compaction_done_event=compaction_done_event,
         )
 
-    async def _run_async_sched_step(self, *, overlap: bool) -> DynamicBatchControllerStepResult:
-        """Run one decode-only step using the async scheduling path.
+    def _run_async_sched_prefill_transition(
+        self, *, overlap: bool, drain_pending_forward: bool
+    ) -> Tuple[_AsyncScheduleResolveResult, Optional[int]]:
+        """Resolve a prefill or mixed batch and prepare its decode successor.
+
+        Args:
+            overlap (bool): Whether GPU work may overlap CPU work.
+            drain_pending_forward (bool): Whether to stop after preparing CPU
+                state instead of launching a successor forward.
+
+        Returns:
+            Tuple[_AsyncScheduleResolveResult, Optional[int]]: Resolution state
+                and the CUDA graph request count used by the consumed forward.
+        """
+        context = self.inference_wrapped_model.inference_context
+        cuda_graph_request_count = self._async_sched_logits.cuda_graph_request_count
+
+        # Sample the completed prefill or mixed forward.
+        sampled_tokens_gpu = self._run_async_sched_sample()
+        sampled_tokens_cpu_view, sample_cpu_ready_event = self._copy_async_sched_sample_to_cpu(
+            sampled_tokens_gpu
+        )
+        self._synchronize_async_sched_event(sample_cpu_ready_event)
+
+        # Resolve request lifecycle before replacing prompt rows with decode rows.
+        self._async_sched_logits.clear()
+        resolve_result = self._run_async_sched_resolve(sampled_tokens_cpu_view, None, overlap)
+
+        if resolve_result.survivor_idxs.numel() == 0:
+            return resolve_result, cuda_graph_request_count
+
+        # Prepare one decode token for each surviving request.
+        if drain_pending_forward:
+            context.prepare_requests()
+            input_ids_gpu_view = position_ids_gpu_view = None
+        else:
+            input_ids_gpu_view, position_ids_gpu_view = self._run_async_sched_prepare()
+
+        sampled_tokens_cpu = resolve_result.sampled_tokens_cpu[resolve_result.survivor_idxs]
+        context.commit_sampled_tokens(sampled_tokens_cpu)
+
+        if drain_pending_forward:
+            return resolve_result, cuda_graph_request_count
+
+        # Populate and publish the successor decode input.
+        survivor_idxs_gpu = resolve_result.survivor_idxs.to(sampled_tokens_gpu.device)
+        context.copy_async_sched_sample_to_forward(sampled_tokens_gpu[survivor_idxs_gpu])
+        bookkeeping_done_event = self._run_async_sched_publish_bookkeeping()
+        if not overlap:
+            self._synchronize_async_sched_event(bookkeeping_done_event)
+
+        forward_done_event = self._run_async_sched_forward(
+            input_ids_gpu_view, position_ids_gpu_view
+        )
+        if not overlap:
+            self._synchronize_async_sched_event(forward_done_event)
+
+        return resolve_result, cuda_graph_request_count
+
+    async def _run_async_sched_step(
+        self, *, overlap: bool, drain_pending_forward: bool = False
+    ) -> DynamicBatchControllerStepResult:
+        """Run one step using the async scheduling path.
 
         A controller step launches at most one model forward. When no pending
         logits exist, this method launches only a forward primer and returns.
@@ -2101,6 +2176,10 @@ class TextGenerationController:
             CPU:            wait for required copies -> resolve N
                             while forward N+1 continues
 
+        A prefill or mixed forward instead follows sample -> resolve -> prepare
+        -> forward. Resolving first converts surviving prefill requests to
+        decode before prepare builds uniform one-token successor rows.
+
         Serial mode uses the same operation order but host-synchronizes at each
         boundary. Input and position tensors are live GPU views populated by
         stream-ordered copies before forward execution. CPU resolution cannot
@@ -2110,6 +2189,8 @@ class TextGenerationController:
         Args:
             overlap (bool): Whether to submit the next forward before waiting
                 for current-step GPU work.
+            drain_pending_forward (bool): Whether to consume pending logits
+                without launching a successor forward.
 
         Returns:
             DynamicBatchControllerStepResult: A primer-only indication or the
@@ -2129,6 +2210,10 @@ class TextGenerationController:
         # -------------------------------------------------------------------------
         # Primer
         # -------------------------------------------------------------------------
+        assert not (
+            drain_pending_forward and not self._async_sched_logits.is_valid
+        ), "Async admission drain requires pending logits."
+
         # Launch the forward primer if no existing logits state can be reused.
         primer_launched, primer_bookkeeping_done_event = self._run_async_sched_forward_primer()
 
@@ -2142,6 +2227,28 @@ class TextGenerationController:
             else:
                 self._synchronize_async_sched_event(current_logits_ready_event)
             return DynamicBatchControllerStepResult(primer_only=True)
+
+        if context.num_prefill_requests != 0:
+            with torch.inference_mode():
+                resolve_result, cuda_graph_request_count = self._run_async_sched_prefill_transition(
+                    overlap=overlap, drain_pending_forward=drain_pending_forward
+                )
+                context.async_sched_step_count += 1
+                result = {
+                    "active_request_ids": resolve_result.active_request_ids,
+                    "finished_request_ids": resolve_result.finished_request_ids,
+                    "sample": resolve_result.sampled_tokens_cpu,
+                    "finished_routing_block_ids": {},
+                    "newly_paused_request_ids": None,
+                    "evict_request_ids": None,
+                    "accepted_tokens": None,
+                    "log_probs": None,
+                    "top_n_logprobs": None,
+                    "cuda_graph_request_count": cuda_graph_request_count,
+                }
+
+            await asyncio.sleep(0)
+            return DynamicBatchControllerStepResult(output=result)
 
         with torch.inference_mode():
             cuda_graph_request_count = self._async_sched_logits.cuda_graph_request_count
@@ -2164,8 +2271,9 @@ class TextGenerationController:
             # Enqueue sampling behind the current logits-producing work.
             sampled_tokens_gpu = self._run_async_sched_sample()
 
-            # Populate the next forward's input-ID view directly from GPU samples.
-            context.copy_async_sched_sample_to_forward(sampled_tokens_gpu)
+            if not drain_pending_forward:
+                # Populate the next forward's input-ID view directly from GPU samples.
+                context.copy_async_sched_sample_to_forward(sampled_tokens_gpu)
 
             # Start D2H after sampling; it may overlap the GPU input-ID copy.
             sampled_tokens_cpu_view, sample_cpu_ready_event = self._copy_async_sched_sample_to_cpu(
@@ -2176,28 +2284,33 @@ class TextGenerationController:
             if not overlap:
                 self._synchronize_async_sched_event(sample_cpu_ready_event)
 
-            # -------------------------------------------------------------------------
-            # Forward
-            # -------------------------------------------------------------------------
-            # Publish positions and metadata without overwriting GPU-resident input IDs.
-            range_push("async_sched_transfer_bookkeeping_to_gpu")
-            bookkeeping_done_event = self._run_async_sched_publish_bookkeeping()
-            range_pop()
+            bookkeeping_done_event = None
+            forward_done_event = None
+            if drain_pending_forward:
+                self._async_sched_logits.clear()
+            else:
+                # -------------------------------------------------------------------------
+                # Forward
+                # -------------------------------------------------------------------------
+                # Publish positions and metadata without overwriting GPU-resident input IDs.
+                range_push("async_sched_transfer_bookkeeping_to_gpu")
+                bookkeeping_done_event = self._run_async_sched_publish_bookkeeping()
+                range_pop()
 
-            # Serial mode completes publication before submitting the forward.
-            if not overlap:
-                self._synchronize_async_sched_event(bookkeeping_done_event)
+                # Serial mode completes publication before submitting the forward.
+                if not overlap:
+                    self._synchronize_async_sched_event(bookkeeping_done_event)
 
-            # The compute stream orders both input updates before forward N+1.
-            range_push("async_sched_forward_pass")
-            forward_done_event = self._run_async_sched_forward(
-                input_ids_gpu_view, position_ids_gpu_view
-            )
-            range_pop()
+                # The compute stream orders both input updates before forward N+1.
+                range_push("async_sched_forward_pass")
+                forward_done_event = self._run_async_sched_forward(
+                    input_ids_gpu_view, position_ids_gpu_view
+                )
+                range_pop()
 
-            # Serial mode completes forward N+1 before resolving N.
-            if not overlap:
-                self._synchronize_async_sched_event(forward_done_event)
+                # Serial mode completes forward N+1 before resolving N.
+                if not overlap:
+                    self._synchronize_async_sched_event(forward_done_event)
 
             # -------------------------------------------------------------------------
             # Resolve
@@ -2205,7 +2318,10 @@ class TextGenerationController:
             # Resolution reads the CPU sample and mutates the H2D source buffer.
             if overlap:
                 self._synchronize_async_sched_event(sample_cpu_ready_event)
-                self._synchronize_async_sched_event(bookkeeping_done_event)
+                if bookkeeping_done_event is not None:
+                    self._synchronize_async_sched_event(bookkeeping_done_event)
+
+            context.commit_sampled_tokens(sampled_tokens_cpu_view)
 
             # Resolve N while forward N+1 continues unless finished resources are needed.
             resolve_result = self._run_async_sched_resolve(
@@ -2213,12 +2329,12 @@ class TextGenerationController:
             )
 
             # Serial mode completes any survivor compaction before returning.
-            if not overlap:
+            if not overlap and resolve_result.compaction_done_event is not None:
                 self._synchronize_async_sched_event(resolve_result.compaction_done_event)
 
             # Count async steps and steps that logically discarded speculative rows.
             context.async_sched_step_count += 1
-            if resolve_result.finished_request_ids.numel() > 0:
+            if not drain_pending_forward and resolve_result.finished_request_ids.numel() > 0:
                 context.async_sched_compaction_step_count += 1
 
             result = {
@@ -2407,13 +2523,15 @@ class TextGenerationController:
             return ret
 
     async def async_generate_output_tokens_dynamic_batch(
-        self, skip_bookkeeping: Optional[bool] = False
+        self, skip_bookkeeping: Optional[bool] = False, *, drain_pending_forward: bool = False
     ) -> DynamicBatchControllerStepResult:
         """Forward step the model and update the inference context.
 
         Args:
             skip_bookkeeping (Optional[bool]): If true, skip context bookkeeping
                 on the legacy path.
+            drain_pending_forward (bool): Whether to consume pending async logits
+                without launching a successor forward.
 
         Returns:
             DynamicBatchControllerStepResult: One controller-step result.
@@ -2421,16 +2539,21 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         mode = context.config.async_sched_mode
 
-        if mode == AsyncScheduleMode.LEGACY or context.num_prefill_requests != 0:
+        if mode == AsyncScheduleMode.LEGACY:
+            assert not drain_pending_forward, "Async admission drain requires async scheduling."
             return DynamicBatchControllerStepResult(
                 output=await self._run_legacy_step(skip_bookkeeping)
             )
         if mode == AsyncScheduleMode.SERIAL:
             assert not skip_bookkeeping, "Async scheduling requires request bookkeeping."
-            return await self._run_async_sched_step(overlap=False)
+            return await self._run_async_sched_step(
+                overlap=False, drain_pending_forward=drain_pending_forward
+            )
         if mode == AsyncScheduleMode.OVERLAP:
             assert not skip_bookkeeping, "Async scheduling requires request bookkeeping."
-            return await self._run_async_sched_step(overlap=True)
+            return await self._run_async_sched_step(
+                overlap=True, drain_pending_forward=drain_pending_forward
+            )
         raise AssertionError(f"Unexpected async scheduling mode: {mode}")
 
     @torch.inference_mode()

@@ -1002,6 +1002,8 @@ class DynamicInferenceEngine(AbstractEngine):
             return
 
         model_config = self.controller.inference_wrapped_model.model.config
+        if self.enable_chunked_prefill:
+            raise ValueError("Async scheduling does not support chunked prefill.")
         if self.num_speculative_tokens > 0:
             raise ValueError("Async scheduling does not support speculative tokens.")
         if self.context.is_hybrid_model:
@@ -1608,14 +1610,30 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         return {"waits": self._prefix_coordination_waits}
 
-    def schedule_waiting_requests(self):
-        """Tries to schedule any requests in the waiting pool."""
+    def _should_defer_async_sched_admission(self) -> bool:
+        """Return whether admission must wait for pending async logits.
+
+        Returns:
+            bool: Whether a ready request must remain queued for one drain step.
+        """
+        return (
+            self.context.config.async_sched_mode != AsyncScheduleMode.LEGACY
+            and self.controller.has_pending_async_forward()
+        )
+
+    def schedule_waiting_requests(self) -> bool:
+        """Try to schedule requests from the waiting pool.
+
+        Returns:
+            bool: Whether a ready request remained queued for one drain step.
+        """
         # Keep track of which requests get scheduled.
         waiting_before = set(self.waiting_request_ids)
         if self.enable_chunked_prefill:
             self.schedule_chunked_prefill()
+            admission_deferred = False
         else:
-            self.schedule_non_chunked_prefill()
+            admission_deferred = self.schedule_non_chunked_prefill()
         waiting_after = set(self.waiting_request_ids)
 
         # Re-stamp kv_cache_epoch on requests that were just scheduled.
@@ -1625,11 +1643,16 @@ class DynamicInferenceEngine(AbstractEngine):
                 if req.kv_cache_epoch is None:
                     req.kv_cache_epoch = [(0, self._generation_epoch)]
 
-    def schedule_non_chunked_prefill(self):
-        """
-        Perform the same original scheduling logic for non-chunked runs
+        return admission_deferred
+
+    def schedule_non_chunked_prefill(self) -> bool:
+        """Schedule non-chunked prefill requests.
+
+        Returns:
+            bool: Whether a ready request remained queued for one drain step.
         """
         prefix_caching_enabled = self.context.enable_prefix_caching
+        admission_deferred = False
         if prefix_caching_enabled:
             pending_block_hashes = set()
             pending_request_ids = []
@@ -1666,6 +1689,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     if not self._cg_admission_check(req, candidate):
                         break
 
+                if self._should_defer_async_sched_admission():
+                    admission_deferred = True
+                    break
+
                 # Add these hashes to pending.
                 if prefix_caching_enabled:
                     for block_hash in req.precomputed_block_hashes:
@@ -1684,6 +1711,8 @@ class DynamicInferenceEngine(AbstractEngine):
         # Prepend pending request ids to waiting queue.
         if prefix_caching_enabled and pending_request_ids:
             self.waiting_request_ids.extendleft(reversed(pending_request_ids))
+
+        return admission_deferred
 
     def _cg_admission_gating_active(self) -> bool:
         """Cudagraph-aware admission gating is active when --inference-cuda-graph-all-prefills
@@ -1934,8 +1963,8 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             raise EngineSuspendedError(self.context.step_count)
 
-        # schedule requests
-        self.schedule_waiting_requests()
+        # Schedule requests, or leave a ready admission queued for one drain step.
+        admission_deferred = self.schedule_waiting_requests()
 
         # The print block (async_bookkeep) and metrics block both fire on this
         # condition after step_count is incremented. Predict it up-front so we
@@ -1974,11 +2003,21 @@ class DynamicInferenceEngine(AbstractEngine):
             self.step_start_event.record()
         while True:
             controller_result: DynamicBatchControllerStepResult = (
-                await self.controller.async_generate_output_tokens_dynamic_batch()
+                await self.controller.async_generate_output_tokens_dynamic_batch(
+                    drain_pending_forward=admission_deferred
+                )
             )
             if not controller_result.primer_only:
                 result = controller_result.output
                 break
+
+        if admission_deferred:
+            # Admit against the resolved batch, then leave its mixed forward pending.
+            assert not self.schedule_waiting_requests(), "Async admission remained deferred."
+            primer_result = await self.controller.async_generate_output_tokens_dynamic_batch()
+            assert (
+                primer_result.primer_only or primer_result.output is None
+            ), "Async admission may only launch a forward primer."
         if will_log_this_step:
             self.step_end_event.record()
             self.step_end_event.synchronize()
