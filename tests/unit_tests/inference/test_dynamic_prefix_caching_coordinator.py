@@ -139,7 +139,17 @@ class DummyEngine(DynamicInferenceEngine):
         self.waiting_request_ids.append(request_id)
         return self.requests[request_id].future
 
-    async def async_step(self, *, verbose: Optional[bool] = False) -> Dict:
+    async def async_step(
+        self, *, has_local_work: bool = True, verbose: Optional[bool] = False
+    ) -> Dict:
+        if not has_local_work:
+            return {
+                "active_request_ids": [],
+                "finished_request_records": [],
+                "step_time": 0.0,
+                "cuda_graph_request_count": None,
+            }
+
         finished_request_records = []
         to_remove = []
         for request_id, entry in self.requests.items():

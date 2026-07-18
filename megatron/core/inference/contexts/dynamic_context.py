@@ -3508,16 +3508,15 @@ class DynamicInferenceContext(BaseInferenceContext):
     def prepare_requests(self) -> None:
         """Speculatively prepare active decode requests for the next forward pass.
 
-        Async scheduling only supports decode-only steps with no pause,
-        evict, or resume lifecycle changes. If preparing the next token would
-        require one of those lifecycle changes, this method raises and the caller
-        should treat async scheduling as unsupported for that workload.
+        Prefill requests must first transition to decode during resolution. This
+        phase does not perform pause, evict, resume, or other lifecycle changes.
+        If advancing a token would require one of those changes, it raises.
         """
         active_request_count = self.total_request_count - self.paused_request_count
         if self.num_speculative_tokens != 0:
             raise RuntimeError("Async scheduling does not support speculative tokens.")
         if self.num_prefill_requests != 0:
-            raise RuntimeError("Async scheduling only supports decode-only steps.")
+            raise RuntimeError("Async prepare requires decode-only request state.")
         if self.paused_request_count != 0:
             raise RuntimeError("Async scheduling does not support paused requests.")
 
@@ -3587,26 +3586,27 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.token_to_input_ids[:active_request_count] = sampled_tokens_cpu
 
-    def resolve_requests(self, active_requests_mask: Tensor) -> Tensor:
+    def resolve_requests(self, active_requests_mask: Tensor) -> Tuple[Tensor, Tensor]:
         """Resolve finished requests after an async scheduling forward pass.
 
-        Async scheduling supports only request completion. The active request rows
-        and current decode-token rows are compacted in survivor order so any
-        following legacy or async scheduling step sees a consistent context.
+        Prefill requests transition to decode during resolution. Request rows use
+        the same hole-filling order as ``update_requests`` so seeded sampling stays
+        consistent with legacy scheduling. Decode token rows are moved in the same
+        order when prepare has already built the successor input; prefill token rows
+        are left untouched because prepare rebuilds them after resolution.
 
         Args:
             active_requests_mask (Tensor): 1D mask marking requests that remain active.
 
         Returns:
-            Tensor: Request IDs for requests that finished during resolution.
+            Tuple[Tensor, Tensor]: Request IDs that finished and source row indices
+                for surviving requests in their resolved destination order.
         """
         if active_requests_mask.is_cuda:
             active_requests_mask = active_requests_mask.cpu()
 
         if self.num_speculative_tokens != 0:
             raise RuntimeError("Async scheduling does not support speculative tokens.")
-        if self.num_prefill_requests != 0:
-            raise RuntimeError("Async scheduling only supports decode-only steps.")
         if self.paused_request_count != 0:
             raise RuntimeError("Async scheduling does not support paused requests.")
 
@@ -3617,22 +3617,36 @@ class DynamicInferenceContext(BaseInferenceContext):
                 f"got {active_requests_mask.numel()}."
             )
 
-        survivor_idxs = torch.nonzero(active_requests_mask == 1, as_tuple=True)[0]
+        had_prefill_requests = self.num_prefill_requests != 0
+        self.num_prefill_requests = 0
+        self.request_in_prefill_status_tensor[self.request_in_prefill_status_tensor == 1] = 0
+
         finished_idxs = torch.nonzero(active_requests_mask == 0, as_tuple=True)[0]
         finished_request_ids = self.request_ids[finished_idxs].clone()
+
+        active_request_count = int(active_requests_mask.sum().item())
+        survivor_idxs = torch.arange(active_request_count, device='cpu')
+        finished_idxs_on_left = torch.nonzero(
+            active_requests_mask[:active_request_count] == 0, as_tuple=True
+        )[0]
+        active_idxs_on_right = (
+            torch.nonzero(active_requests_mask[active_request_count:] == 1, as_tuple=True)[0]
+            + active_request_count
+        )
+        assert finished_idxs_on_left.numel() == active_idxs_on_right.numel()
+        survivor_idxs[finished_idxs_on_left] = active_idxs_on_right
 
         self.reset_attention_state()
 
         if finished_idxs.numel() > 0:
             self.release_memory_blocks_from_request_indexes(finished_idxs)
 
-        active_request_count = survivor_idxs.numel()
         if active_request_count == 0:
             self.request_to_kv_block_ids.fill_(-1)
             self.total_request_count = 0
             self.active_token_count = 0
             self.reset_mamba_state()
-            return finished_request_ids
+            return finished_request_ids, survivor_idxs
 
         dst_idxs = torch.arange(active_request_count, device='cpu')
         if not torch.equal(survivor_idxs, dst_idxs):
@@ -3652,22 +3666,24 @@ class DynamicInferenceContext(BaseInferenceContext):
             for metadata_tensor in self.request_metadata.values():
                 metadata_tensor[dst_idxs] = metadata_tensor[survivor_idxs]
 
-            self.token_to_input_ids[dst_idxs] = self.token_to_input_ids[survivor_idxs]
-            self.token_to_pos_ids[dst_idxs] = self.token_to_pos_ids[survivor_idxs]
-            self.token_to_block_idx[dst_idxs] = self.token_to_block_idx[survivor_idxs]
-            self.token_to_local_position_within_kv_block[dst_idxs] = (
-                self.token_to_local_position_within_kv_block[survivor_idxs]
-            )
-            self.token_to_position_in_request[dst_idxs] = self.token_to_position_in_request[
-                survivor_idxs
-            ]
+            if not had_prefill_requests:
+                self.token_to_input_ids[dst_idxs] = self.token_to_input_ids[survivor_idxs]
+                self.token_to_pos_ids[dst_idxs] = self.token_to_pos_ids[survivor_idxs]
+                self.token_to_block_idx[dst_idxs] = self.token_to_block_idx[survivor_idxs]
+                self.token_to_local_position_within_kv_block[dst_idxs] = (
+                    self.token_to_local_position_within_kv_block[survivor_idxs]
+                )
+                self.token_to_position_in_request[dst_idxs] = self.token_to_position_in_request[
+                    survivor_idxs
+                ]
 
-        self.token_to_request_idx[:active_request_count] = dst_idxs
+        if not had_prefill_requests:
+            self.token_to_request_idx[:active_request_count] = dst_idxs
         stale_slice = slice(active_request_count, old_active_request_count)
         self.request_to_kv_block_ids[stale_slice] = -1
         self.total_request_count = active_request_count
-        self.active_token_count = active_request_count
-        return finished_request_ids
+        self.active_token_count = 0 if had_prefill_requests else active_request_count
+        return finished_request_ids, survivor_idxs
 
     def update_requests(
         self,

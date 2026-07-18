@@ -120,6 +120,7 @@ class DummyEngine(DynamicInferenceEngine):
         self.ep_world_size = 1
         self.disable_ep_consensus = False
         self.ep_consensus_interval = 1  # TODO: add tests for interval > 1 (e.g. verify pausing is delayed by at most N steps)
+        self.dummy_step_count = 0
 
         self.step_start_event = unittest.mock.MagicMock()
         self.step_end_event = unittest.mock.MagicMock()
@@ -170,9 +171,19 @@ class DummyEngine(DynamicInferenceEngine):
 
         return self.requests[request_id].future
 
-    async def async_step(self, *, verbose: Optional[bool] = False) -> Dict:
+    async def async_step(
+        self, *, has_local_work: bool = True, verbose: Optional[bool] = False
+    ) -> Dict:
         """Dummy async_step."""
         await asyncio.sleep(0)
+        if not has_local_work:
+            self.dummy_step_count += 1
+            return {
+                "active_request_ids": [],
+                "finished_request_records": [],
+                "step_time": 0.0,
+                "cuda_graph_request_count": None,
+            }
 
         # Finish "active" requests.
         finished_request_records = []
@@ -420,17 +431,13 @@ class TestCoordinator:
         self, initialize_model_parallel, coordinator, test_case_communicator
     ):
         """With disable_ep_consensus=True, the control loop must call
-        controller.dummy_forward() on iterations where local_pending == 0
-        instead of sleeping, so EP collectives stay in sync. Sleeping here
-        would deadlock peers running real forwards on EP > 1."""
+        async_step(has_local_work=False) on idle iterations so EP collectives
+        stay in sync. Sleeping would deadlock peers running real forwards."""
         dp_addr = coordinator
         port = int(dp_addr.rsplit(":", 1)[-1])
         requests = self.build_requests(num_requests=2)
         engine = DummyEngine()
         engine.disable_ep_consensus = True
-        engine.controller.dummy_forward = unittest.mock.MagicMock(
-            wraps=engine.controller.dummy_forward
-        )
         rank = torch.distributed.get_rank()
         client = None
 
@@ -445,13 +452,12 @@ class TestCoordinator:
                 client.start()
                 await asyncio.wait_for(engine.wait_until(EngineState.RUNNING), timeout=5.0)
 
-                # Idle window: with no work, the loop must spin on dummy_forward,
-                # not sleep. Several iterations should fire within 0.2s.
-                idle_baseline = engine.controller.dummy_forward.call_count
+                # Idle ranks must continue entering the unified dummy step.
+                idle_baseline = engine.dummy_step_count
                 await asyncio.sleep(0.2)
-                idle_calls = engine.controller.dummy_forward.call_count - idle_baseline
+                idle_calls = engine.dummy_step_count - idle_baseline
                 assert idle_calls > 0, (
-                    "disable_ep_consensus must call dummy_forward on idle iterations "
+                    "disable_ep_consensus must run dummy steps on idle iterations "
                     f"to keep EP collectives in sync (call_count={idle_calls})"
                 )
 

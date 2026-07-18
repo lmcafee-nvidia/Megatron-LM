@@ -1009,6 +1009,7 @@ class TestDynamicContext:
 
         active_slice = slice(0, active_request_count)
         ctx.request_ids[active_slice] = torch.tensor(request_ids, dtype=torch.int32)
+        ctx.request_in_prefill_status_tensor[active_slice] = 0
         ctx.request_query_lengths[active_slice] = 1
         ctx.request_output_lengths[active_slice] = 16
         ctx.request_kv_length_offsets[active_slice] = torch.tensor(kv_offsets, dtype=torch.int32)
@@ -1139,42 +1140,90 @@ class TestDynamicContext:
     @pytest.mark.internal
     @rounder_override(8)
     @pytest.mark.parametrize(
-        "mask, expected_finished_ids, expected_request_ids",
-        [([1, 1, 1], [], [10, 11, 12]), ([1, 0, 1], [11], [10, 12]), ([0, 0, 0], [10, 11, 12], [])],
+        "mask, has_prefill, expected_finished_ids, expected_request_ids, expected_survivor_idxs",
+        [
+            ([1, 1, 1], False, [], [10, 11, 12], [0, 1, 2]),
+            ([1, 0, 1], False, [11], [10, 12], [0, 2]),
+            ([1, 0, 1], True, [11], [10, 12], [0, 2]),
+            ([0, 1, 0, 1], False, [10, 12], [13, 11], [3, 1]),
+            ([0, 0, 0], False, [10, 11, 12], [], []),
+        ],
     )
     def test_async_sched_resolve_requests_success(
-        self, mask, expected_finished_ids, expected_request_ids
+        self, mask, has_prefill, expected_finished_ids, expected_request_ids, expected_survivor_idxs
     ):
-        """Async scheduling resolve compacts survivors and releases finished rows."""
+        """Async scheduling resolve preserves legacy request movement and transitions prefill."""
         ctx = self._get_async_sched_context()
         self._setup_async_sched_decode_rows(
             ctx,
             active_request_count=len(mask),
-            request_ids=[10, 11, 12],
-            kv_offsets=[4, 5, 6],
-            last_block_offsets=[0, 1, 2],
+            request_ids=list(range(10, 10 + len(mask))),
+            kv_offsets=list(range(4, 4 + len(mask))),
+            last_block_offsets=list(range(len(mask))),
         )
+        if has_prefill:
+            ctx.num_prefill_requests = 1
+            prefill_idx = len(mask) - 1
+            ctx.request_in_prefill_status_tensor[prefill_idx] = 1
+            ctx.request_query_lengths[prefill_idx] = 4
+            ctx.active_token_count = len(mask) + 3
+            ctx.token_to_request_idx[: ctx.active_token_count] = torch.tensor(
+                list(range(prefill_idx)) + [prefill_idx] * 4
+            )
         active_mask = torch.tensor(mask, dtype=torch.int32)
         if torch.cuda.is_available():
             active_mask = active_mask.cuda()
 
-        finished_request_ids = ctx.resolve_requests(active_mask)
+        finished_request_ids, survivor_idxs = ctx.resolve_requests(active_mask)
 
         assert torch.equal(
             finished_request_ids, torch.tensor(expected_finished_ids, dtype=torch.int32)
         )
+        assert torch.equal(survivor_idxs, torch.tensor(expected_survivor_idxs, dtype=torch.int64))
         assert ctx.total_request_count == len(expected_request_ids)
-        assert ctx.active_token_count == len(expected_request_ids)
+        assert ctx.active_token_count == (0 if has_prefill else len(expected_request_ids))
+        assert ctx.num_prefill_requests == 0
         assert torch.equal(
             ctx.request_ids[: len(expected_request_ids)],
             torch.tensor(expected_request_ids, dtype=torch.int32),
         )
-        assert torch.equal(
-            ctx.token_to_request_idx[: len(expected_request_ids)],
-            torch.arange(len(expected_request_ids), dtype=torch.int32),
-        )
+        if not has_prefill:
+            assert torch.equal(
+                ctx.token_to_request_idx[: len(expected_request_ids)],
+                torch.arange(len(expected_request_ids), dtype=torch.int32),
+            )
+        else:
+            assert torch.all(ctx.request_in_prefill_status_tensor[: len(expected_request_ids)] == 0)
         if not expected_request_ids:
             assert torch.all(ctx.request_to_kv_block_ids == -1)
+
+    @pytest.mark.internal
+    @rounder_override(8)
+    def test_async_sched_resolve_prefill_then_prepare_decode_rows(self):
+        """Prefill resolution leaves request rows ready for decode preparation."""
+        ctx = self._get_async_sched_context()
+        self._setup_async_sched_decode_rows(
+            ctx,
+            active_request_count=2,
+            request_ids=[10, 11],
+            kv_offsets=[4, 6],
+            last_block_offsets=[0, 2],
+        )
+        ctx.num_prefill_requests = 1
+        ctx.request_in_prefill_status_tensor[1] = 1
+        ctx.request_query_lengths[1] = 4
+        ctx.active_token_count = 5
+
+        ctx.resolve_requests(torch.tensor([1, 1], dtype=torch.int32))
+        ctx.prepare_requests()
+
+        assert ctx.num_prefill_requests == 0
+        assert ctx.active_token_count == 2
+        assert torch.equal(
+            ctx.request_kv_length_offsets[:2], torch.tensor([5, 10], dtype=torch.int32)
+        )
+        assert torch.equal(ctx.request_query_lengths[:2], torch.tensor([1, 1], dtype=torch.int32))
+        assert torch.equal(ctx.token_to_request_idx[:2], torch.tensor([0, 1], dtype=torch.int32))
 
     @pytest.mark.internal
     @rounder_override(8)
@@ -1182,7 +1231,6 @@ class TestDynamicContext:
         "setup, mask, expected_message",
         [
             (lambda ctx: setattr(ctx, "num_speculative_tokens", 1), [1, 1], "speculative"),
-            (lambda ctx: setattr(ctx, "num_prefill_requests", 1), [1, 1], "decode-only"),
             (lambda ctx: setattr(ctx, "paused_request_count", 1), [1, 1], "paused"),
             (lambda ctx: None, [1], "Expected active mask"),
         ],

@@ -43,6 +43,10 @@ from megatron.core.inference.inference_request import (
     Status,
 )
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.text_generation_controllers.async_schedule_step import (
+    StepResult,
+    StepSpecialization,
+)
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -1001,6 +1005,8 @@ class DynamicInferenceEngine(AbstractEngine):
             return
 
         model_config = self.controller.inference_wrapped_model.model.config
+        if self.enable_chunked_prefill:
+            raise ValueError("Async scheduling does not support chunked prefill.")
         if self.num_speculative_tokens > 0:
             raise ValueError("Async scheduling does not support speculative tokens.")
         if self.context.is_hybrid_model:
@@ -1607,14 +1613,30 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         return {"waits": self._prefix_coordination_waits}
 
-    def schedule_waiting_requests(self):
-        """Tries to schedule any requests in the waiting pool."""
+    def _should_defer_async_sched_admission(self) -> bool:
+        """Return whether admission must wait for pending async logits.
+
+        Returns:
+            bool: Whether a ready request must remain queued for one drain step.
+        """
+        return (
+            self.context.config.async_sched_mode != AsyncScheduleMode.LEGACY
+            and self.controller.has_pending_async_forward()
+        )
+
+    def schedule_waiting_requests(self) -> bool:
+        """Try to schedule requests from the waiting pool.
+
+        Returns:
+            bool: Whether a ready request remained queued for one drain step.
+        """
         # Keep track of which requests get scheduled.
         waiting_before = set(self.waiting_request_ids)
         if self.enable_chunked_prefill:
             self.schedule_chunked_prefill()
+            admission_deferred = False
         else:
-            self.schedule_non_chunked_prefill()
+            admission_deferred = self.schedule_non_chunked_prefill()
         waiting_after = set(self.waiting_request_ids)
 
         # Re-stamp kv_cache_epoch on requests that were just scheduled.
@@ -1624,11 +1646,16 @@ class DynamicInferenceEngine(AbstractEngine):
                 if req.kv_cache_epoch is None:
                     req.kv_cache_epoch = [(0, self._generation_epoch)]
 
-    def schedule_non_chunked_prefill(self):
-        """
-        Perform the same original scheduling logic for non-chunked runs
+        return admission_deferred
+
+    def schedule_non_chunked_prefill(self) -> bool:
+        """Schedule non-chunked prefill requests.
+
+        Returns:
+            bool: Whether a ready request remained queued for one drain step.
         """
         prefix_caching_enabled = self.context.enable_prefix_caching
+        admission_deferred = False
         if prefix_caching_enabled:
             pending_block_hashes = set()
             pending_request_ids = []
@@ -1665,6 +1692,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     if not self._cg_admission_check(req, candidate):
                         break
 
+                if self._should_defer_async_sched_admission():
+                    admission_deferred = True
+                    break
+
                 # Add these hashes to pending.
                 if prefix_caching_enabled:
                     for block_hash in req.precomputed_block_hashes:
@@ -1683,6 +1714,8 @@ class DynamicInferenceEngine(AbstractEngine):
         # Prepend pending request ids to waiting queue.
         if prefix_caching_enabled and pending_request_ids:
             self.waiting_request_ids.extendleft(reversed(pending_request_ids))
+
+        return admission_deferred
 
     def _cg_admission_gating_active(self) -> bool:
         """Cudagraph-aware admission gating is active when --inference-cuda-graph-all-prefills
@@ -1917,36 +1950,29 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 self.waiting_request_ids.extendleft(reversed(pending_request_ids))
 
-    async def async_forward(self) -> Tuple[Dict, Dict, float]:
-        """Uses `asyncio` for continuous generation.
-        Sleeps when no requests are available, until new requests have been added.
+    async def async_forward(self, *, has_local_work: bool = True) -> Tuple[StepResult, Dict, float]:
+        """Run controller forwards until one engine-visible step completes.
+
+        Args:
+            has_local_work: Whether this rank has requests to process.
 
         Returns:
-            A tuple comprised of:
-                step_result (Optional[Dict]): The result of the step.
-                context_state (Dict): A tuple consisting of the state of the context.
-                is_decode_only, total/paused request count, active token count.
-                step_time (float): How long this step took.
+            Tuple[StepResult, Dict, float]: Controller result, pre/post context
+                state, and step time in seconds.
         """
-
-        # If suspended, no stepping.
         if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             raise EngineSuspendedError(self.context.step_count)
 
-        # schedule requests
-        self.schedule_waiting_requests()
-
-        # The print block (async_bookkeep) and metrics block both fire on this
-        # condition after step_count is incremented. Predict it up-front so we
-        # can skip the GPU-timing sync and the context_state dict builds that
-        # only exist to feed those logging/metrics blocks.
+        # Dummy ranks participate in peer collectives without admitting requests.
+        admission_deferred = self.schedule_waiting_requests() if has_local_work else False
+        is_dummy = not has_local_work
         will_log_this_step = (
             self.logging_step_interval > 0
             and (self.context.step_count + 1) % self.logging_step_interval == 0
         )
 
         is_decode_only = self.context.is_decode_only()
-        if will_log_this_step:
+        if will_log_this_step and not is_dummy:
             pre_step_context_state = {
                 "is_decode_only": is_decode_only,
                 "max_requests": self.context.max_requests,
@@ -1956,34 +1982,50 @@ class DynamicInferenceEngine(AbstractEngine):
                 "step_count": self.context.step_count,
             }
         else:
-            # active_token_count and step_count are still consumed by
-            # post_process_requests' pre_fwd_* args (for add_event_generated_token);
-            # the other four fields are only read in the gated print block.
             pre_step_context_state = {
                 "active_token_count": self.context.active_token_count,
                 "step_count": self.context.step_count,
             }
 
-        # Generate tokens.
-        nvtx_range_push("Prefill" if not is_decode_only else "Decode")
-        # TODO @TDE: Account for this line when overlapping forward and bookkeep.
-        self.is_decode_only = is_decode_only
+        range_name = "EP-dummy-forward" if is_dummy else ("Decode" if is_decode_only else "Prefill")
+        nvtx_range_push(range_name)
+        if not is_dummy:
+            self.is_decode_only = is_decode_only
 
-        if will_log_this_step:
+        # Dummy completion remains synchronized exactly as in the coordinator path.
+        if is_dummy or will_log_this_step:
             self.step_start_event.record()
-        result = await self.controller.async_generate_output_tokens_dynamic_batch()
-        if will_log_this_step:
+        while True:
+            controller_result = await self.controller.async_generate_output_tokens_dynamic_batch(
+                has_local_work=has_local_work, drain_pending_forward=admission_deferred
+            )
+            if not controller_result.primer_only:
+                break
+
+        if admission_deferred:
+            # Admit against the resolved batch, then leave its mixed forward pending.
+            assert not self.schedule_waiting_requests(), "Async admission remained deferred."
+            primer_result = await self.controller.async_generate_output_tokens_dynamic_batch()
+            assert (
+                primer_result.primer_only or primer_result.output is None
+            ), "Async admission may only launch a forward primer."
+
+        if is_dummy:
+            self.step_end_event.record()
+            self.step_end_event.synchronize()
+            step_time = 0.0
+        elif will_log_this_step:
             self.step_end_event.record()
             self.step_end_event.synchronize()
             step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
         else:
             step_time = 0.0
+
         self.context.step_count += 1
         self.context.prefix_cache_lru_clock += 1
+        nvtx_range_pop(range_name)
 
-        nvtx_range_pop("Prefill" if not is_decode_only else "Decode")
-
-        if will_log_this_step:
+        if will_log_this_step and not is_dummy:
             kvcache_util_stats = (
                 self.context.get_kvcache_utilization_stats()
                 if self.metrics_writer is not None
@@ -2001,11 +2043,9 @@ class DynamicInferenceEngine(AbstractEngine):
             }
             context_state = {**pre_step_context_state, **post_step_context_state}
         else:
-            # Keep kv_stats=None so the metrics-block gate at `async_bookkeep`
-            # (`if context_state["kv_stats"] is not None`) remains well-typed.
             context_state = {**pre_step_context_state, "kv_stats": None}
 
-        return result, context_state, step_time
+        return controller_result, context_state, step_time
 
     async def async_bookkeep(
         self, step_result: Optional[Dict], context_state: Dict, step_time: float
@@ -2293,12 +2333,15 @@ class DynamicInferenceEngine(AbstractEngine):
         }
 
     async def async_step(
-        self,
+        self, *, has_local_work: bool = True
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """
         Wrapper for controller.generate_output_tokens_dynamic_batch(), to
         match vLLM API. Uses `asyncio` for continuous generation which allows this
         method to sleep and wake up when new requests are available.
+
+        Args:
+            has_local_work: Whether this rank has requests to process.
 
         Returns:
             A tuple comprised of:
@@ -2306,8 +2349,13 @@ class DynamicInferenceEngine(AbstractEngine):
                 2. Requests that ran in the last step and have now finished.
                 3. The step time in seconds.
         """
-        last_step_data = await self.async_forward()
-        ret = await self.async_bookkeep(*last_step_data)
+        step_result, context_state, step_time = await self.async_forward(
+            has_local_work=has_local_work
+        )
+        if step_result.specialization is StepSpecialization.DUMMY:
+            return [], [], step_time
+
+        ret = await self.async_bookkeep(step_result.output, context_state, step_time)
         # Keep for compatibility with current test suite.
         return ret
 
@@ -2656,27 +2704,19 @@ class DynamicInferenceEngine(AbstractEngine):
                         # NOTE: even with no consensus we must still participate in EP
                         # collectives (NCCL all-to-all, etc.) every iteration. A peer with
                         # real work will block at its all-to-all kernel waiting for this
-                        # rank, so when there is no local work we run dummy_forward()
-                        # rather than sleeping. Sleeping here would deadlock EP > 1.
+                        # rank, so when there is no local work we run a dummy-specialized
+                        # step rather than sleeping. Sleeping here would deadlock EP > 1.
                         if self.state == EngineState.PAUSING:
                             await self._world_barrier()
                             self.state = EngineState.PAUSED
                             self._state_events[EngineState.PAUSED].set()
-                        elif local_pending > 0:
-                            await self.async_step()
                         else:
-                            self.step_start_event.record()
-                            nvtx_range_push("EP-dummy-forward")
-                            self.controller.dummy_forward()
-                            self.step_end_event.record()
-                            self.step_end_event.synchronize()
-                            nvtx_range_pop("EP-dummy-forward")
-                            self.context.step_count += 1
-                            self.context.prefix_cache_lru_clock += 1
+                            await self.async_step(has_local_work=local_pending > 0)
                             # The consensus path yields via _ep_establish_consensus;
                             # without it we must still let other coroutines (signal
                             # delivery, request scheduling) run between steps.
-                            await asyncio.sleep(0)
+                            if local_pending == 0:
+                                await asyncio.sleep(0)
                         continue
                     global_work_from_last_consensus, _ = self._last_ep_consensus
                     if (
@@ -2703,18 +2743,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         self._state_events[EngineState.PAUSED].set()
                     elif global_work > 0:
                         # At least one EP peer has work: all must participate.
-                        if local_pending > 0:
-                            await self.async_step()
-                        else:
-                            # Dummy forward to participate in the EP collective.
-                            self.step_start_event.record()
-                            nvtx_range_push("EP-dummy-forward")
-                            self.controller.dummy_forward()
-                            self.step_end_event.record()
-                            self.step_end_event.synchronize()
-                            nvtx_range_pop("EP-dummy-forward")
-                            self.context.step_count += 1
-                            self.context.prefix_cache_lru_clock += 1
+                        await self.async_step(has_local_work=local_pending > 0)
                     else:
                         # No work, but not all pausing: idle.
                         await asyncio.sleep(0.02)
