@@ -1043,8 +1043,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if self.num_speculative_tokens > self.controller.num_mtp_depths:
             raise ValueError("Async scheduling requires one MTP depth per speculative token.")
-        if not self.materialize_only_last_token_logits:
-            raise ValueError("Async scheduling requires materialize_only_last_token_logits=True.")
 
     def _validate_async_sched_support_for_request(self, request: DynamicInferenceRequest) -> None:
         """Validate request-level restrictions for async scheduling.
@@ -1058,10 +1056,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if mode != AsyncScheduleMode.ASYNC:
             raise AssertionError(f"Unexpected async scheduling mode: {mode}")
 
-        sampling_params = request.sampling_params
-        if sampling_params.return_log_probs or sampling_params.top_n_logprobs > 0:
-            raise ValueError("Async scheduling does not support log probabilities.")
-        if sampling_params.stop_words:
+        if request.sampling_params.stop_words:
             raise ValueError("Async scheduling does not support stop words.")
 
     def _add_request(
