@@ -1918,11 +1918,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # Use remaining prompt tokens for scheduling decisions
             remaining_len = len(req.remaining_prompt_tokens)
-            token_partially_can_be_added = self.context.active_token_count < self.context.max_tokens
-            request_can_be_added, _, kv_cache_available = self.context.check_availability(req)
-            request_can_be_added = is_continuing_chunked_prefill or request_can_be_added
 
-            if request_can_be_added and kv_cache_available and token_partially_can_be_added:
+            if self._can_schedule_chunked_prefill(req):
                 # How many tokens we can admit this step.
                 token_budget = self.context.max_tokens - self.context.active_token_count
 
