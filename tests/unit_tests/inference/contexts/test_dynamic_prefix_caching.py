@@ -1509,6 +1509,24 @@ class TestPerBlockRouting(PrefixCachingTestBase):
     """Tests for per-block routing storage and reconstruction."""
 
     @pytest.mark.internal
+    def test_store_routing_per_block_uses_explicit_forward_layout(self):
+        """A saved forward layout remains valid after context token rows change."""
+        ctx = self._ctx()
+        alloc = ctx.kv_block_allocator
+        block_ids = alloc.allocate_memory_blocks(2).tolist()
+        routing = np.arange(12, dtype=np.int16).reshape(3, 2, 2)
+        routing_block_ids = np.array([block_ids[1], block_ids[0], block_ids[1]])
+        routing_positions = np.array([2, 0, 1])
+
+        ctx.token_to_block_idx[:3] = -1
+        ctx.token_to_local_position_within_kv_block[:3] = -1
+        alloc.store_routing_per_block(routing, routing_block_ids, routing_positions)
+
+        assert np.array_equal(alloc.get_block_routing(block_ids[0])[0], routing[1])
+        assert np.array_equal(alloc.get_block_routing(block_ids[1])[1], routing[2])
+        assert np.array_equal(alloc.get_block_routing(block_ids[1])[2], routing[0])
+
+    @pytest.mark.internal
     def test_store_and_get_block_routing(self):
         """Verify store_block_routing / get_block_routing round-trip."""
         ctx = self._ctx()
@@ -1741,19 +1759,36 @@ class TestPrefixCacheReuse(PrefixCachingTestBase):
         assert len(ctx.kv_block_allocator.kv_hash_to_block_id) == 0  # cleared
 
     @pytest.mark.internal
-    def test_reset_disabled_ignores_preserve_flag(self):
-        # When prefix caching is disabled, preserve_prefix_cache=True still performs
-        # a full reset: step_count returns to 0.
-        ctx_off = self._ctx(enable_prefix_caching=False)
-        ctx_off.step_count = 7
-        ctx_off.reset(preserve_prefix_cache=True)
-        assert ctx_off.step_count == 0
+    @pytest.mark.parametrize("enable_prefix_caching", [False, True])
+    @pytest.mark.parametrize("preserve_prefix_cache", [False, True])
+    @pytest.mark.parametrize("preserve_counters", [False, True])
+    def test_reset_counter_preservation_is_explicit(
+        self, enable_prefix_caching, preserve_prefix_cache, preserve_counters
+    ):
+        """Counter preservation is independent of prefix-cache configuration."""
+        ctx = self._ctx(buffer_size_gb=0.01, rounder=8, enable_prefix_caching=enable_prefix_caching)
+        counter_values = {
+            "step_count": 3,
+            "prefix_cache_lru_clock": 4,
+            "lifetime_prefill_token_count": 5,
+            "async_sched_step_count": 6,
+            "async_sched_compaction_step_count": 7,
+        }
+        for name, value in counter_values.items():
+            setattr(ctx, name, value)
+        ctx.total_request_count = 1
+        ctx.active_token_count = 1
+        ctx.request_ids[0] = 10
 
-        # With caching ON, preserve keeps step_count monotonic (for logging cadence).
-        ctx_on = self._ctx(enable_prefix_caching=True)
-        ctx_on.step_count = 7
-        ctx_on.reset(preserve_prefix_cache=True)
-        assert ctx_on.step_count == 7
+        ctx.reset(preserve_prefix_cache=preserve_prefix_cache, preserve_counters=preserve_counters)
+
+        expected_counters = (
+            counter_values if preserve_counters else dict.fromkeys(counter_values, 0)
+        )
+        assert {name: getattr(ctx, name) for name in counter_values} == expected_counters
+        assert ctx.total_request_count == 0
+        assert ctx.active_token_count == 0
+        assert ctx.request_ids[0] == -1
 
     @pytest.mark.internal
     def test_prefill_computed_and_skipped_counters(self):
