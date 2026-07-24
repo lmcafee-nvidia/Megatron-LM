@@ -84,7 +84,7 @@ def _make_engine(async_sched_mode=AsyncScheduleMode.ASYNC, **overrides):
         ({"materialize_only_last_token_logits": False}, True),
         ({"model_config_expert_model_parallel_size": 2}, False),
         ({"model_config_num_moe_experts": 4}, False),
-        ({"model_config_moe_enable_routing_replay": True}, True),
+        ({"model_config_moe_enable_routing_replay": True}, False),
     ],
 )
 def test_validate_async_sched_support_for_config(overrides, should_raise):
