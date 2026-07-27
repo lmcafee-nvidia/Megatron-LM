@@ -4349,16 +4349,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             Tuple[Tensor, Tensor]: Selected-token log probabilities flattened in
                 active-token order and the full per-row log-probability tensor.
         """
-        logits_squeezed = logits.squeeze(0).float()
+        logits_squeezed = logits.squeeze(0)
         n_active = self.total_request_count - self.paused_request_count
 
         if only_last_token_logits or self.is_decode_only():
             seq_idx = torch.arange(len(new_tokens), dtype=torch.int32, device=logits.device)
+            active_logits = logits_squeezed[: len(new_tokens)].float()
             log_probs = self._processed_log_probs(
-                logits_squeezed[seq_idx], n_active, None, sampling, row_to_request
+                active_logits, n_active, None, sampling, row_to_request
             )
             return log_probs[seq_idx, new_tokens], log_probs
 
+        logits_squeezed = logits_squeezed.float()
         active_slice = slice(self.paused_request_count, self.total_request_count)
         active_query_lengths_cpu = self.request_query_lengths[active_slice]
         active_query_lengths_gpu = self.gpu_view.request_query_lengths[:n_active]

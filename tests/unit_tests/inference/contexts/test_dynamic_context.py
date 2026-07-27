@@ -1801,9 +1801,9 @@ class TestDynamicContext:
         dynamic_context.initialize_attention_state()
         dynamic_context.transfer_bookkeeping_to_gpu()
 
-        # Generate new logits for the decode step. Now each request contributes 1 token.
+        # Generate a padded decode buffer where each active request contributes 1 token.
         decode_logits = torch.randn(
-            1, num_active_requests, vocab_size, device='cuda', dtype=torch.float32
+            1, num_active_requests + 3, vocab_size, device='cuda', dtype=torch.bfloat16
         )
         decode_new_tokens = torch.randint(0, 100, (num_active_requests,), device='cuda').long()
         decode_log_probs, decode_log_probs_full = dynamic_context.calculate_log_probs(
@@ -1812,7 +1812,9 @@ class TestDynamicContext:
 
         # Verify the stored decode log probabilities
         decode_active = [(req_id, 1) for req_id in request_data]
-        expected_decode_full = expected_log_probs(decode_logits, decode_active)
+        expected_decode_full = expected_log_probs(
+            decode_logits[:, :num_active_requests], decode_active
+        )
         assert torch.allclose(decode_log_probs_full, expected_decode_full, atol=1e-6)
         expected_decode_log_probs = expected_decode_full.to(torch.float32)
 
