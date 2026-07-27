@@ -385,14 +385,11 @@ class TextGenerationController:
             self._sampling: Sampling = FlashInferSampling(
                 self.vocab_size,
                 self.sampling_rng,
-                sampled_tokens_buffer=self._sampled_tokens_cuda,
                 config=self.model_config,
                 enable_cuda_graph=self._enable_cuda_graph,
             )
         else:
-            self._sampling: Sampling = TorchSampling(
-                self.sampling_rng, self.vocab_size, sampled_tokens_buffer=self._sampled_tokens_cuda
-            )
+            self._sampling: Sampling = TorchSampling(self.sampling_rng, self.vocab_size)
 
         # Cache values that are constant across inference steps.
         self._unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
@@ -1306,13 +1303,14 @@ class TextGenerationController:
             else context.gpu_view.active_request_last_token_idxs
         )
         no_top_k, no_top_p = self._active_requests_sampling_filter_flags(active_request_count)
-        self._sampling.sample_kernel_into(
+        self._sampling.sample_kernel(
             self._all_logits_cuda.squeeze(0),
             n,
             context,
             gather_indices=gather_indices,
             no_top_k=no_top_k,
             no_top_p=no_top_p,
+            output=self._sampled_tokens_cuda[:n],
         )
 
     def _active_requests_sampling_filter_flags(

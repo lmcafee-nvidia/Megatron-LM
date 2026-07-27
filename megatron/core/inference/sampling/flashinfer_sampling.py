@@ -31,25 +31,11 @@ class FlashInferSampling(Sampling):
     """
 
     def __init__(
-        self,
-        vocab_size: int,
-        rng: torch.Generator,
-        config=None,
-        enable_cuda_graph: bool = False,
-        sampled_tokens_buffer: Optional[Tensor] = None,
+        self, vocab_size: int, rng: torch.Generator, config=None, enable_cuda_graph: bool = False
     ) -> None:
-        """Initialize FlashInfer sampling.
-
-        Args:
-            vocab_size: Model vocabulary size.
-            rng: Generator used by FlashInfer sampling.
-            config: Accepted for factory API symmetry.
-            enable_cuda_graph: Accepted for factory API symmetry.
-            sampled_tokens_buffer: Stable destination used by ordinary dynamic sampling.
-        """
-        # FlashInfer sampling remains eager so each launch consumes fresh RNG state.
+        # `config` / `enable_cuda_graph` are accepted for factory API symmetry but
+        # intentionally unused: the sampler is never graphed (see class docstring).
         del config, enable_cuda_graph
-        super().__init__(sampled_tokens_buffer)
         self._vocab_size = vocab_size
         self._rng = rng
 

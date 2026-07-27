@@ -14,14 +14,6 @@ class Sampling(ABC):
     CUDA graphs are added via `CudaGraphManager`.
     """
 
-    def __init__(self, sampled_tokens_buffer: Optional[Tensor] = None) -> None:
-        """Initialize a sampling backend.
-
-        Args:
-            sampled_tokens_buffer: Stable destination used by ordinary dynamic sampling.
-        """
-        self._sampled_tokens_buffer = sampled_tokens_buffer
-
     @abstractmethod
     def sample_kernel(
         self,
@@ -57,46 +49,6 @@ class Sampling(ABC):
             Sampled token ids of shape `[n]`.
         """
         ...
-
-    def sample_kernel_into(
-        self,
-        logits: Tensor,
-        n: int,
-        context,
-        *,
-        no_top_k: bool,
-        no_top_p: bool,
-        gather_indices: Optional[Tensor] = None,
-        eager: bool = False,
-        cache_key: Any = None,
-    ) -> tuple:
-        """Sample ordinary dynamic requests into the stable controller buffer.
-
-        Args:
-            logits: Logits tensor of shape `[>=n, vocab_size]`.
-            n: Number of rows to sample.
-            context: The active DynamicInferenceContext.
-            no_top_k, no_top_p: Batch-level sampling-filter flags.
-            gather_indices: If provided, only sample from `logits[gather_indices[:n], :]`.
-            eager: Whether to bypass a wrapped CUDA graph.
-            cache_key: CUDA graph lookup key.
-        """
-        # CudaGraphManager consumes these args, if it exists.
-        del eager, cache_key
-
-        assert self._sampled_tokens_buffer is not None
-        assert n <= self._sampled_tokens_buffer.numel()
-        self.sample_kernel(
-            logits,
-            n,
-            context,
-            no_top_k=no_top_k,
-            no_top_p=no_top_p,
-            gather_indices=gather_indices,
-            output=self._sampled_tokens_buffer[:n],
-        )
-        # CudaGraphManager expects an iterable output, even when no tensor is returned.
-        return ()
 
     def sample_speculative(
         self,
@@ -163,6 +115,7 @@ class Sampling(ABC):
             no_top_p=no_top_p,
             gather_indices=gather_indices,
             token_to_request_index=token_to_request_index,
+            eager=True,
         )
 
     @abstractmethod

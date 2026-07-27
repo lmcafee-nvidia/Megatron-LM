@@ -15,17 +15,7 @@ class TorchSampling(Sampling):
     Groups requests into unique buckets by `(temperature, top_k, top_p)` for separate launches.
     """
 
-    def __init__(
-        self, rng: torch.Generator, vocab_size: int, sampled_tokens_buffer: Optional[Tensor] = None
-    ) -> None:
-        """Initialize Torch sampling.
-
-        Args:
-            rng: Generator used for multinomial sampling.
-            vocab_size: Model vocabulary size.
-            sampled_tokens_buffer: Stable destination used by ordinary dynamic sampling.
-        """
-        super().__init__(sampled_tokens_buffer)
+    def __init__(self, rng: torch.Generator, vocab_size: int) -> None:
         self._rng = rng
         self._vocab_size = vocab_size
 

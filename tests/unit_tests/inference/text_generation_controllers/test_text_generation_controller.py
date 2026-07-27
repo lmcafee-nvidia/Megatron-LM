@@ -285,16 +285,16 @@ def _make_async_sched_controller(context=None, model_config=None):
     controller._async_sched_mtp_token_row_indices = None
     controller._all_logits_cuda = torch.empty(0)
     controller._sampled_tokens_cuda = torch.empty(context.max_requests, dtype=torch.int64)
-    controller._sampling = SimpleNamespace()
 
-    def sample_kernel_into(logits, n, _context, **_kwargs):
-        controller._sampled_tokens_cuda[:n].copy_(torch.argmax(logits[:n], dim=-1))
-        return ()
+    def sample_kernel(logits, n, _context, **kwargs):
+        sampled_tokens = torch.argmax(logits[:n], dim=-1)
+        output = kwargs.get("output")
+        if output is None:
+            return sampled_tokens
+        output.copy_(sampled_tokens)
+        return output
 
-    controller._sampling.sample_kernel = mock.Mock(
-        side_effect=lambda logits, n, _context, **_kwargs: torch.argmax(logits[:n], dim=-1)
-    )
-    controller._sampling.sample_kernel_into = mock.Mock(side_effect=sample_kernel_into)
+    controller._sampling = SimpleNamespace(sample_kernel=mock.Mock(side_effect=sample_kernel))
     controller._async_sched_sampled_tokens_cpu_buffer = torch.empty(
         context.max_requests, dtype=torch.int64
     )
@@ -940,55 +940,17 @@ def test_run_async_sched_sample_reuses_gpu_buffer(logits_dtype):
     assert torch.equal(result.sampled_tokens_cpu_view, expected_tokens)
     assert result.routing_record is routing_record
     assert controller._async_sched_forward.routing_record is None
-    controller._sampling.sample_kernel_into.assert_called_once()
-    logits, n, called_context = controller._sampling.sample_kernel_into.call_args.args
+    controller._sampling.sample_kernel.assert_called_once()
+    logits, n, called_context = controller._sampling.sample_kernel.call_args.args
     assert torch.equal(logits, controller._all_logits_cuda.squeeze(0))
     assert n == 3
     assert called_context is context
-    assert controller._sampling.sample_kernel_into.call_args.kwargs == {
-        "gather_indices": None,
-        "eager": True,
-        "cache_key": None,
-    }
-
-
-@pytest.mark.parametrize(
-    "backend, enable_cuda_graph, using_cuda_graph, expected_n, expected_eager, expected_cache_key",
-    [
-        ("torch", True, True, 3, True, None),
-        ("flashinfer", False, False, 3, True, None),
-        ("flashinfer", True, True, 8, False, ("sample", 8)),
-    ],
-)
-def test_run_async_sched_sample_routes_backend_and_graph(
-    backend, enable_cuda_graph, using_cuda_graph, expected_n, expected_eager, expected_cache_key
-):
-    context = _make_async_sched_context(total_request_count=3)
-    context.max_requests = context.padded_active_request_count
-    context.using_cuda_graph_this_step.return_value = using_cuda_graph
-    controller = _make_async_sched_controller(context)
-    controller._sampling_backend = backend
-    controller._enable_cuda_graph = enable_cuda_graph
-    controller._all_logits_cuda = torch.zeros(1, 8, 5)
-    controller._sampling.sample_kernel_into.side_effect = (
-        lambda _logits, n, _context, **_kwargs: controller._sampled_tokens_cuda[:n].copy_(
-            torch.arange(n)
-        )
-    )
-
-    result = controller._run_async_sched_sample()
-
-    assert torch.equal(result.sampled_tokens_gpu, torch.tensor([0, 1, 2]))
-    controller._sampling.sample_kernel_into.assert_called_once()
-    logits, n, called_context = controller._sampling.sample_kernel_into.call_args.args
-    assert torch.equal(logits, controller._all_logits_cuda.squeeze(0))
-    assert n == expected_n
-    assert called_context is context
-    assert controller._sampling.sample_kernel_into.call_args.kwargs == {
-        "gather_indices": None,
-        "eager": expected_eager,
-        "cache_key": expected_cache_key,
-    }
+    sample_kwargs = controller._sampling.sample_kernel.call_args.kwargs
+    assert set(sample_kwargs) == {"gather_indices", "no_top_k", "no_top_p", "output"}
+    assert sample_kwargs["gather_indices"] is None
+    assert not sample_kwargs["no_top_k"]
+    assert sample_kwargs["no_top_p"]
+    assert sample_kwargs["output"].data_ptr() == controller._sampled_tokens_cuda.data_ptr()
 
 
 @pytest.mark.internal
@@ -1986,10 +1948,10 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         """`_sampled_tokens_cuda` is a single `max_requests` buffer written in place by
         every sampling path. The non-speculative path (`_dynamic_step_sample_logits`)
         writes its `active_request_count` prefix, and the async-scheduling path
-        (`_run_async_sched_sample`) writes its own prefix via `torch.max(out=...)`. The
-        buffer must retain its full capacity across successive steps regardless of each
-        step's active count, so a later step with more active requests than an earlier
-        one still has an in-bounds destination.
+        (`_run_async_sched_sample`) writes its own prefix through `sample_kernel`. The buffer
+        must retain its full capacity across successive steps regardless of each step's
+        active count, so a later step with more active requests than an earlier one still
+        has an in-bounds destination.
 
         Drive a small-batch non-speculative sample followed by a larger-batch async
         sample through the same buffer, and confirm the buffer keeps its capacity and
@@ -2029,10 +1991,12 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         assert controller._sampled_tokens_cuda.data_ptr() == buffer_ptr
         assert torch.equal(controller._sampled_tokens_cuda[:small_count], small_expected)
 
-        # Async-scheduling sample over a larger active batch through the same buffer;
-        # its `torch.max(out=...)` destination is `_sampled_tokens_cuda[:large_count]`.
+        # Async-scheduling sample over a larger active batch through the same buffer.
         context.total_request_count = large_count
         context.paused_request_count = 0
+        context.active_request_metadata["temperature"][:large_count].fill_(1.0)
+        context.active_request_metadata["top_k"][:large_count].fill_(1)
+        context.active_request_metadata["top_p"][:large_count].fill_(0.0)
         large_expected = torch.tensor([0, 1, 2, 3, 4], device="cuda")
         large_logits = torch.zeros(1, large_count, self.vocab_size, device="cuda")
         for row, col in enumerate(large_expected.tolist()):

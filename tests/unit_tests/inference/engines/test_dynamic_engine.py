@@ -51,7 +51,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord, delete_cuda_graphs
+from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
@@ -1215,7 +1215,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             pytest.param({}, "torch", 0.8, 10, 0.0, None, id="torch-eager-top-k"),
             pytest.param({}, "torch", 1.0, 0, 0.9, 2, id="torch-graphed-forward-top-p"),
             pytest.param({}, "flashinfer", 1.2, 0, 0.0, None, id="flashinfer-eager-unfiltered"),
-            pytest.param({}, "flashinfer", 0.8, 10, 0.9, 2, id="flashinfer-sampling-graph"),
+            pytest.param({}, "flashinfer", 0.8, 10, 0.9, 2, id="flashinfer-graphed-forward"),
             pytest.param(
                 {
                     "model_provider": "hybrid",
@@ -1279,15 +1279,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert (
             generated_tokens[AsyncScheduleMode.ASYNC] == generated_tokens[AsyncScheduleMode.LEGACY]
         )
-
-        if sampling_backend == "flashinfer" and num_cuda_graphs is not None:
-            assert final_env is not None
-            assert any(
-                runner.base_module is final_env.engine.controller._sampling
-                for runner, _graph_type, _args, _kwargs in (
-                    _CudagraphGlobalRecord.cudagraph_inference_record
-                )
-            )
 
     @pytest.mark.internal
     @pytest.mark.skipif(
