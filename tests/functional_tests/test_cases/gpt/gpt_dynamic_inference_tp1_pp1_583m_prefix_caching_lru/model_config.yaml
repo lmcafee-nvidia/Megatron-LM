@@ -5,6 +5,7 @@ ENV_VARS:
   CUBLAS_WORKSPACE_CONFIG: :4096:8
 TEST_TYPE: frozen-start
 MODE: inference
+PREFIX_CACHE_SCENARIO: pc.functional.gpt_lru_chunked_flashinfer
 MODEL_ARGS:
   --tiktoken-pattern: v2
   --use-mcore-models: true
@@ -40,17 +41,45 @@ MODEL_ARGS:
   --temperature: 1.0
   --top_k: 1
   --return-log-probs: true
+  --skip-prompt-log-probs: true
   --num-tokens-to-generate: 30
-  --inference-dynamic-batching-buffer-size-gb: 20
+  --inference-dynamic-batching-buffer-size-gb: 0.05
+  --inference-dynamic-batching-max-tokens: 64
+  --inference-dynamic-batching-max-requests: 4
+  --enable-chunked-prefill: true
+  --inference-dynamic-batching-sampling-backend: flashinfer
+  --use-flashinfer-fused-rope: true
   --inference-dynamic-batching-prefix-caching: true
   --inference-dynamic-batching-prefix-caching-eviction-policy: lru
+  --prefix-cache-compare: true
+  --prefix-cache-stress-groups: 8
+  --prefix-cache-stress-copies: 2
+  --prefix-cache-stress-prompt-tokens: 512
+  --prefix-cache-stress-staged: true
   --dist-ckpt-strictness: log_unexpected
   --inference-ckpt-non-strict: true
   --output-path: ${INFERENCE_OUTPUT_PATH}
   --prompts: "Time travel to 2008, and go to a bar or a club or one of the myriad disco-basements on the Lower East Side that does not quite know which of those it is. Dance awkwardly in a room full of other glittered-up nerds, and wait for something to happen, buoyed on the feeling that this is the big swollen heart of life, that this is New York like the movies."
-  --incoming-requests-per-sec: -1
-  --inference-repeat-n: 8
+  --incoming-requests-per-step: 1
+  --inference-repeat-n: 3
   --inference-logging-step-interval: 1
 METRICS:
-  - "generated_tokens"
-  - "logprobs"
+  - prefix_cache_comparison
+  - memory_phase_leak
+INFERENCE_COMPARISON:
+  memory_phase_leak_fraction: 0.02
+  memory_phase_leak_bytes: 16777216
+  minimum_cycle_observations:
+    prefix_cache_hits: 8
+    prefix_cache_blocks_matched: 8
+    prefill_tokens_skipped: 2048
+    chunk_boundaries_crossed: 1
+    kv_lru_evicted_blocks: 1
+    kv_physical_block_reuses: 1
+  minimum_observations:
+    prefix_cache_hits: 24
+    prefill_tokens_skipped: 6144
+    kv_lru_evicted_blocks: 1
+    kv_physical_block_reuses: 1
+  expected_observations:
+    sampling_backend: flashinfer

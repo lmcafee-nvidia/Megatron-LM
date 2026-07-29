@@ -747,12 +747,6 @@ class TestCoordinator:
             await cleanup_engine(engine, client, timeout=60.0)
 
 
-def _set_hash_rank(coord, h, rank_identity, timestamp):
-    """Test helper: set a hash→rank timestamp in the coordinator's dict."""
-    rank_idx = coord.identity_to_rank_index[rank_identity]
-    coord._hash_table.setdefault(h, {})[rank_idx] = timestamp
-
-
 def _make_routing_coordinator(
     num_ranks=4, enable_prefix_caching=False, policy=PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
 ):
@@ -774,91 +768,68 @@ def _make_routing_coordinator(
 
 
 class TestRoutingPolicies:
-    """Unit tests for routing behavior under different policies and load conditions."""
+    """Stress fallback routing contracts that prefix-aware scoring does not cover."""
 
-    def test_no_prefix_caching_uses_load_balanced(self):
-        """When prefix caching is off, routing goes to the least-loaded rank."""
-        coord = _make_routing_coordinator(num_ranks=3, enable_prefix_caching=False)
-        coord._pending_counts[coord.identity_to_rank_index[b"rank-0"]] = 2
-        coord._pending_counts[coord.identity_to_rank_index[b"rank-1"]] = 1
-
-        # rank-2 has the fewest in-flight requests (0).
-        assert coord.get_best_data_parallel_rank([]) == b"rank-2"
-
-    def test_empty_hashes_uses_load_balanced(self):
-        """Empty hash list falls back to the least-loaded rank."""
-        coord = _make_routing_coordinator(num_ranks=4)
-        coord._pending_counts[coord.identity_to_rank_index[b"rank-0"]] = 3
-        coord._pending_counts[coord.identity_to_rank_index[b"rank-1"]] = 5
-        coord._pending_counts[coord.identity_to_rank_index[b"rank-2"]] = 1
-        coord._pending_counts[coord.identity_to_rank_index[b"rank-3"]] = 4
-
-        assert coord.get_best_data_parallel_rank([]) == b"rank-2"
-
-    def test_prefix_affinity_routing(self):
-        """When prefix caching is on with hashes, scoring picks the best rank."""
-        coord = _make_routing_coordinator(
+    def test_fallback_modes_follow_load_churn_and_ignore_confirmed_affinity(self):
+        """Disabled, hashless, and explicit load-only modes follow changing load."""
+        disabled = _make_routing_coordinator(
+            num_ranks=3,
+            enable_prefix_caching=False,
+            policy=PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
+        )
+        hashless = _make_routing_coordinator(
             num_ranks=3,
             enable_prefix_caching=True,
             policy=PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
         )
-        for ident in coord.identities_of_data_parallel_ranks:
-            coord._pending_counts[coord.identity_to_rank_index[ident]] = 1
-
-        # Seed a hash on rank-2 so prefix routing prefers it.
-        fake_hash = 12345
-        _set_hash_rank(coord, fake_hash, b"rank-2", 1)
-
-        chosen = coord.get_best_data_parallel_rank([fake_hash])
-        assert chosen == b"rank-2"
-
-    def test_prefix_affinity_beats_free_capacity(self):
-        """A rank with a prefix match and capacity is preferred over a free rank."""
-        coord = _make_routing_coordinator(
-            num_ranks=3,
-            enable_prefix_caching=True,
-            policy=PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
-        )
-        coord._pending_counts[coord.identity_to_rank_index[b"rank-0"]] = 2
-        coord._pending_counts[coord.identity_to_rank_index[b"rank-1"]] = 1
-
-        fake_hash = 99999
-        _set_hash_rank(coord, fake_hash, b"rank-1", 1)
-
-        # Scoring: rank-1 gets prefix match bonus, which outweighs rank-2's
-        # free capacity advantage.
-        chosen = coord.get_best_data_parallel_rank([fake_hash])
-        assert chosen == b"rank-1"
-
-    def test_free_capacity_wins_when_prefix_rank_is_full(self):
-        """A free rank wins when the prefix-matched rank is full and alpha is low."""
-        coord = _make_routing_coordinator(
-            num_ranks=2,
-            enable_prefix_caching=True,
-            policy=PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK,
-        )
-        coord.prefix_caching_routing_alpha = 0.1
-        coord._pending_counts[coord.identity_to_rank_index[b"rank-0"]] = 10
-
-        fake_hash = 42
-        _set_hash_rank(coord, fake_hash, b"rank-0", 1)
-
-        # score(rank-0) = 0.1*1 + 0.9*(0/10) = 0.1
-        # score(rank-1) = 0.1*0 + 0.9*(10/10) = 0.9
-        chosen = coord.get_best_data_parallel_rank([fake_hash])
-        assert chosen == b"rank-1"
-
-    def test_load_balanced_policy_ignores_prefix(self):
-        """LOAD_BALANCED policy routes to the least-loaded rank, ignoring prefix affinity."""
-        coord = _make_routing_coordinator(
+        load_balanced = _make_routing_coordinator(
             num_ranks=3,
             enable_prefix_caching=True,
             policy=PrefixCachingCoordinatorPolicy.LOAD_BALANCED,
         )
-        coord._pending_counts[coord.identity_to_rank_index[b"rank-0"]] = 2
-        coord._pending_counts[coord.identity_to_rank_index[b"rank-1"]] = 1
+        confirmed_hash = 99
+        assert load_balanced._apply_prefix_cache_state(
+            b"rank-0",
+            None,
+            load_balanced._rank_cache_stream_ids[b"rank-0"],
+            load_balanced._rank_cache_resync_ids[b"rank-0"],
+            1,
+            True,
+            [confirmed_hash],
+            [],
+        )
 
-        # Seed a prefix match on the most-loaded rank; load balancing must ignore it.
-        _set_hash_rank(coord, 99, b"rank-0", 1)
+        load_profiles = ((3, 1, 0), (0, 4, 2), (5, 0, 3), (2, 3, 0))
+        expected_ranks = (b"rank-2", b"rank-0", b"rank-1", b"rank-2")
+        routes_by_mode = []
+        for coordinator, request_hashes in (
+            (disabled, [confirmed_hash]),
+            (hashless, []),
+            (load_balanced, [confirmed_hash]),
+        ):
+            routes = []
+            for profile_index, (pending_counts, expected_rank) in enumerate(
+                zip(load_profiles, expected_ranks)
+            ):
+                if coordinator is load_balanced and profile_index > 0:
+                    assert coordinator._apply_prefix_cache_state(
+                        b"rank-0",
+                        None,
+                        coordinator._rank_cache_stream_ids[b"rank-0"],
+                        coordinator._rank_cache_resync_ids[b"rank-0"],
+                        profile_index + 1,
+                        False,
+                        [confirmed_hash + profile_index],
+                        [],
+                    )
+                coordinator._pending_counts[:] = pending_counts
+                routes.append(coordinator.get_best_data_parallel_rank(request_hashes))
+                assert routes[-1] == expected_rank
+            assert sum(previous != current for previous, current in zip(routes, routes[1:])) == (
+                len(routes) - 1
+            )
+            routes_by_mode.append(routes)
 
-        assert coord.get_best_data_parallel_rank([99]) == b"rank-2"
+        assert routes_by_mode[0] == routes_by_mode[1] == routes_by_mode[2]
+        assert load_balanced._rank_cache_sequences[b"rank-0"] == 4
+        assert len(load_balanced._rank_hashes[b"rank-0"]) == 4

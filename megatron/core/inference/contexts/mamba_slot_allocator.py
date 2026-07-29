@@ -10,10 +10,12 @@ from megatron.core.inference.config import PrefixCachingEvictionPolicy
 if TYPE_CHECKING:
     from .dynamic_context import DynamicInferenceContext
 
-# Maximum intermediate state extraction offsets per request. The 3 candidates
-# are: KV divergence boundary, last block-aligned boundary, and penultimate
-# block boundary (see compute_and_store_offsets for details).
-MAX_INTERMEDIATE_OFFSETS_PER_REQUEST = 3
+# Maximum distinct intermediate state extraction offsets per request. The
+# candidates are the KV divergence, last block-aligned, and penultimate block
+# boundaries, but at most two can lie strictly inside one valid prefill chunk:
+# the last-aligned boundary is outside a non-final chunk, and on a final chunk
+# it either equals the penultimate boundary or is the excluded end position.
+MAX_INTERMEDIATE_OFFSETS_PER_REQUEST = 2
 
 
 class MambaSlotAllocator:
@@ -57,6 +59,10 @@ class MambaSlotAllocator:
         # Free slot pool (stack, CPU).
         self.free_slots = torch.arange(max_slots, dtype=torch.int32, device='cpu')
         self.free_count = max_slots
+        self.eviction_count = 0
+        self.restore_hit_count = 0
+        self.restore_miss_count = 0
+        self.commit_count = 0
 
         # Durable cache state tensors (GPU - accessed by Mamba CUDA kernels):
         # one slot per cached block boundary, reused across requests. Sized to
@@ -75,6 +81,7 @@ class MambaSlotAllocator:
 
         # Hash-to-block mapping: only blocks with cached Mamba state
         self.hash_to_block_id: Dict[int, int] = {}
+        self.cache_state_version = 0
 
         # Per-request intermediate state storage.
         # offsets_cpu and counts_cpu: CPU source of truth.  GPU copies are
@@ -125,6 +132,18 @@ class MambaSlotAllocator:
     # Slot allocation
     # =========================================================================
 
+    def get_allocatable_slot_count(self, protected_block_ids: list[int] | None = None) -> int:
+        """Return free plus evictable slots, excluding requested existing state."""
+        kv_allocator = self.context.kv_block_allocator
+        has_slot = self.block_to_slot[: kv_allocator.pool_size] >= 0
+        is_evictable = kv_allocator.block_ref_counts[: kv_allocator.pool_size] == 0
+        if protected_block_ids:
+            protected = torch.tensor(
+                protected_block_ids, dtype=torch.int64, device=is_evictable.device
+            )
+            is_evictable[protected] = False
+        return self.free_count + int((has_slot & is_evictable).sum())
+
     def allocate_slots_batch(self, block_ids: list) -> list:
         """Get free Mamba cache slots for multiple blocks, evicting if necessary.
 
@@ -150,14 +169,22 @@ class MambaSlotAllocator:
         # seen_new maps block_id -> index in new_bids list
         seen_new = {}
         new_bids = []
+        protected_bids = []
         for i, (bid, slot) in enumerate(zip(block_ids, existing_slots)):
-            if slot < 0 and bid not in seen_new:
+            if slot >= 0:
+                protected_bids.append(bid)
+            elif bid not in seen_new:
                 seen_new[bid] = len(new_bids)
                 new_bids.append(bid)
 
         num_new = len(new_bids)
         if num_new == 0:
             return existing_slots
+
+        # Preflight before consuming the free stack. A failed eviction must not
+        # leak slots already popped for this batch.
+        if self.get_allocatable_slot_count(protected_bids) < num_new:
+            raise RuntimeError("No evictable Mamba cache slots available")
 
         # Phase 3: Get slots from free pool, evicting if necessary
         from_free = min(num_new, self.free_count)
@@ -169,7 +196,9 @@ class MambaSlotAllocator:
 
         need_evict = num_new - from_free
         if need_evict > 0:
-            new_slots.extend(self._evict_lru_slots_batch(need_evict))
+            new_slots.extend(
+                self._evict_lru_slots_batch(need_evict, protected_block_ids=protected_bids)
+            )
 
         # Phase 4: Batch GPU writes for new mappings
         new_bid_tensor = torch.tensor(new_bids, dtype=torch.int64, device=device)
@@ -188,13 +217,17 @@ class MambaSlotAllocator:
                 result.append(alloc_bid_to_slot[bid])
         return result
 
-    def _evict_lru_slots_batch(self, num_needed: int) -> list:
+    def _evict_lru_slots_batch(
+        self, num_needed: int, protected_block_ids: list[int] | None = None
+    ) -> list:
         """Evict the least recently used Mamba cache slots.
 
         Does NOT return slots to the free pool — caller takes ownership.
 
         Args:
             num_needed: Number of slots to evict.
+            protected_block_ids: Existing mappings requested by the same batch;
+                these must not be recycled for a new block.
 
         Returns:
             List of freed slot indices.
@@ -203,6 +236,11 @@ class MambaSlotAllocator:
         # Find blocks that have mamba slots and ref_count == 0
         has_slot_mask = self.block_to_slot[: kv_alloc.pool_size] >= 0
         ref_zero_mask = kv_alloc.block_ref_counts[: kv_alloc.pool_size] == 0
+        if protected_block_ids:
+            protected = torch.tensor(
+                protected_block_ids, dtype=torch.int64, device=ref_zero_mask.device
+            )
+            ref_zero_mask[protected] = False
         candidates = has_slot_mask & ref_zero_mask
         candidate_ids = torch.nonzero(candidates, as_tuple=True)[0]
 
@@ -216,6 +254,7 @@ class MambaSlotAllocator:
             evict_ids = candidate_ids[sorted_indices]
         else:
             evict_ids = candidate_ids[:num_needed]
+        self.eviction_count += int(evict_ids.numel())
 
         # Batch gather slots + hashes (2 GPU syncs)
         slots = self.block_to_slot[evict_ids].tolist()
@@ -227,9 +266,13 @@ class MambaSlotAllocator:
         self.slot_to_block[slot_tensor] = -1
 
         # Clean up hash dict (CPU loop)
+        removed_hash = False
         for h in hashes:
             if h > 0 and h in self.hash_to_block_id:
                 del self.hash_to_block_id[h]
+                removed_hash = True
+        if removed_hash:
+            self.cache_state_version += 1
 
         return slots
 
@@ -306,6 +349,7 @@ class MambaSlotAllocator:
                 from collections import deque
 
                 deque(map(self.hash_to_block_id.pop, mamba_keys), maxlen=0)
+                self.cache_state_version += 1
                 self._invalidate_blocks_batch(block_ids_list)
 
     # =========================================================================
@@ -361,7 +405,9 @@ class MambaSlotAllocator:
         """
         slot = self.block_to_slot[block_id].item()
         if slot < 0:
+            self.restore_miss_count += 1
             return False
+        self.restore_hit_count += 1
         mamba_idx = self.context.mamba_metadata.request_to_mamba_state_idx[request_idx].item()
         self.context.mamba_conv_states[:, mamba_idx].copy_(self.conv_states[:, slot])
         self.context.mamba_ssm_states[:, mamba_idx].copy_(self.ssm_states[:, slot])
@@ -382,6 +428,8 @@ class MambaSlotAllocator:
         """
         updates = {h: bid for bid, h in zip(block_ids, hashes) if h > 0}
         if updates:
+            if updates.keys() - self.hash_to_block_id.keys():
+                self.cache_state_version += 1
             self.hash_to_block_id.update(updates)
 
     # =========================================================================
@@ -447,6 +495,7 @@ class MambaSlotAllocator:
 
         offsets = sorted(offsets_set)
         count = len(offsets)
+        assert count <= MAX_INTERMEDIATE_OFFSETS_PER_REQUEST
 
         # CPU bookkeeping writes (no GPU kernel launches).
         if count > 0:
@@ -483,7 +532,7 @@ class MambaSlotAllocator:
 
         Returns:
             Tuple of (offsets_cpu, counts_cpu) where:
-                offsets_cpu: [prefill_count, 3] int32 CPU tensor
+                offsets_cpu: [prefill_count, 2] int32 CPU tensor
                 counts_cpu: [prefill_count] int32 CPU tensor
             Returns (None, None) if no prefill requests or no intermediates.
         """
@@ -533,19 +582,60 @@ class MambaSlotAllocator:
             return
         intermediate_bids, src_offsets, eos_bids, eos_ctx_indices, all_hashes = collected
 
-        # Allocate all slots in one batch (intermediates + EOS)
+        # Durable prefix states are immutable once materialized. Filter out
+        # existing destinations, then stable-deduplicate newly seen block IDs so
+        # concurrent producers cannot overwrite or race on the same cache slot.
         all_bids = intermediate_bids + eos_bids
-        all_slots = self.allocate_slots_batch(all_bids)
+        device = self.block_to_slot.device
+        bid_tensor = torch.tensor(all_bids, dtype=torch.int64, device=device)
+        existing_slots = self.block_to_slot[bid_tensor].tolist()
 
-        # Copy intermediate states from output buffers to cache
+        selected_indices = []
+        seen_new_bids = set()
+        for index, (block_id, slot) in enumerate(zip(all_bids, existing_slots)):
+            if slot < 0 and block_id not in seen_new_bids:
+                selected_indices.append(index)
+                seen_new_bids.add(block_id)
+
+        if not selected_indices:
+            self._clear_intermediate_state()
+            return
+
+        # Prefix snapshots are an optimization. When every remaining durable
+        # slot is pinned by active KV, retain as many earliest prefix boundaries
+        # as fit and skip the rest instead of failing inference.
+        selected_indices = selected_indices[: self.get_allocatable_slot_count()]
+        if not selected_indices:
+            self._clear_intermediate_state()
+            return
+
+        selected_bids = [all_bids[index] for index in selected_indices]
+        selected_hashes = [all_hashes[index] for index in selected_indices]
+        selected_slots = self.allocate_slots_batch(selected_bids)
+        self.commit_count += len(selected_bids)
+
         n_intermediate = len(intermediate_bids)
-        self._copy_intermediate_to_cache(src_offsets, all_slots[:n_intermediate])
+        intermediate_src_offsets = []
+        intermediate_slots = []
+        eos_request_indices = []
+        eos_slots = []
+        for index, slot in zip(selected_indices, selected_slots):
+            if index < n_intermediate:
+                intermediate_src_offsets.append(src_offsets[index])
+                intermediate_slots.append(slot)
+            else:
+                eos_index = index - n_intermediate
+                eos_request_indices.append(eos_ctx_indices[eos_index])
+                eos_slots.append(slot)
+
+        # Each destination appears at most once in these vectorized copies.
+        self._copy_intermediate_to_cache(intermediate_src_offsets, intermediate_slots)
 
         # Copy EOS states from live buffers to cache
-        self.store_from_live_batch(all_slots[n_intermediate:], eos_ctx_indices)
+        self.store_from_live_batch(eos_slots, eos_request_indices)
 
-        # Register hashes for all committed blocks
-        self.register_block_hashes_batch(all_bids, all_hashes)
+        # Register only the newly materialized states.
+        self.register_block_hashes_batch(selected_bids, selected_hashes)
 
         self._clear_intermediate_state()
 
@@ -653,6 +743,8 @@ class MambaSlotAllocator:
         self.slot_to_block.fill_(-1)
         self.free_slots = torch.arange(self.max_slots, dtype=torch.int32, device='cpu')
         self.free_count = self.max_slots
+        if self.hash_to_block_id:
+            self.cache_state_version += 1
         self.hash_to_block_id.clear()
         self.intermediate_ssm_out.zero_()
         self.intermediate_conv_out.zero_()
@@ -661,3 +753,10 @@ class MambaSlotAllocator:
         self._intermediate_block_ids_cpu.fill_(-1)
         self._eos_cache_block_id_cpu.fill_(-1)
         self._has_intermediates = False
+
+    def reset_metrics(self) -> None:
+        """Reset lifetime pressure counters without changing cached state."""
+        self.eviction_count = 0
+        self.restore_hit_count = 0
+        self.restore_miss_count = 0
+        self.commit_count = 0

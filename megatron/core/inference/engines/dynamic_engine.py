@@ -7,6 +7,7 @@ import math
 import multiprocessing
 import socket
 import time
+import uuid
 import warnings
 from collections import deque
 from contextlib import contextmanager
@@ -112,6 +113,19 @@ DEPRECATED_ARGS = [
     "inference_logging_step_interval",
     "pg_collection",
 ]
+
+_KV_PREFIX_METRIC_ATTRS = {
+    "kv_blocks_deregistered": "deregistered_block_count",
+    "kv_lru_evictions": "lru_evicted_block_count",
+    "kv_physical_reuses": "physical_block_reuse_count",
+    "kv_epoch_invalidations": "epoch_invalidated_block_count",
+}
+_MAMBA_PREFIX_METRIC_ATTRS = {
+    "mamba_evictions": "eviction_count",
+    "mamba_restore_hits": "restore_hit_count",
+    "mamba_restore_misses": "restore_miss_count",
+    "mamba_commits": "commit_count",
+}
 
 
 class EngineState(Enum):
@@ -264,6 +278,13 @@ class DynamicInferenceEngine(AbstractEngine):
         # Throw a cudagraph-admission warning if deferred for > max_sequence_length steps.
         # The floor value of 100 avoids warnings in test configs where max_sequence_length < 100.
         self._cg_admission_warn_after = max(100, self.context.max_sequence_length)
+        self._generation_epoch: Optional[int] = None
+        self._last_reported_prefix_hashes: Optional[frozenset[int]] = None
+        self._last_reported_prefix_cache_state_version: Optional[int] = None
+        self._prefix_cache_report_sequence = 0
+        self._prefix_cache_stream_id: Optional[str] = None
+        self._prefix_cache_resync_id: Optional[int] = None
+        self.use_coordinator = False
         # Initialize engine.
         self.reset()
 
@@ -306,7 +327,16 @@ class DynamicInferenceEngine(AbstractEngine):
     def reset(self) -> None:
         """Reset by removing all requests and reset all state."""
 
+        generation_epoch = self._generation_epoch
+        report_sequence = self._prefix_cache_report_sequence
+        stream_id = self._prefix_cache_stream_id
+        resync_id = self._prefix_cache_resync_id
+        use_coordinator = self.use_coordinator
         self.context.reset()
+        self._prefix_allocator_metric_totals = {
+            metric: 0 for metric in (*_KV_PREFIX_METRIC_ATTRS, *_MAMBA_PREFIX_METRIC_ATTRS)
+        }
+        self._reset_current_prefix_allocator_metrics()
 
         # Request state.
         self.request_counter = Counter()
@@ -316,7 +346,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.requests: Dict[int, RequestEntry] = {}
         self.waiting_request_ids = deque()
         self.failed_request_ids = []
-        self._generation_epoch: Optional[int] = None
+        self._generation_epoch: Optional[int] = generation_epoch
         # Track requests that should stop due to stop words (detected in post_process_requests)
         self.stop_word_finished_request_ids: set[int] = set()
         # Track requests currently being finished due to stop words (to skip extra token)
@@ -355,9 +385,18 @@ class DynamicInferenceEngine(AbstractEngine):
         self._prefill_tokens_computed = 0
         self._prefill_tokens_skipped = 0
         self._prefix_coordination_waits = 0
+        self._last_reported_prefix_hashes: Optional[frozenset[int]] = None
+        self._last_reported_prefix_cache_state_version: Optional[int] = None
+        # Sequence numbers remain monotonic within one coordinator-issued
+        # resync cycle.
+        self._prefix_cache_report_sequence = report_sequence
+        self._prefix_cache_stream_id = stream_id
+        self._prefix_cache_resync_id = resync_id
 
         # Coordinator state.
-        self.use_coordinator = False
+        self.use_coordinator = use_coordinator
+        if self.use_coordinator and self.is_mp_coordinator:
+            self._report_prefix_cache_state(confirmed_hashes=frozenset())
 
     async def wait_until(self, state: EngineState):
         """Wait until the engine reaches the given state.
@@ -687,8 +726,19 @@ class DynamicInferenceEngine(AbstractEngine):
             self.socket_for_receiving_requests.setsockopt(zmq.IDENTITY, identity.encode('utf-8'))
             self.socket_for_receiving_requests.connect(dp_addr)
 
-            # send empty string. this is used to register with the coordinator.
-            self.socket_for_receiving_requests.send(b"")
+            # Registration clears any coordinator-side ownership for this
+            # identity, so the next report must rebuild it with a full snapshot.
+            self._last_reported_prefix_hashes = None
+            self._last_reported_prefix_cache_state_version = None
+            self._prefix_cache_report_sequence = 0
+            self._prefix_cache_stream_id = uuid.uuid4().hex
+            self._prefix_cache_resync_id = None
+            self.socket_for_receiving_requests.send(
+                msgpack.packb(
+                    [Headers.PREFIX_CACHE_REGISTER.value, self._prefix_cache_stream_id],
+                    use_bin_type=True,
+                )
+            )
 
             # 2. Create a publisher socket. This is used to publish or broadcast
             #    requests within the model parallel group
@@ -812,11 +862,25 @@ class DynamicInferenceEngine(AbstractEngine):
 
         InferenceMode.unset_active()
 
+        if self.context.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
+            # RECOMPUTE replaces allocator state. Drain its pressure evidence
+            # first so lifecycle metrics remain cumulative across suspension.
+            self._drain_prefix_allocator_metrics()
+
         # Deallocate context tensors.
         with self.__class__.suspend_resume_ctx(
             "suspended", unified_memory_level=self.unified_memory_level
         ):
             self.context.deallocate_inference_state_buffers()
+
+        if (
+            self.context.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE
+            and self.use_coordinator
+            and self.is_mp_coordinator
+        ):
+            # RECOMPUTE destroys the cache. Withdraw ownership immediately so
+            # the coordinator cannot route against state that no longer exists.
+            self._report_prefix_cache_state(confirmed_hashes=frozenset())
 
         if (
             self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST
@@ -1041,6 +1105,7 @@ class DynamicInferenceEngine(AbstractEngine):
     ) -> asyncio.Future[DynamicInferenceRequest]:
 
         request_id = request.request_id
+        request.set_prefix_cache_namespace(self._generation_epoch)
         self._validate_async_sched_support_for_request(request)
 
         # Add request to self.requests. If the engine has previously been
@@ -1199,6 +1264,7 @@ class DynamicInferenceEngine(AbstractEngine):
             sampling_params=sampling_params,
             block_size_tokens=self.context.block_size_tokens,
             enable_prefix_caching=self.context.enable_prefix_caching,
+            prefix_cache_namespace=self._generation_epoch,
         )
 
         # Add request.
@@ -1521,7 +1587,9 @@ class DynamicInferenceEngine(AbstractEngine):
             # Checkpoint requests (i.e., prompt += generations) + add eviction event.
             for request_id in evict_request_ids:
                 self.requests[request_id].record.checkpoint()
-                self.get_request(request_id).add_event_evict()
+                checkpointed_request = self.get_request(request_id)
+                checkpointed_request.set_prefix_cache_namespace(self._generation_epoch)
+                checkpointed_request.add_event_evict()
 
         # Clear the stop word being finished set after processing
         self.stop_word_being_finished_ids.clear()
@@ -1607,6 +1675,83 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         return {"waits": self._prefix_coordination_waits}
 
+    def _read_current_prefix_allocator_metrics(self) -> dict:
+        """Read lifetime counters owned by the current allocator instances."""
+        metrics = {metric: 0 for metric in (*_KV_PREFIX_METRIC_ATTRS, *_MAMBA_PREFIX_METRIC_ATTRS)}
+        if not self.context.enable_prefix_caching:
+            return metrics
+
+        allocator = self.context.kv_block_allocator
+        for metric, attr in _KV_PREFIX_METRIC_ATTRS.items():
+            metrics[metric] = int(getattr(allocator, attr))
+        mamba_allocator = self.context.mamba_slot_allocator
+        if mamba_allocator is not None:
+            for metric, attr in _MAMBA_PREFIX_METRIC_ATTRS.items():
+                metrics[metric] = int(getattr(mamba_allocator, attr))
+        return metrics
+
+    def _reset_current_prefix_allocator_metrics(self) -> None:
+        """Reset counters on the current allocators without changing cache state."""
+        if not self.context.enable_prefix_caching:
+            return
+
+        self.context.kv_block_allocator.reset_metrics()
+        mamba_allocator = self.context.mamba_slot_allocator
+        if mamba_allocator is not None:
+            mamba_allocator.reset_metrics()
+
+    def _drain_prefix_allocator_metrics(self) -> None:
+        """Move current allocator counters into engine-lifetime totals."""
+        for metric, value in self._read_current_prefix_allocator_metrics().items():
+            self._prefix_allocator_metric_totals[metric] += value
+        self._reset_current_prefix_allocator_metrics()
+
+    def get_prefix_cache_metrics(self) -> dict:
+        """Return execution evidence and pressure counters for prefix caching."""
+        allocator = self.context.kv_block_allocator
+        current_allocator_metrics = self._read_current_prefix_allocator_metrics()
+        allocator_metric_totals = self._prefix_allocator_metric_totals
+        metrics = {
+            "enabled": self.context.enable_prefix_caching,
+            "hits": self._prefix_cache_hits + self.context.prefix_cache_hits,
+            "blocks_matched": (
+                self._prefix_cache_blocks_matched + self.context.prefix_cache_blocks_matched
+            ),
+            "prefill_tokens_computed": (
+                self._prefill_tokens_computed + self.context.prefix_cache_prefill_computed_tokens
+            ),
+            "prefill_tokens_skipped": (
+                self._prefill_tokens_skipped + self.context.prefix_cache_prefill_skipped_tokens
+            ),
+            "coordination_waits": self._prefix_coordination_waits,
+            "kv_blocks_cached": (
+                len(allocator.kv_hash_to_block_id) if self.context.enable_prefix_caching else 0
+            ),
+        }
+        metrics.update(
+            {
+                metric: allocator_metric_totals[metric] + current_allocator_metrics[metric]
+                for metric in _KV_PREFIX_METRIC_ATTRS
+            }
+        )
+        mamba_allocator = self.context.mamba_slot_allocator
+        metrics.update(
+            {
+                "mamba_slots_cached": (
+                    mamba_allocator.max_slots - mamba_allocator.free_count
+                    if mamba_allocator is not None
+                    else 0
+                )
+            }
+        )
+        metrics.update(
+            {
+                metric: allocator_metric_totals[metric] + current_allocator_metrics[metric]
+                for metric in _MAMBA_PREFIX_METRIC_ATTRS
+            }
+        )
+        return metrics
+
     def schedule_waiting_requests(self):
         """Tries to schedule any requests in the waiting pool."""
         # Keep track of which requests get scheduled.
@@ -1634,9 +1779,10 @@ class DynamicInferenceEngine(AbstractEngine):
             pending_request_ids = []
         while self.waiting_request_ids:
             req = self.get_request(self.waiting_request_ids[0])
+            request_prefix_caching_enabled = self.context.is_request_prefix_cache_eligible(req)
 
             # Check for conflicting block hashes.
-            if prefix_caching_enabled:
+            if request_prefix_caching_enabled:
                 has_pending_hash = False
                 for block_hash in req.precomputed_block_hashes:
                     if block_hash in pending_block_hashes:
@@ -1666,7 +1812,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         break
 
                 # Add these hashes to pending.
-                if prefix_caching_enabled:
+                if request_prefix_caching_enabled:
                     for block_hash in req.precomputed_block_hashes:
                         if block_hash not in self.context.kv_block_allocator.kv_hash_to_block_id:
                             pending_block_hashes.add(block_hash)
@@ -1791,13 +1937,14 @@ class DynamicInferenceEngine(AbstractEngine):
         while self.waiting_request_ids and can_schedule:
             can_schedule = False
             req = self.get_request(self.waiting_request_ids[0])
+            request_prefix_caching_enabled = self.context.is_request_prefix_cache_eligible(req)
 
             # is_continuing_chunked_prefill is True if we are scheduling next
             # chunk of a existing chunked prefill request
             is_continuing_chunked_prefill = self.context.chunked_prefill_request_id >= 0
 
             # Check for conflicting block hashes.
-            if prefix_caching_enabled and not is_continuing_chunked_prefill:
+            if request_prefix_caching_enabled and not is_continuing_chunked_prefill:
                 has_pending_hash = False
                 for block_hash in req.precomputed_block_hashes:
                     # pylint: disable-next=possibly-used-before-assignment
@@ -1830,7 +1977,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # (latency then scales with prompt length instead of the delta).
                 # add_request() only computes `effective = span - skip` tokens.
                 prefix_skip = 0
-                if prefix_caching_enabled and not is_continuing_chunked_prefill:
+                if request_prefix_caching_enabled and not is_continuing_chunked_prefill:
                     (_, _, _, _, prefix_skip, _) = self.context._compute_prefix_match(
                         req, remaining_len
                     )
@@ -1911,7 +2058,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         break
 
                 # Add hashes to pending set (prefix-caching bookkeeping).
-                if prefix_caching_enabled:
+                if request_prefix_caching_enabled:
                     for block_hash in req.precomputed_block_hashes:
                         if block_hash not in self.context.kv_block_allocator.kv_hash_to_block_id:
                             pending_block_hashes.add(block_hash)
@@ -2038,6 +2185,78 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return result, context_state, step_time
 
+    def _get_routable_prefix_hashes(self) -> frozenset[int]:
+        """Return prefixes this engine can execute as cache hits."""
+        kv_hashes = self.context.kv_block_allocator.kv_hash_to_block_id.keys()
+        if not self.context.is_hybrid_model:
+            return frozenset(kv_hashes)
+
+        mamba_allocator = self.context.mamba_slot_allocator
+        if mamba_allocator is None:
+            return frozenset()
+        return frozenset(kv_hashes) & frozenset(mamba_allocator.hash_to_block_id.keys())
+
+    def _get_prefix_cache_state_version(self) -> int:
+        """Return a scalar that changes whenever routable cache inputs mutate."""
+        kv_allocator = self.context.kv_block_allocator
+        if not self.context.is_hybrid_model:
+            return kv_allocator.cache_state_version
+
+        mamba_allocator = self.context.mamba_slot_allocator
+        if mamba_allocator is None:
+            return 0
+        return kv_allocator.cache_state_version + mamba_allocator.cache_state_version
+
+    def _report_prefix_cache_state(self, confirmed_hashes: Optional[frozenset[int]] = None) -> None:
+        """Send an epoch-scoped delta of prefixes the local engine can serve."""
+        if (
+            not self.context.enable_prefix_caching
+            or self._prefix_cache_stream_id is None
+            or self._prefix_cache_resync_id is None
+        ):
+            return
+
+        if confirmed_hashes is None:
+            cache_state_version = self._get_prefix_cache_state_version()
+            if (
+                self._last_reported_prefix_hashes is not None
+                and cache_state_version == self._last_reported_prefix_cache_state_version
+            ):
+                return
+            confirmed_hashes = self._get_routable_prefix_hashes()
+        else:
+            cache_state_version = None
+        previous_hashes = self._last_reported_prefix_hashes
+        if previous_hashes is not None and confirmed_hashes == previous_hashes:
+            self._last_reported_prefix_cache_state_version = cache_state_version
+            return
+
+        is_full_snapshot = previous_hashes is None
+        if is_full_snapshot:
+            added_hashes = confirmed_hashes
+            removed_hashes = frozenset()
+        else:
+            added_hashes = confirmed_hashes - previous_hashes
+            removed_hashes = previous_hashes - confirmed_hashes
+
+        self._prefix_cache_report_sequence += 1
+        payload = msgpack.packb(
+            [
+                Headers.PREFIX_CACHE_STATE.value,
+                self._generation_epoch,
+                self._prefix_cache_stream_id,
+                self._prefix_cache_resync_id,
+                self._prefix_cache_report_sequence,
+                is_full_snapshot,
+                sorted(added_hashes),
+                sorted(removed_hashes),
+            ],
+            use_bin_type=True,
+        )
+        self.socket_for_receiving_requests.send(payload)
+        self._last_reported_prefix_hashes = confirmed_hashes
+        self._last_reported_prefix_cache_state_version = cache_state_version
+
     async def async_bookkeep(
         self, step_result: Optional[Dict], context_state: Dict, step_time: float
     ):
@@ -2131,6 +2350,10 @@ class DynamicInferenceEngine(AbstractEngine):
         # Failed request replies were already sent in _handle_failed_request,
         # so only send completed records here.
         if self.use_coordinator and self.is_mp_coordinator:
+            # Publish ownership before completions. A client may submit a
+            # dependent follower as soon as it receives the completion, and the
+            # coordinator must see the producer's newly materialized prefix first.
+            self._report_prefix_cache_state()
             records_to_send = [
                 r for r in finished_request_records if r.requests[-1].status != Status.FAILED
             ]
@@ -2406,6 +2629,82 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return finished_request_records_list
 
+    def _apply_prefix_cache_resync(self, stream_id: str, resync_id: int) -> None:
+        """Start a coordinator-requested cache-state recovery cycle."""
+        if (
+            stream_id != self._prefix_cache_stream_id
+            or not isinstance(resync_id, int)
+            or isinstance(resync_id, bool)
+            or resync_id <= 0
+        ):
+            return
+        if self._prefix_cache_resync_id is not None and resync_id <= self._prefix_cache_resync_id:
+            return
+
+        self._prefix_cache_resync_id = resync_id
+        self._prefix_cache_report_sequence = 0
+        self._last_reported_prefix_hashes = None
+        self._last_reported_prefix_cache_state_version = None
+        if self.is_mp_coordinator:
+            self._report_prefix_cache_state()
+
+    def _apply_generation_epoch(self, generation_epoch: int) -> None:
+        """Invalidate reusable prefixes and move safe requests to a new weight epoch."""
+        if generation_epoch == self._generation_epoch:
+            return
+
+        self._generation_epoch = generation_epoch
+        if self.context.enable_prefix_caching:
+            self.context.kv_block_allocator.invalidate_prefix_cache()
+            self._last_reported_prefix_hashes = None
+            self._last_reported_prefix_cache_state_version = None
+            self._prefix_cache_report_sequence = 0
+            self._prefix_cache_resync_id = None
+
+        waiting_request_ids = set(self.waiting_request_ids)
+        chunked_prefill_request_id = self.context.chunked_prefill_request_id
+        for request_id, entry in self.requests.items():
+            request = entry.record[-1]
+            is_unadmitted = (
+                request_id in waiting_request_ids and request_id != chunked_prefill_request_id
+            )
+            if is_unadmitted:
+                # This request has no model state yet, so all of its future KV and
+                # Mamba state can safely be shared under the new epoch.
+                request.set_prefix_cache_namespace(generation_epoch)
+            elif request.enable_prefix_caching:
+                # Admitted requests may retain state produced by the previous
+                # weights. They can continue, but none of their mixed-epoch state
+                # may be published as a reusable prefix.
+                request.enable_prefix_caching = False
+
+            if request_id == chunked_prefill_request_id and request.finished_chunk_token_count > 0:
+                total = request.finished_chunk_token_count
+            else:
+                total = len(request.prompt_tokens) + len(request.generated_tokens)
+            is_never_admitted = is_unadmitted and len(entry.record.requests) == 1
+            if is_never_admitted:
+                request.policy_epoch = [(0, generation_epoch)]
+                request.kv_cache_epoch = [(0, generation_epoch)]
+                continue
+
+            if is_unadmitted:
+                # An evicted checkpoint will recompute its complete expanded
+                # prompt under the new weights, even though its generated-token
+                # policy history still spans earlier epochs.
+                request.kv_cache_epoch = [(0, generation_epoch)]
+
+            if total > 0:
+                boundary = (total - 1, generation_epoch)
+                if request.policy_epoch is None:
+                    request.policy_epoch = [(0, generation_epoch)]
+                else:
+                    request.policy_epoch.append(boundary)
+                if request.kv_cache_epoch is None:
+                    request.kv_cache_epoch = [(0, generation_epoch)]
+                elif not is_unadmitted:
+                    request.kv_cache_epoch.append(boundary)
+
     def schedule_requests(self) -> int:
         """Drains the ZMQ socket for a batch of requests and adds them to the engine.
 
@@ -2459,6 +2758,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # First pass: add requests.
         # Control signals are queued for the second pass.
         new_generation_epoch = None
+        prefix_cache_resyncs = []
         for message in all_messages:
             data = msgpack.unpackb(message, raw=False)
             header = Headers(data[0])
@@ -2470,6 +2770,11 @@ class DynamicInferenceEngine(AbstractEngine):
                 nvtx_range_pop("add_request")
             elif header == Headers.SET_GENERATION_EPOCH:
                 new_generation_epoch = data[1]
+            elif header == Headers.PREFIX_CACHE_RESYNC:
+                if len(data) != 3:
+                    logging.warning("Engine: ignoring malformed prefix cache resync request.")
+                    continue
+                prefix_cache_resyncs.append((data[1], data[2]))
             elif header == Headers.START_CUDA_PROFILER:
                 # Side-effect, not a state transition: apply immediately on every
                 # rank so an outer nsys --capture-range=cudaProfilerApi starts here.
@@ -2481,22 +2786,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 self._pending_signals.append(message)
 
         if new_generation_epoch is not None:
-            self._generation_epoch = new_generation_epoch
-            # Stamp all active requests with the new epoch.
-            # Each field stores a sparse list of (start_token_index, epoch) boundaries.
-            for entry in self.requests.values():
-                request = entry.record[-1]
-                total = len(request.prompt_tokens) + len(request.generated_tokens)
-                if total > 0:
-                    boundary = (total - 1, new_generation_epoch)
-                    if request.policy_epoch is None:
-                        request.policy_epoch = [(0, new_generation_epoch)]
-                    else:
-                        request.policy_epoch.append(boundary)
-                    if request.kv_cache_epoch is None:
-                        request.kv_cache_epoch = [(0, new_generation_epoch)]
-                    else:
-                        request.kv_cache_epoch.append(boundary)
+            self._apply_generation_epoch(new_generation_epoch)
+        for stream_id, resync_id in prefix_cache_resyncs:
+            self._apply_prefix_cache_resync(stream_id, resync_id)
 
         # Second pass: apply at most one control signal (the engine loop
         # processes one state transition per iteration).

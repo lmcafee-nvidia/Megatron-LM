@@ -204,7 +204,7 @@ class MambaMetadata:
             cu_seqlens (Tensor): Cumulative sequence lengths.
             batch_dimensions (InferenceBatchDimensions): Dimensions of the current batch.
             padded_batch_dimensions (InferenceBatchDimensions): Dimensions of the padded batch.
-            intermediate_offsets_gpu (Tensor): [prefill_count, 3] int32 GPU tensor of
+            intermediate_offsets_gpu (Tensor): [prefill_count, 2] int32 GPU tensor of
                 per-request intermediate token offsets, or None.
             intermediate_counts_gpu (Tensor): [prefill_count] int32 GPU tensor of
                 per-request intermediate offset counts, or None.
@@ -386,10 +386,10 @@ class MambaMetadata:
         to fixed buffer size.
 
         Args:
-            intermediate_offsets_gpu: [real_prefill_count, 3] int32 GPU tensor
+            intermediate_offsets_gpu: [real_prefill_count, 2] int32 GPU tensor
                 of per-request token offsets, or None if no extraction needed.
             intermediate_counts_gpu: [real_prefill_count] int32 GPU tensor of
-                per-request offset counts (0-3), or None.
+                per-request offset counts (0-2), or None.
             real_prefill_count: Number of real (non-padding) prefill requests.
             padded_prefill_count: Prefill request count after batch padding
                 (equals the captured graph bucket under CUDA graphs, or the
@@ -440,7 +440,8 @@ class MambaMetadata:
                 seq_starts = cu[:real_prefill_count].to(torch.int64)
                 offsets = intermediate_offsets_gpu.to(torch.int64)
 
-                # Expand per-request values to [real_prefill_count, 3]
+                # Expand per-request values to
+                # [real_prefill_count, MAX_INTERMEDIATE_OFFSETS_PER_REQUEST].
                 cum_chunks_exp = cum_chunks[:real_prefill_count].unsqueeze(1).expand_as(offsets)
                 seq_starts_exp = seq_starts.unsqueeze(1).expand_as(offsets)
 

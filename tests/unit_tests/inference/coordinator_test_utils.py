@@ -4,6 +4,7 @@
 
 import itertools
 from collections import deque
+from unittest.mock import MagicMock
 
 import numpy as np
 
@@ -45,6 +46,7 @@ def make_coordinator_direct(
     coordinator.data_parallel_size = data_parallel_size
     coordinator.block_size_tokens = block_size_tokens
     coordinator.enable_prefix_caching = enable_prefix_caching
+    coordinator.generation_epoch = None
     coordinator.prefix_caching_coordinator_policy = policy
     coordinator.prefix_caching_routing_alpha = prefix_caching_routing_alpha
     coordinator.max_requests = max_requests
@@ -72,5 +74,14 @@ def make_coordinator_direct(
 
     coordinator._pending_counts = np.zeros(n_ranks, dtype=np.int32)
     coordinator._identities_list = list(sorted_identities)
+    coordinator._rank_hashes = {identity: set() for identity in sorted_identities}
+    coordinator._rank_cache_epochs = {identity: None for identity in sorted_identities}
+    coordinator._rank_cache_sequences = {identity: None for identity in sorted_identities}
+    coordinator._rank_cache_stream_ids = {
+        identity: f"stream-{idx}" for idx, identity in enumerate(sorted_identities)
+    }
+    coordinator._rank_cache_resync_ids = {identity: 1 for identity in sorted_identities}
+    coordinator._rank_cache_needs_full_snapshot = {identity: True for identity in sorted_identities}
+    coordinator.router_socket = MagicMock()
 
     return coordinator

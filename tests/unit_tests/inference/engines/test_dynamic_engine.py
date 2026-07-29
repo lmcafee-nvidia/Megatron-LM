@@ -13,6 +13,7 @@ from functools import partial
 from typing import Dict, List, Optional, Tuple
 from unittest import mock
 
+import msgpack
 import pytest
 import torch
 from tqdm import tqdm
@@ -24,6 +25,7 @@ from megatron.core.inference.config import (
     InferenceConfig,
     KVCacheManagementMode,
     MambaInferenceStateConfig,
+    PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.contexts.dynamic_context import (
     ActiveRequestCountOverflowError,
@@ -34,6 +36,7 @@ from megatron.core.inference.contexts.dynamic_context import (
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.engines.dynamic_engine import EngineState
+from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
@@ -138,6 +141,10 @@ class DynamicEngineTestConfig:
     skip_prompt_log_probs: bool = False
     enable_chunked_prefill: bool = False
     enable_prefix_caching: bool = False
+    prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = PrefixCachingEvictionPolicy.LRU
+    prefix_caching_mamba_gb: Optional[float] = None
+    logprobs_mode: str = "raw_logprobs"
+    use_flashinfer_fused_rope: Optional[bool] = None
     cuda_graph_modules: List[CudaGraphModule] = field(default_factory=list)
     inference_cuda_graph_scope: InferenceCudaGraphScope = InferenceCudaGraphScope.block
     cuda_graph_impl: Optional[str] = None
@@ -311,7 +318,10 @@ class DynamicInferenceEngineTestBase:
                 static_kv_memory_pointers=test_config.static_kv_memory_pointers,
                 enable_chunked_prefill=test_config.enable_chunked_prefill,
                 enable_prefix_caching=test_config.enable_prefix_caching,
-                use_flashinfer_fused_rope=None,  # default to using flash-infer if available
+                prefix_caching_eviction_policy=test_config.prefix_caching_eviction_policy,
+                prefix_caching_mamba_gb=test_config.prefix_caching_mamba_gb,
+                logprobs_mode=test_config.logprobs_mode,
+                use_flashinfer_fused_rope=test_config.use_flashinfer_fused_rope,
                 # this is for compatibility with the LTS environment
                 unified_memory_level=0,  # unit tests currently broken with UVM
                 track_generated_token_events=test_config.track_generated_token_events,
@@ -640,6 +650,288 @@ def _make_prefix_cached_request_for_checkpoint(request_id: int) -> DynamicInfere
     )
 
 
+def test_report_prefix_cache_state_scales_with_allocator_churn():
+    """Large caches publish one full state followed by delta-sized updates."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    allocator = types.SimpleNamespace(
+        kv_hash_to_block_id={block_hash: block_hash for block_hash in range(1, 5001)},
+        cache_state_version=1,
+    )
+    engine.context = types.SimpleNamespace(
+        enable_prefix_caching=True, is_hybrid_model=False, kv_block_allocator=allocator
+    )
+    engine.socket_for_receiving_requests = mock.MagicMock()
+    engine._generation_epoch = 17
+    engine._last_reported_prefix_hashes = None
+    engine._last_reported_prefix_cache_state_version = None
+    engine._prefix_cache_report_sequence = 0
+    engine._prefix_cache_stream_id = "stream-1"
+    engine._prefix_cache_resync_id = 1
+    engine._get_routable_prefix_hashes = mock.MagicMock(wraps=engine._get_routable_prefix_hashes)
+
+    engine._report_prefix_cache_state()
+    payload = msgpack.unpackb(
+        engine.socket_for_receiving_requests.send.call_args.args[0], raw=False
+    )
+    assert payload[:6] == [Headers.PREFIX_CACHE_STATE.value, 17, "stream-1", 1, 1, True]
+    assert payload[6] == list(range(1, 5001))
+    assert payload[7] == []
+    assert engine._get_routable_prefix_hashes.call_count == 1
+
+    # An unchanged scalar version avoids both a message and a full hash-set scan.
+    engine._report_prefix_cache_state()
+    assert engine.socket_for_receiving_requests.send.call_count == 1
+    assert engine._get_routable_prefix_hashes.call_count == 1
+
+    # Evict one hash and reuse its physical block for one new hash. The second
+    # message stays constant-size rather than retransmitting all 5,000 entries.
+    del allocator.kv_hash_to_block_id[1]
+    allocator.kv_hash_to_block_id[5001] = 1
+    allocator.cache_state_version += 1
+    engine._report_prefix_cache_state()
+    payload = msgpack.unpackb(
+        engine.socket_for_receiving_requests.send.call_args.args[0], raw=False
+    )
+    assert payload == [Headers.PREFIX_CACHE_STATE.value, 17, "stream-1", 1, 2, False, [5001], [1]]
+    assert engine.socket_for_receiving_requests.send.call_count == 2
+    assert engine._get_routable_prefix_hashes.call_count == 2
+
+
+def test_prefix_cache_resync_restarts_sequence_with_full_snapshot():
+    """A matching newer resync request publishes a full state; stale requests do nothing."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.context = types.SimpleNamespace(
+        enable_prefix_caching=True,
+        is_hybrid_model=False,
+        kv_block_allocator=types.SimpleNamespace(
+            kv_hash_to_block_id={11: 1, 22: 2}, cache_state_version=7
+        ),
+    )
+    engine.socket_for_receiving_requests = mock.MagicMock()
+    engine.is_mp_coordinator = True
+    engine._generation_epoch = 17
+    engine._prefix_cache_stream_id = "current-stream"
+    engine._prefix_cache_resync_id = 3
+    engine._prefix_cache_report_sequence = 9
+    engine._last_reported_prefix_hashes = frozenset({11})
+    engine._last_reported_prefix_cache_state_version = 6
+
+    engine._apply_prefix_cache_resync("stale-stream", 4)
+    engine._apply_prefix_cache_resync("current-stream", 3)
+    assert engine.socket_for_receiving_requests.send.call_count == 0
+
+    engine._apply_prefix_cache_resync("current-stream", 4)
+    payload = msgpack.unpackb(
+        engine.socket_for_receiving_requests.send.call_args.args[0], raw=False
+    )
+    assert payload == [
+        Headers.PREFIX_CACHE_STATE.value,
+        17,
+        "current-stream",
+        4,
+        1,
+        True,
+        [11, 22],
+        [],
+    ]
+
+
+def test_reset_with_coordinator_withdraws_cache_without_restarting_sequence():
+    """A runtime reset publishes an ordered empty snapshot for exact routing."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.context = types.SimpleNamespace(
+        reset=mock.Mock(),
+        enable_prefix_caching=True,
+        kv_block_allocator=types.SimpleNamespace(reset_metrics=mock.Mock()),
+        mamba_slot_allocator=None,
+    )
+    engine.num_speculative_tokens = 0
+    engine._generation_epoch = 17
+    engine._prefix_cache_report_sequence = 8
+    engine._last_reported_prefix_hashes = frozenset({11, 22})
+    engine._last_reported_prefix_cache_state_version = 4
+    engine._prefix_cache_stream_id = "stream-1"
+    engine._prefix_cache_resync_id = 2
+    engine.use_coordinator = True
+    engine.is_mp_coordinator = True
+    engine.socket_for_receiving_requests = mock.MagicMock()
+
+    with (
+        mock.patch.object(torch.distributed, "get_rank", return_value=0),
+        mock.patch.object(torch.cuda, "Event", return_value=mock.MagicMock()),
+        mock.patch(
+            "megatron.core.inference.engines.dynamic_engine.get_asyncio_loop",
+            return_value=mock.MagicMock(),
+        ),
+    ):
+        engine.reset()
+
+    payload = msgpack.unpackb(
+        engine.socket_for_receiving_requests.send.call_args.args[0], raw=False
+    )
+    assert payload == [Headers.PREFIX_CACHE_STATE.value, 17, "stream-1", 2, 9, True, [], []]
+    assert engine.use_coordinator
+
+
+def test_recompute_suspend_withdraws_confirmed_cache_state():
+    """RECOMPUTE suspension removes stale coordinator ownership immediately."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    kv_allocator = types.SimpleNamespace(
+        deregistered_block_count=31,
+        lru_evicted_block_count=17,
+        physical_block_reuse_count=23,
+        epoch_invalidated_block_count=5,
+        reset_metrics=mock.Mock(),
+    )
+    mamba_allocator = types.SimpleNamespace(
+        eviction_count=13,
+        restore_hit_count=11,
+        restore_miss_count=7,
+        commit_count=29,
+        reset_metrics=mock.Mock(),
+    )
+    engine.context = types.SimpleNamespace(
+        kv_cache_management_mode=KVCacheManagementMode.RECOMPUTE,
+        static_kv_memory_pointers=True,
+        chunked_prefill_request_id=-1,
+        enable_prefix_caching=True,
+        kv_block_allocator=kv_allocator,
+        mamba_slot_allocator=mamba_allocator,
+        deallocate_inference_state_buffers=mock.Mock(),
+    )
+    engine.state = EngineState.RUNNING
+    engine.unified_memory_level = 0
+    engine.use_coordinator = True
+    engine.is_mp_coordinator = True
+    engine.socket_for_receiving_requests = mock.MagicMock()
+    engine._generation_epoch = 17
+    engine._prefix_cache_report_sequence = 8
+    engine._last_reported_prefix_hashes = frozenset({11, 22})
+    engine._last_reported_prefix_cache_state_version = 4
+    engine._prefix_cache_stream_id = "stream-1"
+    engine._prefix_cache_resync_id = 2
+    engine.waiting_request_ids = deque()
+    engine.requests = {}
+    engine._prefix_allocator_metric_totals = {
+        "kv_blocks_deregistered": 0,
+        "kv_lru_evictions": 0,
+        "kv_physical_reuses": 0,
+        "kv_epoch_invalidations": 0,
+        "mamba_evictions": 0,
+        "mamba_restore_hits": 0,
+        "mamba_restore_misses": 0,
+        "mamba_commits": 0,
+    }
+
+    with (
+        mock.patch.object(
+            DynamicInferenceEngine,
+            "suspend_resume_ctx",
+            side_effect=lambda *args, **kwargs: nullcontext(),
+        ),
+        mock.patch.object(InferenceMode, "unset_active"),
+    ):
+        engine.suspend()
+
+    payload = msgpack.unpackb(
+        engine.socket_for_receiving_requests.send.call_args.args[0], raw=False
+    )
+    assert payload == [Headers.PREFIX_CACHE_STATE.value, 17, "stream-1", 2, 9, False, [], [11, 22]]
+    assert engine._prefix_allocator_metric_totals == {
+        "kv_blocks_deregistered": 31,
+        "kv_lru_evictions": 17,
+        "kv_physical_reuses": 23,
+        "kv_epoch_invalidations": 5,
+        "mamba_evictions": 13,
+        "mamba_restore_hits": 11,
+        "mamba_restore_misses": 7,
+        "mamba_commits": 29,
+    }
+    kv_allocator.reset_metrics.assert_called_once_with()
+    mamba_allocator.reset_metrics.assert_called_once_with()
+
+
+def test_hybrid_prefix_cache_reports_only_executable_kv_mamba_intersection():
+    """Hybrid affinity must not advertise KV-only prefixes as executable hits."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.context = types.SimpleNamespace(
+        enable_prefix_caching=True,
+        is_hybrid_model=True,
+        kv_block_allocator=types.SimpleNamespace(
+            kv_hash_to_block_id={11: 1, 22: 2, 33: 3}, cache_state_version=1
+        ),
+        mamba_slot_allocator=types.SimpleNamespace(
+            hash_to_block_id={11: 1, 33: 3, 44: 4}, cache_state_version=1
+        ),
+    )
+    assert engine._get_routable_prefix_hashes() == frozenset({11, 33})
+
+    # Memory-only hybrid caching still shares KV storage locally, but cannot
+    # skip execution and therefore must not claim coordinator cache affinity.
+    engine.context.mamba_slot_allocator = None
+    assert engine._get_routable_prefix_hashes() == frozenset()
+
+
+def test_finished_producer_publishes_prefix_before_dependent_reply():
+    """A follower submitted on completion must see the producer's cache state."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    allocator = types.SimpleNamespace(kv_hash_to_block_id={101: 1, 202: 2}, cache_state_version=1)
+    engine.context = types.SimpleNamespace(
+        enable_prefix_caching=True,
+        is_hybrid_model=False,
+        kv_block_allocator=allocator,
+        prefix_cache_hits=0,
+        prefix_cache_blocks_matched=0,
+        prefix_cache_prefill_computed_tokens=0,
+        prefix_cache_prefill_skipped_tokens=0,
+    )
+    engine.socket_for_receiving_requests = mock.MagicMock()
+    engine._generation_epoch = 3
+    engine._last_reported_prefix_hashes = None
+    engine._last_reported_prefix_cache_state_version = None
+    engine._prefix_cache_report_sequence = 0
+    engine._prefix_cache_stream_id = "stream-1"
+    engine._prefix_cache_resync_id = 1
+    engine._prefix_cache_hits = 0
+    engine._prefix_cache_blocks_matched = 0
+    engine._prefill_tokens_computed = 0
+    engine._prefill_tokens_skipped = 0
+    engine.use_coordinator = True
+    engine.is_mp_coordinator = True
+    engine.track_paused_request_events = False
+    engine.failed_request_ids = []
+    engine.requests = {}
+    engine.logging_step_interval = 0
+
+    merged_request = types.SimpleNamespace(serialize=lambda: {"request_id": 9})
+    finished_record = types.SimpleNamespace(
+        requests=[types.SimpleNamespace(status=Status.COMPLETED)], merge=lambda: merged_request
+    )
+    engine.post_process_requests = mock.Mock(return_value=([], [finished_record]))
+    step_result = {
+        "active_request_ids": [],
+        "finished_request_ids": [],
+        "newly_paused_request_ids": None,
+        "evict_request_ids": None,
+        "sample": torch.empty(0, dtype=torch.int64),
+        "accepted_tokens": None,
+        "log_probs": [],
+        "cuda_graph_request_count": None,
+    }
+
+    asyncio.run(
+        engine.async_bookkeep(
+            step_result, {"kv_stats": None, "active_token_count": 0, "step_count": 0}, 0.0
+        )
+    )
+
+    headers = [
+        Headers(msgpack.unpackb(call.args[0], raw=False)[0])
+        for call in engine.socket_for_receiving_requests.send.call_args_list
+    ]
+    assert headers == [Headers.PREFIX_CACHE_STATE, Headers.ENGINE_REPLY]
+
+
 def _assert_prefix_cache_checkpoint(
     original: DynamicInferenceRequest, checkpointed: DynamicInferenceRequest
 ) -> None:
@@ -655,7 +947,9 @@ def _assert_prefix_cache_checkpoint(
         )
     )
     expected_hashes = compute_block_hashes_batched(
-        expected_prompt, block_size=original.block_size_tokens
+        expected_prompt,
+        block_size=original.block_size_tokens,
+        namespace=original.prefix_cache_namespace,
     )
 
     assert checkpointed.enable_prefix_caching is True
@@ -704,10 +998,20 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
     request = _make_prefix_cached_request_for_checkpoint(request_id=23)
     record = DynamicInferenceRequestRecord.from_request(request)
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    kv_allocator = types.SimpleNamespace(
+        deregistered_block_count=0,
+        lru_evicted_block_count=0,
+        physical_block_reuse_count=0,
+        epoch_invalidated_block_count=0,
+        reset_metrics=mock.Mock(),
+    )
     engine.context = types.SimpleNamespace(
         chunked_prefill_request_id=-1,
         kv_cache_management_mode=KVCacheManagementMode.RECOMPUTE,
         static_kv_memory_pointers=True,
+        enable_prefix_caching=True,
+        kv_block_allocator=kv_allocator,
+        mamba_slot_allocator=None,
         deallocate_inference_state_buffers=mock.Mock(),
         reinitialize_inference_state_buffers=mock.Mock(),
     )
@@ -719,6 +1023,16 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
     engine._add_request = mock.Mock()
     engine._notify_cond_for_new_request = mock.Mock(return_value=None)
     engine._loop = types.SimpleNamespace(call_soon_threadsafe=mock.Mock())
+    engine._prefix_allocator_metric_totals = {
+        "kv_blocks_deregistered": 0,
+        "kv_lru_evictions": 0,
+        "kv_physical_reuses": 0,
+        "kv_epoch_invalidations": 0,
+        "mamba_evictions": 0,
+        "mamba_restore_hits": 0,
+        "mamba_restore_misses": 0,
+        "mamba_commits": 0,
+    }
 
     with (
         mock.patch.object(
@@ -3643,124 +3957,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             assert (
                 len(merged_req.generated_tokens) == 511
             ), f"Request {request_id} didn't generate expected tokens."
-
-    @pytest.mark.internal
-    @pytest.mark.skipif(
-        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
-    )
-    @torch.inference_mode()
-    def test_speculative_decoding_with_prefix_caching(self):
-        """Test that speculative decoding works correctly when prefix caching is enabled.
-
-        Two requests share the same prompt prefix. The second request should reuse
-        cached KV blocks from the first and still generate correctly with spec decoding.
-        """
-        test_config = DynamicEngineTestConfig(
-            num_requests=0,  # Added manually below
-            min_prompt_length=256,
-            max_prompt_length=256,
-            num_tokens_to_generate=4,
-            num_speculative_tokens=2,
-            enable_prefix_caching=True,  # Set at config level
-            context_block_size_tokens=256,  # Ensure exact 1 block per prompt
-            materialize_only_last_token_logits=False,
-            model_provider="gpt",
-            context_max_tokens=4096,
-            context_max_requests=512,
-            max_sequence_length=1024,
-        )
-        env = self._build_test_env(test_config)
-
-        # Create two pairs of requests with identical shared prefixes.
-        shared_prompt_a = torch.randint(
-            0, test_config.vocab_size - 1, (256,), dtype=torch.int64, device='cuda'
-        )
-        shared_prompt_b = torch.randint(
-            0, test_config.vocab_size - 1, (256,), dtype=torch.int64, device='cuda'
-        )
-
-        prompts = [shared_prompt_a, shared_prompt_a, shared_prompt_b, shared_prompt_b]
-
-        for i, prompt in enumerate(prompts):
-            # Using the clean public API guarantees correct hashing and dataclass creation
-            env.engine.add_request(
-                request_id=i,
-                prompt=prompt.clone(),
-                sampling_params=SamplingParams(num_tokens_to_generate=128, termination_id=99),
-            )
-
-        # First, run schedule_waiting_requests and ONE step to allocate the prefill blocks.
-        # Req 0 and 2 will schedule immediately. Req 1 and 3 will defer because their hashes
-        # are currently pending (being registered by 0 and 2).
-        env.engine.schedule_waiting_requests()
-        env.engine.step_modern()
-
-        # After step 1, Req 0 and 2 have completely registered their cached blocks.
-        # Now, schedule the deferred ones (Req 1 and 3). They will find the registered blocks!
-        env.engine.schedule_waiting_requests()
-        env.engine.step_modern()
-
-        # 4 requests. 2 unique prefixes (1 block each).
-        # Without sharing, we'd need 8 blocks + 1 dummy = 9 active_used.
-        # With sharing, we need 2 shared blocks + 4 generation blocks + 1 dummy = 7 active_used.
-        active_used = env.engine.context.kv_block_allocator.get_active_used()
-        assert (
-            active_used <= 7
-        ), f"Prefix caching failed, expected <= 7 active blocks but got {active_used}"
-
-        while env.engine.has_unfinished_requests():
-            env.engine.step_modern()
-
-        # Context should be clean after all requests finish.
-        assert env.engine.context.active_token_count == 0
-        assert env.engine.context.total_request_count == 0
-
-    @pytest.mark.internal
-    @pytest.mark.skipif(
-        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
-    )
-    @torch.inference_mode()
-    def test_speculative_decoding_chunked_prefill_and_prefix_caching(self):
-        """End-to-end test combining speculative decoding, chunked prefill, and prefix caching.
-
-        Verifies that all three features interact correctly:
-        - Prefix caching shares KV blocks between requests with common prompts
-        - Chunked prefill processes long prompts in chunks
-        - Speculative decoding generates multiple tokens per step
-        """
-        test_config = DynamicEngineTestConfig(
-            num_requests=0,
-            min_prompt_length=512,
-            max_prompt_length=512,
-            num_tokens_to_generate=128,
-            num_speculative_tokens=2,
-            materialize_only_last_token_logits=False,
-            enable_chunked_prefill=True,
-            enable_prefix_caching=True,  # Set at config level
-            context_block_size_tokens=256,
-            model_provider="gpt",
-            context_max_tokens=1536,  # Force chunking
-            context_max_requests=48,
-        )
-        env = self._build_test_env(test_config)
-
-        # Create identical prompts for all 4 requests
-        shared_prompt = torch.randint(
-            0, test_config.vocab_size - 1, (512,), dtype=torch.int64, device='cuda'
-        )
-
-        for i in range(4):
-            env.engine.add_request(
-                request_id=i,
-                prompt=shared_prompt.clone(),
-                sampling_params=SamplingParams(num_tokens_to_generate=128, termination_id=99),
-            )
-
-        while env.engine.has_unfinished_requests():
-            env.engine.step_modern()
-
-        assert env.engine.context.active_token_count == 0
-        assert env.engine.context.total_request_count == 0
 
     @pytest.mark.internal
     @pytest.mark.skipif(

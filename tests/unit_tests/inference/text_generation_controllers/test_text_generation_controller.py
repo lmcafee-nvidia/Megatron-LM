@@ -2042,109 +2042,6 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         assert sampled_mtp_tokens.shape == (num_spec, 2)
 
     @pytest.mark.internal
-    def test_rewind_kv_cache_with_prefix_caching_ref_counts(self):
-        """Test that _rewind_kv_cache correctly decrements ref counts on shared blocks
-        when speculative token rejection causes a block boundary crossing."""
-        self.setup_model(
-            torch.float32,
-            static=False,
-            num_speculative_tokens=2,
-            block_size_tokens=4,
-            enable_prefix_caching=True,
-            max_requests=16,
-            mtp_num_layers=2,
-        )
-
-        ctx = self.text_generation_controller.inference_wrapped_model.inference_context
-        context_device = ctx.request_kv_length_offsets.device
-        ctx.total_request_count = 2
-        ctx.paused_request_count = 0
-        ctx.request_in_prefill_status_tensor[:2] = torch.tensor(
-            [0, 0], dtype=torch.int32, device=context_device
-        )
-
-        # Req 0: 3 blocks, offset 1 in last block. Rewinding 1 token -> no block release.
-        # Req 1: 3 blocks, offset 0 in last block. Rewinding 2 tokens -> crosses back, release block.
-        ctx.request_kv_length_offsets[:2] = torch.tensor([9, 9], device=context_device)
-        ctx.request_kv_block_counts[:2] = torch.tensor([3, 3], device=context_device)
-        ctx.request_last_kv_block_offset[:2] = torch.tensor([1, 0], device=context_device)
-        ctx.request_last_kv_block_id[:2] = torch.tensor([10, 20], device=context_device)
-        ctx.request_to_kv_block_ids[:2, :3] = torch.tensor(
-            [[8, 9, 10], [18, 19, 20]], dtype=torch.int, device=context_device
-        )
-
-        # Set ref counts: block 20 is shared (ref=2), block 10 is exclusive (ref=1).
-        ctx.kv_block_allocator.block_ref_counts[20] = 2
-        ctx.kv_block_allocator.block_ref_counts[10] = 1
-
-        initial_avail = ctx.kv_block_allocator.pool_avail
-
-        # Req 0 accepts 1 (rewinds 1), Req 1 accepts 0 (rewinds 2, crosses boundary).
-        self.text_generation_controller._init_mtp_sampling_tensors()
-        self.text_generation_controller._accepted_token_counts_per_request = torch.tensor(
-            [1, 0], device='cuda'
-        )
-
-        blocks_to_release, remove_mask = self.text_generation_controller._rewind_kv_cache()
-        ctx.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
-
-        # Req 1 should have released block 20 (ref count decremented).
-        assert ctx.kv_block_allocator.block_ref_counts[20].item() == 1
-        # Block 10 should be untouched.
-        assert ctx.kv_block_allocator.block_ref_counts[10].item() == 1
-
-    @pytest.mark.internal
-    def test_rewind_kv_cache_does_not_release_shared_prefix_blocks(self):
-        """Test that rewinding only releases the last block, never shared prefix blocks."""
-        self.setup_model(
-            torch.float32,
-            static=False,
-            num_speculative_tokens=3,
-            block_size_tokens=4,
-            max_requests=16,
-            mtp_num_layers=3,
-        )
-
-        ctx = self.text_generation_controller.inference_wrapped_model.inference_context
-        context_device = ctx.request_kv_length_offsets.device
-        ctx.total_request_count = 1
-        ctx.paused_request_count = 0
-        ctx.request_in_prefill_status_tensor[:1] = torch.tensor(
-            [0], dtype=torch.int32, device=context_device
-        )
-
-        # 4 blocks. Offset 2 in last block. Rewinding 3 crosses into previous block.
-        ctx.request_kv_length_offsets[:1] = torch.tensor([14], device=context_device)
-        ctx.request_kv_block_counts[:1] = torch.tensor([4], device=context_device)
-        ctx.request_last_kv_block_offset[:1] = torch.tensor([2], device=context_device)
-        ctx.request_last_kv_block_id[:1] = torch.tensor([40], device=context_device)
-        ctx.request_to_kv_block_ids[0, :4] = torch.tensor(
-            [10, 20, 30, 40], dtype=torch.int, device=context_device
-        )
-
-        # Blocks 10, 20 are shared prefix blocks. Block 30, 40 are exclusive.
-        ctx.kv_block_allocator.pool_avail = 50
-
-        self.text_generation_controller._init_mtp_sampling_tensors()
-        self.text_generation_controller._accepted_token_counts_per_request = torch.tensor(
-            [0], device='cuda'
-        )
-
-        blocks_to_release, remove_mask = self.text_generation_controller._rewind_kv_cache()
-        ctx.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
-
-        # Only block 40 should be released, not blocks 10, 20, or 30.
-        assert ctx.request_kv_block_counts[0].item() == 3
-        assert ctx.request_last_kv_block_id[0].item() == 30
-        assert ctx.request_to_kv_block_ids[0, 3].item() == -1
-        assert ctx.kv_block_allocator.pool_avail == 51  # exactly 1 block released
-
-        # Prefix blocks remain in request_to_kv_block_ids.
-        assert ctx.request_to_kv_block_ids[0, 0].item() == 10
-        assert ctx.request_to_kv_block_ids[0, 1].item() == 20
-        assert ctx.request_to_kv_block_ids[0, 2].item() == 30
-
-    @pytest.mark.internal
     def test_speculative_mtp_position_ids_with_prefill(self):
         """Test that _compute_serial_mtp_and_sample uses the correct position IDs
         for a mixed batch of prefill and decode requests."""
@@ -2587,8 +2484,7 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
                 ), f"Rank {i} tokens differ from rank {local_rank} tokens for request {j}"
 
     @pytest.mark.parametrize("static", [True, False])
-    @pytest.mark.parametrize("enable_prefix_caching", [True, False])
-    def test_sampled_tokens_dp_mismatch(self, static, enable_prefix_caching):
+    def test_sampled_tokens_dp_mismatch(self, static):
         """
         TextGenerationController should generate different tokens
         on every DP rank given the same prompt / request.
@@ -2605,7 +2501,6 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
             expert_model_parallel_size=1,
             # Test all batching and balancing strategies.
             static=static,
-            enable_prefix_caching=enable_prefix_caching,
             # Set a random seed for generation, so we can
             # verify that different DP ranks produce disparate
             # generations given the DP rank seed offset.

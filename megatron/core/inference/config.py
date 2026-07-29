@@ -338,11 +338,11 @@ class InferenceConfig:
     (ssm_states/conv_states, max_slots slots reused across requests) and the per-step
     extraction scratch (intermediate_ssm_out/intermediate_conv_out). The scratch is
     sized to the tighter of two per-step bounds,
-    ``min(ceil(max_tokens / block_size_tokens), 3 * max_requests)``, since a single
-    engine step can extract at most one state per block_size_tokens of its token budget
-    (and at most 3 per request). The scratch is reserved from this budget first, so a
-    smaller ``max_tokens`` (or ``max_requests``) shrinks the scratch and leaves more
-    durable cache slots."""
+    ``min(max(0, ceil(max_tokens / block_size_tokens) - 1), 2 * max_requests)``,
+    since extraction points are internal block boundaries and each request has at
+    most two distinct candidate boundaries. The scratch is reserved from this budget
+    first, so a smaller ``max_tokens`` (or ``max_requests``) shrinks the scratch and
+    leaves more durable cache slots."""
 
     # =================================
     # Logging config

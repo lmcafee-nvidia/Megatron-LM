@@ -60,9 +60,18 @@ class KVBlockAllocator:
 
             # Hash-to-block mapping for O(1) prefix lookup
             self.kv_hash_to_block_id: Dict[int, int] = {}
+            self.cache_state_version = 0
 
             # Reference count per block: 0 = cached (evictable), >0 = actively used
             self.block_ref_counts = torch.zeros((self.pool_size,), dtype=torch.int32, device='cpu')
+            # Fresh blocks stay below recycled blocks in block_bag. Tracking the
+            # remaining fresh portion is enough to count physical reuse without
+            # allocating per-block diagnostics or adding indexed hot-path work.
+            self.never_allocated_count = self.pool_size - 1
+            self.physical_block_reuse_count = 0
+            self.deregistered_block_count = 0
+            self.lru_evicted_block_count = 0
+            self.epoch_invalidated_block_count = 0
 
             # LRU timestamps for eviction ordering (higher = more recently used)
             # Only needed in LRU mode; RZ mode evicts immediately on ref_count==0
@@ -193,6 +202,10 @@ class KVBlockAllocator:
 
         if self.enable_prefix_caching:
             # Initialize ref counts for newly allocated blocks
+            recycled_count = self.pool_avail + num_blocks - self.never_allocated_count
+            reuse_count = min(num_blocks, recycled_count)
+            self.physical_block_reuse_count += reuse_count
+            self.never_allocated_count -= num_blocks - reuse_count
             self.block_ref_counts[block_ids] = 1
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.update_timestamps(block_ids)
@@ -271,8 +284,11 @@ class KVBlockAllocator:
             self.block_hashes.fill_(-1)
 
             # Reset prefix caching state
+            if self.kv_hash_to_block_id:
+                self.cache_state_version += 1
             self.kv_hash_to_block_id.clear()
             self.block_ref_counts.fill_(0)
+            self.never_allocated_count = self.pool_size - 1
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.block_timestamps.fill_(0)
                 self.block_parent_id.fill_(-1)
@@ -281,9 +297,59 @@ class KVBlockAllocator:
         # Clear per-block routing storage
         self.block_routing.clear()
 
+    def reset_metrics(self) -> None:
+        """Reset lifetime pressure counters without changing allocator state."""
+        if not self.enable_prefix_caching:
+            return
+        self.physical_block_reuse_count = 0
+        self.deregistered_block_count = 0
+        self.lru_evicted_block_count = 0
+        self.epoch_invalidated_block_count = 0
+
     # =========================================================================
     # Prefix caching methods
     # =========================================================================
+
+    def invalidate_prefix_cache(self) -> int:
+        """Make every registered prefix undiscoverable without moving live KV.
+
+        Weight updates change the meaning of every cached state. Zero-reference
+        blocks are returned to the free pool immediately. Referenced blocks stay
+        allocated for their current requests, but lose their hashes so new
+        requests cannot reuse old-weight KV; their final release returns them to
+        the pool through the normal unregistered-block path.
+
+        Returns:
+            Number of registered blocks invalidated.
+        """
+        if not self.enable_prefix_caching:
+            return 0
+
+        registered_ids = torch.nonzero(self.block_hashes != -1, as_tuple=True)[0]
+        if registered_ids.numel() == 0:
+            return 0
+        self.epoch_invalidated_block_count += int(registered_ids.numel())
+
+        hashes = set(self.block_hashes[registered_ids].tolist())
+        if self.on_blocks_deregistered is not None:
+            self.on_blocks_deregistered(registered_ids.tolist(), hashes)
+
+        if self.kv_hash_to_block_id:
+            self.cache_state_version += 1
+        self.kv_hash_to_block_id.clear()
+        self.block_hashes[registered_ids] = -1
+        if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
+            self.block_timestamps[registered_ids] = 0
+            self.block_parent_id[registered_ids] = -1
+            self.block_child_count[registered_ids] = 0
+
+        releasable_ids = registered_ids[self.block_ref_counts[registered_ids] == 0]
+        if releasable_ids.numel() > 0:
+            num_releasable = releasable_ids.numel()
+            self.block_bag[self.pool_avail : self.pool_avail + num_releasable] = releasable_ids
+            self.pool_avail += num_releasable
+
+        return int(registered_ids.numel())
 
     def register_kv_block_hashes(
         self,
@@ -310,6 +376,8 @@ class KVBlockAllocator:
             assert len(parent_hashes) == len(block_ids)
         # Add the new blocks to the hash map first so that a block whose parent is
         # elsewhere in this same batch (block k's parent is block k-1) resolves.
+        if set(block_hashes) - self.kv_hash_to_block_id.keys():
+            self.cache_state_version += 1
         self.kv_hash_to_block_id.update(zip(block_hashes, block_ids))
 
         if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
@@ -351,10 +419,11 @@ class KVBlockAllocator:
 
         # Remove from kv_hash_to_block_id dict (set ops + C-level map, no Python loop)
         keys_to_delete = set(hashes) - {-1}
-        deque(
-            map(self.kv_hash_to_block_id.pop, keys_to_delete & self.kv_hash_to_block_id.keys()),
-            maxlen=0,
-        )
+        registered_keys_to_delete = keys_to_delete & self.kv_hash_to_block_id.keys()
+        if registered_keys_to_delete:
+            self.deregistered_block_count += len(registered_keys_to_delete)
+            self.cache_state_version += 1
+        deque(map(self.kv_hash_to_block_id.pop, registered_keys_to_delete), maxlen=0)
 
         # Notify Mamba slot allocator (if wired) to clean up its state
         if self.on_blocks_deregistered is not None:
@@ -450,8 +519,8 @@ class KVBlockAllocator:
         Worked example, evicting 3 from::
 
             A(ts 1) -> B(ts 2) -> C(ts 5)   (C, F are leaves under B)
-                              \-> F(ts 3)
-                    \-> D(ts 3) -> E(ts 5)   (E is a leaf under D)
+                              \\-> F(ts 3)
+                    \\-> D(ts 3) -> E(ts 5)   (E is a leaf under D)
 
         Leaf-peel evicts F(3), then C(5); B is now childless so it joins the
         leaves with its own ts=2 and is evicted next -> retains {A, D, E}, keeping
@@ -525,6 +594,7 @@ class KVBlockAllocator:
         )
 
         blocks_to_evict = cached_block_ids[torch.tensor(evicted_local, dtype=torch.int64)]
+        self.lru_evicted_block_count += int(blocks_to_evict.numel())
         self._deregister_blocks(blocks_to_evict)
 
         return True

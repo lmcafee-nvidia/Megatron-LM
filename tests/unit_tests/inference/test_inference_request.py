@@ -61,18 +61,43 @@ def test_compute_block_hashes_batched():
     chains: the hash of block i depends on block i-1. Single combined test
     because the contract is one function with one shape of behavior."""
     # Sub-block prompt → no hashes.
-    assert compute_block_hashes_batched(torch.arange(3, dtype=torch.int64), block_size=4) == []
+    assert (
+        compute_block_hashes_batched(
+            torch.arange(3, dtype=torch.int64), block_size=4, namespace=None
+        )
+        == []
+    )
     # Two complete blocks + 2 leftover tokens → 2 distinct hashes; same input is deterministic.
-    h = compute_block_hashes_batched(torch.arange(10, dtype=torch.int64), block_size=4)
+    h = compute_block_hashes_batched(
+        torch.arange(10, dtype=torch.int64), block_size=4, namespace=None
+    )
     assert len(h) == 2 and h[0] != h[1]
-    assert compute_block_hashes_batched(torch.arange(10, dtype=torch.int64), block_size=4) == h
+    assert (
+        compute_block_hashes_batched(
+            torch.arange(10, dtype=torch.int64), block_size=4, namespace=None
+        )
+        == h
+    )
     # Chained: mutating block 0 changes the hash of block 1 (load-bearing for prefix caching).
     prompt_b = torch.arange(8, dtype=torch.int64)
     prompt_b[0] = 99
-    h_b = compute_block_hashes_batched(prompt_b, block_size=4)
+    h_b = compute_block_hashes_batched(prompt_b, block_size=4, namespace=None)
     assert (
-        compute_block_hashes_batched(torch.arange(8, dtype=torch.int64), block_size=4)[1] != h_b[1]
+        compute_block_hashes_batched(
+            torch.arange(8, dtype=torch.int64), block_size=4, namespace=None
+        )[1]
+        != h_b[1]
     )
+
+    # Equal tokens under different weight epochs must never alias.
+    h_epoch_7 = compute_block_hashes_batched(
+        torch.arange(8, dtype=torch.int64), block_size=4, namespace=7
+    )
+    h_epoch_8 = compute_block_hashes_batched(
+        torch.arange(8, dtype=torch.int64), block_size=4, namespace=8
+    )
+    assert h_epoch_7 != h
+    assert h_epoch_7 != h_epoch_8
 
 
 def test_inference_parameters_alias_warns_and_copies():
@@ -124,36 +149,6 @@ def test_inference_request_serialize_round_trip_through_msgpack():
     assert dyn_out.routing_indices.tolist() == [[1, 2], [3, 4]]
 
 
-def test_dynamic_inference_request_post_init_prefix_caching():
-    """DynamicInferenceRequest.__post_init__ computes block hashes if and only
-    if (a) prefix caching is enabled, (b) block_size_tokens is set, and (c) the
-    caller hasn't already supplied them. remaining_prompt_tokens is initialized
-    to a copy of prompt_tokens. Both are non-trivial: they gate prefix-cache
-    routing on every request submitted."""
-    # Without block_size_tokens, no hashes are computed.
-    req = _make_dynamic_request(enable_prefix_caching=True, block_size_tokens=None)
-    assert req.precomputed_block_hashes == []
-    assert torch.equal(req.remaining_prompt_tokens, req.prompt_tokens)
-    assert req.remaining_prompt_length == 4
-
-    # With block_size_tokens and no override, hashes are computed.
-    req = _make_dynamic_request(
-        prompt_tokens=torch.arange(8, dtype=torch.int64),
-        block_size_tokens=4,
-        enable_prefix_caching=True,
-    )
-    assert len(req.precomputed_block_hashes) == 2
-
-    # With explicit precomputed_block_hashes, the supplied value wins.
-    req = _make_dynamic_request(
-        prompt_tokens=torch.arange(8, dtype=torch.int64),
-        block_size_tokens=4,
-        enable_prefix_caching=True,
-        precomputed_block_hashes=[42],
-    )
-    assert req.precomputed_block_hashes == [42]
-
-
 def test_dynamic_inference_request_tracked_metadata_defaults_termination_id():
     """Accessing `tracked_metadata` mutates a `termination_id=None` sampling
     param to -1 in-place (the runtime needs an integer sentinel)."""
@@ -195,7 +190,7 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     assert new_req.block_size_tokens == 4
     assert new_req.enable_prefix_caching
     assert new_req.precomputed_block_hashes == compute_block_hashes_batched(
-        new_req.prompt_tokens, new_req.block_size_tokens
+        new_req.prompt_tokens, new_req.block_size_tokens, namespace=None
     )
     assert new_req.precomputed_block_hashes is not original_hashes
     assert len(new_req.precomputed_block_hashes) == 2
@@ -212,7 +207,7 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     assert second_new_req.block_size_tokens == 4
     assert second_new_req.enable_prefix_caching
     assert second_new_req.precomputed_block_hashes == compute_block_hashes_batched(
-        second_new_req.prompt_tokens, second_new_req.block_size_tokens
+        second_new_req.prompt_tokens, second_new_req.block_size_tokens, namespace=None
     )
     assert second_new_req.precomputed_block_hashes is not previous_hashes
     assert len(second_new_req.precomputed_block_hashes) == 3
@@ -242,6 +237,8 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
         sampling_params=sp,
         generated_tokens=[12],
     )
+    a.prefix_cache_namespace = 7
+    b.prefix_cache_namespace = 8
     a.generated_text = "foo"
     b.generated_text = "bar"
     a.routing_indices = np.array([[1, 2]])
@@ -253,6 +250,7 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     assert merged.generated_text == "foobar"
     assert merged.generated_length == 3 and merged.latency == 4.2
     assert merged.routing_indices.tolist() == [[1, 2], [3, 4]]
+    assert merged.prefix_cache_namespace == 7
 
     # merge() with both generated_text=None propagates None (rather than "None"+"None").
     c = DynamicInferenceRequest(
@@ -276,11 +274,14 @@ def test_dynamic_inference_request_serialize_strips_event_add_engine():
     request back with its events list intact. Tested via a record round-trip
     because that's the real caller."""
     req = _make_dynamic_request()
+    req.prefix_cache_namespace = 17
     req.add_event_finish()
     data = req.serialize()
     assert "event_add_engine" not in data
+    assert "prefix_cache_namespace" not in data
     out = DynamicInferenceRequest.deserialize(unwrap_serialized_tensors(data))
     assert out.request_id == req.request_id
+    assert out.prefix_cache_namespace is None
     assert len(out.events) == 1
     assert out.events[0].type == DynamicInferenceEventType.FINISH
 

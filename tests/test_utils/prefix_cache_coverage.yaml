@@ -1,0 +1,2316 @@
+schema_version: 1
+
+contract:
+  active_only_counts: true
+  pair_ownership: first_listed_covering_scenario
+  flag_only_coverage: zero
+  isolated_hit_coverage: zero
+  unsupported_coverage: zero
+
+# This catalog contains only executable supported coverage. Missing,
+# unsupported, or externally owned surfaces are listed under `unsupported`
+# and never contribute scenarios, behaviors, pairs, or case counts.
+
+# Runtime observations are counters or measurements emitted by a test.  There
+# is intentionally no "prefix caching enabled" observation: configuration
+# alone never earns coverage.
+observations:
+  boundary_positions_exercised: Number of before/exactly-on/after boundary positions executed.
+  cache_mutations: Number of registrations, invalidations, evictions, or physical reuses.
+  cache_off_on_comparisons: Number of complete cache-disabled/cache-enabled workload comparisons.
+  cache_state_updates: Number of confirmed worker-to-coordinator cache-state updates.
+  checkpoint_round_trips: Number of request checkpoint/requeue/restore round trips.
+  chunk_boundaries_crossed: Number of cache-block boundaries crossed by continued prefill chunks.
+  concurrent_followers: Peak number of simultaneous requests sharing a published prefix.
+  epoch_invalidations: Number of weight-epoch changes that invalidate old cache state.
+  eligible_cache_followers: Number of prompt-logprob-eligible follower requests that hit.
+  failure_points_injected: Number of post-allocation failure locations deliberately exercised.
+  graph_replays: Number of forwards confirmed to use an already captured CUDA graph.
+  hashes_computed: Number of complete chained block hashes computed and checked.
+  lru_evictions: Number of zero-reference cached blocks selected and evicted by LRU.
+  mamba_restorations: Number of Mamba states restored from a durable prefix slot.
+  mamba_slot_evictions: Number of durable Mamba slots evicted while the free list was empty.
+  mamba_slot_reuses: Number of invalidated durable Mamba slot IDs reused by a later generation.
+  matched_blocks: Number of complete prefix blocks matched by follower requests.
+  memory_phases_measured: Number of allocation/reservation/peak memory lifecycle phases recorded.
+  physical_reuses: Number of released physical block IDs allocated to a later cache generation.
+  pool_exhaustions: Number of allocation attempts made with no immediately free usable block.
+  prefill_tokens_computed: Number of prompt tokens actually evaluated by the model.
+  prefill_tokens_skipped: Number of prompt tokens skipped because executable prefix state matched.
+  prompt_logprob_bypass_requests: Number of prompt-logprob requests forced through full prefill.
+  prompt_logprob_cache_immutability_checks: Bypass admissions that preserved discoverable hashes.
+  producer_follower_cycles: Number of complete seed/hit/release/pressure cycles.
+  property_cases: Number of deterministic generated state-machine or topology cases executed.
+  reference_transitions: Number of checked reference-count acquire/release transitions.
+  refzero_deregistrations: Number of hashes removed on the final REF_ZERO release.
+  resets: Number of preserve/clear reset cycles executed and verified.
+  rollback_checks: Number of complete pre-failure/post-rollback state comparisons.
+  route_changes: Number of routing decisions deliberately changed by cache or load state.
+  routing_matched_requests: Number of scheduled requests with confirmed affinity on the chosen worker.
+  routing_decisions: Number of coordinator choices checked against an independent score oracle.
+  routing_owner_matches: Number of followers routed to the worker that published their seed prefix.
+  routing_owner_mismatches: Number of followers deliberately spread away from their seed worker.
+  routing_removal_checks: Number of post-invalidation probes proven to have zero stale affinity.
+  routing_reconstructions: Number of routing records reconstructed after physical block reuse.
+  routing_seed_distinct_ranks: Number of distinct workers that materialized controlled seed prefixes.
+  sampling_modes_executed: Number of distinct sampling branches executed during cache churn.
+  speculative_rewinds: Number of accepted/rejected speculative-token boundary rewinds.
+  state_checksum_checks: Number of byte-level KV or Mamba state immutability comparisons.
+  suspend_resume_cycles: Number of completed deallocate/offload/recompute and resume cycles.
+  termination_releases: Number of early-terminated requests followed through final cache release.
+  worker_state_transitions: Number of empty/matched/evicted/reconnected/refit worker-state transitions.
+
+output_fields:
+  generated_logprobs: Generated-token log probabilities compared at identical token positions.
+  output_length: Returned output length compared exactly.
+  prompt_logprobs: Prompt log probabilities compared at identical token positions.
+  request_status: Terminal request status compared exactly.
+  routing_indices: Per-token expert routing indices compared exactly.
+  termination_position: Stop or termination position compared exactly.
+  text: Generated text compared exactly.
+  tokens: Generated token IDs compared exactly.
+  top_n_logprobs: Top-N token IDs compared exactly and probabilities within dtype tolerance.
+
+oracles:
+  allocator_invariants: Independent counts and block-table invariants hold after every mutation.
+  byte_immutability: Published KV and Mamba bytes do not change under serial or concurrent followers.
+  cache_state_oracle: Hash maps, references, routing records, and Mamba slots match a scalar model.
+  dtype_logprob_parity: Finite position-aligned log probabilities meet a strict dtype-aware tolerance.
+  exact_output_parity: Cache-disabled and cache-enabled tokens and discrete outputs are identical.
+  leaf_peeling_lru: LRU victims match an independent cached-forest leaf-peeling implementation.
+  memory_bound: Configured cache bytes and per-phase leak bounds are not exceeded.
+  no_stale_generation: Reused physical storage never exposes a previous KV, Mamba, or routing generation.
+  rollback_identity: State after an injected failure is identical to state before admission began.
+  routing_score_oracle: Coordinator choice matches an independent scalar score and tie-break model.
+
+stress_profiles:
+  boundary_sweep:
+    description: Sweep block hashing and matching before, exactly on, and after boundaries.
+    minimums:
+      block_sizes: 3
+      boundary_positions: 3
+    runtime_minimums:
+      boundary_positions_exercised: 3
+      hashes_computed: 1
+
+  context_boundary_churn:
+    description: Continue hidden prefill requests across local block boundaries and acquire additional cached blocks.
+    minimums:
+      boundary_positions: 3
+      cycles: 3
+    runtime_minimums:
+      chunk_boundaries_crossed: 3
+      matched_blocks: 3
+      prefill_tokens_skipped: 3
+
+  capacity_churn:
+    description: Fill the cache, remove availability, and repeatedly recycle physical storage.
+    minimums:
+      cycles: 3
+      pool_exhausted: true
+    runtime_minimums:
+      cache_mutations: 3
+      physical_reuses: 3
+      pool_exhaustions: 1
+
+  execution_replay:
+    description: Compare cache-off and cache-on model execution through repeated prefix reuse.
+    minimums:
+      cycles: 3
+      prompt_blocks: 2
+    runtime_minimums:
+      cache_off_on_comparisons: 1
+      matched_blocks: 3
+      prefill_tokens_skipped: 3
+      producer_follower_cycles: 3
+
+  graph_replay:
+    description: Reuse prefixes while repeatedly executing captured graphs across lifecycle changes.
+    minimums:
+      cycles: 3
+      replays: 3
+    runtime_minimums:
+      cache_off_on_comparisons: 1
+      graph_replays: 3
+      matched_blocks: 3
+
+  hybrid_depth_replay:
+    description: Repeatedly match KV prefixes at each executable Mamba depth and verify restored or recomputed state.
+    minimums:
+      cycles: 3
+      match_depths: 4
+    runtime_minimums:
+      matched_blocks: 3
+      producer_follower_cycles: 3
+      reference_transitions: 3
+      state_checksum_checks: 3
+
+  boundary_state_replay:
+    description: Publish and restore Mamba state from continuation and end-of-prompt boundaries.
+    minimums:
+      cycles: 3
+      boundary_sources: 2
+    runtime_minimums:
+      chunk_boundaries_crossed: 3
+      mamba_restorations: 3
+      producer_follower_cycles: 3
+      state_checksum_checks: 3
+
+  pinned_state_pressure:
+    description: Repeated failed allocation preserves pinned durable state before released storage is recycled.
+    minimums:
+      cycles: 3
+      failure_points: 1
+    runtime_minimums:
+      failure_points_injected: 3
+      mamba_slot_evictions: 1
+      mamba_slot_reuses: 3
+      physical_reuses: 3
+      state_checksum_checks: 3
+
+  immutability_replay:
+    description: Repeatedly attempt real KV and Mamba writes through canonical and follower paths.
+    minimums:
+      cycles: 3
+      overwrite_attempts: 3
+    runtime_minimums:
+      producer_follower_cycles: 3
+      state_checksum_checks: 3
+
+  lifecycle_failure:
+    description: Inject failures after mutations and prove complete transactional rollback.
+    minimums:
+      cycles: 3
+      failure_points: 1
+    runtime_minimums:
+      failure_points_injected: 1
+      rollback_checks: 1
+      reference_transitions: 3
+
+  checkpoint_churn:
+    description: Repeatedly evict live requests, checkpoint them, requeue them, and resume from cached prefixes.
+    minimums:
+      cycles: 3
+      transitions: 3
+    runtime_minimums:
+      checkpoint_round_trips: 3
+      matched_blocks: 1
+      reference_transitions: 3
+
+  reset_rebuild:
+    description: Alternate cache-preserving and cache-clearing resets while proving hits and full recomputation.
+    minimums:
+      cycles: 3
+      reset_modes: 2
+    runtime_minimums:
+      matched_blocks: 3
+      prefill_tokens_computed: 3
+      prefill_tokens_skipped: 3
+      resets: 6
+
+  epoch_rebuild:
+    description: Invalidate a populated generation epoch, then rebuild and reuse fresh prefixes.
+    minimums:
+      cycles: 3
+      transitions: 1
+    runtime_minimums:
+      epoch_invalidations: 1
+      matched_blocks: 3
+      prefill_tokens_skipped: 3
+      producer_follower_cycles: 3
+
+  routing_churn:
+    description: Route from confirmed cache state, evict or invalidate it, and route again.
+    minimums:
+      cycles: 3
+      workers: 2
+    runtime_minimums:
+      cache_state_updates: 3
+      route_changes: 2
+
+  routing_fallback_churn:
+    description: Repeatedly change confirmed affinity and load while proving load-only routing ignores the cache signal.
+    minimums:
+      cycles: 3
+      workers: 2
+    runtime_minimums:
+      cache_state_updates: 3
+      route_changes: 2
+
+  coordinator_execution_replay:
+    description: Execute cache-off and real-ZMQ cache-on generations, then remove confirmed affinity and probe again.
+    minimums:
+      cycles: 3
+      workers: 8
+    runtime_minimums:
+      cache_off_on_comparisons: 1
+      matched_blocks: 3
+      prefill_tokens_skipped: 3
+      producer_follower_cycles: 3
+      routing_removal_checks: 1
+
+  rebalance_churn:
+    description: Repeatedly exhaust the shared pool, evict the minimal paused suffix, and reactivate every funded survivor.
+    minimums:
+      cycles: 3
+      transitions: 3
+    runtime_minimums:
+      cache_mutations: 3
+      pool_exhaustions: 1
+      reference_transitions: 3
+
+  state_reuse_churn:
+    description: Deduplicate competing state producers and reuse the same physical slots repeatedly.
+    minimums:
+      cycles: 3
+      destinations: 2
+    runtime_minimums:
+      mamba_slot_reuses: 2
+      producer_follower_cycles: 3
+      state_checksum_checks: 3
+
+  state_machine_property:
+    description: Run a deterministic generated workload against an independent scalar model.
+    minimums:
+      deterministic_cases: 200
+      transitions_per_case: 3
+    runtime_minimums:
+      property_cases: 200
+      reference_transitions: 3
+
+behaviors:
+  admission_pressure:
+    description: Allocation decisions balance free, matching, evictable, and required-new blocks.
+    status: active
+    stress_profiles:
+      [state_machine_property, capacity_churn, lifecycle_failure, rebalance_churn]
+    runtime_observations: [pool_exhaustions, cache_mutations]
+
+  admission_rollback:
+    description: A matched-prefix admission rejected at real pool exhaustion restores its pin, LRU age, diagnostics, and hybrid state before a successful retry.
+    status: active
+    stress_profiles: [lifecycle_failure]
+    runtime_observations: [failure_points_injected, rollback_checks]
+
+  chunked_boundary_reuse:
+    description: Continued chunked prefills restore and skip only complete executable prefixes.
+    status: active
+    stress_profiles:
+      [context_boundary_churn, execution_replay, graph_replay, boundary_state_replay]
+    runtime_observations: [chunk_boundaries_crossed, prefill_tokens_skipped]
+
+  cuda_graph_replay:
+    description: Decode, prefill, and mixed-batch graphs replay during repeated cache reuse.
+    status: active
+    stress_profiles: [graph_replay]
+    runtime_observations: [graph_replays, matched_blocks]
+
+  coordinator_exact_routing:
+    description: Routing uses confirmed current worker cache state and changes after invalidation.
+    status: active
+    stress_profiles: [routing_churn, coordinator_execution_replay]
+    runtime_observations: [cache_state_updates, route_changes]
+
+  coordinator_load_balancing:
+    description: Load-balanced routing ignores cache affinity while still executing cache hits on every worker.
+    status: active
+    stress_profiles: [routing_fallback_churn, coordinator_execution_replay]
+    runtime_observations: [route_changes, routing_owner_mismatches]
+
+  hybrid_coordinator_restore:
+    description: Prefix-routed hybrid followers restore durable Mamba state on every data-parallel worker.
+    status: active
+    stress_profiles: [coordinator_execution_replay]
+    runtime_observations: [mamba_restorations, routing_owner_matches]
+
+  epoch_invalidation:
+    description: Weight updates invalidate local and coordinator state before later cache rebuilding.
+    status: active
+    stress_profiles: [capacity_churn, routing_churn, epoch_rebuild, coordinator_execution_replay]
+    runtime_observations: [epoch_invalidations, matched_blocks]
+
+  hash_boundaries:
+    description: Hash count and ancestry are correct across block sizes and boundary positions.
+    status: active
+    stress_profiles: [boundary_sweep]
+    runtime_observations: [boundary_positions_exercised, hashes_computed]
+
+  hash_mutation_propagation:
+    description: Mutating a complete block changes that block and every descendant hash.
+    status: active
+    stress_profiles: [boundary_sweep]
+    runtime_observations: [hashes_computed, state_checksum_checks]
+
+  kv_mamba_atomicity:
+    description: Hybrid matches, invalidations, releases, and reuse update KV and Mamba together.
+    status: active
+    stress_profiles:
+      [hybrid_depth_replay, boundary_state_replay, pinned_state_pressure, execution_replay]
+    runtime_observations: [mamba_restorations, state_checksum_checks]
+
+  lru_eviction_order:
+    description: LRU pressure selects only eligible oldest cached leaves and preserves dependencies.
+    status: active
+    stress_profiles: [state_machine_property, capacity_churn, execution_replay]
+    runtime_observations: [lru_evictions, pool_exhaustions]
+
+  mamba_slot_exhaustion:
+    description: Durable Mamba slots evict from an empty free list without evicting pinned state.
+    status: active
+    stress_profiles: [pinned_state_pressure, execution_replay]
+    runtime_observations: [mamba_slot_evictions]
+
+  mamba_producer_deduplication:
+    description: Concurrent producers select one stable source per destination and batch unique copies.
+    status: active
+    stress_profiles: [state_reuse_churn]
+    runtime_observations: [mamba_slot_reuses, state_checksum_checks]
+
+  mamba_budget_partition:
+    description: Independently sized KV and durable-Mamba pools become limiting in the predicted order.
+    status: active
+    stress_profiles: [capacity_churn]
+    runtime_observations: [physical_reuses, pool_exhaustions]
+
+  mixed_cached_uncached:
+    description: Mixed followers and unrelated requests schedule and allocate correctly together.
+    status: active
+    stress_profiles: [state_machine_property, execution_replay]
+    runtime_observations: [matched_blocks, prefill_tokens_computed]
+
+  moe_routing_replay:
+    description: Expert routing is reconstructed consistently across ranks after physical block reuse.
+    status: active
+    stress_profiles: [capacity_churn, execution_replay]
+    runtime_observations: [physical_reuses, routing_reconstructions]
+
+  output_parity:
+    description: Stressed cache-on execution matches the same fresh cache-off workload.
+    status: active
+    stress_profiles:
+      - execution_replay
+      - graph_replay
+      - capacity_churn
+      - routing_churn
+      - coordinator_execution_replay
+      - checkpoint_churn
+      - epoch_rebuild
+    runtime_observations: [cache_off_on_comparisons]
+
+  prefix_match_shapes:
+    description: Exact, partial, absent, and branching prefixes allocate and skip correctly.
+    status: active
+    stress_profiles: [state_machine_property, execution_replay]
+    runtime_observations: [matched_blocks, prefill_tokens_skipped]
+
+  prompt_logprob_bypass:
+    description: Prompt-logprob requests recompute their prompt while neighboring requests continue to hit.
+    status: active
+    stress_profiles: [execution_replay]
+    runtime_observations: [prefill_tokens_computed, producer_follower_cycles]
+
+  published_state_immutability:
+    description: Followers cannot overwrite canonical cached KV or Mamba state.
+    status: active
+    stress_profiles:
+      - execution_replay
+      - immutability_replay
+      - hybrid_depth_replay
+      - pinned_state_pressure
+    runtime_observations: [state_checksum_checks]
+
+  refzero_release_reuse:
+    description: Final REF_ZERO release deregisters once and later reuse cannot expose stale state.
+    status: active
+    stress_profiles:
+      - state_machine_property
+      - capacity_churn
+      - execution_replay
+      - graph_replay
+    runtime_observations: [refzero_deregistrations, physical_reuses]
+
+  request_checkpoint_requeue:
+    description: Prefix configuration and hashes survive pause, checkpoint, requeue, and restore.
+    status: active
+    stress_profiles: [checkpoint_churn]
+    runtime_observations: [checkpoint_round_trips, matched_blocks]
+
+  paused_request_rebalance:
+    description: Paused retention limits evict enough requests to fund reactivation under pool pressure.
+    status: active
+    stress_profiles: [state_machine_property, capacity_churn, rebalance_churn]
+    runtime_observations: [pool_exhaustions, cache_mutations]
+
+  reset_and_reuse:
+    description: Preserve resets retain cache state while ordinary resets clear it before rebuilding.
+    status: active
+    stress_profiles: [reset_rebuild]
+    runtime_observations: [resets, matched_blocks]
+
+  shared_reference_churn:
+    description: Concurrent followers acquire and release shared blocks exactly once.
+    status: active
+    stress_profiles: [state_machine_property, capacity_churn]
+    runtime_observations: [concurrent_followers, reference_transitions]
+
+  sampling_output_modes:
+    description: Greedy, top-k, top-p, and temperature sampling preserve cache-off parity under churn.
+    status: active
+    stress_profiles: [execution_replay]
+    runtime_observations: [sampling_modes_executed, cache_off_on_comparisons]
+
+  speculative_rewind:
+    description: Speculative accept/reject rewinds release only crossed exclusive blocks.
+    status: active
+    stress_profiles: [state_machine_property, execution_replay]
+    runtime_observations: [speculative_rewinds, reference_transitions]
+
+  suspend_resume:
+    description: Persist, offload, and recompute transitions preserve or rebuild intended cache state.
+    status: active
+    stress_profiles: [graph_replay]
+    runtime_observations: [suspend_resume_cycles, matched_blocks]
+
+  memory_bounds:
+    description: Cache capacity remains bounded and repeated lifecycle phases do not leak memory.
+    status: active
+    stress_profiles: [execution_replay, graph_replay]
+    runtime_observations: [memory_phases_measured, producer_follower_cycles]
+
+  termination_release:
+    description: Length, stop-word, and termination-token completion release final references exactly once.
+    status: active
+    stress_profiles: [execution_replay, lifecycle_failure]
+    runtime_observations: [termination_releases, reference_transitions]
+
+features:
+  api_surface:
+    description: Public surface that owns request construction and completion.
+    values:
+      coordinator_client: InferenceClient over the data-parallel coordinator.
+      direct: In-process dynamic-engine API.
+      http: Inference HTTP server API.
+      rl_refit: Reinforcement-learning worker with repeated weight refits.
+
+  architecture:
+    description: Model state layout participating in prefix caching.
+    values:
+      gpt: Attention-only GPT.
+      hybrid: Attention plus Mamba hybrid.
+      mla: Multi-latent-attention KV layout.
+      moe: Mixture-of-experts model with routing replay.
+
+  arrival_pattern:
+    description: Temporal relationship among producers, followers, and unrelated requests.
+    values:
+      concurrent: Followers overlap while the canonical prefix is pinned.
+      serial: A producer releases before its follower arrives.
+      staggered: Followers complete in different orders while pressure is added.
+
+  cache_management:
+    description: Large-cache handling across engine deallocation and allocation.
+    values:
+      offload: Copy cache tensors to CPU and restore them.
+      persist: Keep cache tensors resident.
+      recompute: Discard cache tensors and rebuild executable state.
+
+  chunk_cut:
+    description: Position where an unfinished prefill chunk stops relative to a cache-block boundary.
+    values:
+      after: One token after a block boundary.
+      before: One token before a block boundary.
+      exact: Exactly on a block boundary.
+
+  coordinator_policy:
+    description: Data-parallel coordinator routing policy.
+    values:
+      first_prefix_block: Route using the first block hash.
+      load_balanced: Ignore affinity and select the least-loaded worker.
+      longest_prefix: Score the longest consecutive cached prefix.
+
+  eviction_policy:
+    description: Prefix block retention policy after the final request reference.
+    values:
+      lru: Retain zero-reference blocks until selected under pressure.
+      ref_zero: Deregister immediately at the final release.
+
+  execution_mode:
+    description: Forward scheduling path used while cache state is reused.
+    values:
+      chunked_prefill: Prompt work continues across multiple engine steps.
+      cuda_graph: Captured forward graphs are replayed.
+      eager: Ordinary uncaptured forward execution.
+
+  failure_point:
+    description: Admission mutation after which an exception is injected.
+    values:
+      after_block_allocation: KV blocks have been removed from the free pool.
+      after_hash_registration: Newly completed prefix hashes have been registered.
+      after_mamba_slot: Durable Mamba slots have been reserved or populated.
+      after_match_pin: Existing matched blocks have acquired request references.
+      after_routing_state: Per-block routing state has been attached.
+
+  graph_prefill_scope:
+    description: Forward-step families represented by captured CUDA graphs.
+    values:
+      all_prefills: Prefill graphs span the complete max-token budget.
+      decode_only: Only decode steps use captured graphs.
+      mixed_bounded: Mixed and prefill graphs stop at the configured graph token ceiling.
+
+  graph_sizing:
+    description: Token-count distribution used to select captured graph sizes.
+    values:
+      exponential: Graph token counts use exponential spacing.
+      linear: Graph token counts use linear spacing.
+
+  logit_materialization:
+    description: Amount of pre-sampling logits materialized by the engine.
+    values:
+      full: Materialize logits for all required positions.
+      last_token: Materialize only the final position.
+
+  logprob_representation:
+    description: Log-probability representation returned by inference.
+    values:
+      none: No log probabilities are requested on the token-only path.
+      processed: Values after configured sampling transformations.
+      raw: Values before sampling transformations.
+
+  mamba_cache_mode:
+    description: Hybrid Mamba state retained alongside KV state.
+    values:
+      full_prefix: Durable Mamba prefix slots make a KV match executable.
+      memory_only: Live request Mamba states exist without durable prefix slots.
+
+  mamba_match_mode:
+    description: Executable relationship between matched KV blocks and durable Mamba state.
+    values:
+      equal: KV and Mamba restore the same three-block prefix.
+      kv_only: KV hashes match while no durable Mamba state is executable.
+      mamba_shorter: Mamba state shortens a three-block KV match to two executable blocks.
+      memory_only: Live Mamba state is recomputed while KV blocks are reused.
+
+  mamba_state_dtype:
+    description: Data type used by live and durable Mamba inference state.
+    values:
+      bfloat16: Mamba convolution and SSM states use bfloat16.
+      float32: Mamba convolution and SSM states use float32.
+
+  mamba_block_chunk_profile:
+    description: Prefix-block and Mamba-chunk boundary pair exercised together.
+    values:
+      bs64_chunk64: 64-token KV blocks with 64-token Mamba chunks.
+      bs128_chunk64: 128-token KV blocks with 64-token Mamba chunks.
+      bs256_chunk128: 256-token KV blocks with 128-token Mamba chunks.
+
+  mamba_boundary_source:
+    description: Execution point from which a durable Mamba boundary state is extracted.
+    values:
+      continuation: A later chunk completes and publishes the boundary.
+      eos: End-of-prompt publication supplies the boundary.
+
+  mamba_scratch_limit:
+    description: Resource that limits intermediate Mamba extraction slots.
+    values:
+      requests: The two-per-request cap is smaller than the token cap.
+      tokens: The token-derived cap is smaller than the request cap.
+
+  mamba_live_ratio:
+    description: Relative portion of the hybrid memory pool reserved for live Mamba request state.
+    values:
+      balanced: Live Mamba state and KV storage reach their intended balanced split.
+      large: Live Mamba reservation is near its supported upper boundary.
+      small: Live Mamba reservation is near its supported lower boundary.
+
+  match_shape:
+    description: Prefix relationship between producer and follower token sequences.
+    values:
+      branching: Followers share a parent and diverge into different children.
+      exact: All complete producer blocks match.
+      none: No complete producer block matches.
+      partial: Some complete blocks match before divergence.
+
+  memory_backing:
+    description: Backing used for large inference cache tensors.
+    values:
+      gpu: Ordinary device allocation.
+      tms: Torch Memory Saver managed allocation.
+      uvm: Unified virtual memory allocation.
+
+  prefix_mamba_budget:
+    description: Durable Mamba prefix-cache budget relative to one usable slot.
+    values:
+      below_one_slot: Scratch leaves insufficient memory for one durable slot.
+      exactly_one_slot: Scratch leaves room for exactly one durable slot.
+      multiple_slots: Scratch leaves room for multiple durable slots.
+
+  output_mode:
+    description: Model output that must be compared between cache-off and stressed cache-on runs.
+    values:
+      generated_logprobs: Generated token IDs and their log probabilities.
+      prompt_logprobs: Prompt positions requiring intentional prefix-skip bypass.
+      tokens: Generated token IDs.
+      top_n_logprobs: Top-N token IDs and probabilities for each requested position.
+
+  parallelism:
+    description: Distributed execution topology stressed while prefixes churn.
+    values:
+      moe_tp_ep_sp: Tensor, expert, and sequence-parallel MoE execution.
+      single: Single data-parallel worker model execution.
+      tp_pp: Tensor- and pipeline-parallel execution without sequence parallelism.
+      tp_pp_sp: Tensor-, pipeline-, and sequence-parallel GPT execution.
+
+  pressure_shape:
+    description: Availability and pinning state when another allocation is required.
+    values:
+      exact_capacity: The request fits exactly after eligible releases.
+      exhausted: No free or evictable block can satisfy admission.
+      one_over: One additional block forces release or eviction.
+      pinned: Capacity exists only in blocks still referenced by live requests.
+
+  paused_budget:
+    description: Paused-request block retention limit relative to reactivation demand.
+    values:
+      exact: Retained paused blocks exactly fund the required reactivations.
+      insufficient: Retention requires request eviction before reactivation.
+      zero: No paused request may retain KV blocks under pressure.
+
+  paused_topology:
+    description: Physical block-sharing pattern among paused request rows at a fully exhausted pool.
+    values:
+      disjoint_pairs: Four paused requests each own two distinct blocks.
+      shared_prefix: Four paused requests share one block and each own one distinct block.
+      sparse_singletons: Four paused requests each own one block while other pool blocks remain pinned outside their rows.
+      uneven_tail: Three paused requests own pairs and the final request owns one block.
+
+  relative_capacity:
+    description: Relative KV-block and durable Mamba-slot pressure in hybrid caching.
+    values:
+      balanced: KV and Mamba capacities reach pressure together.
+      kv_limited: KV blocks exhaust before durable Mamba slots.
+      mamba_limited: Durable Mamba slots exhaust before KV blocks.
+
+  rope_backend:
+    description: Rotary-position embedding implementation used by attention layers.
+    values:
+      flashinfer_fused: FlashInfer fused RoPE.
+      torch: Standard model RoPE path.
+
+  routing_alpha:
+    description: Prefix-affinity weight used by prefix-aware coordinator scoring.
+    values:
+      balanced: Prefix match and normalized load both contribute.
+      load_only: Load dominates scoring.
+      prefix_only: Prefix length dominates scoring.
+
+  sampling_backend:
+    description: Token sampler used after stressed model execution.
+    values:
+      flashinfer: FlashInfer sampling implementation.
+      torch: Torch sampling implementation.
+
+  sampling_control:
+    description: Sampling branch exercised while cache state is repeatedly reused.
+    values:
+      greedy: Deterministic argmax sampling.
+      temperature: Non-unit temperature scaling with a fixed RNG seed.
+      top_k: Bounded top-k sampling with a fixed RNG seed.
+      top_p: Nucleus sampling with a fixed RNG seed.
+
+  schedule_mode:
+    description: Dynamic-engine scheduling interleaving.
+    values:
+      async_overlap: Prepare/forward and sample/resolve phases overlap.
+      async_serial: Speculative preparation occurs without phase overlap.
+      sync: Requests resolve before preparing the next forward.
+
+  speculation:
+    description: Speculative-token execution around cache block boundaries.
+    values:
+      disabled: Ordinary one-token decode.
+      mtp: Multi-token prediction with accepted and rejected speculative tokens.
+
+  static_pointers:
+    description: Whether cache tensor addresses must remain stable across lifecycle changes.
+    values:
+      disabled: Reallocation may change tensor addresses.
+      enabled: Captured graphs require stable cache tensor addresses.
+
+  termination:
+    description: Request completion path that releases its final cache references.
+    values:
+      cancellation: An in-flight request is explicitly cancelled.
+      length: Generation reaches its requested length.
+      stop_word: Detokenization detects a configured stop sequence.
+      termination_token: Sampling produces the configured termination token.
+
+  transport:
+    description: Worker/coordinator communication path.
+    values:
+      direct: Production handlers invoked in process.
+      zmq_async: Asynchronous ZMQ request/reply transport.
+      zmq_sync: Synchronous ZMQ request/reply transport.
+
+  worker_cache_state:
+    description: Confirmed worker prefix-cache state used by the coordinator.
+    values:
+      empty: Worker reports no executable hashes.
+      evicted: A formerly matching hash has been removed under pressure.
+      matched: Worker reports a consecutive executable prefix.
+      reconnected: A restarted transport replaces prior worker state.
+      refit: A weight epoch invalidates the worker's previous hashes.
+
+matrices:
+  allocator_execution:
+    description: Local allocator rows whose axes are all exercised by concrete block mutations.
+    status: active
+    axes:
+      eviction_policy: [ref_zero, lru]
+      match_shape: [none, partial, exact, branching]
+      arrival_pattern: [serial, concurrent, staggered]
+      pressure_shape: [exact_capacity, one_over, pinned, exhausted]
+    exclusions: []
+    scenarios: [pc.unit.allocator_execution_matrix]
+
+  context_continuation:
+    description: Continued prefill matching around block boundaries with and without speculative tokens.
+    status: active
+    axes:
+      eviction_policy: [ref_zero, lru]
+      speculation: [disabled, mtp]
+      chunk_cut: [before, exact, after]
+    exclusions: []
+    scenarios: [pc.unit.context_continuation]
+
+  engine_execution_local:
+    description: Single-rank GPT and hybrid model execution with real cache hits and an independent cache-disabled run.
+    status: active
+    axes:
+      architecture: [gpt, hybrid]
+      eviction_policy: [ref_zero, lru]
+      execution_mode: [eager, chunked_prefill]
+      output_mode: [tokens, generated_logprobs, prompt_logprobs, top_n_logprobs]
+      logit_materialization: [last_token, full]
+      logprob_representation: [none, raw, processed]
+      sampling_control: [greedy, top_k, top_p, temperature]
+      match_shape: [partial, exact, branching]
+      speculation: [disabled, mtp]
+      termination: [length, termination_token, stop_word]
+    exclusions:
+      - values:
+          output_mode: prompt_logprobs
+          logit_materialization: last_token
+        reason: Prompt-position log probabilities require full-position logits.
+      - values:
+          speculation: mtp
+          logprob_representation: processed
+        reason: Speculative decoding currently supports only raw log probabilities.
+      - values:
+          output_mode: tokens
+          logprob_representation: raw
+        reason: Token-only requests do not execute a log-probability representation.
+      - values:
+          output_mode: tokens
+          logprob_representation: processed
+        reason: Token-only requests do not execute a log-probability representation.
+      - values:
+          output_mode: generated_logprobs
+          logprob_representation: none
+        reason: Generated log probabilities require a concrete representation.
+      - values:
+          output_mode: prompt_logprobs
+          logprob_representation: none
+        reason: Prompt log probabilities require a concrete representation.
+      - values:
+          output_mode: top_n_logprobs
+          logprob_representation: none
+        reason: Top-N log probabilities require a concrete representation.
+    scenarios: [pc.engine.execution_local_matrix]
+
+  paused_rebalance_local:
+    description: Real paused-request eviction and reactivation across fully exhausted sharing topologies.
+    status: active
+    axes:
+      eviction_policy: [ref_zero, lru]
+      paused_budget: [zero, exact, insufficient]
+      paused_topology: [disjoint_pairs, shared_prefix, sparse_singletons, uneven_tail]
+    exclusions: []
+    scenarios: [pc.unit.paused_rebalance_local_matrix]
+
+  mamba_match_depth:
+    description: KV reuse crossed with every executable Mamba depth and state dtype.
+    status: active
+    axes:
+      eviction_policy: [ref_zero, lru]
+      mamba_match_mode: [memory_only, kv_only, mamba_shorter, equal]
+      mamba_state_dtype: [float32, bfloat16]
+    rows:
+      - {eviction_policy: ref_zero, mamba_match_mode: memory_only, mamba_state_dtype: float32}
+      - {eviction_policy: ref_zero, mamba_match_mode: kv_only, mamba_state_dtype: bfloat16}
+      - {eviction_policy: ref_zero, mamba_match_mode: mamba_shorter, mamba_state_dtype: float32}
+      - {eviction_policy: ref_zero, mamba_match_mode: equal, mamba_state_dtype: bfloat16}
+      - {eviction_policy: lru, mamba_match_mode: memory_only, mamba_state_dtype: bfloat16}
+      - {eviction_policy: lru, mamba_match_mode: kv_only, mamba_state_dtype: float32}
+      - {eviction_policy: lru, mamba_match_mode: mamba_shorter, mamba_state_dtype: bfloat16}
+      - {eviction_policy: lru, mamba_match_mode: equal, mamba_state_dtype: float32}
+    exclusions: []
+    scenarios: [pc.unit.mamba_match_depth]
+
+  mamba_relative_capacity:
+    description: Independently sized KV and durable Mamba pools force Mamba-first, tied, and KV-first capacity limits.
+    status: active
+    axes:
+      eviction_policy: [ref_zero, lru]
+      relative_capacity: [mamba_limited, balanced, kv_limited]
+      mamba_state_dtype: [float32, bfloat16]
+    rows:
+      - {eviction_policy: ref_zero, relative_capacity: mamba_limited, mamba_state_dtype: float32}
+      - {eviction_policy: ref_zero, relative_capacity: balanced, mamba_state_dtype: bfloat16}
+      - {eviction_policy: ref_zero, relative_capacity: kv_limited, mamba_state_dtype: float32}
+      - {eviction_policy: lru, relative_capacity: mamba_limited, mamba_state_dtype: bfloat16}
+      - {eviction_policy: lru, relative_capacity: balanced, mamba_state_dtype: float32}
+      - {eviction_policy: lru, relative_capacity: kv_limited, mamba_state_dtype: bfloat16}
+    exclusions: []
+    scenarios: [pc.unit.mamba_relative_capacity]
+
+  mamba_boundary_extraction:
+    description: Durable Mamba states fill the limiting scratch buffer, then commit and restore across every local block, chunk, source, policy, and dtype pair.
+    status: active
+    axes:
+      eviction_policy: [ref_zero, lru]
+      mamba_block_chunk_profile: [bs64_chunk64, bs128_chunk64, bs256_chunk128]
+      mamba_boundary_source: [continuation, eos]
+      mamba_scratch_limit: [tokens, requests]
+      mamba_state_dtype: [float32, bfloat16]
+    rows:
+      - {eviction_policy: ref_zero, mamba_block_chunk_profile: bs64_chunk64, mamba_boundary_source: continuation, mamba_scratch_limit: tokens, mamba_state_dtype: float32}
+      - {eviction_policy: ref_zero, mamba_block_chunk_profile: bs128_chunk64, mamba_boundary_source: eos, mamba_scratch_limit: requests, mamba_state_dtype: float32}
+      - {eviction_policy: ref_zero, mamba_block_chunk_profile: bs256_chunk128, mamba_boundary_source: continuation, mamba_scratch_limit: requests, mamba_state_dtype: bfloat16}
+      - {eviction_policy: lru, mamba_block_chunk_profile: bs64_chunk64, mamba_boundary_source: eos, mamba_scratch_limit: requests, mamba_state_dtype: bfloat16}
+      - {eviction_policy: lru, mamba_block_chunk_profile: bs128_chunk64, mamba_boundary_source: continuation, mamba_scratch_limit: tokens, mamba_state_dtype: bfloat16}
+      - {eviction_policy: lru, mamba_block_chunk_profile: bs256_chunk128, mamba_boundary_source: eos, mamba_scratch_limit: tokens, mamba_state_dtype: float32}
+    exclusions: []
+    scenarios: [pc.unit.mamba_boundary_extraction]
+
+  coordinator:
+    description: Prefix-aware routing from exact worker state through eviction and epoch changes.
+    status: active
+    axes:
+      coordinator_policy: [longest_prefix, first_prefix_block]
+      routing_alpha: [load_only, balanced, prefix_only]
+      arrival_pattern: [serial, concurrent, staggered]
+      worker_cache_state: [empty, matched, evicted, reconnected, refit]
+    exclusions: []
+    scenarios: [pc.unit.coordinator_matrix]
+
+  admission_rollback:
+    description: Real matched-prefix allocation failure at an exhausted pool crossed with both eviction policies.
+    status: active
+    axes:
+      eviction_policy: [ref_zero, lru]
+      pressure_shape: [exhausted]
+      failure_point: [after_match_pin]
+    exclusions: []
+    scenarios: [pc.unit.admission_rollback]
+
+  hybrid_suspend_lifecycle:
+    description: The three implemented suspend modes exercise their actual, correlated memory and pointer configurations.
+    status: active
+    axes:
+      architecture: [hybrid]
+      eviction_policy: [lru]
+      execution_mode: [cuda_graph]
+      cache_management: [persist, offload, recompute]
+      memory_backing: [gpu, tms]
+      static_pointers: [disabled, enabled]
+    rows:
+      - {architecture: hybrid, eviction_policy: lru, execution_mode: cuda_graph, cache_management: persist, memory_backing: gpu, static_pointers: disabled}
+      - {architecture: hybrid, eviction_policy: lru, execution_mode: cuda_graph, cache_management: offload, memory_backing: tms, static_pointers: enabled}
+      - {architecture: hybrid, eviction_policy: lru, execution_mode: cuda_graph, cache_management: recompute, memory_backing: gpu, static_pointers: disabled}
+    exclusions:
+      - values: {cache_management: persist, memory_backing: tms}
+        reason: Persist keeps tensors resident on the GPU and does not use torch-memory-saver backing.
+      - values: {cache_management: persist, static_pointers: enabled}
+        reason: This workload enables static pointers only for the offload restore path.
+      - values: {cache_management: offload, memory_backing: gpu}
+        reason: Static offload uses torch memory saver rather than ordinary resident GPU backing.
+      - values: {cache_management: offload, static_pointers: disabled}
+        reason: The CUDA-graph offload restore path requires address-stable cache pointers.
+      - values: {cache_management: recompute, memory_backing: tms}
+        reason: Recompute discards cache tensors instead of preserving them through torch memory saver.
+      - values: {cache_management: recompute, static_pointers: enabled}
+        reason: Recompute rebuilds tensors and therefore does not retain static cache pointers.
+      - values: {memory_backing: tms, static_pointers: disabled}
+        reason: This workload reaches torch memory saver only through static-pointer offload.
+      - values: {memory_backing: gpu, static_pointers: enabled}
+        reason: This workload does not enable static pointers for resident or recomputed GPU tensors.
+    scenarios: [pc.functional.hybrid_suspend_resume]
+
+scenarios:
+  pc.unit.context_continuation:
+    description: Every row hides and restores a continued prefill request, then matches two additional cached blocks for three generations.
+    status: active
+    layer: unit
+    test:
+      kind: pytest
+      path: tests/unit_tests/inference/prefix_cache/test_context_execution.py
+      node: TestChunkContinuationStress::test_continuation_discovers_additional_cached_blocks
+    matrix: context_continuation
+    values:
+      eviction_policy: [ref_zero, lru]
+      speculation: [disabled, mtp]
+      chunk_cut: [before, exact, after]
+    behaviors: [chunked_boundary_reuse]
+    stress:
+      profile: context_boundary_churn
+      parameters:
+        boundary_positions: 3
+        cycles: 3
+    runtime_minimums:
+      chunk_boundaries_crossed: 6
+      matched_blocks: 9
+      prefill_tokens_skipped: 3
+      reference_transitions: 9
+    oracles: [allocator_invariants, cache_state_oracle]
+    output:
+      produces: false
+      cache_off_on: false
+      fields: []
+    planned_cases: 6
+
+  pc.active.hybrid_immutability_serial:
+    description: A serial follower uses real KV append and Mamba commit paths without changing published bytes.
+    status: active
+    layer: unit
+    test:
+      kind: pytest
+      path: tests/unit_tests/inference/contexts/test_dynamic_prefix_caching.py
+      node: TestMambaSlotAllocator::test_hybrid_followers_preserve_published_kv_and_mamba_state[serial]
+    matrix: null
+    values:
+      architecture: hybrid
+      eviction_policy: ref_zero
+      arrival_pattern: serial
+      mamba_cache_mode: full_prefix
+    behaviors: [published_state_immutability]
+    stress:
+      profile: immutability_replay
+      parameters:
+        cycles: 3
+        overwrite_attempts: 3
+    runtime_minimums:
+      producer_follower_cycles: 3
+      state_checksum_checks: 3
+    oracles: [byte_immutability]
+    output:
+      produces: false
+      cache_off_on: false
+      fields: []
+    planned_cases: 1
+
+  pc.active.hybrid_immutability_concurrent:
+    description: Four concurrent followers attempt distinct KV and Mamba writes without changing published bytes.
+    status: active
+    layer: unit
+    test:
+      kind: pytest
+      path: tests/unit_tests/inference/contexts/test_dynamic_prefix_caching.py
+      node: TestMambaSlotAllocator::test_hybrid_followers_preserve_published_kv_and_mamba_state[concurrent]
+    matrix: null
+    values:
+      architecture: hybrid
+      eviction_policy: ref_zero
+      arrival_pattern: concurrent
+      mamba_cache_mode: full_prefix
+    behaviors: [published_state_immutability]
+    stress:
+      profile: immutability_replay
+      parameters:
+        cycles: 3
+        overwrite_attempts: 3
+    runtime_minimums:
+      concurrent_followers: 4
+      producer_follower_cycles: 3
+      state_checksum_checks: 3
+    oracles: [byte_immutability]
+    output:
+      produces: false
+      cache_off_on: false
+      fields: []
+    planned_cases: 1
+
+  pc.active.mamba_producer_dedup_reuse:
+    description: Competing producers select stable winners and reuse the same durable slots for three generations.
+    status: active
+    layer: unit
+    test:
+      kind: pytest
+      path: tests/unit_tests/inference/contexts/test_dynamic_prefix_caching.py
+      node: TestMambaSlotAllocator::test_concurrent_mamba_producers_stably_deduplicate_across_slot_reuse
+    matrix: null
+    values:
+      architecture: hybrid
+      eviction_policy: ref_zero
+      arrival_pattern: concurrent
+      mamba_cache_mode: full_prefix
+    behaviors: [mamba_producer_deduplication]
+    stress:
+      profile: state_reuse_churn
+      parameters:
+        cycles: 3
+        destinations: 2
+    runtime_minimums:
+      mamba_slot_reuses: 2
+      producer_follower_cycles: 3
+      state_checksum_checks: 3
+    oracles: [byte_immutability, no_stale_generation]
+    output:
+      produces: false
+      cache_off_on: false
+      fields: []
+    planned_cases: 1
+
+  pc.unit.allocator_execution_matrix:
+    description: Every generated row mutates the real allocator through three match, sharing, pressure, eviction, and physical-reuse cycles.
+    status: active
+    layer: unit
+    test:
+      kind: pytest
+      path: tests/unit_tests/inference/prefix_cache/test_kv_allocator.py
+      node: test_allocator_execution_pairwise_stress
+    matrix: allocator_execution
+    values:
+      eviction_policy: [ref_zero, lru]
+      match_shape: [none, partial, exact, branching]
+      arrival_pattern: [serial, concurrent, staggered]
+      pressure_shape: [exact_capacity, one_over, pinned, exhausted]
+    behaviors:
+      - admission_pressure
+      - lru_eviction_order
+      - refzero_release_reuse
+      - shared_reference_churn
+    stress:
+      profile: capacity_churn
+      parameters:
+        cycles: 3
+        pool_exhausted: true
+    runtime_minimums:
+      cache_mutations: 3
+      concurrent_followers: 4
+      lru_evictions: 3
+      physical_reuses: 3
+      pool_exhaustions: 1
+      reference_transitions: 8
+      refzero_deregistrations: 3
+    oracles:
+      - allocator_invariants
+      - cache_state_oracle
+      - leaf_peeling_lru
+      - no_stale_generation
+    output:
+      produces: false
+      cache_off_on: false
+      fields: []
+    planned_cases: 16
+
+  pc.unit.lru_forest_property:
+    description: Nine named LRU regressions repeat under full-pool pressure beside 200 generated forests with pinned ancestors and independent leaf-peeling decisions.
+    status: active
+    layer: unit
+    test:
+      kind: pytest
+      path: tests/unit_tests/inference/prefix_cache/test_kv_allocator.py
+      node: test_lru_forest_property_stress
+    matrix: null
+    values:
+      eviction_policy: lru
+    behaviors: [lru_eviction_order]
+    stress:
+      profile: state_machine_property
+      parameters:
+        deterministic_cases: 227
+        transitions_per_case: 3
+    runtime_minimums:
+      lru_evictions: 3
+      pool_exhaustions: 227
+      property_cases: 227
+      reference_transitions: 3
+    oracles: [allocator_invariants, leaf_peeling_lru]
+    output:
+      produces: false
+      cache_off_on: false
+      fields: []
+    planned_cases: 10
+
+  pc.unit.epoch_invalidation_lifecycle:
+    description: REF_ZERO and LRU repeatedly invalidate a full pool containing cached and multiply referenced blocks, then rebuild on the same physical IDs.
+    status: active
+    layer: unit
+    test:
+      kind: pytest
+      path: tests/unit_tests/inference/prefix_cache/test_kv_allocator.py
+      node: test_epoch_invalidation_lifecycle_stress
+    matrix: null
+    values:
+      eviction_policy: [ref_zero, lru]
+    behaviors: [epoch_invalidation]
+    stress:
+      profile: capacity_churn
+      parameters:
+        cycles: 3
+        pool_exhausted: true
+    runtime_minimums:
+      cache_mutations: 9
+      epoch_invalidations: 6
+      matched_blocks: 18
+      physical_reuses: 9
+      pool_exhaustions: 3
+    oracles: [allocator_invariants, cache_state_oracle, no_stale_generation]
+    output:
+      produces: false
+      cache_off_on: false
+      fields: []
+    planned_cases: 2
+
+  pc.unit.hash_lifecycle:
+    description: Generated hash chains, mutation propagation, and serialization boundaries.
+    status: active
+    layer: unit
+    test:
+      kind: pytest
+      path: tests/unit_tests/inference/prefix_cache/test_hash_contract.py
+      node: test_hash_chain_boundary_and_request_lifecycle_stress
+    matrix: null
+    values: {}
+    behaviors: [hash_boundaries, hash_mutation_propagation]
+    stress:
+      profile: boundary_sweep
+      parameters:
+        block_sizes: 3
+        boundary_positions: 7
+    runtime_minimums:
+      boundary_positions_exercised: 7
+      hashes_computed: 120
+      state_checksum_checks: 3
+    oracles: [cache_state_oracle]
+    output:
+      produces: false
+      cache_off_on: false
+      fields: []
+    planned_cases: 5
+
+  pc.unit.paused_rebalance_local_matrix:
+    description: Twelve generated rows exhaust the real pool and verify the minimal paused suffix funds every reactivated survivor.
+    status: active
+    layer: unit
+    test:
+      kind: pytest
+      path: tests/unit_tests/inference/prefix_cache/test_kv_allocator.py
+      node: TestPausedRequestRebalance::test_paused_rebalance_pairwise_stress
+    matrix: paused_rebalance_local
+    values:
+      eviction_policy: [ref_zero, lru]
+      paused_budget: [zero, exact, insufficient]
+      paused_topology: [disjoint_pairs, shared_prefix, sparse_singletons, uneven_tail]
+    behaviors: [admission_pressure, paused_request_rebalance]
+    stress:
+      profile: rebalance_churn
+      parameters:
+        cycles: 3
+        transitions: 3
+    runtime_minimums:
+      cache_mutations: 3
+      pool_exhaustions: 3
+      reference_transitions: 3
+    oracles: [allocator_invariants, cache_state_oracle]
+    output:
+      produces: false
+      cache_off_on: false
+      fields: []
+    planned_cases: 12
+
+  pc.engine.execution_local_matrix:
+    description: Across sixteen single-rank real-model rows, cache-disabled and cache-enabled runs execute prefix hits, explicit misses, policy-specific pressure, MTP rewinds, and all supported completion paths.
+    status: active
+    layer: engine
+    test:
+      kind: pytest
+      path: tests/unit_tests/inference/prefix_cache/test_engine_e2e.py
+      node: TestPrefixCacheEngineExecution::test_execution_pairwise_stress
+    matrix: engine_execution_local
+    values:
+      architecture: [gpt, hybrid]
+      eviction_policy: [ref_zero, lru]
+      execution_mode: [eager, chunked_prefill]
+      output_mode: [tokens, generated_logprobs, prompt_logprobs, top_n_logprobs]
+      logit_materialization: [last_token, full]
+      logprob_representation: [none, raw, processed]
+      sampling_control: [greedy, top_k, top_p, temperature]
+      match_shape: [partial, exact, branching]
+      speculation: [disabled, mtp]
+      termination: [length, termination_token, stop_word]
+    behaviors:
+      - chunked_boundary_reuse
+      - mixed_cached_uncached
+      - output_parity
+      - prefix_match_shapes
+      - prompt_logprob_bypass
+      - refzero_release_reuse
+      - sampling_output_modes
+      - speculative_rewind
+      - termination_release
+    stress:
+      profile: execution_replay
+      parameters:
+        cycles: 3
+        prompt_blocks: 3
+    runtime_minimums:
+      cache_off_on_comparisons: 1
+      cache_mutations: 3
+      chunk_boundaries_crossed: 3
+      matched_blocks: 3
+      physical_reuses: 3
+      prefill_tokens_computed: 1
+      prefill_tokens_skipped: 3
+      producer_follower_cycles: 3
+      reference_transitions: 3
+      refzero_deregistrations: 3
+      sampling_modes_executed: 4
+      speculative_rewinds: 3
+      termination_releases: 3
+    oracles: [dtype_logprob_parity, exact_output_parity, no_stale_generation]
+    output:
+      produces: true
+      cache_off_on: true
+      fields:
+        - tokens
+        - prompt_logprobs
+        - generated_logprobs
+        - top_n_logprobs
+        - termination_position
+        - request_status
+        - output_length
+    planned_cases: 16
+
+  pc.engine.cuda_graph_replay:
+    description: GPT and hybrid models execute staged and mixed cache-hit batches through real CUDA graph replays.
+    status: active
+    layer: engine
+    test:
+      kind: pytest
+      path: tests/unit_tests/inference/engines/test_prefix_caching_cuda_graphs.py
+      node: TestPrefixCachingCudaGraphs::test_prefix_caching_cuda_graphs
+    matrix: null
+    values:
+      architecture: [gpt, hybrid]
+      eviction_policy: lru
+      execution_mode: cuda_graph
+      arrival_pattern: [serial, concurrent]
+    behaviors: [cuda_graph_replay, output_parity]
+    stress:
+      profile: graph_replay
+      parameters:
+        cycles: 3
+        replays: 3
+    runtime_minimums:
+      cache_off_on_comparisons: 1
+      graph_replays: 3
+      matched_blocks: 3
+      producer_follower_cycles: 3
+    oracles: [exact_output_parity]
+    output:
+      produces: true
+      cache_off_on: true
+      fields: [tokens]
+    planned_cases: 4
+
+  pc.engine.checkpoint_requeue:
+    description: GPT and hybrid requests repeatedly checkpoint, requeue, and resume under both eviction policies without changing tokens or log probabilities.
+    status: active
+    layer: engine
+    test:
+      kind: pytest
+      path: tests/unit_tests/inference/prefix_cache/test_lifecycle.py
+      node: TestPrefixCacheRequestLifecycle::test_checkpoint_requeue_resume_execution
+    matrix: null
+    values:
+      architecture: [gpt, hybrid]
+      eviction_policy: [ref_zero, lru]
+      api_surface: direct
+    behaviors: [output_parity, request_checkpoint_requeue]
+    stress:
+      profile: checkpoint_churn
+      parameters:
+        cycles: 3
+        transitions: 3
+    runtime_minimums:
+      cache_off_on_comparisons: 2
+      checkpoint_round_trips: 3
+      matched_blocks: 1
+      reference_transitions: 3
+    oracles: [dtype_logprob_parity, exact_output_parity, no_stale_generation]
+    output:
+      produces: true
+      cache_off_on: true
+      fields: [tokens, generated_logprobs, request_status, output_length]
+    planned_cases: 2
+
+  pc.unit.reset_reuse:
+    description: Three preserving resets keep serving cached prefixes and three clearing resets force full recomputation.
+    status: active
+    layer: unit
+    test:
+      kind: pytest
+      path: tests/unit_tests/inference/contexts/test_dynamic_prefix_caching.py
+      node: TestPrefixCacheReuse::test_reset_preserves_prefix_cache_when_requested
+    matrix: null
+    values:
+      architecture: gpt
+      eviction_policy: ref_zero
+      api_surface: direct
+    behaviors: [reset_and_reuse]
+    stress:
+      profile: reset_rebuild
+      parameters:
+        cycles: 3
+        reset_modes: 2
+    runtime_minimums:
+      matched_blocks: 3
+      prefill_tokens_computed: 3
+      prefill_tokens_skipped: 3
+      resets: 6
+    oracles: [allocator_invariants, cache_state_oracle]
+    output:
+      produces: false
+      cache_off_on: false
+      fields: []
+    planned_cases: 1
+
+  pc.unit.admission_rollback:
+    description: REF_ZERO and LRU real pool-exhaustion failures restore matched KV and Mamba state exactly before retry.
+    status: active
+    layer: unit
+    test:
+      kind: pytest
+      path: tests/unit_tests/inference/prefix_cache/test_admission_rollback.py
+      node: TestPrefixCacheAdmissionRollback::test_exhausted_match_pin_rolls_back_before_retry
+    matrix: admission_rollback
+    values:
+      eviction_policy: [ref_zero, lru]
+      pressure_shape: [exhausted]
+      failure_point: after_match_pin
+    behaviors: [admission_rollback]
+    stress:
+      profile: lifecycle_failure
+      parameters:
+        cycles: 3
+        failure_points: 1
+    runtime_minimums:
+      failure_points_injected: 1
+      pool_exhaustions: 1
+      reference_transitions: 3
+      rollback_checks: 3
+    oracles: [allocator_invariants, rollback_identity]
+    output:
+      produces: false
+      cache_off_on: false
+      fields: []
+    planned_cases: 2
+
+  pc.unit.mamba_match_depth:
+    description: Every row repeats real KV reuse at one executable Mamba depth in both state dtypes.
+    status: active
+    layer: unit
+    test:
+      kind: pytest
+      path: tests/unit_tests/inference/prefix_cache/test_mamba_cache.py
+      node: TestHybridMambaPrefixCacheStress::test_executable_kv_mamba_depths_repeat_real_reuse
+    matrix: mamba_match_depth
+    values:
+      eviction_policy: [ref_zero, lru]
+      mamba_match_mode: [memory_only, kv_only, mamba_shorter, equal]
+      mamba_state_dtype: [float32, bfloat16]
+    behaviors: [kv_mamba_atomicity, published_state_immutability]
+    stress:
+      profile: hybrid_depth_replay
+      parameters:
+        cycles: 3
+        match_depths: 4
+    runtime_minimums:
+      matched_blocks: 3
+      producer_follower_cycles: 3
+      reference_transitions: 3
+      state_checksum_checks: 3
+      mamba_restorations: 3
+    oracles: [byte_immutability, cache_state_oracle]
+    output:
+      produces: false
+      cache_off_on: false
+      fields: []
+    planned_cases: 8
+
+  pc.unit.mamba_relative_capacity:
+    description: Every row fills its limiting pool, proves surplus in the larger pool, and recycles physical KV and Mamba storage for three generations.
+    status: active
+    layer: unit
+    test:
+      kind: pytest
+      path: tests/unit_tests/inference/prefix_cache/test_mamba_cache.py
+      node: TestHybridMambaPrefixCacheStress::test_relative_kv_mamba_capacities_churn_three_generations
+    matrix: mamba_relative_capacity
+    values:
+      eviction_policy: [ref_zero, lru]
+      relative_capacity: [mamba_limited, balanced, kv_limited]
+      mamba_state_dtype: [float32, bfloat16]
+    behaviors: [mamba_budget_partition, refzero_release_reuse]
+    stress:
+      profile: capacity_churn
+      parameters:
+        cycles: 3
+        pool_exhausted: true
+    runtime_minimums:
+      cache_mutations: 3
+      physical_reuses: 3
+      pool_exhaustions: 1
+      refzero_deregistrations: 3
+      state_checksum_checks: 3
+    oracles: [cache_state_oracle, no_stale_generation]
+    output:
+      produces: false
+      cache_off_on: false
+      fields: []
+    planned_cases: 6
+
+  pc.unit.mamba_boundary_extraction:
+    description: Every local block/chunk/source/scratch pair fills its scratch limit, then publishes and restores boundary state for three generations.
+    status: active
+    layer: unit
+    test:
+      kind: pytest
+      path: tests/unit_tests/inference/prefix_cache/test_mamba_cache.py
+      node: TestHybridMambaPrefixCacheStress::test_chunk_boundary_extraction_commits_and_restores_three_times
+    matrix: mamba_boundary_extraction
+    values:
+      eviction_policy: [ref_zero, lru]
+      mamba_block_chunk_profile: [bs64_chunk64, bs128_chunk64, bs256_chunk128]
+      mamba_boundary_source: [continuation, eos]
+      mamba_scratch_limit: [tokens, requests]
+      mamba_state_dtype: [float32, bfloat16]
+    behaviors: [chunked_boundary_reuse, kv_mamba_atomicity]
+    stress:
+      profile: boundary_state_replay
+      parameters:
+        cycles: 3
+        boundary_sources: 2
+    runtime_minimums:
+      chunk_boundaries_crossed: 3
+      mamba_restorations: 3
+      producer_follower_cycles: 3
+      state_checksum_checks: 3
+      prefill_tokens_skipped: 3
+    oracles: [byte_immutability, cache_state_oracle]
+    output:
+      produces: false
+      cache_off_on: false
+      fields: []
+    planned_cases: 6
+
+  pc.unit.mamba_pinned_pressure:
+    description: Both policies and both state dtypes repeatedly reject pinned-slot allocation, then recycle released KV and Mamba storage without changing pinned bytes.
+    status: active
+    layer: unit
+    test:
+      kind: pytest
+      path: tests/unit_tests/inference/prefix_cache/test_mamba_cache.py
+      node: TestHybridMambaPrefixCacheStress::test_pinned_slot_pressure_is_transactional_then_reuses_physical_state
+    matrix: null
+    values:
+      architecture: hybrid
+      eviction_policy: [ref_zero, lru]
+      pressure_shape: pinned
+      mamba_state_dtype: [float32, bfloat16]
+      prefix_mamba_budget: multiple_slots
+    behaviors: [mamba_slot_exhaustion, published_state_immutability]
+    stress:
+      profile: pinned_state_pressure
+      parameters:
+        cycles: 3
+        failure_points: 1
+    runtime_minimums:
+      failure_points_injected: 3
+      mamba_slot_evictions: 1
+      mamba_slot_reuses: 3
+      physical_reuses: 3
+      state_checksum_checks: 3
+    oracles: [byte_immutability, cache_state_oracle, no_stale_generation]
+    output:
+      produces: false
+      cache_off_on: false
+      fields: []
+    planned_cases: 4
+
+  pc.unit.coordinator_matrix:
+    description: Scalar-checked coordinator matrix using confirmed cache state and lifecycle updates.
+    status: active
+    layer: unit
+    test:
+      kind: pytest
+      path: tests/unit_tests/inference/prefix_cache/test_coordinator.py
+      node: TestCoordinatorStressMatrix::test_coordinator_pairwise_routing_stress
+    matrix: coordinator
+    values:
+      coordinator_policy: [longest_prefix, first_prefix_block]
+      routing_alpha: [load_only, balanced, prefix_only]
+      arrival_pattern: [serial, concurrent, staggered]
+      worker_cache_state: [empty, matched, evicted, reconnected, refit]
+    behaviors: [coordinator_exact_routing]
+    stress:
+      profile: routing_churn
+      parameters:
+        cycles: 3
+        workers: 3
+    runtime_minimums:
+      cache_state_updates: 3
+      route_changes: 2
+      routing_decisions: 540
+      worker_state_transitions: 5
+    oracles: [cache_state_oracle, routing_score_oracle]
+    output:
+      produces: false
+      cache_off_on: false
+      fields: []
+    planned_cases: 15
+
+  pc.unit.coordinator_load_fallback:
+    description: Load-balanced routing ignores repeatedly confirmed affinity and follows four changing load profiles.
+    status: active
+    layer: unit
+    test:
+      kind: pytest
+      path: tests/unit_tests/inference/test_data_parallel_inference_coordinator.py
+      node: TestRoutingPolicies::test_fallback_modes_follow_load_churn_and_ignore_confirmed_affinity
+    matrix: null
+    values:
+      coordinator_policy: load_balanced
+      arrival_pattern: staggered
+    behaviors: [coordinator_load_balancing]
+    stress:
+      profile: routing_fallback_churn
+      parameters:
+        cycles: 4
+        workers: 3
+    runtime_minimums:
+      cache_state_updates: 4
+      route_changes: 9
+      routing_decisions: 12
+      routing_owner_mismatches: 3
+    oracles: [cache_state_oracle, routing_score_oracle]
+    output:
+      produces: false
+      cache_off_on: false
+      fields: []
+    planned_cases: 1
+
+  pc.unit.speculative_rewind:
+    description: REF_ZERO and LRU speculative rewind property traces across shared boundaries.
+    status: active
+    layer: unit
+    test:
+      kind: pytest
+      path: tests/unit_tests/inference/prefix_cache/test_speculative_controller.py
+      node: test_speculative_rewind_state_machine_stress
+    matrix: null
+    values:
+      eviction_policy: [ref_zero, lru]
+      speculation: [mtp]
+      match_shape: partial
+    behaviors: [shared_reference_churn, speculative_rewind]
+    stress:
+      profile: state_machine_property
+      parameters:
+        deterministic_cases: 200
+        transitions_per_case: 3
+    runtime_minimums:
+      concurrent_followers: 4
+      property_cases: 200
+      reference_transitions: 8
+      speculative_rewinds: 3
+    oracles: [allocator_invariants, cache_state_oracle]
+    output:
+      produces: false
+      cache_off_on: false
+      fields: []
+    planned_cases: 2
+
+  pc.functional.gpt_refzero:
+    description: GPT REF_ZERO live sharing, final release, and physical block reuse.
+    status: active
+    layer: functional
+    test:
+      kind: functional
+      path: tests/test_utils/recipes/h100/prefix-cache-stress.yaml
+      case: gpt_dynamic_inference_tp1_pp1_583m_prefix_caching
+    matrix: null
+    values:
+      architecture: gpt
+      eviction_policy: ref_zero
+      execution_mode: eager
+      parallelism: single
+      rope_backend: torch
+      sampling_backend: torch
+      schedule_mode: sync
+    behaviors: [memory_bounds, output_parity, prompt_logprob_bypass, refzero_release_reuse]
+    stress:
+      profile: execution_replay
+      parameters:
+        cycles: 3
+        prompt_blocks: 2
+    runtime_minimums:
+      cache_mutations: 3
+      cache_off_on_comparisons: 1
+      physical_reuses: 3
+      matched_blocks: 3
+      memory_phases_measured: 4
+      prefill_tokens_skipped: 3
+      prefill_tokens_computed: 3
+      prompt_logprob_bypass_requests: 3
+      prompt_logprob_cache_immutability_checks: 3
+      eligible_cache_followers: 3
+      producer_follower_cycles: 3
+      refzero_deregistrations: 3
+    oracles: [dtype_logprob_parity, exact_output_parity, memory_bound, no_stale_generation]
+    output:
+      produces: true
+      cache_off_on: true
+      fields: [tokens, prompt_logprobs, generated_logprobs, request_status, output_length]
+    planned_cases: 1
+
+  pc.functional.gpt_lru_chunked_flashinfer:
+    description: GPT LRU chunked prefill with FlashInfer and repeated eviction churn.
+    status: active
+    layer: functional
+    test:
+      kind: functional
+      path: tests/test_utils/recipes/h100/prefix-cache-stress.yaml
+      case: gpt_dynamic_inference_tp1_pp1_583m_prefix_caching_lru
+    matrix: null
+    values:
+      architecture: gpt
+      eviction_policy: lru
+      execution_mode: chunked_prefill
+      sampling_backend: flashinfer
+      rope_backend: flashinfer_fused
+    behaviors: [chunked_boundary_reuse, memory_bounds, output_parity]
+    stress:
+      profile: execution_replay
+      parameters:
+        cycles: 3
+        prompt_blocks: 3
+    runtime_minimums:
+      cache_off_on_comparisons: 1
+      chunk_boundaries_crossed: 3
+      lru_evictions: 3
+      matched_blocks: 3
+      memory_phases_measured: 4
+      pool_exhaustions: 1
+      prefill_tokens_skipped: 3
+      producer_follower_cycles: 3
+    oracles: [dtype_logprob_parity, exact_output_parity, memory_bound]
+    output:
+      produces: true
+      cache_off_on: true
+      fields: [tokens, generated_logprobs, request_status, output_length]
+    planned_cases: 1
+
+  pc.functional.gpt_refzero_cuda_graph_distributed:
+    description: GPT REF_ZERO TP2/PP2 with confirmed CUDA graph replay during cache churn.
+    status: active
+    layer: functional
+    test:
+      kind: functional
+      path: tests/test_utils/recipes/h100/prefix-cache-stress.yaml
+      case: gpt_dynamic_inference_tp2_pp2_583m_prefix_caching_cuda_graphs
+    matrix: null
+    values:
+      architecture: gpt
+      eviction_policy: ref_zero
+      execution_mode: cuda_graph
+      parallelism: tp_pp
+    behaviors: [cuda_graph_replay, output_parity, refzero_release_reuse]
+    stress:
+      profile: graph_replay
+      parameters:
+        cycles: 3
+        replays: 3
+    runtime_minimums:
+      cache_off_on_comparisons: 1
+      graph_replays: 3
+      matched_blocks: 3
+      physical_reuses: 3
+      producer_follower_cycles: 3
+      refzero_deregistrations: 3
+    oracles: [dtype_logprob_parity, exact_output_parity, no_stale_generation]
+    output:
+      produces: true
+      cache_off_on: true
+      fields: [tokens, generated_logprobs, request_status, output_length]
+    planned_cases: 1
+
+  pc.functional.moe_routing_replay:
+    description: MoE TP4/EP4 routing replay remains exact through physical cache reuse.
+    status: active
+    layer: functional
+    test:
+      kind: functional
+      path: tests/test_utils/recipes/h100/prefix-cache-stress.yaml
+      case: gpt_dynamic_inference_tp4_pp1_ep4_16B_prefix_caching
+    matrix: null
+    values:
+      architecture: moe
+      eviction_policy: ref_zero
+      parallelism: moe_tp_ep_sp
+      transport: direct
+    behaviors: [moe_routing_replay, output_parity, refzero_release_reuse]
+    stress:
+      profile: execution_replay
+      parameters:
+        cycles: 3
+        prompt_blocks: 2
+    runtime_minimums:
+      cache_mutations: 3
+      cache_off_on_comparisons: 1
+      matched_blocks: 3
+      physical_reuses: 3
+      prefill_tokens_skipped: 3
+      producer_follower_cycles: 3
+      refzero_deregistrations: 3
+      routing_reconstructions: 3
+    oracles: [exact_output_parity, no_stale_generation]
+    output:
+      produces: true
+      cache_off_on: true
+      fields: [tokens, generated_logprobs, routing_indices, request_status, output_length]
+    planned_cases: 1
+
+  pc.functional.hybrid_refzero_no_mtp:
+    description: Hybrid REF_ZERO without MTP verifies immutability, memory, logprobs, and reuse.
+    status: active
+    layer: functional
+    test:
+      kind: functional
+      path: tests/test_utils/recipes/h100/prefix-cache-stress.yaml
+      case: hybrid_dynamic_inference_tp1_pp1_583m_prefix_caching_refzero_no_mtp
+    matrix: null
+    values:
+      architecture: hybrid
+      eviction_policy: ref_zero
+      execution_mode: eager
+      speculation: disabled
+      mamba_cache_mode: full_prefix
+    behaviors:
+      - memory_bounds
+      - output_parity
+      - refzero_release_reuse
+    stress:
+      profile: execution_replay
+      parameters:
+        cycles: 3
+        prompt_blocks: 3
+    runtime_minimums:
+      cache_off_on_comparisons: 1
+      concurrent_followers: 4
+      matched_blocks: 3
+      mamba_restorations: 3
+      memory_phases_measured: 4
+      physical_reuses: 3
+      prefill_tokens_skipped: 3
+      producer_follower_cycles: 3
+      refzero_deregistrations: 3
+    oracles: [dtype_logprob_parity, exact_output_parity, memory_bound, no_stale_generation]
+    output:
+      produces: true
+      cache_off_on: true
+      fields: [tokens, generated_logprobs, request_status, output_length]
+    planned_cases: 1
+
+  pc.functional.hybrid_lru_mamba_pressure:
+    description: Hybrid LRU chunked prefill with true durable Mamba-slot exhaustion.
+    status: active
+    layer: functional
+    test:
+      kind: functional
+      path: tests/test_utils/recipes/h100/prefix-cache-stress.yaml
+      case: hybrid_dynamic_inference_tp1_pp1_583m_prefix_caching_lru_chunked_mamba_pressure
+    matrix: null
+    values:
+      architecture: hybrid
+      eviction_policy: lru
+      execution_mode: chunked_prefill
+      mamba_cache_mode: full_prefix
+    behaviors: [chunked_boundary_reuse, mamba_slot_exhaustion, memory_bounds, output_parity]
+    stress:
+      profile: execution_replay
+      parameters:
+        cycles: 3
+        prompt_blocks: 2
+    runtime_minimums:
+      cache_off_on_comparisons: 1
+      chunk_boundaries_crossed: 3
+      matched_blocks: 3
+      mamba_restorations: 3
+      mamba_slot_evictions: 1
+      memory_phases_measured: 4
+      prefill_tokens_skipped: 3
+      producer_follower_cycles: 3
+    oracles: [dtype_logprob_parity, exact_output_parity, memory_bound, no_stale_generation]
+    output:
+      produces: true
+      cache_off_on: true
+      fields: [tokens, generated_logprobs, request_status, output_length]
+    planned_cases: 1
+
+  pc.functional.hybrid_lru_cuda_graph:
+    description: Hybrid LRU CUDA graph state restoration with repeated replay and real cache hits.
+    status: active
+    layer: functional
+    test:
+      kind: functional
+      path: tests/test_utils/recipes/h100/prefix-cache-stress.yaml
+      case: hybrid_dynamic_inference_tp1_pp1_583m_prefix_caching_lru_cuda_graph_restore
+    matrix: null
+    values:
+      architecture: hybrid
+      eviction_policy: lru
+      execution_mode: cuda_graph
+      mamba_cache_mode: full_prefix
+    behaviors: [cuda_graph_replay, output_parity]
+    stress:
+      profile: graph_replay
+      parameters:
+        cycles: 3
+        replays: 3
+    runtime_minimums:
+      cache_off_on_comparisons: 1
+      graph_replays: 3
+      mamba_restorations: 3
+      matched_blocks: 3
+      producer_follower_cycles: 3
+    oracles: [dtype_logprob_parity, exact_output_parity]
+    output:
+      produces: true
+      cache_off_on: true
+      fields: [tokens, generated_logprobs, request_status, output_length]
+    planned_cases: 1
+
+  pc.functional.dp_longest_prefix:
+    description: Longest-prefix routing follows controlled owners and drops them after epoch invalidation.
+    status: active
+    layer: functional
+    test:
+      kind: functional
+      path: tests/test_utils/recipes/h100/prefix-cache-coordinator-stress.yaml
+      case: gpt_dynamic_inference_tp1_pp1_dp8_583m_prefix_caching_longest_prefix_zmq
+    matrix: null
+    values:
+      architecture: gpt
+      eviction_policy: lru
+      coordinator_policy: longest_prefix
+      api_surface: coordinator_client
+      transport: zmq_async
+    behaviors: [coordinator_exact_routing, epoch_invalidation, output_parity]
+    stress:
+      profile: coordinator_execution_replay
+      parameters:
+        cycles: 3
+        workers: 8
+    runtime_minimums:
+      cache_state_updates: 16
+      cache_off_on_comparisons: 1
+      epoch_invalidations: 1
+      matched_blocks: 3
+      prefill_tokens_skipped: 3
+      producer_follower_cycles: 3
+      route_changes: 1
+      routing_matched_requests: 3
+      routing_owner_matches: 3
+      routing_removal_checks: 1
+      routing_seed_distinct_ranks: 8
+    oracles: [dtype_logprob_parity, exact_output_parity]
+    output:
+      produces: true
+      cache_off_on: true
+      fields: [tokens, generated_logprobs, request_status, output_length]
+    planned_cases: 1
+
+  pc.functional.dp_first_prefix_block:
+    description: First-block routing follows eight confirmed producers for three hit cycles, then drops all stale affinity at an epoch change.
+    status: active
+    layer: functional
+    test:
+      kind: functional
+      path: tests/test_utils/recipes/h100/prefix-cache-coordinator-stress.yaml
+      case: gpt_dynamic_inference_tp1_pp1_dp8_583m_prefix_caching_first_prefix_block_zmq
+    matrix: null
+    values:
+      architecture: gpt
+      eviction_policy: lru
+      coordinator_policy: first_prefix_block
+      api_surface: coordinator_client
+      transport: zmq_async
+    behaviors: [coordinator_exact_routing, epoch_invalidation, output_parity]
+    stress:
+      profile: coordinator_execution_replay
+      parameters:
+        cycles: 3
+        workers: 8
+    runtime_minimums:
+      cache_state_updates: 16
+      cache_off_on_comparisons: 1
+      epoch_invalidations: 1
+      matched_blocks: 3
+      prefill_tokens_skipped: 3
+      producer_follower_cycles: 3
+      route_changes: 1
+      routing_matched_requests: 192
+      routing_owner_matches: 192
+      routing_removal_checks: 1
+      routing_seed_distinct_ranks: 8
+    oracles: [cache_state_oracle, dtype_logprob_parity, exact_output_parity]
+    output:
+      produces: true
+      cache_off_on: true
+      fields: [tokens, text, generated_logprobs, request_status, output_length]
+    planned_cases: 1
+
+  pc.functional.hybrid_dp_longest_prefix:
+    description: Hybrid longest-prefix routing executes three cache-hit generations with durable Mamba restores on all eight workers.
+    status: active
+    layer: functional
+    test:
+      kind: functional
+      path: tests/test_utils/recipes/h100/prefix-cache-coordinator-stress.yaml
+      case: hybrid_dynamic_inference_tp1_pp1_dp8_583m_prefix_caching_longest_prefix_zmq
+    matrix: null
+    values:
+      architecture: hybrid
+      eviction_policy: lru
+      coordinator_policy: longest_prefix
+      api_surface: coordinator_client
+      transport: zmq_async
+      mamba_cache_mode: full_prefix
+    behaviors:
+      [coordinator_exact_routing, epoch_invalidation, hybrid_coordinator_restore, output_parity]
+    stress:
+      profile: coordinator_execution_replay
+      parameters:
+        cycles: 3
+        workers: 8
+    runtime_minimums:
+      cache_state_updates: 16
+      cache_off_on_comparisons: 1
+      epoch_invalidations: 1
+      matched_blocks: 3
+      mamba_restorations: 3
+      prefill_tokens_skipped: 3
+      producer_follower_cycles: 3
+      route_changes: 1
+      routing_matched_requests: 96
+      routing_owner_matches: 96
+      routing_removal_checks: 1
+      routing_seed_distinct_ranks: 8
+    oracles: [cache_state_oracle, dtype_logprob_parity, exact_output_parity]
+    output:
+      produces: true
+      cache_off_on: true
+      fields: [tokens, text, generated_logprobs, request_status, output_length]
+    planned_cases: 1
+
+  pc.functional.dp_load_balanced:
+    description: Load-balanced DP distributes actual cache-hit execution across ZMQ workers.
+    status: active
+    layer: functional
+    test:
+      kind: functional
+      path: tests/test_utils/recipes/h100/prefix-cache-coordinator-stress.yaml
+      case: gpt_dynamic_inference_tp1_pp1_dp8_583m_prefix_caching_load_balanced_zmq
+    matrix: null
+    values:
+      architecture: gpt
+      eviction_policy: lru
+      coordinator_policy: load_balanced
+      api_surface: coordinator_client
+      transport: zmq_async
+    behaviors: [coordinator_load_balancing, epoch_invalidation, output_parity]
+    stress:
+      profile: coordinator_execution_replay
+      parameters:
+        cycles: 3
+        workers: 8
+    runtime_minimums:
+      cache_state_updates: 16
+      cache_off_on_comparisons: 1
+      epoch_invalidations: 1
+      matched_blocks: 3
+      prefill_tokens_skipped: 3
+      producer_follower_cycles: 3
+      route_changes: 2
+      routing_owner_mismatches: 1
+      routing_removal_checks: 1
+      routing_seed_distinct_ranks: 8
+    oracles: [dtype_logprob_parity, exact_output_parity]
+    output:
+      produces: true
+      cache_off_on: true
+      fields:
+        - tokens
+        - generated_logprobs
+        - request_status
+        - output_length
+    planned_cases: 1
+
+  pc.functional.hybrid_suspend_resume:
+    description: Hybrid CUDA graphs survive persist/offload/recompute cycles with Mamba state intact.
+    status: active
+    layer: functional
+    test:
+      kind: functional
+      path: tests/test_utils/recipes/h100/prefix-cache-stress.yaml
+      case: hybrid_dynamic_inference_tp1_pp1_583m_prefix_caching_cuda_graph_suspend_lifecycle
+    matrix: hybrid_suspend_lifecycle
+    values:
+      architecture: hybrid
+      eviction_policy: lru
+      execution_mode: cuda_graph
+      cache_management: [persist, offload, recompute]
+      memory_backing: [gpu, tms]
+      static_pointers: [disabled, enabled]
+    behaviors: [cuda_graph_replay, output_parity, suspend_resume]
+    stress:
+      profile: graph_replay
+      parameters:
+        cycles: 3
+        replays: 3
+    runtime_minimums:
+      cache_off_on_comparisons: 1
+      graph_replays: 3
+      matched_blocks: 3
+      memory_phases_measured: 4
+      producer_follower_cycles: 3
+      suspend_resume_cycles: 3
+    oracles: [dtype_logprob_parity, exact_output_parity, no_stale_generation]
+    output:
+      produces: true
+      cache_off_on: true
+      fields: [tokens, generated_logprobs, request_status, output_length]
+    planned_cases: 3
+
+  pc.functional.generation_epoch_invalidation:
+    description: Dynamic inference invalidates, rebuilds, and reuses prefixes across generation epochs.
+    status: active
+    layer: functional
+    test:
+      kind: functional
+      path: tests/test_utils/recipes/h100/prefix-cache-stress.yaml
+      case: gpt_dynamic_inference_tp8_pp1_583m_prefix_caching
+    matrix: null
+    values:
+      architecture: gpt
+      eviction_policy: lru
+      api_surface: direct
+      execution_mode: eager
+    behaviors: [epoch_invalidation, output_parity]
+    stress:
+      profile: epoch_rebuild
+      parameters:
+        cycles: 3
+        transitions: 1
+    runtime_minimums:
+      cache_off_on_comparisons: 1
+      epoch_invalidations: 1
+      matched_blocks: 3
+      prefill_tokens_skipped: 3
+      producer_follower_cycles: 3
+    oracles: [dtype_logprob_parity, exact_output_parity, no_stale_generation]
+    output:
+      produces: true
+      cache_off_on: true
+      fields: [tokens, generated_logprobs, request_status, output_length]
+    planned_cases: 1
+
+unsupported:
+  async_scheduler:
+    category: unsupported
+    description: Prefix caching with asynchronous dynamic-engine scheduling.
+    reason: Production configuration rejects this combination, so a positive execution-stress test would be dishonest.
+    values:
+      schedule_mode: [async_serial, async_overlap]
+
+  uvm_backing:
+    category: external
+    description: Prefix-cache pressure with unified virtual memory backing.
+    reason: The UVM path is not currently runnable by the active Megatron unit fixture and has no functional stress owner.
+    values:
+      memory_backing: uvm
+
+  mla_layout:
+    category: external
+    description: Prefix reuse with the MLA KV layout.
+    reason: Dynamic inference has no active MLA model fixture that can produce repeated cache hits and cache-off parity.
+    values:
+      architecture: mla
+
+  http_api:
+    category: external
+    description: Prefix-cache stress through the HTTP inference API.
+    reason: The HTTP result surface does not currently expose enough cache-hit and pressure evidence for this contract.
+    values:
+      api_surface: http
+
+  rl_refit:
+    category: external
+    description: Prefix reuse across reinforcement-learning weight refits.
+    reason: The RL worker and refit lifecycle are owned by an external integration environment, not this active test suite.
+    values:
+      api_surface: rl_refit
+      worker_cache_state: refit
+
+  request_cancellation:
+    category: unsupported
+    description: Explicit cancellation of an in-flight cached request.
+    reason: Dynamic inference has no public request-cancellation operation to exercise.
+    values:
+      termination: cancellation
+
+  below_one_mamba_slot:
+    category: unsupported
+    description: A durable Mamba prefix budget smaller than one usable slot.
+    reason: This is an invalid configuration rejected at construction, not a positive prefix-cache execution mode.
+    values:
+      prefix_mamba_budget: below_one_slot
+
+  zmq_sync_transport:
+    category: external
+    description: Coordinator cache routing through synchronous ZMQ.
+    reason: Active coordinator stress uses the asynchronous production client; no synchronous end-to-end workload records hit and invalidation evidence.
+    values:
+      api_surface: coordinator_client
+      transport: zmq_sync
+
+  moe_lru:
+    category: external
+    description: MoE routing reconstruction under LRU cache eviction.
+    reason: The active MoE functional workload stresses REF_ZERO only.
+    values:
+      architecture: moe
+      eviction_policy: lru
+
+  gpt_sequence_parallel:
+    category: external
+    description: GPT prefix-cache stress with sequence parallelism.
+    reason: The TP2/PP2 CUDA-graph workload does not enable sequence parallelism; only the MoE workload currently does.
+    values:
+      architecture: gpt
+      parallelism: tp_pp_sp
+
+  hybrid_refzero_cuda_graph:
+    category: external
+    description: Hybrid CUDA-graph prefix reuse under REF_ZERO.
+    reason: Active hybrid graph workloads use LRU, while active REF_ZERO hybrid execution is eager.
+    values:
+      architecture: hybrid
+      eviction_policy: ref_zero
+      execution_mode: cuda_graph
+
+  coordinator_refzero:
+    category: external
+    description: Data-parallel coordinator routing while workers use REF_ZERO.
+    reason: Every active coordinator functional workload uses LRU.
+    values:
+      api_surface: coordinator_client
+      eviction_policy: ref_zero
+
+  hybrid_coordinator_policy_variants:
+    category: external
+    description: Hybrid coordinator execution with first-block and load-balanced policies.
+    reason: Hybrid coordinator stress currently covers longest-prefix routing only.
+    values:
+      architecture: hybrid
+      coordinator_policy: [first_prefix_block, load_balanced]
+
+  flashinfer_cross_product:
+    category: external
+    description: FlashInfer sampling and fused RoPE across every architecture and eviction policy.
+    reason: The active FlashInfer workload is GPT with LRU; the remaining architecture-policy pairs have no functional stress owner.
+    values:
+      sampling_backend: flashinfer
+      rope_backend: flashinfer_fused
+      architecture: [hybrid, moe]
+
+  graph_speculation:
+    category: external
+    description: Prefix-cache CUDA graph replay combined with speculative decoding.
+    reason: Graph replay and MTP rewind are each stressed, but not in the same execution workload.
+    values:
+      execution_mode: cuda_graph
+      speculation: mtp
+
+  graph_prompt_logprobs:
+    category: external
+    description: Prompt-logprob bypass while cache hits execute through CUDA graphs.
+    reason: Prompt-logprob bypass is stressed in eager and chunked execution, while graph workloads return generated-token outputs.
+    values:
+      execution_mode: cuda_graph
+      output_mode: prompt_logprobs
+
+  admission_failure_points:
+    category: external
+    description: Transactional rollback after later allocator, Mamba, hash, and routing mutations.
+    reason: Active rollback stress injects a real failure after matching and pinning; the later mutation points do not yet have fault-injection hooks.
+    values:
+      failure_point: [after_block_allocation, after_hash_registration, after_mamba_slot, after_routing_state]
+
+  graph_prefill_scope_variants:
+    category: external
+    description: Each configurable CUDA graph prefill scope under repeated prefix hits.
+    reason: Active graph tests prove decode, prefill, and mixed replay, but do not vary every graph-scope configuration.
+    values:
+      graph_prefill_scope: [decode_only, mixed_bounded, all_prefills]
+
+  graph_sizing_variants:
+    category: external
+    description: Linear and exponential CUDA graph bucket sizing under repeated prefix hits.
+    reason: Active graph workloads use their configured default sizing rather than comparing both sizing algorithms.
+    values:
+      graph_sizing: [linear, exponential]
+
+  mamba_memory_only_mode:
+    category: external
+    description: Hybrid execution with live Mamba request state but no durable Mamba prefix slots.
+    reason: Unit depth stress exercises the memory-only matching branch, but no cache-off/cache-on model workload owns this runtime mode.
+    values:
+      architecture: hybrid
+      mamba_cache_mode: memory_only
+
+  mamba_live_pool_ratios:
+    category: external
+    description: Supported live-Mamba memory split boundaries under prefix-cache churn.
+    reason: Active tests vary durable KV-to-Mamba capacity, not the live request-state reservation ratio.
+    values:
+      architecture: hybrid
+      mamba_live_ratio: [small, balanced, large]
+
+  exactly_one_mamba_slot:
+    category: external
+    description: Repeated hybrid prefix reuse with exactly one usable durable Mamba slot.
+    reason: Active pressure tests use multiple durable slots; the single-slot boundary has no execution-stress owner.
+    values:
+      architecture: hybrid
+      prefix_mamba_budget: exactly_one_slot
+
+  moe_rank_consensus:
+    category: external
+    description: Direct evidence that every expert-parallel rank reconstructs identical cached routing.
+    reason: The MoE workload compares returned routing with cache off and on, but does not emit a separate cross-rank consensus counter.
+    values:
+      architecture: moe
+      parallelism: moe_tp_ep_sp

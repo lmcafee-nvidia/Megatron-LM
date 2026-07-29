@@ -100,7 +100,17 @@ def handle_submit_request(coordinator, sender_identity, payload):
         [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params], use_bin_type=True
     )
 
-    request_hashes = coordinator.compute_request_hashes(prompt)
+    needs_prompt_log_probs = not sampling_params.get("skip_prompt_log_probs", False) and (
+        sampling_params.get("return_log_probs", False)
+        or sampling_params.get("top_n_logprobs", 0) > 0
+    )
+    request_hashes = (
+        []
+        if needs_prompt_log_probs
+        else coordinator.compute_request_hashes(
+            prompt, add_BOS=sampling_params.get("add_BOS", False)
+        )
+    )
     if (
         coordinator.prefix_caching_coordinator_policy
         == PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
@@ -121,16 +131,56 @@ def handle_submit_request(coordinator, sender_identity, payload):
 
     coordinator.request_id_to_rank[request_id] = next_identity
     coordinator._pending_counts[coordinator.identity_to_rank_index[next_identity]] += 1
-    if request_hashes:
-        coordinator._update_rank_hashes(next_identity, request_hashes)
     if coordinator.schedule_records is not None:
+        matched_prefix_blocks = 0
+        if (
+            request_hashes
+            and coordinator.prefix_caching_coordinator_policy
+            != PrefixCachingCoordinatorPolicy.LOAD_BALANCED
+        ):
+            selected_rank_idx = coordinator.identity_to_rank_index[next_identity]
+            match, _ = coordinator._match_vector(request_hashes)
+            matched_prefix_blocks = int(
+                round(float(match[selected_rank_idx]) * len(request_hashes))
+            )
         coordinator.schedule_records.append(
             {
                 "request_id": request_id,
                 "rank_index": coordinator.identity_to_rank_index[next_identity],
                 "num_hashes": len(request_hashes),
+                "matched_prefix_blocks": matched_prefix_blocks,
             }
         )
+
+
+@message_handler(Headers.PREFIX_CACHE_REGISTER)
+def handle_prefix_cache_register(coordinator, sender_identity, payload):
+    """Register one engine incarnation and request its initial full snapshot."""
+    if len(payload) != 2 or not isinstance(payload[1], str) or not payload[1]:
+        logging.warning("Coordinator: ignoring malformed prefix cache registration.")
+        return
+    coordinator._handle_rank_registration(sender_identity, payload[1])
+
+
+@message_handler(Headers.PREFIX_CACHE_STATE)
+def handle_prefix_cache_state(coordinator, sender_identity, payload):
+    """Apply an ordered full snapshot or delta from an engine's actual cache."""
+    if len(payload) != 8:
+        logging.warning("Coordinator: ignoring malformed prefix cache state payload.")
+        return
+    (_, epoch, stream_id, resync_id, sequence, is_full_snapshot, added_hashes, removed_hashes) = (
+        payload
+    )
+    coordinator._apply_prefix_cache_state(
+        sender_identity,
+        epoch,
+        stream_id,
+        resync_id,
+        sequence,
+        is_full_snapshot,
+        added_hashes,
+        removed_hashes,
+    )
 
 
 @message_handler(
@@ -157,9 +207,23 @@ def handle_control_signal(coordinator, sender_identity, payload):
     if transition.new_state is not None:
         coordinator.state = transition.new_state
 
+    generation_epoch_changed = False
+    if header == Headers.SET_GENERATION_EPOCH:
+        new_generation_epoch = payload[1]
+        if new_generation_epoch == coordinator.generation_epoch:
+            return
+        coordinator.generation_epoch = new_generation_epoch
+        generation_epoch_changed = True
+        # Stop routing against old-weight KV immediately. Engines will repopulate
+        # ownership from their post-invalidation allocator snapshots.
+        coordinator._reset_prefix_cache_protocol()
+
     # Broadcast the control signal. Forward the full deserialized payload so
     # that data-bearing signals (e.g. SET_GENERATION_EPOCH) retain their args.
     coordinator._broadcast_to_engines(payload)
+    if generation_epoch_changed:
+        for rank_identity in list(coordinator.identities_of_data_parallel_ranks):
+            coordinator._request_prefix_cache_resync(rank_identity)
 
     # STOP affects engines; reset coordinator to RUNNING to allow future engines.
     if header == Headers.STOP:

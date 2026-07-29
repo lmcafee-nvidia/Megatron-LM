@@ -5,6 +5,7 @@ ENV_VARS:
   CUBLAS_WORKSPACE_CONFIG: :4096:8
 TEST_TYPE: frozen-start
 MODE: inference
+PREFIX_CACHE_SCENARIO: pc.functional.moe_routing_replay
 MODEL_ARGS:
   --log-num-zeros-in-grad: true
   --log-validation-ppl-to-tensorboard: true
@@ -69,15 +70,33 @@ MODEL_ARGS:
   --temperature: 1.0
   --top_k: 1
   --return-log-probs: true
+  --skip-prompt-log-probs: true
   --num-tokens-to-generate: 30
+  --moe-enable-routing-replay: true
   --max-tokens-to-oom: 3600000
   --inference-max-seq-length: 4096
   --output-path: ${INFERENCE_OUTPUT_PATH}
   --prompts: "Time travel to 2008, and go to a bar or a club or one of the myriad disco-basements on the Lower East Side that does not quite know which of those it is. Dance awkwardly in a room full of other glittered-up nerds, and wait for something to happen, buoyed on the feeling that this is the big swollen heart of life, that this is New York like the movies."
-  --incoming-requests-per-sec: -1 # all requests arrive up front.
-  --inference-repeat-n: 8
-  --inference-dynamic-batching-buffer-size-gb: 20
+  --incoming-requests-per-step: 1
+  --inference-repeat-n: 3
+  --inference-dynamic-batching-buffer-size-gb: 2
+  --inference-dynamic-batching-max-requests: 8
+  --inference-dynamic-batching-max-tokens: 1024
   --inference-dynamic-batching-prefix-caching: true
+  --prefix-cache-compare: true
+  --prefix-cache-stress-groups: 3
+  --prefix-cache-stress-copies: 2
+  --prefix-cache-stress-prompt-tokens: 512
+  --prefix-cache-stress-staged: true
 METRICS:
-  - "generated_tokens"
-  - "logprobs"
+  - prefix_cache_comparison
+INFERENCE_COMPARISON:
+  minimum_cycle_observations:
+    prefix_cache_hits: 3
+    prefix_cache_blocks_matched: 3
+    prefill_tokens_skipped: 768
+    routing_reconstruction_requests: 1
+  minimum_observations:
+    prefix_cache_hits: 9
+    prefill_tokens_skipped: 2304
+    routing_reconstruction_requests: 1

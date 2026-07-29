@@ -1,15 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Parameterized test for prefix caching with CUDA graphs.
+"""Stress prefix caching with real CUDA-graph execution.
 
-Verifies prefix caching correctness and CUDA graph usage across every
-combination of model type (transformer, hybrid) and batch structure
-(prefill, decode, mixed).
-
-For each case, the same prefix-sharing scenario is run twice (with and
-without CUDA graphs) and compared:
-  1. Generated tokens match exactly (correctness).
-  2. context.using_cuda_graph_this_step() returned True at expected steps.
+Each case runs the same three-cycle reuse workload with cache-off/graphs-on,
+cache-on/graphs-off, and cache-on/graphs-on. This separately verifies cache
+correctness and graph correctness while proving that cache hits really occur.
 """
 
 import random
@@ -148,16 +143,15 @@ class TestPrefixCachingCudaGraphs:
                 module.cudagraph_runners.clear()
                 module.custom_cudagraphs_lookup_table.clear()
 
-    def _build_engine(self, model, mamba_config, num_cuda_graphs):
-        """Build an engine with prefix caching and optional CUDA graphs."""
+    def _build_engine(self, model, mamba_config, enable_prefix_caching, num_cuda_graphs):
+        """Build an engine with independently controlled prefix caching and CUDA graphs."""
         set_rounder(4)
         inference_config_kwargs = dict(
             max_sequence_length=MAX_SEQ_LEN,
             buffer_size_gb=0.5,
             block_size_tokens=BLOCK_SIZE,
             materialize_only_last_token_logits=False,
-            enable_prefix_caching=True,
-            prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
+            enable_prefix_caching=enable_prefix_caching,
             unified_memory_level=0,
             num_cuda_graphs=num_cuda_graphs,
             use_cuda_graphs_for_non_decode_steps=True,
@@ -167,9 +161,13 @@ class TestPrefixCachingCudaGraphs:
             # size. The Mamba cache budget must cover the per-step extraction scratch
             # (which scales with max_requests) on top of the durable cache.
             # max_requests is left uncapped to preserve this test's CUDA-graph buckets.
-            inference_config_kwargs.update(
-                mamba_inference_state_config=mamba_config, prefix_caching_mamba_gb=2.0
+            inference_config_kwargs["mamba_inference_state_config"] = mamba_config
+        if enable_prefix_caching:
+            inference_config_kwargs["prefix_caching_eviction_policy"] = (
+                PrefixCachingEvictionPolicy.LRU
             )
+            if mamba_config is not None:
+                inference_config_kwargs["prefix_caching_mamba_gb"] = 2.0
         context = DynamicInferenceContext(
             model_config=model.config, inference_config=InferenceConfig(**inference_config_kwargs)
         )
@@ -187,44 +185,39 @@ class TestPrefixCachingCudaGraphs:
         return DynamicInferenceEngine(controller, context)
 
     def _create_prompts(self):
-        """Build 4 prompts with overlapping prefixes.
-
-        req 0: tokens[0:300] — seed, no prefix match
-        req 1: tokens[0:300] — identical to req 0, full prefix match (1 block)
-        req 2: tokens[0:256] + unique[256:500] — partial match, 1 block
-        req 3: tokens[0:256] + unique[256:600] — partial match, 1 block shared + 1 unique
-        """
+        """Build one seed and six requests that reuse its first block."""
         device = torch.cuda.current_device()
         base = torch.arange(0, 256, dtype=torch.int64, device=device)
         extra = torch.arange(256, 300, dtype=torch.int64, device=device)
-        unique_2 = torch.arange(1000, 1244, dtype=torch.int64, device=device)
-        unique_3 = torch.arange(2000, 2344, dtype=torch.int64, device=device)
-        return [
-            torch.cat([base, extra]),  # req 0: 300
-            torch.cat([base, extra]),  # req 1: 300
-            torch.cat([base, unique_2]),  # req 2: 500
-            torch.cat([base, unique_3]),  # req 3: 600
-        ]
+        prompts = [torch.cat([base, extra])]
+        for cycle in range(6):
+            unique_length = 144 + 50 * cycle
+            unique_start = 1000 + 500 * cycle
+            unique = torch.arange(
+                unique_start, unique_start + unique_length, dtype=torch.int64, device=device
+            )
+            prompts.append(torch.cat([base, unique]))
+        return prompts
 
-    def _make_request(self, req_id, prompt):
+    def _make_request(self, req_id, prompt, enable_prefix_caching):
         return DynamicInferenceRequest(
             request_id=req_id,
             prompt_tokens=prompt,
             sampling_params=SamplingParams(
                 num_tokens_to_generate=NUM_TOKENS_TO_GENERATE, termination_id=-1, top_k=1
             ),
-            block_size_tokens=BLOCK_SIZE,
-            enable_prefix_caching=True,
+            block_size_tokens=BLOCK_SIZE if enable_prefix_caching else None,
+            enable_prefix_caching=enable_prefix_caching,
         )
 
-    def _run_scenario(self, engine, batch_structure, prompts):
-        """Run the prefix-sharing scenario with the given batch structure.
+    def _run_scenario(self, engine, schedule, prompts, enable_prefix_caching):
+        """Run three seed-reuse cycles with staged or mixed batching.
 
-        Returns (outputs, step_log) where step_log is a list of
-        (prefill_req_count, decode_req_count, using_cuda_graph) per step.
+        Returns outputs, executed requests, step dimensions, and cache metrics.
         """
         ctx = engine.context
         finished = {}
+        requests = []
         step_log = []
 
         def _step_and_log():
@@ -240,34 +233,42 @@ class TestPrefixCachingCudaGraphs:
                 merged = record.merge()
                 finished[merged.request_id] = list(merged.generated_tokens)
 
-        if batch_structure in ("prefill", "decode"):
-            # Add all 4 requests before first step.
-            for i, prompt in enumerate(prompts):
-                engine._add_request(self._make_request(i, prompt))
+        def _add_request(prompt):
+            request = self._make_request(
+                len(requests), prompt, enable_prefix_caching=enable_prefix_caching
+            )
+            requests.append(request)
+            engine._add_request(request)
+
+        def _drain():
             while engine.has_unfinished_requests():
                 _step_and_log()
 
-        elif batch_structure == "mixed":
-            # Add req 0+1 first, step until both are decoding, then add 2+3.
-            for i in [0, 1]:
-                engine._add_request(self._make_request(i, prompts[i]))
-            reqs_added = False
-            while engine.has_unfinished_requests():
-                _step_and_log()
-                if not reqs_added:
-                    last_p, last_d, _ = step_log[-1]
-                    if last_p == 0 and last_d > 0:
-                        for i in [2, 3]:
-                            engine._add_request(self._make_request(i, prompts[i]))
-                        reqs_added = True
+        _add_request(prompts[0])
+        _drain()
 
-        return finished, step_log
+        if schedule == "staged":
+            for prompt in prompts[1:4]:
+                _add_request(prompt)
+                _drain()
+        else:
+            for cycle in range(3):
+                _add_request(prompts[1 + 2 * cycle])
+                while engine.has_unfinished_requests():
+                    _step_and_log()
+                    prefill_count, decode_count, _ = step_log[-1]
+                    if prefill_count == 0 and decode_count > 0:
+                        break
+                _add_request(prompts[2 + 2 * cycle])
+                _drain()
+
+        return finished, requests, step_log, engine.get_prefix_cache_metrics()
 
     @pytest.mark.parametrize("model_type", ["transformer", "hybrid"])
-    @pytest.mark.parametrize("batch_structure", ["prefill", "decode", "mixed"])
+    @pytest.mark.parametrize("schedule", ["staged", "mixed"])
     @torch.inference_mode()
-    def test_prefix_caching_cuda_graphs(self, model_type, batch_structure):
-        """Verify correctness and CUDA graph usage for prefix caching."""
+    def test_prefix_caching_cuda_graphs(self, model_type, schedule):
+        """Verify three reuse cycles against cache-off and graph-off references."""
         if model_type == "hybrid":
             sequence_packing_available, reason = _check_mamba_sequence_packing_support()
             if not sequence_packing_available:
@@ -277,34 +278,48 @@ class TestPrefixCachingCudaGraphs:
         model, mamba_config = self._create_model(model_type, num_cuda_graphs=2)
         prompts = self._create_prompts()
 
-        # Baseline: no CUDA graphs.
-        baseline_engine = self._build_engine(model, mamba_config, num_cuda_graphs=None)
-        baseline_outputs, _ = self._run_scenario(baseline_engine, batch_structure, prompts)
+        off_graph_engine = self._build_engine(
+            model, mamba_config, enable_prefix_caching=False, num_cuda_graphs=2
+        )
+        off_outputs, _, _, off_metrics = self._run_scenario(
+            off_graph_engine, schedule, prompts, enable_prefix_caching=False
+        )
 
-        # CG enabled.
-        cg_engine = self._build_engine(model, mamba_config, num_cuda_graphs=2)
-        cg_outputs, step_log = self._run_scenario(cg_engine, batch_structure, prompts)
+        on_eager_engine = self._build_engine(
+            model, mamba_config, enable_prefix_caching=True, num_cuda_graphs=None
+        )
+        on_eager_outputs, on_eager_requests, _, on_eager_metrics = self._run_scenario(
+            on_eager_engine, schedule, prompts, enable_prefix_caching=True
+        )
 
-        # 1. Correctness: generated tokens must match.
-        for req_id in range(4):
-            assert baseline_outputs[req_id] == cg_outputs[req_id], (
-                f"req {req_id}: baseline {baseline_outputs[req_id]} != " f"cg {cg_outputs[req_id]}"
-            )
+        on_graph_engine = self._build_engine(
+            model, mamba_config, enable_prefix_caching=True, num_cuda_graphs=2
+        )
+        on_graph_outputs, on_graph_requests, step_log, on_graph_metrics = self._run_scenario(
+            on_graph_engine, schedule, prompts, enable_prefix_caching=True
+        )
 
-        # 2. CUDA graph usage at expected batch types.
-        if batch_structure == "prefill":
-            assert any(
-                p > 0 and d == 0 and cg for p, d, cg in step_log
-            ), f"no prefill-only CG step found in {step_log}"
+        assert off_outputs == on_eager_outputs == on_graph_outputs
+        assert off_metrics["hits"] == off_metrics["blocks_matched"] == 0
 
-        elif batch_structure == "decode":
-            decode_only = [(p, d, cg) for p, d, cg in step_log if p == 0 and d > 0]
-            assert decode_only, f"no decode-only steps found in {step_log}"
-            assert all(
-                cg for _, _, cg in decode_only
-            ), f"not all decode-only steps used CG: {decode_only}"
+        expected_hits = 3 if schedule == "staged" else 6
+        for metrics in (on_eager_metrics, on_graph_metrics):
+            assert metrics["hits"] >= expected_hits
+            assert metrics["blocks_matched"] >= expected_hits
+            assert metrics["prefill_tokens_skipped"] >= expected_hits * BLOCK_SIZE
+            if model_type == "hybrid":
+                assert metrics["mamba_restore_hits"] >= expected_hits
 
-        elif batch_structure == "mixed":
+        for requests in (on_eager_requests, on_graph_requests):
+            for request in requests[1:]:
+                assert request.num_cached_tokens >= BLOCK_SIZE
+                if model_type == "hybrid":
+                    assert request._mamba_num_matched_blocks >= 1
+
+        assert any(p > 0 and d == 0 and cg for p, d, cg in step_log), step_log
+        decode_only = [(p, d, cg) for p, d, cg in step_log if p == 0 and d > 0]
+        assert decode_only and all(cg for _, _, cg in decode_only), step_log
+        if schedule == "mixed":
             assert any(
                 p > 0 and d > 0 and cg for p, d, cg in step_log
             ), f"no mixed CG step found in {step_log}"
@@ -385,6 +400,8 @@ class TestHybridChunkedPrefillIntermediateState:
         enable_chunked_prefill,
         max_tokens=None,
         num_cuda_graphs=None,
+        max_requests=128,
+        cuda_graph_max_tokens=None,
     ):
         """Build an engine with the given prefix caching / chunked prefill config."""
         set_rounder(4)
@@ -399,7 +416,7 @@ class TestHybridChunkedPrefillIntermediateState:
             use_cuda_graphs_for_non_decode_steps=True,
             enable_prefix_caching=enable_prefix_caching,
             enable_chunked_prefill=enable_chunked_prefill,
-            max_requests=128,
+            max_requests=max_requests,
         )
         if enable_prefix_caching:
             # The Mamba cache budget must cover both the durable cache and the
@@ -411,6 +428,8 @@ class TestHybridChunkedPrefillIntermediateState:
             )
         if max_tokens is not None:
             inference_config_kwargs["max_tokens"] = max_tokens
+        if cuda_graph_max_tokens is not None:
+            inference_config_kwargs["cuda_graph_max_tokens"] = cuda_graph_max_tokens
         context = DynamicInferenceContext(
             model_config=model.config, inference_config=InferenceConfig(**inference_config_kwargs)
         )
@@ -440,15 +459,11 @@ class TestHybridChunkedPrefillIntermediateState:
 
     @torch.inference_mode()
     def test_hybrid_chunked_prefill_intermediate_state(self):
-        """Concurrent Mamba state extraction (mid-chunk) and restoration (prefix-cached).
+        """Stress concurrent Mamba extraction and restoration for three cycles.
 
-        req0 (300 tokens): seeds the cache with 1 block of Mamba state.
-        req1 (800 tokens): 256 shared prefix, 544 unique. With max_tokens=400 and 1
-            Mamba match (skip 256, effective=544), this request is chunked across steps.
-        req2 (300 tokens): identical to req0. Full prefix match, 1 Mamba match.
-
-        In the critical step, req2 has Mamba state restored from cache while req1 has
-        Mamba state being computed fresh with intermediate state extraction.
+        Each cycle co-schedules a long request whose unique suffix is chunked with
+        a short request that restores the seed state. Cache-off and cache-on use
+        the same chunking configuration and external admission order.
         """
         sequence_packing_available, reason = _check_mamba_sequence_packing_support()
         if not sequence_packing_available:
@@ -460,93 +475,96 @@ class TestHybridChunkedPrefillIntermediateState:
         mamba_config = MambaInferenceStateConfig.from_model(model)
 
         device = torch.cuda.current_device()
-        prompt0 = torch.arange(0, 300, dtype=torch.int64, device=device)
-        prompt1 = torch.cat(
-            [
-                torch.arange(0, 256, dtype=torch.int64, device=device),
-                torch.arange(5000, 5544, dtype=torch.int64, device=device),
-            ]
-        )  # 800 tokens: 256 shared + 544 unique
-        prompt2 = torch.arange(0, 300, dtype=torch.int64, device=device)  # identical to prompt0
+        base = torch.arange(0, BLOCK_SIZE, dtype=torch.int64, device=device)
+        seed_prompt = torch.arange(0, 300, dtype=torch.int64, device=device)
+        long_prompts = [
+            torch.cat(
+                [
+                    base,
+                    torch.arange(
+                        5000 + cycle * 600, 5544 + cycle * 600, dtype=torch.int64, device=device
+                    ),
+                ]
+            )
+            for cycle in range(3)
+        ]
 
-        # Baseline: no prefix caching, no chunked prefill.
-        baseline_engine = self._build_engine(
-            model, mamba_config, enable_prefix_caching=False, enable_chunked_prefill=False
-        )
-        for i, prompt in enumerate([prompt0, prompt1, prompt2]):
-            baseline_engine._add_request(self._make_request(i, prompt, enable_pc=False))
-        baseline_outputs = {}
-        while baseline_engine.has_unfinished_requests():
-            result = baseline_engine.step_modern()
-            for record in result["finished_request_records"]:
-                merged = record.merge()
-                baseline_outputs[merged.request_id] = list(merged.generated_tokens)
+        def run(enable_prefix_caching):
+            engine = self._build_engine(
+                model,
+                mamba_config,
+                enable_prefix_caching=enable_prefix_caching,
+                enable_chunked_prefill=True,
+                max_tokens=400,
+            )
+            outputs = {}
+            reuse_requests = []
+            concurrent_prefills = []
 
-        # Test: prefix caching + chunked prefill, max_tokens=400.
-        test_engine = self._build_engine(
-            model,
-            mamba_config,
-            enable_prefix_caching=True,
-            enable_chunked_prefill=True,
-            max_tokens=400,
-        )
-        ctx = test_engine.context
+            def drain():
+                max_prefill_requests = 0
+                while engine.has_unfinished_requests():
+                    result = engine.step_modern()
+                    max_prefill_requests = max(
+                        max_prefill_requests, engine.context.batch_dimensions.prefill_req_count
+                    )
+                    for record in result["finished_request_records"]:
+                        merged = record.merge()
+                        outputs[merged.request_id] = list(merged.generated_tokens)
+                return max_prefill_requests
 
-        test_outputs = {}
+            seed = self._make_request(0, seed_prompt, enable_pc=enable_prefix_caching)
+            engine._add_request(seed)
+            drain()
 
-        def collect_finished(result):
-            for record in result["finished_request_records"]:
-                merged = record.merge()
-                test_outputs[merged.request_id] = list(merged.generated_tokens)
+            for cycle, long_prompt in enumerate(long_prompts):
+                long_request = self._make_request(
+                    1 + 2 * cycle, long_prompt, enable_pc=enable_prefix_caching
+                )
+                short_request = self._make_request(
+                    2 + 2 * cycle, seed_prompt, enable_pc=enable_prefix_caching
+                )
+                reuse_requests.extend((long_request, short_request))
+                engine._add_request(long_request)
+                engine._add_request(short_request)
+                concurrent_prefills.append(drain())
 
-        # Phase 1: run req0 to completion (seeds cache).
-        req0 = self._make_request(0, prompt0, enable_pc=True)
-        test_engine._add_request(req0)
-        while test_engine.has_unfinished_requests():
-            collect_finished(test_engine.step_modern())
+            return (
+                outputs,
+                reuse_requests,
+                concurrent_prefills,
+                engine.get_prefix_cache_metrics(),
+                engine.context,
+            )
 
-        # Verify req0 cached its Mamba state.
-        assert (
-            len(ctx.mamba_slot_allocator.hash_to_block_id) > 0
-        ), "req0 should have cached Mamba state"
+        off_outputs, _, _, off_metrics, off_context = run(False)
+        on_outputs, on_requests, concurrent_prefills, on_metrics, on_context = run(True)
 
-        # Phase 2: add req1 + req2 simultaneously.
-        req1 = self._make_request(1, prompt1, enable_pc=True)
-        req2 = self._make_request(2, prompt2, enable_pc=True)
-        test_engine._add_request(req1)
-        test_engine._add_request(req2)
+        assert off_outputs == on_outputs
+        assert off_metrics["hits"] == off_metrics["blocks_matched"] == 0
+        assert on_metrics["hits"] >= 6
+        assert on_metrics["mamba_restore_hits"] >= 6
+        assert on_metrics["prefill_tokens_skipped"] >= 6 * BLOCK_SIZE
+        assert on_context.lifetime_prefill_token_count < off_context.lifetime_prefill_token_count
+        assert all(prefill_count >= 2 for prefill_count in concurrent_prefills)
 
-        while test_engine.has_unfinished_requests():
-            collect_finished(test_engine.step_modern())
-
-        # Verify Mamba state was restored for req2 (prefix-cached).
-        assert (
-            req2._mamba_num_matched_blocks == 1
-        ), f"req2 should have 1 Mamba match, got {req2._mamba_num_matched_blocks}"
-
-        # Verify prefix caching saved prefill tokens.
-        assert ctx.lifetime_prefill_token_count < (300 + 800 + 300), (
-            f"prefix caching should reduce total prefill tokens, "
-            f"got {ctx.lifetime_prefill_token_count}"
-        )
-
-        # Correctness: generated tokens must match baseline.
-        for req_id in range(3):
-            assert baseline_outputs[req_id] == test_outputs[req_id], (
-                f"req {req_id}: baseline {baseline_outputs[req_id]} != "
-                f"test {test_outputs[req_id]}"
+        for request in on_requests:
+            assert request.num_cached_tokens >= BLOCK_SIZE
+            assert request._mamba_num_matched_blocks >= 1
+        for request in on_requests[::2]:
+            assert any(
+                block_hash in on_context.mamba_slot_allocator.hash_to_block_id
+                for block_hash in request.precomputed_block_hashes[1:]
             )
 
     @torch.inference_mode()
     def test_prefill_shorter_than_conv_window(self):
-        """A prefill captured into a CUDA graph whose token bucket is smaller than the
-        Mamba conv window (d_conv) generates correctly.
+        """Restore a prefix before graphing a suffix shorter than the Mamba conv window.
 
         Conv-state extraction gathers d_conv positions per slot, and unused slots use
         abs_position == d_conv (gather indices up to d_conv-1). The CUDA-graph bucket
-        list always includes a size-1 (tp_size) graph, so a prompt shorter than d_conv
-        is captured at a bucket whose token layout is shorter than the gather window.
-        CUDA graphs (num_cuda_graphs) are required to exercise this capture path.
+        list always includes a size-1 (tp_size) graph. Each reuse request restores one
+        full block, leaving fewer than d_conv fresh prompt tokens in the captured graph.
         """
         sequence_packing_available, reason = _check_mamba_sequence_packing_support()
         if not sequence_packing_available:
@@ -559,27 +577,74 @@ class TestHybridChunkedPrefillIntermediateState:
         device = torch.cuda.current_device()
 
         d_conv = mamba_config.conv_states_shape[-1]
-        if d_conv < 2:
+        if d_conv < 3:
             pytest.skip(f"d_conv={d_conv} too small to exercise a sub-window prefill")
 
-        # Prompt shorter than the conv window: its prefill chunk snaps to a CUDA-graph
-        # bucket < d_conv, so the captured graph's token layout is < d_conv.
-        engine = self._build_engine(
-            model,
-            mamba_config,
-            enable_prefix_caching=True,
-            enable_chunked_prefill=True,
-            num_cuda_graphs=2,
-        )
-        short_prompt = torch.arange(0, d_conv - 1, dtype=torch.int64, device=device)
+        base = torch.arange(0, BLOCK_SIZE, dtype=torch.int64, device=device)
+        fresh_suffix_tokens = 2
+        reuse_prompts = [
+            torch.cat(
+                [
+                    base,
+                    torch.arange(
+                        5000 + cycle * d_conv,
+                        5000 + cycle * d_conv + fresh_suffix_tokens,
+                        dtype=torch.int64,
+                        device=device,
+                    ),
+                ]
+            )
+            for cycle in range(3)
+        ]
 
-        engine._add_request(self._make_request(0, short_prompt, enable_pc=True))
-        outputs = {}
-        while engine.has_unfinished_requests():
-            result = engine.step_modern()
-            for record in result["finished_request_records"]:
-                merged = record.merge()
-                outputs[merged.request_id] = list(merged.generated_tokens)
+        def run(enable_prefix_caching):
+            engine = self._build_engine(
+                model,
+                mamba_config,
+                enable_prefix_caching=enable_prefix_caching,
+                enable_chunked_prefill=True,
+                num_cuda_graphs=2,
+                max_requests=2,
+                cuda_graph_max_tokens=fresh_suffix_tokens,
+            )
+            outputs = {}
+            requests = []
+            step_log = []
 
-        # Generation completes and produces the requested number of tokens.
-        assert len(outputs[0]) == NUM_TOKENS_TO_GENERATE
+            def drain():
+                while engine.has_unfinished_requests():
+                    result = engine.step_modern()
+                    step_log.append(
+                        (
+                            engine.context.batch_dimensions.prefill_req_count,
+                            engine.context.using_cuda_graph_this_step(),
+                        )
+                    )
+                    for record in result["finished_request_records"]:
+                        merged = record.merge()
+                        outputs[merged.request_id] = list(merged.generated_tokens)
+
+            seed = self._make_request(0, base, enable_pc=enable_prefix_caching)
+            engine._add_request(seed)
+            drain()
+            for req_id, prompt in enumerate(reuse_prompts, start=1):
+                request = self._make_request(req_id, prompt, enable_pc=enable_prefix_caching)
+                requests.append(request)
+                engine._add_request(request)
+                drain()
+
+            return outputs, requests, step_log, engine.get_prefix_cache_metrics()
+
+        off_outputs, _, _, off_metrics = run(False)
+        on_outputs, on_requests, on_step_log, on_metrics = run(True)
+
+        assert off_outputs == on_outputs
+        assert off_metrics["hits"] == off_metrics["blocks_matched"] == 0
+        assert on_metrics["hits"] >= 3
+        assert on_metrics["blocks_matched"] >= 3
+        assert on_metrics["mamba_restore_hits"] >= 3
+        assert on_metrics["prefill_tokens_skipped"] >= 3 * BLOCK_SIZE
+        assert any(prefill_count > 0 and used_graph for prefill_count, used_graph in on_step_log)
+        for request in on_requests:
+            assert request.num_cached_tokens == BLOCK_SIZE
+            assert request._mamba_num_matched_blocks == 1

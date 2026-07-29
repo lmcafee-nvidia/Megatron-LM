@@ -262,19 +262,27 @@ class TestMambaPrefixCachingE2E:
         num_tokens=NUM_TOKENS_TO_GENERATE,
         **engine_kwargs,
     ):
-        """Run all prompts with given pc setting, return (finished_dict, lifetime_prefill)."""
+        """Run all prompts with one cache setting and return outputs plus execution evidence."""
         engine = self._build_engine(
             model, mamba_config, enable_prefix_caching=enable_pc, **engine_kwargs
         )
+        requests = []
         for i, prompt in enumerate(prompts):
-            engine._add_request(self._make_request(base_req_id + i, prompt, enable_pc, num_tokens))
+            request = self._make_request(base_req_id + i, prompt, enable_pc, num_tokens)
+            requests.append(request)
+            engine._add_request(request)
         finished = {}
         while engine.has_unfinished_requests():
             result = engine.step_modern()
             for record in result["finished_request_records"]:
                 merged = record.merge()
                 finished[merged.request_id] = list(merged.generated_tokens)
-        return finished, engine.context.lifetime_prefill_token_count
+        return (
+            finished,
+            engine.context.lifetime_prefill_token_count,
+            requests,
+            engine.get_prefix_cache_metrics(),
+        )
 
     def _get_ref_count(self, alloc, block_hash):
         bid = alloc.kv_hash_to_block_id.get(block_hash)
@@ -336,50 +344,15 @@ class TestMambaPrefixCachingE2E:
             assert len(ctx.mamba_slot_allocator.hash_to_block_id) == G * 6
             assert step_prefill == G * 288, f"step 4: expected {G * 288}, got {step_prefill}"
 
-    def _run_pc_on(self, model, mamba_config, prompts):
-        """Run requests with prefix caching enabled, verifying per-step state."""
-        engine = self._build_engine(model, mamba_config, enable_prefix_caching=True)
-        alloc = engine.context.kv_block_allocator
-        ctx = engine.context
-
-        reqs = {i: self._make_request(i, p, True) for i, p in enumerate(prompts)}
-        for i in [0, 1, 2, 4]:
-            engine._add_request(reqs[i])
-
-        step = 0
-        req3_added = False
-        finished = {}
-        prev_prefill = 0
-        reqs_by_group = [{k: reqs[k] for k in reqs}]
-
-        while engine.has_unfinished_requests():
-            result = engine.step_modern()
-            step += 1
-            step_prefill = ctx.lifetime_prefill_token_count - prev_prefill
-            prev_prefill = ctx.lifetime_prefill_token_count
-            for record in result["finished_request_records"]:
-                merged = record.merge()
-                finished[merged.request_id] = list(merged.generated_tokens)
-
-            if step <= 2 or (step == 3 and not req3_added) or (step == 4 and req3_added):
-                self._assert_step(step, reqs_by_group, alloc, step_prefill, 1, ctx)
-            if step == 3 and not req3_added:
-                engine._add_request(reqs[3])
-                req3_added = True
-
-        return finished, ctx.lifetime_prefill_token_count
-
-    def _run_multi_pc_on(self, model, mamba_config, all_prompts, num_cuda_graphs=None):
-        """Run 4 groups with prefix caching enabled, verifying per-step state."""
+    def _run_grouped_scenario(self, model, mamba_config, all_prompts, enable_pc):
+        """Run one or more independent prefix groups with the same admission schedule."""
+        num_groups = len(all_prompts)
         engine = self._build_engine(
             model,
             mamba_config,
-            enable_prefix_caching=True,
-            buffer_size_gb=2.0,
-            # Large buffer auto-derives many max_requests, so the extraction scratch
-            # is large; give the Mamba cache enough budget to cover it plus durable.
-            prefix_caching_mamba_gb=4.0,
-            num_cuda_graphs=num_cuda_graphs,
+            enable_prefix_caching=enable_pc,
+            buffer_size_gb=0.5 if num_groups == 1 else 2.0,
+            prefix_caching_mamba_gb=2.0 if num_groups == 1 else 4.0,
         )
         alloc = engine.context.kv_block_allocator
         ctx = engine.context
@@ -390,11 +363,14 @@ class TestMambaPrefixCachingE2E:
             for lid, prompt in enumerate(prompts):
                 rid = g * 5 + lid
                 group_reqs[lid] = self._make_request(
-                    rid, prompt, True, MULTI_GROUP_TOKENS_TO_GENERATE
+                    rid,
+                    prompt,
+                    enable_pc,
+                    NUM_TOKENS_TO_GENERATE if num_groups == 1 else MULTI_GROUP_TOKENS_TO_GENERATE,
                 )
             reqs.append(group_reqs)
 
-        for g in range(NUM_GROUPS):
+        for g in range(num_groups):
             for lid in [0, 1, 2, 4]:
                 engine._add_request(reqs[g][lid])
 
@@ -412,74 +388,68 @@ class TestMambaPrefixCachingE2E:
                 merged = record.merge()
                 finished[merged.request_id] = list(merged.generated_tokens)
 
-            if step <= 2 or (step == 3 and not req3_added) or (step == 4 and req3_added):
-                self._assert_step(step, reqs, alloc, step_prefill, NUM_GROUPS, ctx)
+            if enable_pc and (
+                step <= 2 or (step == 3 and not req3_added) or (step == 4 and req3_added)
+            ):
+                self._assert_step(step, reqs, alloc, step_prefill, num_groups, ctx)
             if step == 3 and not req3_added:
-                for g in range(NUM_GROUPS):
+                for g in range(num_groups):
                     engine._add_request(reqs[g][3])
                 req3_added = True
 
-        return finished, ctx.lifetime_prefill_token_count
+        return (finished, ctx.lifetime_prefill_token_count, reqs, engine.get_prefix_cache_metrics())
 
     @torch.inference_mode()
     def test_mamba_prefix_caching_e2e(self):
-        """Verify output tokens match between pc=off and pc=on."""
+        """Stress every Mamba/KV match-depth relationship against cache-off."""
         skip_if_mamba_sequence_packing_not_available()
         model = self._create_model()
         mamba_config = MambaInferenceStateConfig.from_model(model)
         prompts = self._create_prompts()
 
-        off_outputs, off_prefill = self._run_simple(model, mamba_config, prompts, False)
-        on_outputs, on_prefill = self._run_pc_on(model, mamba_config, prompts)
+        off_outputs, off_prefill, _, off_metrics = self._run_grouped_scenario(
+            model, mamba_config, [prompts], False
+        )
+        on_outputs, on_prefill, on_requests, on_metrics = self._run_grouped_scenario(
+            model, mamba_config, [prompts], True
+        )
 
-        for req_id in range(5):
-            assert (
-                off_outputs[req_id] == on_outputs[req_id]
-            ), f"req {req_id}: pc=off {off_outputs[req_id]} != pc=on {on_outputs[req_id]}"
+        assert off_outputs == on_outputs
         assert off_prefill == 3800 and on_prefill == 2008 and on_prefill < off_prefill
+        assert off_metrics["hits"] == off_metrics["blocks_matched"] == 0
+        assert on_metrics["hits"] >= 4
+        assert on_metrics["blocks_matched"] >= 7
+        assert on_metrics["mamba_restore_hits"] >= 4
+        for request in (on_requests[0][lid] for lid in [1, 2, 3, 4]):
+            assert request.num_cached_tokens >= BLOCK_SIZE
+            assert request._mamba_num_matched_blocks >= 1
 
-    @pytest.mark.parametrize("num_cuda_graphs", [None, 2])
     @torch.inference_mode()
-    def test_mamba_prefix_caching_multi_group_e2e(self, num_cuda_graphs):
-        """Verify multi-group prefix caching with 4 independent groups."""
+    def test_mamba_prefix_caching_multi_group_e2e(self):
+        """Stress four concurrent prefix trees against the same cache-off schedule."""
         skip_if_mamba_sequence_packing_not_available()
-        model = self._create_model(num_cuda_graphs=num_cuda_graphs)
+        model = self._create_model()
         mamba_config = MambaInferenceStateConfig.from_model(model)
         all_prompts = [self._create_prompts(g * GROUP_TOKEN_STRIDE) for g in range(NUM_GROUPS)]
 
-        _, off_prefill = self._run_simple(
-            model,
-            mamba_config,
-            [p for group in all_prompts for p in group],
-            False,
-            num_tokens=MULTI_GROUP_TOKENS_TO_GENERATE,
-            num_cuda_graphs=num_cuda_graphs,
-            buffer_size_gb=2.0,
-            prefix_caching_mamba_gb=0.2,
+        off_outputs, off_prefill, _, off_metrics = self._run_grouped_scenario(
+            model, mamba_config, all_prompts, False
         )
-        on_outputs, on_prefill = self._run_multi_pc_on(
-            model, mamba_config, all_prompts, num_cuda_graphs=num_cuda_graphs
+        on_outputs, on_prefill, on_requests, on_metrics = self._run_grouped_scenario(
+            model, mamba_config, all_prompts, True
         )
 
-        # verify per-group outputs match independent runs
-        for g in range(NUM_GROUPS):
-            ref_outputs, _ = self._run_simple(
-                model,
-                mamba_config,
-                all_prompts[g],
-                True,
-                base_req_id=g * 5,
-                num_tokens=MULTI_GROUP_TOKENS_TO_GENERATE,
-                num_cuda_graphs=num_cuda_graphs,
-            )
-            for lid in range(5):
-                rid = g * 5 + lid
-                assert (
-                    on_outputs[rid] == ref_outputs[rid]
-                ), f"group {g} req {lid}: multi {on_outputs[rid]} != per-group {ref_outputs[rid]}"
-
+        assert off_outputs == on_outputs
         assert off_prefill == NUM_GROUPS * 3800
         assert on_prefill == NUM_GROUPS * 2008 and on_prefill < off_prefill
+        assert off_metrics["hits"] == off_metrics["blocks_matched"] == 0
+        assert on_metrics["hits"] >= NUM_GROUPS * 4
+        assert on_metrics["blocks_matched"] >= NUM_GROUPS * 7
+        assert on_metrics["mamba_restore_hits"] >= NUM_GROUPS * 4
+        for group_requests in on_requests:
+            for lid in [1, 2, 3, 4]:
+                assert group_requests[lid].num_cached_tokens >= BLOCK_SIZE
+                assert group_requests[lid]._mamba_num_matched_blocks >= 1
 
     def _create_block_aligned_prompts(self):
         """Build 4 prompts with block-aligned lengths for EOS path testing."""
@@ -547,7 +517,7 @@ class TestMambaPrefixCachingE2E:
                 assert len(ctx.mamba_slot_allocator.hash_to_block_id) == 2
                 assert step_prefill == 256
 
-        return finished, ctx.lifetime_prefill_token_count
+        return (finished, ctx.lifetime_prefill_token_count, reqs, engine.get_prefix_cache_metrics())
 
     @torch.inference_mode()
     def test_mamba_block_aligned_eos_e2e(self):
@@ -557,85 +527,109 @@ class TestMambaPrefixCachingE2E:
         mamba_config = MambaInferenceStateConfig.from_model(model)
         prompts = self._create_block_aligned_prompts()
 
-        off_outputs, off_prefill = self._run_simple(model, mamba_config, prompts, False)
-        on_outputs, on_prefill = self._run_eos_pc_on(model, mamba_config, prompts)
+        off_outputs, off_prefill, _, off_metrics = self._run_simple(
+            model, mamba_config, prompts, False
+        )
+        on_outputs, on_prefill, on_requests, on_metrics = self._run_eos_pc_on(
+            model, mamba_config, prompts
+        )
 
-        for req_id in range(4):
-            assert (
-                off_outputs[req_id] == on_outputs[req_id]
-            ), f"req {req_id}: pc=off {off_outputs[req_id]} != pc=on {on_outputs[req_id]}"
+        assert off_outputs == on_outputs
         assert off_prefill == 1536 and on_prefill == 1024 and on_prefill < off_prefill
+        assert off_metrics["hits"] == off_metrics["blocks_matched"] == 0
+        assert on_metrics["hits"] >= 3
+        assert on_metrics["mamba_restore_hits"] >= 2
+        for request in (on_requests[i] for i in [1, 2, 3]):
+            assert request.num_cached_tokens >= BLOCK_SIZE
+            assert request._mamba_num_matched_blocks >= 1
 
     def _create_eviction_prompts(self):
         device = torch.cuda.current_device()
         return [
-            torch.arange(8000, 8300, dtype=torch.int64, device=device),
-            torch.arange(8300, 8600, dtype=torch.int64, device=device),
-            torch.arange(8000, 8300, dtype=torch.int64, device=device),  # identical to E
+            (
+                torch.arange(1000 + cycle * 2000, 1300 + cycle * 2000, device=device),
+                torch.arange(2000 + cycle * 2000, 2300 + cycle * 2000, device=device),
+            )
+            for cycle in range(3)
         ]
 
     @torch.inference_mode()
     def test_mamba_lru_eviction_e2e(self):
-        """Verify KV eviction invalidates mamba state via invalidate_mamba_state_for_block."""
+        """Stress KV/Mamba eviction coupling through three hit-evict-miss cycles."""
         skip_if_mamba_sequence_packing_not_available()
         model = self._create_model()
         mamba_config = MambaInferenceStateConfig.from_model(model)
-        prompts = self._create_eviction_prompts()
+        prompt_cycles = self._create_eviction_prompts()
 
-        engine = self._build_engine(
-            model,
-            mamba_config,
-            enable_prefix_caching=True,
-            buffer_size_gb=0.002,
-            prefix_caching_mamba_gb=0.05,
-            request_rounder=1,
-        )
-        alloc = engine.context.kv_block_allocator
-        ctx = engine.context
+        def run(enable_pc):
+            engine = self._build_engine(
+                model,
+                mamba_config,
+                enable_prefix_caching=enable_pc,
+                buffer_size_gb=0.002,
+                prefix_caching_mamba_gb=0.05,
+                request_rounder=1,
+            )
+            alloc = engine.context.kv_block_allocator
+            ctx = engine.context
+            assert alloc.pool_size == 3, f"expected 3 total blocks, got {alloc.pool_size}"
+            assert ctx.max_requests >= 1
 
-        assert alloc.pool_size == 3, f"expected 3 total blocks, got {alloc.pool_size}"
-        assert ctx.max_requests >= 1
+            outputs = {}
+            cycle_requests = []
 
-        finished = {}
+            def run_one(req_id, prompt):
+                # Two generated tokens keep the request alive until intermediate
+                # Mamba snapshots are committed after the prefill forward pass.
+                request = self._make_request(req_id, prompt, enable_pc, num_tokens=2)
+                engine._add_request(request)
+                while engine.has_unfinished_requests():
+                    result = engine.step_modern()
+                    for record in result["finished_request_records"]:
+                        merged = record.merge()
+                        outputs[merged.request_id] = list(merged.generated_tokens)
+                return request
 
-        def _run_one(req_id, prompt):
-            # Use num_tokens_to_generate=2 so the request survives the prefill
-            # step (commit_mamba_intermediate_states runs after update_requests)
-            req = self._make_request(req_id, prompt, True, num_tokens=2)
-            engine._add_request(req)
-            while engine.has_unfinished_requests():
-                result = engine.step_modern()
-                for record in result["finished_request_records"]:
-                    merged = record.merge()
-                    finished[merged.request_id] = list(merged.generated_tokens)
-            return req
+            for cycle, (seed_prompt, pressure_prompt) in enumerate(prompt_cycles):
+                first_id = cycle * 4
+                seed = run_one(first_id, seed_prompt)
+                hit = run_one(first_id + 1, seed_prompt)
+                if enable_pc:
+                    seed_hash = seed.precomputed_block_hashes[0]
+                    assert hit._mamba_num_matched_blocks == 1
+                    assert hit.num_cached_tokens >= BLOCK_SIZE
 
-        # E: seed request
-        req_E = _run_one(0, prompts[0])
-        h_E0 = req_E.precomputed_block_hashes[0]
-        assert (
-            h_E0 in ctx.mamba_slot_allocator.hash_to_block_id and h_E0 in alloc.kv_hash_to_block_id
-        )
-        assert len(ctx.mamba_slot_allocator.hash_to_block_id) == 1 and alloc.pool_avail == 1
+                pressure = run_one(first_id + 2, pressure_prompt)
+                if enable_pc:
+                    assert seed_hash not in alloc.kv_hash_to_block_id
+                    assert seed_hash not in ctx.mamba_slot_allocator.hash_to_block_id
 
-        # F: disjoint prefix, forces eviction of E's cached block
-        req_F = _run_one(1, prompts[1])
-        assert req_F.precomputed_block_hashes[0] in ctx.mamba_slot_allocator.hash_to_block_id
-        assert (
-            h_E0 not in alloc.kv_hash_to_block_id
-            and h_E0 not in ctx.mamba_slot_allocator.hash_to_block_id
-        )
-        assert len(ctx.mamba_slot_allocator.hash_to_block_id) == 1
+                post_eviction = run_one(first_id + 3, seed_prompt)
+                cycle_requests.append((seed, hit, pressure, post_eviction))
 
-        # G: identical to E, but E's state was evicted
-        req_G = _run_one(2, prompts[2])
-        assert req_G._mamba_num_matched_blocks == 0
-        assert h_E0 in ctx.mamba_slot_allocator.hash_to_block_id
-        assert finished[0] == finished[2]
+                if enable_pc:
+                    assert post_eviction._mamba_num_matched_blocks == 0
+                    assert seed_hash in alloc.kv_hash_to_block_id
+                    assert seed_hash in ctx.mamba_slot_allocator.hash_to_block_id
+
+            return outputs, cycle_requests, engine.get_prefix_cache_metrics()
+
+        off_outputs, _, off_metrics = run(False)
+        on_outputs, on_requests, on_metrics = run(True)
+
+        assert off_outputs == on_outputs
+        assert off_metrics["hits"] == off_metrics["blocks_matched"] == 0
+        assert on_metrics["hits"] >= 3
+        assert on_metrics["mamba_restore_hits"] >= 3
+        assert on_metrics["kv_lru_evictions"] >= 3
+        assert on_metrics["kv_blocks_deregistered"] >= 3
+        for seed, hit, _, post_eviction in on_requests:
+            assert on_outputs[seed.request_id] == on_outputs[hit.request_id]
+            assert on_outputs[seed.request_id] == on_outputs[post_eviction.request_id]
 
     @torch.inference_mode()
     def test_mamba_chunked_prefill_unaligned_boundary_snapshot(self):
-        """Chunked prefill snapshots Mamba state at the last block boundary.
+        """Stress last-boundary snapshots across three unaligned chunked reuses.
 
         ``compute_and_store_offsets`` records a Mamba state snapshot at a KV-block
         boundary only when that boundary is a whole multiple of the SSM chunk size
@@ -647,8 +641,8 @@ class TestMambaPrefixCachingE2E:
         (256), so the request spans several chunks and its last full-block boundary
         (token 768) lands in a continuation chunk. The scheduler keeps each chunk
         boundary block-aligned, so the final chunk begins at token 512 and the
-        token-768 snapshot is extracted and committed. A second request sharing the
-        768-token prefix then restores that state and skips those blocks.
+        token-768 snapshot is extracted and committed. Three requests then restore
+        that state, and their outputs are compared with the same chunked cache-off run.
         """
         skip_if_mamba_sequence_packing_not_available()
         model = self._create_model()
@@ -660,47 +654,68 @@ class TestMambaPrefixCachingE2E:
         prompt = torch.arange(9000, 9800, dtype=torch.int64, device=device)
         assert len(prompt) == 800
 
-        engine = self._build_engine(
-            model,
-            mamba_config,
-            enable_prefix_caching=True,
-            enable_chunked_prefill=True,
-            max_tokens=300,  # not a multiple of BLOCK_SIZE (256) -> forces unaligned cuts
-            max_requests=4,
-            request_rounder=4,
-        )
-        ctx = engine.context
-        # Sanity: the prompt genuinely spans multiple prefill chunks.
-        assert ctx.max_tokens < len(prompt)
+        reuse_prompts = [
+            torch.cat(
+                [
+                    prompt[:768],
+                    torch.arange(
+                        7000 + cycle * 100, 7100 + cycle * 100, dtype=torch.int64, device=device
+                    ),
+                ]
+            )
+            for cycle in range(3)
+        ]
 
-        # --- Seed request: fills the cache, no prior matches. ---
-        seed = self._make_request(0, prompt, enable_pc=True, num_tokens=4)
-        engine._add_request(seed)
-        while engine.has_unfinished_requests():
-            engine.step_modern()
-        # Seed has no prior cache, so no Mamba blocks are matched during its prefill.
+        def run(enable_pc):
+            engine = self._build_engine(
+                model,
+                mamba_config,
+                enable_prefix_caching=enable_pc,
+                enable_chunked_prefill=True,
+                max_tokens=300,
+                max_requests=4,
+                request_rounder=4,
+            )
+            ctx = engine.context
+            assert ctx.max_tokens < len(prompt)
+            outputs = {}
+            reuse_requests = []
+
+            def drain():
+                while engine.has_unfinished_requests():
+                    result = engine.step_modern()
+                    for record in result["finished_request_records"]:
+                        merged = record.merge()
+                        outputs[merged.request_id] = list(merged.generated_tokens)
+
+            seed = self._make_request(0, prompt, enable_pc=enable_pc, num_tokens=4)
+            engine._add_request(seed)
+            drain()
+
+            for req_id, reuse_prompt in enumerate(reuse_prompts, start=1):
+                reuse = self._make_request(req_id, reuse_prompt, enable_pc=enable_pc, num_tokens=4)
+                reuse_requests.append(reuse)
+                engine._add_request(reuse)
+                drain()
+
+            return (outputs, seed, reuse_requests, ctx, engine.get_prefix_cache_metrics())
+
+        off_outputs, _, _, off_context, off_metrics = run(False)
+        on_outputs, seed, reuse_requests, on_context, on_metrics = run(True)
+
+        assert off_outputs == on_outputs
+        assert off_metrics["hits"] == off_metrics["blocks_matched"] == 0
+        assert on_context.lifetime_prefill_token_count < off_context.lifetime_prefill_token_count
+
         assert seed._mamba_num_matched_blocks == 0
-
-        # block index 2 == the boundary at token 768 (768 // 256 - 1). The final
-        # chunk begins block-aligned at token 512, so (768 - 512) % 128 == 0 and
-        # the state at this boundary is extracted and committed.
         assert len(seed.precomputed_block_hashes) == 3
         last_block_hash = seed.precomputed_block_hashes[2]
-        assert (
-            last_block_hash in ctx.mamba_slot_allocator.hash_to_block_id
-        ), "Mamba snapshot at the last block boundary (token 768) was not recorded."
+        assert last_block_hash in on_context.mamba_slot_allocator.hash_to_block_id
 
-        # --- Reuse request: shares the full 768-token prefix, should restore the
-        # cached Mamba state and skip those blocks entirely. ---
-        reuse_prompt = torch.cat(
-            [prompt[:768], torch.arange(9800, 9900, dtype=torch.int64, device=device)]
-        )
-        reuse = self._make_request(1, reuse_prompt, enable_pc=True, num_tokens=4)
-        engine._add_request(reuse)
-        while engine.has_unfinished_requests():
-            engine.step_modern()
-
-        assert reuse._mamba_num_matched_blocks == 3, (
-            "Reuse request should restore Mamba state from the token-768 snapshot "
-            f"(3 matched blocks), got {reuse._mamba_num_matched_blocks}."
-        )
+        assert on_metrics["hits"] >= 3
+        assert on_metrics["blocks_matched"] >= 9
+        assert on_metrics["mamba_restore_hits"] >= 3
+        assert on_metrics["prefill_tokens_skipped"] >= 3 * 3 * BLOCK_SIZE
+        for reuse in reuse_requests:
+            assert reuse.num_cached_tokens == 3 * BLOCK_SIZE
+            assert reuse._mamba_num_matched_blocks == 3

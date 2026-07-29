@@ -55,10 +55,24 @@ class Transport(IntEnum):
     TP_BROADCAST = 80
 
 
+class Cache(IntEnum):
+    """Engine cache-state updates used for prefix-aware routing."""
+
+    PREFIX_CACHE_STATE = 100
+    """Ordered engine update:
+    ``[header, epoch, stream_id, resync_id, sequence, is_full_snapshot,
+    added_hashes, removed_hashes]``.
+    """
+    PREFIX_CACHE_REGISTER = 101
+    """Engine registration: ``[header, stream_id]``."""
+    PREFIX_CACHE_RESYNC = 102
+    """Coordinator snapshot request: ``[header, stream_id, resync_id]``."""
+
+
 # All header categories. To add a new class of headers, define a new IntEnum in
 # its own (disjoint) numeric range and append it here; nothing else needs to
 # change. Ranges are spaced out to leave room for growth within each category.
-HEADER_ENUMS = (Connection, Request, Control, Lifecycle, Transport)
+HEADER_ENUMS = (Connection, Request, Control, Lifecycle, Transport, Cache)
 
 
 class UnknownHeaderError(Exception):

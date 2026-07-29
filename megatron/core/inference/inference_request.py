@@ -88,17 +88,23 @@ class Status(Enum):
 # =========================================================================
 
 
-def compute_block_hashes_batched(prompt_tokens: torch.Tensor, block_size: int) -> List[int]:
+def compute_block_hashes_batched(
+    prompt_tokens: torch.Tensor, block_size: int, *, namespace: Optional[int]
+) -> List[int]:
     """Compute SHA-256 based hashes for all complete blocks in a prompt.
 
     Each block hash is computed as SHA-256(parent_digest || block_bytes), where
-    parent_digest chains from the previous block (starting from a zero digest).
+    parent_digest chains from the previous block. The chain starts from a zero
+    digest when ``namespace`` is None, or from a digest of the namespace when
+    one is supplied. Generation epochs use this namespace so KV produced by
+    different model weights can never match.
     This provides cryptographic collision resistance with no exploitable algebraic
     structure.
 
     Args:
         prompt_tokens: All prompt token IDs, shape [seq_len].
         block_size: Number of tokens per block.
+        namespace: Optional cache namespace, normally the generation epoch.
 
     Returns:
         List of positive integer hash values in [1, 2^63-1], one per complete block.
@@ -113,7 +119,11 @@ def compute_block_hashes_batched(prompt_tokens: torch.Tensor, block_size: int) -
     block_byte_size = block_size * tokens_cpu.element_size()  # 8 bytes per int64
 
     hashes = []
-    parent_digest = b'\x00' * 32  # SHA-256 digest size
+    parent_digest = (
+        b'\x00' * 32
+        if namespace is None
+        else hashlib.sha256(f"mcore-prefix-cache:{namespace}".encode()).digest()
+    )
 
     for i in range(num_complete_blocks):
         block_bytes = tokens_bytes[i * block_byte_size : (i + 1) * block_byte_size]
@@ -385,6 +395,7 @@ class DynamicInferenceRequest(InferenceRequest):
     block_size_tokens: Optional[int] = None  # Block size for hash computation
     enable_prefix_caching: bool = False  # Whether prefix caching is enabled
     num_cached_tokens: int = 0  # Tokens served from prefix cache (set by context on first match)
+    prefix_cache_namespace: Optional[int] = None  # Separates cache entries across weight epochs.
 
     # Computed field - not passed by caller
     precomputed_block_hashes: List[int] = field(default_factory=list)
@@ -411,8 +422,20 @@ class DynamicInferenceRequest(InferenceRequest):
         - precomputed_block_hashes is [hash1, ...] for N complete blocks
         """
         self.precomputed_block_hashes = compute_block_hashes_batched(
-            self.prompt_tokens, self.block_size_tokens
+            self.prompt_tokens, self.block_size_tokens, namespace=self.prefix_cache_namespace
         )
+
+    def set_prefix_cache_namespace(self, namespace: Optional[int]) -> None:
+        """Move this request to a cache namespace and recompute its hash chain."""
+        if self.prefix_cache_namespace == namespace:
+            return
+        self.prefix_cache_namespace = namespace
+        if (
+            self.enable_prefix_caching
+            and self.block_size_tokens is not None
+            and self.prompt_tokens is not None
+        ):
+            self._compute_block_hashes()
 
     @property
     def remaining_prompt_length(self):
@@ -465,6 +488,7 @@ class DynamicInferenceRequest(InferenceRequest):
         obj = super().serialize()
         obj["events"] = [e.serialize() for e in self.events]
         obj.pop("event_add_engine", None)
+        obj.pop("prefix_cache_namespace", None)
         obj["prompt_length"] = prompt_len
 
         # Sanity check routing_indices: ndarray [total_tokens - 1, num_layers, topk]
@@ -705,6 +729,7 @@ class DynamicInferenceRequestRecord:
             kv_cache_epoch=kv_cache_epoch,
             block_size_tokens=old_request.block_size_tokens,
             enable_prefix_caching=old_request.enable_prefix_caching,
+            prefix_cache_namespace=old_request.prefix_cache_namespace,
         )
         # Preserve event_add_engine from old request if it exists, otherwise set it.
         # This ensures TTFT calculation works correctly for evicted/resumed requests.
@@ -768,6 +793,7 @@ class DynamicInferenceRequestRecord:
             routing_indices=routing_indices,
             block_size_tokens=self.requests[0].block_size_tokens,
             enable_prefix_caching=self.requests[0].enable_prefix_caching,
+            prefix_cache_namespace=self.requests[0].prefix_cache_namespace,
             precomputed_block_hashes=self.requests[0].precomputed_block_hashes,
             num_cached_tokens=self.requests[0].num_cached_tokens,
         )
