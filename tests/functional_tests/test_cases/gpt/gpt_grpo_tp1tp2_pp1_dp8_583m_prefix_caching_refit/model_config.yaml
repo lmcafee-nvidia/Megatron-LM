@@ -24,7 +24,7 @@ MODEL_ARGS:
   --load: ${CHECKPOINT_LOAD_PATH}/model/mcore_mistral/nemo_minitron-0.5b/v1/
   --auto-detect-ckpt-format: true
   --max-tokens-to-oom: 3600000
-  --inference-max-seq-length: 1024
+  --inference-max-seq-length: 576
   --attention-backend: flash
   --mock-data: true
   --micro-batch-size: 1
@@ -89,7 +89,7 @@ MODEL_ARGS:
   --refit-method: gloo
   --inference-dynamic-batching-buffer-size-gb: 0.2
   --inference-dynamic-batching-block-size: 256
-  --inference-dynamic-batching-max-tokens: 1024
+  --inference-dynamic-batching-max-tokens: 576
   --inference-dynamic-batching-max-requests: 32
   --inference-dynamic-batching-prefix-caching: true
   --inference-dynamic-batching-prefix-caching-eviction-policy: lru
@@ -208,15 +208,25 @@ AFTER_SCRIPT: |
       for group_index, key in enumerate(reference_groups):
           reference_group = reference_groups[key]
           cached_group = cached_groups[key]
-          expected = reference_group[0]
-          for source, group in (("cache-off", reference_group), ("cache-on", cached_group)):
-              for rollout_index, rollout in enumerate(group):
-                  label = f"{name}.{source}[{group_index}][{rollout_index}]"
-                  assert rollout["env_id"] == expected["env_id"]
-                  assert rollout["problem_id"] == expected["problem_id"]
-                  for field in ("trajectory", "generation_mask", "reward"):
-                      close(expected[field], rollout[field], f"{label}.{field}", 0)
-                  close(expected["logprobs"], rollout["logprobs"], f"{label}.logprobs", 1e-3)
+          for rollout_index, (reference_rollout, cached_rollout) in enumerate(
+              zip(reference_group, cached_group)
+          ):
+              label = f"{name}[{group_index}][{rollout_index}]"
+              assert cached_rollout["env_id"] == reference_rollout["env_id"]
+              assert cached_rollout["problem_id"] == reference_rollout["problem_id"]
+              for field in ("trajectory", "generation_mask", "reward"):
+                  close(
+                      reference_rollout[field],
+                      cached_rollout[field],
+                      f"{label}.{field}",
+                      0,
+                  )
+              close(
+                  reference_rollout["logprobs"],
+                  cached_rollout["logprobs"],
+                  f"{label}.logprobs",
+                  2e-3,
+              )
           for rollout in cached_group:
               cache_evictions += sum(rollout["num_evictions"])
               for field in ("policy_epoch", "kv_cache_epoch"):

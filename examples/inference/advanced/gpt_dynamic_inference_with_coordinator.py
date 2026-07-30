@@ -398,7 +398,7 @@ if __name__ == "__main__":
                 if policy == "ref_zero":
                     assert all(s[0][3] == world_size for s in snapshots)
                 else:
-                    assert all(s[0][4] == world_size and s[0][2] < world_size for s in snapshots)
+                    assert all(s[0][4] == world_size and s[0][2] == 0 for s in snapshots)
                 assert snapshots[-1][1] <= snapshots[-2][1] + 64 * 1024**2 * world_size
         else:
             asyncio.run(main(engine, requests, args.inference_coordinator_port))

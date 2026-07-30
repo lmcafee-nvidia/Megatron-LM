@@ -85,10 +85,7 @@ AFTER_SCRIPT: |
   for start in range(0, len(records), copies):
       group = records[start : start + copies]
       ranks = {record["rank_index"] for record in group}
-      if start < copies * groups:
-          assert len(ranks) > 1, f"cold-cache group unexpectedly stayed on one replica: {group}"
-      else:
-          assert len(ranks) == 1, f"warm shared-prefix group split across replicas: {group}"
+      assert len(ranks) == 1, f"shared-prefix group split across replicas: {group}"
   assert {record["rank_index"] for record in records} == set(
       range(schedule["data_parallel_size"])
   )

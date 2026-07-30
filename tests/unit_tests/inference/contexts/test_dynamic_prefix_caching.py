@@ -2879,7 +2879,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
 
         donor = self._make_engine_request(
             engine.context,
-            -2,
+            100,
             prompt.clone(),
             enable_prefix_caching=enable_prefix_caching,
             return_log_probs=False,
@@ -2894,7 +2894,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
 
         request = self._make_engine_request(
             engine.context,
-            -1,
+            101,
             prompt,
             enable_prefix_caching=enable_prefix_caching,
             return_log_probs=True,
@@ -2907,12 +2907,15 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         assert request.precomputed_block_hashes == []
 
         output = None
-        while output is None:
+        for _ in range(32):
             result = engine.step_modern()
             for record in result["finished_request_records"]:
                 merged = record.merge()
                 if merged.request_id == request.request_id:
                     output = merged
+            if output is not None:
+                break
+        assert output is not None, "prompt-logprob request did not finish"
         assert engine._prefix_cache_hits == hits_before
         assert output.num_cached_tokens == 0
         assert len(output.prompt_log_probs) == len(prompt) - 1
