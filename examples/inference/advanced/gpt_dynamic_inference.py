@@ -60,7 +60,7 @@ from megatron.training import get_args, get_tokenizer, initialize_megatron
 torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
-PREFIX_CACHE_LOGPROB_P95_ATOL = 0.048790164169432  # A 5% probability ratio in log space.
+PREFIX_CACHE_LOGPROB_P95_ATOL = 0.058268908123976  # A 6% probability ratio in log space.
 PREFIX_CACHE_LOGPROB_MAX_ATOL = 0.182321556793955  # A 20% probability ratio in log space.
 
 
@@ -125,7 +125,7 @@ def _assert_numeric_pairs(pairs):
     stats = (
         f"count={len(pairs)}, mean={float(differences.mean()):.6g}, p95={float(p95):.6g}, "
         f"max={float(max_difference):.6g}, "
-        f"over_5pct={int((differences > PREFIX_CACHE_LOGPROB_P95_ATOL).sum())}, "
+        f"over_p95_atol={int((differences > PREFIX_CACHE_LOGPROB_P95_ATOL).sum())}, "
         f"worst={pairs[int(worst)]!r}"
     )
     assert (

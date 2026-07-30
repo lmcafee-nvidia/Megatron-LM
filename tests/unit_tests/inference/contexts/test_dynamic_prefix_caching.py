@@ -2825,6 +2825,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         deferred_graph_resume_count = 0
         eager_deferred_graph_step_count = 0
         hidden_chunk_resume_count = 0
+        awaiting_post_drain_graph_replay = False
         saw_mixed_batch = False
         suspend_count = 0
         uvm_pointer_stability_checks = 0
@@ -2983,6 +2984,11 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                         manager.cudagraph_runners for manager in CudaGraphManager._instances
                     )
                     eager_deferred_graph_step_count += 1
+                if awaiting_post_drain_graph_replay and using_cuda_graph:
+                    assert ctx.cuda_graphs_available
+                    assert not engine._cuda_graph_rebuild_pending
+                    assert any(manager.cudagraph_runners for manager in CudaGraphManager._instances)
+                    awaiting_post_drain_graph_replay = False
                 saw_mixed_batch |= (
                     ctx.batch_dimensions.prefill_req_count > 0
                     and ctx.batch_dimensions.decode_req_count > 0
@@ -3009,6 +3015,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                     config.suspend_resume_interval is not None
                     and engine.has_unfinished_requests()
                     and step_count % config.suspend_resume_interval == 0
+                    and not awaiting_post_drain_graph_replay
                 ):
                     engine.suspend()
                     assert not ctx.is_tensor_state_allocated
@@ -3021,6 +3028,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                         assert not ctx.cuda_graphs_available
                         deferred_graph_resume_count += 1
                         hidden_chunk_resume_count += int(ctx.chunked_prefill_request_id != -1)
+                        awaiting_post_drain_graph_replay = True
                     if (config.num_cuda_graphs or 0) > 0:
                         assert engine.capture_stats["pool_reserved_bytes"] > 0
                     if case["feature"] == "uvm":

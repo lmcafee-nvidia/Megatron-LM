@@ -272,7 +272,10 @@ async def main(
 
     if dist.get_rank() == 0:
         client.shutdown_coordinator()
+        await asyncio.to_thread(engine.inference_coordinator_process.join, 30)
+        assert engine.inference_coordinator_process.exitcode == 0
         client.stop()
+    dist.barrier()
     logging.info(f"Rank: {dist.get_rank()} stopped their engine instance successfully.")
     return result_cycles, stress_snapshots
 
@@ -290,7 +293,6 @@ if __name__ == "__main__":
 
         tokenizer = get_tokenizer()
 
-        # Sampling params.
         sampling_params = SamplingParams(
             temperature=args.temperature,
             top_k=args.top_k,
@@ -355,7 +357,6 @@ if __name__ == "__main__":
             print(setup_prefix)
             print("~~~")
 
-        # Start Nsight profiler.
         if os.environ.get("NSIGHT_PREFIX"):
             torch.cuda.cudart().cudaProfilerStart()
 
@@ -403,6 +404,5 @@ if __name__ == "__main__":
         else:
             asyncio.run(main(engine, requests, args.inference_coordinator_port))
 
-        # Stop Nsight profiler.
         if os.environ.get("NSIGHT_PREFIX"):
             torch.cuda.cudart().cudaProfilerStop()
