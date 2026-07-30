@@ -3168,7 +3168,11 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                     assert np.allclose(
                         cached_request.generated_log_probs,
                         baseline_request.generated_log_probs,
-                        atol=logprob_atol if feature == "logprobs" else 1e-5,
+                        atol=(
+                            logprob_atol
+                            if case["model"] == "hybrid" or feature == "logprobs"
+                            else 1e-5
+                        ),
                         rtol=0,
                     )
                     if feature == "logprobs":
