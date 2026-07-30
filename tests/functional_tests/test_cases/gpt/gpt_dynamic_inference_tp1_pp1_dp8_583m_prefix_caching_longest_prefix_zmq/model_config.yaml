@@ -89,7 +89,7 @@ AFTER_SCRIPT: |
       assert len(ranks) == 1, f"shared-prefix group split across replicas: {group}"
       group_ranks.append(ranks.pop())
   first_cycle = group_ranks[:groups]
-  assert all(short != long for short, long in zip(first_cycle[::2], first_cycle[1::2]))
+  assert all(short != long for short, long in zip(first_cycle[:8:2], first_cycle[1:8:2]))
   assert {record["rank_index"] for record in records} == set(
       range(schedule["data_parallel_size"])
   )

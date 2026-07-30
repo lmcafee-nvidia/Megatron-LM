@@ -82,6 +82,7 @@ def build_server_cmd(
         "1024",
         "--seq-length",
         "1024",
+        "--inference-logging-step-interval=1",
         "--inference-dynamic-batching-buffer-size-gb",
         "0.25" if stress_mode else "20",
         "--dist-ckpt-strictness",
@@ -238,8 +239,8 @@ def run_server(args, prefix_cache=False):
             assert (body.get("choices") or [{}])[0].get("text")
         else:
             outputs, cached_by_wave, memory = [], [], []
-            shared = ("deterministic shared prefix for cache stress. " * 80).strip()
             for cycle in range(args.prefix_cache_stress_cycles):
+                shared = (f"deterministic shared prefix {cycle} for cache stress. " * 80).strip()
                 for wave in (
                     [shared],
                     [shared] * 8,
@@ -292,9 +293,8 @@ def main() -> int:
     assert args.prefix_cache_stress_cycles >= 3
     reference, _, reference_memory = run_server(args, prefix_cache=False)
     cached, activation, memory = run_server(args, prefix_cache=True)
-    assert len(reference) == len(cached)
     pairs = []
-    for idx, (ref_output, cached_output) in enumerate(zip(reference, cached)):
+    for idx, (ref_output, cached_output) in enumerate(zip(reference, cached, strict=True)):
         assert ref_output[:2] == cached_output[:2], f"HTTP output mismatch at request {idx}"
         assert len(ref_output[2]["content"]) == len(ref_output[0])
         collect_numeric_pairs(ref_output[2], cached_output[2], f"request {idx}.logprobs", pairs)
