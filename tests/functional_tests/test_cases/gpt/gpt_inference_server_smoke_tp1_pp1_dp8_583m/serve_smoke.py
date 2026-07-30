@@ -241,6 +241,7 @@ def run_server(args, prefix_cache=False):
             shared = ("deterministic shared prefix for cache stress. " * 80).strip()
             for cycle in range(args.prefix_cache_stress_cycles):
                 for wave in (
+                    [shared],
                     [shared] * 8,
                     [shared] * 8,
                     [(f"pressure {cycle:02d} {idx:03d}. " * 120).strip() for idx in range(32)],
@@ -253,13 +254,8 @@ def run_server(args, prefix_cache=False):
                     for response in responses:
                         choice = response["choices"][0]
                         message = choice["message"]
-                        outputs.append(
-                            (
-                                message["generation_token_ids"],
-                                message["content"],
-                                choice["logprobs"],
-                            )
-                        )
+                        token_ids = message["generation_token_ids"]
+                        outputs.append((token_ids, message["content"], choice["logprobs"]))
                         cached.append(response["usage"]["prompt_tokens_details"]["cached_tokens"])
                     cached_by_wave.append((min(cached), max(cached)))
                 output = subprocess.check_output(
@@ -303,9 +299,9 @@ def main() -> int:
         assert len(ref_output[2]["content"]) == len(ref_output[0])
         collect_numeric_pairs(ref_output[2], cached_output[2], f"request {idx}.logprobs", pairs)
     assert_numeric_pairs(pairs)
-    assert all(activation[idx][0] > 0 for idx in range(1, len(activation), 5))
-    assert all(activation[idx] == (0, 0) for idx in range(3, len(activation), 5))
-    assert all(activation[idx][0] > 0 for idx in range(4, len(activation), 5))
+    assert all(low == 0 < high for low, high in activation[1::6])
+    assert all(value == (0, 0) for value in activation[4::6])
+    assert all(low > 0 for wave in (activation[2::6], activation[5::6]) for low, _ in wave)
     assert max(memory) <= max(reference_memory) + 64 * 8
     assert memory[-1] <= memory[-2] + 64 * 8  # Allow 64 MiB/GPU for lazy workspaces.
     return 0

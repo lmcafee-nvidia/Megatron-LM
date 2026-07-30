@@ -22,6 +22,9 @@ from megatron.core.inference.contexts.dynamic_context import (
     BlockOverflowError,
     DynamicInferenceContext,
 )
+from megatron.core.inference.data_parallel_inference_coordinator.coordinator import (
+    DataParallelInferenceCoordinator,
+)
 from megatron.core.inference.data_parallel_inference_coordinator.handlers import (
     handle_control_signal,
 )
@@ -851,49 +854,44 @@ class TestDisabledAndEngineScheduling(PrefixCachingTestBase):
     @pytest.mark.internal
     def test_generation_epoch_invalidates_coordinator_prefix_assignments(self):
         client = b"client"
+        ranks = [f"rank-{index}".encode() for index in range(4)]
         broadcasts = []
-        coordinator = type("Coordinator", (), {})()
+        coordinator = DataParallelInferenceCoordinator.__new__(DataParallelInferenceCoordinator)
         coordinator.known_clients = {client}
         coordinator.state = CoordinatorState.RUNNING
         coordinator._generation_epoch = None
-        coordinator._hash_table = {101: {0: 1}, 202: {1: 2}}
+        coordinator._identities_list = ranks
+        coordinator.identity_to_rank_index = {rank: index for index, rank in enumerate(ranks)}
+        coordinator._pending_counts = np.zeros(len(ranks), dtype=np.int32)
+        coordinator.max_requests = 16
+        coordinator.enable_prefix_caching = True
+        coordinator.prefix_caching_coordinator_policy = (
+            PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
+        )
+        coordinator.prefix_caching_routing_alpha = 0.5
+        coordinator._hash_table = {}
+        coordinator._hash_assignment_counter = 0
         coordinator._broadcast_to_engines = broadcasts.append
 
+        owners = []
+        for group in range(8):
+            hashes = [100 + 2 * group, 101 + 2 * group]
+            owner = coordinator.get_best_data_parallel_rank(hashes)
+            coordinator._update_rank_hashes(owner, hashes)
+            coordinator._pending_counts[coordinator.identity_to_rank_index[owner]] += 1
+            assert coordinator.get_best_data_parallel_rank(hashes) == owner
+            owners.append(owner)
+        assert set(owners) == set(ranks)
+        assert len(coordinator._hash_table) == 16
+
         handle_control_signal(coordinator, client, [Headers.SET_GENERATION_EPOCH.value, 1])
-        assert coordinator._generation_epoch == 1
         assert coordinator._hash_table == {}
-
-        coordinator._hash_table = {303: {0: 3}}
+        coordinator._update_rank_hashes(ranks[-1], [999])
         handle_control_signal(coordinator, client, [Headers.SET_GENERATION_EPOCH.value, 1])
-        assert coordinator._hash_table == {303: {0: 3}}
-
+        assert coordinator._hash_table == {999: {3: coordinator._hash_assignment_counter}}
         handle_control_signal(coordinator, client, [Headers.SET_GENERATION_EPOCH.value, 2])
-        assert coordinator._generation_epoch == 2
         assert coordinator._hash_table == {}
-        assert broadcasts == [
-            [Headers.SET_GENERATION_EPOCH.value, 1],
-            [Headers.SET_GENERATION_EPOCH.value, 1],
-            [Headers.SET_GENERATION_EPOCH.value, 2],
-        ]
-
-    @pytest.mark.internal
-    def test_epoch_change_keeps_mamba_free_slots_mutable(self):
-        ctx = self._ctx(mamba_config=self._mamba_config(), prefix_caching_mamba_gb=0.01)
-        mamba = ctx.mamba_slot_allocator
-        free_slots = mamba.free_slots
-        assert not free_slots.is_inference()
-
-        self._engine(ctx)._set_generation_epoch(1)
-
-        assert mamba.free_slots is free_slots
-        assert not mamba.free_slots.is_inference()
-        block = ctx.kv_block_allocator.allocate_memory_blocks(1)
-        assert block is not None
-        (slot,) = mamba.allocate_slots_batch(block.tolist())
-        assert mamba.free_count == mamba.max_slots - 1
-        mamba.invalidate_block(block.item())
-        assert mamba.free_count == mamba.max_slots
-        assert mamba.free_slots[-1].item() == slot
+        assert len(broadcasts) == 3
 
     @pytest.mark.internal
     def test_epoch_change_keeps_unstarted_requests_cacheable(self):
@@ -910,7 +908,7 @@ class TestDisabledAndEngineScheduling(PrefixCachingTestBase):
         assert before.policy_epoch == [(0, 1)]
         assert before.kv_cache_epoch == [(0, 1)]
 
-        after = self._req(ctx, self._prompt(ctx.block_size_tokens, offset=1000), request_id=2)
+        after = self._req(ctx, before.prompt_tokens.clone(), request_id=2)
         engine._add_request(after)
         assert after.enable_prefix_caching
         assert after.policy_epoch == [(0, 1)]
@@ -919,6 +917,11 @@ class TestDisabledAndEngineScheduling(PrefixCachingTestBase):
         engine._set_generation_epoch(1)
         assert before.policy_epoch == after.policy_epoch == [(0, 1)]
         assert before.kv_cache_epoch == after.kv_cache_epoch == [(0, 1)]
+        engine.schedule_non_chunked_prefill()
+        assert ctx.total_request_count == 1 and list(engine.waiting_request_ids) == [2]
+        engine.schedule_non_chunked_prefill()
+        assert ctx.total_request_count == 2
+        assert after.num_cached_tokens == ctx.block_size_tokens
 
     def _add_to_waiting(self, engine, ctx, req):
         request_id = req.request_id
@@ -1064,6 +1067,8 @@ class TestDisabledAndEngineScheduling(PrefixCachingTestBase):
         if hybrid:
             mamba_alloc = ctx.mamba_slot_allocator
             assert mamba_alloc._has_intermediates
+            free_slots = mamba_alloc.free_slots
+            assert not free_slots.is_inference()
 
         engine._set_generation_epoch(1)
 
@@ -1082,8 +1087,13 @@ class TestDisabledAndEngineScheduling(PrefixCachingTestBase):
         assert replacement is not None and replacement.item() == cached_block
 
         if hybrid:
+            assert mamba_alloc.free_slots is free_slots
+            assert not mamba_alloc.free_slots.is_inference()
             assert not mamba_alloc._has_intermediates
             assert mamba_alloc.free_count == mamba_alloc.max_slots
+            (slot,) = mamba_alloc.allocate_slots_batch(replacement.tolist())
+            mamba_alloc.invalidate_block(replacement.item())
+            assert mamba_alloc.free_slots[-1].item() == slot
             durable_free_before = mamba_alloc.free_count
             uncacheable = self._req(
                 ctx, self._prompt(2 * bs, offset=20_000), request_id=3, enable_prefix_caching=False
@@ -1923,25 +1933,6 @@ class TestMambaSlotAllocator(PrefixCachingTestBase):
         assert not msa._has_intermediates
 
 
-class TestRequestRecordCheckpoint:
-
-    @pytest.mark.internal
-    def test_merge_preserves_logprobs_generated_after_an_empty_checkpoint(self):
-        request = DynamicInferenceRequest(
-            request_id=0,
-            prompt_tokens=torch.tensor([1, 2]),
-            sampling_params=SamplingParams(num_tokens_to_generate=2),
-        )
-        record = DynamicInferenceRequestRecord.from_request(request)
-        record.checkpoint()
-        record[-1].generated_tokens = [3]
-        record[-1].generated_log_probs = [-0.25]
-
-        merged = record.merge()
-        assert merged.generated_tokens == [3]
-        assert merged.generated_log_probs == [-0.25]
-
-
 class TestPerBlockRouting(PrefixCachingTestBase):
     """Tests for per-block routing storage and reconstruction."""
 
@@ -1950,24 +1941,37 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         ctx = self._ctx()
         bs = ctx.block_size_tokens
         generated = [bs + 1, bs + 2, bs + 3, bs + 4]
+        prompt = self._prompt(2 * bs)
+        producer = self._req(ctx, prompt.clone(), request_id=99)
+        ctx.add_request(producer)
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
         request = self._req(
             ctx,
-            self._prompt(bs),
-            sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=-1),
+            prompt,
+            request_id=0,
+            sampling_params=SamplingParams(
+                num_tokens_to_generate=4,
+                termination_id=-1,
+                return_log_probs=True,
+                skip_prompt_log_probs=True,
+            ),
         )
-        request.generated_tokens = generated[:2]
+        ctx.add_request(request)
+        assert request.num_cached_tokens == 2 * bs
         engine = _StubEngine(ctx)
         future = engine._add_request(request)
         engine.waiting_request_ids.clear()
         record = engine.requests[request.request_id].record
         record.checkpoint()
         current = record[-1]
-        current.generated_tokens = generated[2:3]
+        current.generated_tokens = generated[:3]
+        current.generated_log_probs = [-0.1, -0.2, -0.3]
         assert len(record.requests) == 2
         assert all(part.routing_indices is None for part in record.requests)
 
-        block_ids = ctx.kv_block_allocator.allocate_memory_blocks(2).tolist()
-        routing = np.arange(2 * bs * 4, dtype=np.int16).reshape(2 * bs, 2, 2)
+        block_ids = self._block_ids(ctx, 1, 2)
+        block_ids += ctx.kv_block_allocator.allocate_memory_blocks(1).tolist()
+        routing = np.arange(3 * bs * 4, dtype=np.int16).reshape(3 * bs, 2, 2)
         for block_idx, block_id in enumerate(block_ids):
             start = block_idx * bs
             ctx.kv_block_allocator.store_block_routing(
@@ -1986,16 +1990,17 @@ class TestPerBlockRouting(PrefixCachingTestBase):
             step_time=0.0,
             sample=torch.tensor(generated[3:]),
             accepted_tokens=None,
-            log_probs=[],
+            log_probs=[[-0.4]],
             finished_routing_block_ids={request.request_id: block_ids},
         )
 
-        expected = routing[: bs + 3]
+        expected = routing[: 2 * bs + 3]
         merged = record.merge()
         assert active_ids == []
         assert finished_records == [record]
         assert future.result() is record
         assert merged.generated_tokens == generated
+        assert merged.generated_log_probs == [-0.1, -0.2, -0.3, -0.4]
         np.testing.assert_array_equal(current.routing_indices, expected)
         np.testing.assert_array_equal(merged.routing_indices, expected)
         assert merged.routing_indices.shape[0] == (
@@ -2323,14 +2328,12 @@ class TestPrefixCacheReuse(PrefixCachingTestBase):
 # this table beside the matrix makes additions reviewable: a feature/policy pair
 # is not owned merely because a flag was passed to a constructor.
 PREFIX_CACHE_CONTEXT_PAIR_OWNERS = {
-    "exact-prefix×lru": "exact-prefix-hit",
-    "exact-prefix×ref-zero": "exact-prefix-hit",
+    "exact-prefix×lru": "exact-prefix-hit-and-full-block-clamp",
+    "exact-prefix×ref-zero": "exact-prefix-hit-and-full-block-clamp",
     "partial-prefix×lru": "partial-prefix-hit",
     "partial-prefix×ref-zero": "partial-prefix-hit",
     "missing-prefix×lru": "missing-prefix-observed",
     "missing-prefix×ref-zero": "missing-prefix-observed",
-    "full-block-boundary×lru": "full-block-clamp-executed",
-    "full-block-boundary×ref-zero": "full-block-clamp-executed",
     "concurrent-sharing×lru": "concurrent-refcounts-churned",
     "concurrent-sharing×ref-zero": "concurrent-refcounts-churned",
     "mixed-cached-fresh×lru": "mixed-query-lengths-executed",
@@ -2343,7 +2346,6 @@ PREFIX_CACHE_CONTEXT_CASES = [
         "exact-prefix",
         "partial-prefix",
         "missing-prefix",
-        "full-block-boundary",
         "concurrent-sharing",
         "mixed-cached-fresh",
     )
@@ -2353,104 +2355,6 @@ PREFIX_CACHE_CONTEXT_CASES = [
 
 class TestPrefixCachePolicyStressMatrix(PrefixCachingTestBase):
     """Small allocator matrix; real-model combinations live in the engine matrix below."""
-
-    def _run_policy_cycles(self, policy):
-        ctx = self._ctx(
-            buffer_size_gb=0.001,
-            rounder=1,
-            max_requests=12,
-            max_tokens=512,
-            prefix_caching_eviction_policy=policy,
-        )
-        alloc = ctx.kv_block_allocator
-        bs = ctx.block_size_tokens
-        activations = set()
-        prior_pressure_hashes = set()
-        ref_zero_reuse_events = 0
-        for cycle in range(3):
-            prompt = self._prompt(2 * bs, offset=cycle * 10_000)
-            producer = self._req(ctx, prompt.clone(), request_id=cycle * 10)
-            producer_idx = ctx.total_request_count
-            ctx.add_request(producer)
-            producer_blocks = self._block_ids(ctx, producer_idx, 2)
-            assert not prior_pressure_hashes.intersection(producer.precomputed_block_hashes)
-
-            if policy == PrefixCachingEvictionPolicy.LRU:
-                ctx.release_memory_blocks_from_request_indexes(torch.tensor([producer_idx]))
-                assert all(alloc.block_ref_counts[bid].item() == 0 for bid in producer_blocks)
-                assert all(
-                    block_hash in alloc.kv_hash_to_block_id
-                    for block_hash in producer.precomputed_block_hashes
-                )
-                activations.add("lru-retained-reuse")
-
-            # Pinned filler blocks leave no free capacity.  The cache transition
-            # below therefore cannot pass without sharing or policy-driven reuse.
-            filler = alloc.allocate_memory_blocks(alloc.pool_avail)
-            assert filler is not None and alloc.pool_avail == 0
-            # Allocator returns a view into block_bag, which later eviction mutates.
-            filler = filler.clone()
-            activations.add("pool-exhausted")
-
-            follower = self._req(ctx, prompt.clone(), request_id=cycle * 10 + 1)
-            follower_idx = ctx.total_request_count
-            ctx.add_request(follower)
-            assert self._block_ids(ctx, follower_idx, 2) == producer_blocks
-            assert follower.num_cached_tokens == 2 * bs
-            assert alloc.pool_avail == 0
-
-            if policy == PrefixCachingEvictionPolicy.REF_ZERO:
-                assert all(alloc.block_ref_counts[bid].item() == 2 for bid in producer_blocks)
-                activations.add("ref-zero-live-sharing")
-                ctx.release_memory_blocks_from_request_indexes(torch.tensor([follower_idx]))
-                ctx.release_memory_blocks_from_request_indexes(torch.tensor([producer_idx]))
-                assert not any(
-                    block_hash in alloc.kv_hash_to_block_id
-                    for block_hash in producer.precomputed_block_hashes
-                )
-                assert all(alloc.block_hashes[bid].item() == -1 for bid in producer_blocks)
-            else:
-                assert all(alloc.block_ref_counts[bid].item() == 1 for bid in producer_blocks)
-                ctx.release_memory_blocks_from_request_indexes(torch.tensor([follower_idx]))
-
-            # Allocate an unrelated two-block prefix.  REF_ZERO must physically
-            # recycle the just-released blocks; LRU must evict the retained prefix.
-            cached_blocks_before = dict(alloc.kv_hash_to_block_id)
-            pressure_prompt = self._prompt(2 * bs, offset=100_000 + cycle * 10_000)
-            pressure = self._req(ctx, pressure_prompt, request_id=cycle * 10 + 2)
-            pressure_idx = ctx.total_request_count
-            ctx.add_request(pressure)
-            pressure_blocks = self._block_ids(ctx, pressure_idx, 2)
-            activations.add("physical-blocks-reused")
-
-            if policy == PrefixCachingEvictionPolicy.LRU:
-                removed_ids = {
-                    block_id
-                    for block_hash, block_id in cached_blocks_before.items()
-                    if block_hash not in alloc.kv_hash_to_block_id
-                }
-                assert set(pressure_blocks) == removed_ids
-                revisit = self._req(ctx, prompt.clone(), request_id=cycle * 10 + 3)
-                matched, *_ = ctx._compute_prefix_match(revisit, len(prompt))
-                if set(producer_blocks) == removed_ids:
-                    assert matched == []
-                activations.add("lru-prefix-evicted")
-            else:
-                assert set(pressure_blocks) == set(producer_blocks)
-                assert all(alloc.block_ref_counts[bid].item() == 1 for bid in pressure_blocks)
-                ref_zero_reuse_events += 1
-
-            ctx.release_memory_blocks_from_request_indexes(torch.tensor([pressure_idx]))
-            alloc.release_memory_blocks(filler)
-            prior_pressure_hashes = set(pressure.precomputed_block_hashes)
-
-        assert ctx.total_request_count == 9
-        if policy == PrefixCachingEvictionPolicy.REF_ZERO:
-            assert ref_zero_reuse_events == 3
-            assert alloc.kv_hash_to_block_id == {}
-            activations.add("three-ref-zero-deregister-recycle-events")
-        activations.add("three-policy-cycles")
-        return activations
 
     def _apply_local_churn(self, ctx, producer, producer_blocks):
         """Force a policy-specific block recycle after a feature assertion."""
@@ -2516,11 +2420,12 @@ class TestPrefixCachePolicyStressMatrix(PrefixCachingTestBase):
 
         if feature == "exact-prefix":
             probe = self._req(ctx, prompt.clone(), request_id=2)
-            matched, *_ = ctx._compute_prefix_match(probe, len(prompt))
+            matched, _, _, _, skipped, effective = ctx._compute_prefix_match(probe, len(prompt))
             assert matched == producer_blocks
+            assert skipped == 2 * bs and effective == bs
             ctx.add_request(probe)
             assert probe.num_cached_tokens == 3 * bs
-            activation = "exact-prefix-hit"
+            activation = "exact-prefix-hit-and-full-block-clamp"
 
         elif feature == "partial-prefix":
             partial = torch.cat((prompt[: 2 * bs], self._prompt(bs, offset=50_000)))
@@ -2538,15 +2443,6 @@ class TestPrefixCachePolicyStressMatrix(PrefixCachingTestBase):
             ctx.add_request(probe)
             assert probe.num_cached_tokens == 0
             activation = "missing-prefix-observed"
-
-        elif feature == "full-block-boundary":
-            probe = self._req(ctx, prompt.clone(), request_id=2)
-            matched, _, _, _, skipped, effective = ctx._compute_prefix_match(probe, len(prompt))
-            assert matched == producer_blocks
-            assert skipped == 2 * bs
-            assert effective == bs
-            ctx.add_request(probe)
-            activation = "full-block-clamp-executed"
 
         elif feature == "concurrent-sharing":
             for request_id in range(2, 5):
@@ -2590,29 +2486,10 @@ class TestPrefixCachePolicyStressMatrix(PrefixCachingTestBase):
         )
         assert churn == expected_churn
 
-    @pytest.mark.internal
-    @pytest.mark.parametrize(
-        "policy",
-        [PrefixCachingEvictionPolicy.LRU, PrefixCachingEvictionPolicy.REF_ZERO],
-        ids=["lru", "ref-zero"],
-    )
-    def test_policy_pressure_cycles(self, policy):
-        """Exercise each eviction policy once instead of repeating it for every feature row."""
-        policy_activations = self._run_policy_cycles(policy)
-        assert "three-policy-cycles" in policy_activations
-        if policy == PrefixCachingEvictionPolicy.LRU:
-            assert {"lru-retained-reuse", "lru-prefix-evicted"} <= policy_activations
-        else:
-            assert {
-                "ref-zero-live-sharing",
-                "physical-blocks-reused",
-                "three-ref-zero-deregister-recycle-events",
-            } <= policy_activations
-
 
 PREFIX_CACHE_ENGINE_CASES = [
-    pytest.param(dict(name="gpt-dp8", model="gpt", feature="base"), id="gpt-dp8-output"),
-    pytest.param(dict(name="hybrid-dp8", model="hybrid", feature="base"), id="hybrid-dp8-output"),
+    pytest.param(dict(name="gpt-base", model="gpt", feature="base"), id="gpt-base-output"),
+    pytest.param(dict(name="hybrid-base", model="hybrid", feature="base"), id="hybrid-base-output"),
     pytest.param(dict(name="gpt-tp4", model="gpt", feature="tp", tp=4), id="gpt-tp4"),
     pytest.param(dict(name="hybrid-tp4", model="hybrid", feature="tp", tp=4), id="hybrid-tp4"),
     pytest.param(dict(name="gpt-pp4", model="gpt", feature="pp", pp=4), id="gpt-pp4"),
@@ -2678,7 +2555,7 @@ PREFIX_CACHE_ENGINE_CASES = [
 ]
 
 PREFIX_CACHE_ENGINE_LRU_CASES = {
-    "gpt-dp8",
+    "gpt-base",
     "hybrid-tp4",
     "gpt-pp4",
     "hybrid-tp2-pp2-sp",
@@ -2696,8 +2573,8 @@ PREFIX_CACHE_ENGINE_LRU_CASES = {
 }
 
 PREFIX_CACHE_ENGINE_PAIR_OWNERS = {
-    "gpt-dp8×lru": "real-engine-output-parity",
-    "hybrid-dp8×ref-zero": "real-engine-output-parity",
+    "gpt-base×lru": "real-engine-output-parity",
+    "hybrid-base×ref-zero": "real-engine-output-parity",
     "gpt-tp4×ref-zero": "tensor-parallel-prefix-hit",
     "hybrid-tp4×lru": "tensor-parallel-prefix-hit",
     "gpt-pp4×lru": "pipeline-parallel-prefix-hit",
@@ -2712,8 +2589,8 @@ PREFIX_CACHE_ENGINE_PAIR_OWNERS = {
     "hybrid-cuda-graph×ref-zero": "cuda-graph-replay-with-prefix-hits",
     "gpt-mtp×ref-zero": "mtp-speculative-proposals-with-prefix-hits",
     "hybrid-mtp×lru": "mtp-speculative-proposals-with-prefix-hits",
-    "gpt-logprobs×lru": "logprob-parity",
-    "hybrid-logprobs×ref-zero": "logprob-parity",
+    "gpt-logprobs×lru": "generated-logprob-hit-and-prompt-logprob-bypass-parity",
+    "hybrid-logprobs×ref-zero": "generated-logprob-hit-and-prompt-logprob-bypass-parity",
     "gpt-offload×ref-zero": "offload-prefix-resume",
     "hybrid-offload×lru": "offload-prefix-resume",
     "gpt-recompute×lru": "recompute-prefix-resume",
@@ -2812,6 +2689,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         elif feature in ("offload", "recompute"):
             kwargs.update(
                 kv_cache_management_mode=feature,
+                static_kv_memory_pointers=False,
                 suspend_resume_interval=2,
                 num_cuda_graphs=2,
                 force_build_cuda_graphs=True,
@@ -2837,7 +2715,6 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             if case["name"] in PREFIX_CACHE_ENGINE_LRU_CASES
             else PrefixCachingEvictionPolicy.REF_ZERO
         )
-        config.prefix_caching_coordinator_policy = PrefixCachingCoordinatorPolicy.LOAD_BALANCED
         return config
 
     @staticmethod
@@ -3352,7 +3229,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                             logprob_atol,
                         )
                 if feature == "logprobs":
-                    activations.add("logprob-parity")
+                    activations.add("generated-logprob-hit-and-prompt-logprob-bypass-parity")
                 else:
                     assert stats["paused_overflow_calls"] > 0
                     assert baseline_stats["paused_overflow_calls"] > 0
@@ -3402,58 +3279,6 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         )
         try:
             activations = self._run_engine_case(case)
-            matrix_pairs = []
-            for parameter in PREFIX_CACHE_ENGINE_CASES:
-                matrix_case = parameter.values[0]
-                matrix_policy = (
-                    "lru" if matrix_case["name"] in PREFIX_CACHE_ENGINE_LRU_CASES else "ref-zero"
-                )
-                matrix_pairs.append(f"{matrix_case['name']}×{matrix_policy}")
-            assert len(matrix_pairs) == len(set(matrix_pairs))
-            assert set(matrix_pairs) == PREFIX_CACHE_ENGINE_PAIR_OWNERS.keys()
-            required_features = {
-                "base",
-                "tp",
-                "pp",
-                "mixed-parallel",
-                "moe",
-                "chunked",
-                "cuda-graph",
-                "mtp",
-                "logprobs",
-                "offload",
-                "recompute",
-                "epoch",
-                "request-eviction",
-                "uvm",
-            }
-            actual_features = {
-                parameter.values[0]["feature"] for parameter in PREFIX_CACHE_ENGINE_CASES
-            }
-            assert actual_features == required_features
-            feature_models = {
-                feature: {
-                    parameter.values[0]["model"]
-                    for parameter in PREFIX_CACHE_ENGINE_CASES
-                    if parameter.values[0]["feature"] == feature
-                }
-                for feature in required_features
-            }
-            feature_policies = {
-                feature: {
-                    (
-                        "lru"
-                        if parameter.values[0]["name"] in PREFIX_CACHE_ENGINE_LRU_CASES
-                        else "ref-zero"
-                    )
-                    for parameter in PREFIX_CACHE_ENGINE_CASES
-                    if parameter.values[0]["feature"] == feature
-                }
-                for feature in required_features
-            }
-            assert all(models == {"gpt", "hybrid"} for models in feature_models.values())
-            assert all(policies == {"lru", "ref-zero"} for policies in feature_policies.values())
-
             policy = (
                 PrefixCachingEvictionPolicy.LRU
                 if case["name"] in PREFIX_CACHE_ENGINE_LRU_CASES

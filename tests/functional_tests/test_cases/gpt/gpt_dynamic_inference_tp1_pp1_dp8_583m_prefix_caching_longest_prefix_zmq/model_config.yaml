@@ -46,7 +46,7 @@ MODEL_ARGS:
   --num-tokens-to-generate: 4
   --inference-dynamic-batching-buffer-size-gb: 0.15
   --inference-dynamic-batching-max-requests: 16
-  --inference-dynamic-batching-max-tokens: 2048
+  --inference-dynamic-batching-max-tokens: 4096
   --inference-dynamic-batching-prefix-caching: true
   --inference-dynamic-batching-prefix-caching-eviction-policy: lru
   --inference-dynamic-batching-prefix-caching-coordinator-policy: longest_prefix
@@ -82,10 +82,14 @@ AFTER_SCRIPT: |
   records = schedule["records"]
   assert schedule["policy"] == "longest_prefix"
   assert len(records) == copies * groups * cycles
+  group_ranks = []
   for start in range(0, len(records), copies):
       group = records[start : start + copies]
       ranks = {record["rank_index"] for record in group}
       assert len(ranks) == 1, f"shared-prefix group split across replicas: {group}"
+      group_ranks.append(ranks.pop())
+  first_cycle = group_ranks[:groups]
+  assert all(short != long for short, long in zip(first_cycle[::2], first_cycle[1::2]))
   assert {record["rank_index"] for record in records} == set(
       range(schedule["data_parallel_size"])
   )

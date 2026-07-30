@@ -43,6 +43,18 @@ spec:
       --prefix-cache-compare \
       --prefix-cache-stress-cycles 3
 
+    python - <<'PY'
+    import re
+    from pathlib import Path
+
+    hit_ranks = {
+        int(log.parent.name)
+        for log in Path("{assets_dir}/logs/1").rglob("stdout.log")
+        if re.search(r"prefix cache \(cumul\): [1-9][0-9]* hits", log.read_text())
+    }
+    assert hit_ranks == set(range(8)), f"load-balanced cache hits reached ranks {hit_ranks}"
+    PY
+
 products:
   - test_case: [gpt_inference_server_smoke_tp1_pp1_dp8_583m]
     products:
