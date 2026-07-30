@@ -3223,7 +3223,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         # multi-chunk prompt falls in a continuation chunk, and caching its Mamba
         # state is precisely what lets a later turn skip prefill on a hybrid model.
         # Mamba slot allocation / state restore above stays first-chunk-only.
-        if self.is_hybrid_model and self.mamba_slot_allocator is not None:
+        if (
+            self.is_hybrid_model
+            and self.mamba_slot_allocator is not None
+            and req.precomputed_block_hashes
+        ):
             self.mamba_slot_allocator.compute_and_store_offsets(
                 req,
                 current_id,

@@ -2406,6 +2406,37 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return finished_request_records_list
 
+    def _set_generation_epoch(self, generation_epoch: int) -> None:
+        """Apply a model-generation epoch received from the inference client."""
+        epoch_changed = generation_epoch != self._generation_epoch
+        if epoch_changed:
+            self.context.kv_block_allocator.invalidate_prefix_cache()
+            if self.context.mamba_slot_allocator is not None:
+                self.context.mamba_slot_allocator.invalidate_cache()
+        self._generation_epoch = generation_epoch
+
+        # Stamp all active requests with the new epoch. Each field stores a
+        # sparse list of (start_token_index, epoch) boundaries.
+        for entry in self.requests.values():
+            request = entry.record[-1]
+            if epoch_changed and request.enable_prefix_caching:
+                # This request may still own KV computed by the prior model.
+                # Let it finish, but do not publish any more of its blocks for
+                # reuse by requests that start in the new epoch.
+                request.enable_prefix_caching = False
+                request.precomputed_block_hashes = []
+            total = len(request.prompt_tokens) + len(request.generated_tokens)
+            if total > 0:
+                boundary = (total - 1, generation_epoch)
+                if request.policy_epoch is None:
+                    request.policy_epoch = [(0, generation_epoch)]
+                else:
+                    request.policy_epoch.append(boundary)
+                if request.kv_cache_epoch is None:
+                    request.kv_cache_epoch = [(0, generation_epoch)]
+                else:
+                    request.kv_cache_epoch.append(boundary)
+
     def schedule_requests(self) -> int:
         """Drains the ZMQ socket for a batch of requests and adds them to the engine.
 
@@ -2481,22 +2512,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 self._pending_signals.append(message)
 
         if new_generation_epoch is not None:
-            self._generation_epoch = new_generation_epoch
-            # Stamp all active requests with the new epoch.
-            # Each field stores a sparse list of (start_token_index, epoch) boundaries.
-            for entry in self.requests.values():
-                request = entry.record[-1]
-                total = len(request.prompt_tokens) + len(request.generated_tokens)
-                if total > 0:
-                    boundary = (total - 1, new_generation_epoch)
-                    if request.policy_epoch is None:
-                        request.policy_epoch = [(0, new_generation_epoch)]
-                    else:
-                        request.policy_epoch.append(boundary)
-                    if request.kv_cache_epoch is None:
-                        request.kv_cache_epoch = [(0, new_generation_epoch)]
-                    else:
-                        request.kv_cache_epoch.append(boundary)
+            self._set_generation_epoch(new_generation_epoch)
 
         # Second pass: apply at most one control signal (the engine loop
         # processes one state transition per iteration).

@@ -1,36 +1,95 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+import copy
+import gc
 import json
 import logging
 import os
 import time
 import warnings
 from collections import defaultdict
+from dataclasses import replace
 from typing import List
 
 import torch
 import torch.distributed as dist
 
+from examples.inference.advanced.gpt_dynamic_inference import (
+    _assert_nested_close,
+    build_engine,
+    build_prefix_cache_stress_requests,
+)
 from examples.inference.utils import Request, build_dynamic_engine_setup_prefix, build_requests
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.inference_client import InferenceClient
-from megatron.core.inference.inference_request import DynamicInferenceRequestRecord
+from megatron.core.inference.inference_request import (
+    DynamicInferenceRequestRecord,
+    compute_block_hashes_batched,
+)
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.moe.router_trace import get_moe_router_tracer, init_moe_router_tracer
 from megatron.core.utils import configure_nvtx_profiling
 from megatron.inference.utils import (
     add_inference_args,
-    get_dynamic_inference_engine,
+    get_inference_config_from_model_and_args,
     get_model_for_inference,
 )
 from megatron.training import get_args, get_tokenizer, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
 
-# pylint: disable=line-too-long
+# pylint: disable=line-too-long,protected-access
 
 logging.basicConfig(level=logging.INFO, force=True)
+
+
+def add_runner_args(parser):
+    parser = add_inference_args(parser)
+    group = parser.add_argument_group(title="Prefix-cache stress")
+    group.add_argument("--prefix-cache-compare", action="store_true")
+    group.add_argument("--prefix-cache-stress-groups", type=int, default=0)
+    group.add_argument("--prefix-cache-stress-copies", type=int, default=2)
+    group.add_argument("--prefix-cache-stress-prompt-tokens", type=int, default=512)
+    return parser
+
+
+def _assert_result_parity(reference, actual):
+    assert len(reference) == len(actual)
+    for idx, (ref_request, request) in enumerate(zip(reference, actual)):
+        assert ref_request.generated_tokens == request.generated_tokens
+        assert ref_request.generated_text == request.generated_text
+        for field in (
+            "prompt_log_probs",
+            "generated_log_probs",
+            "prompt_top_n_logprobs",
+            "generated_top_n_logprobs",
+        ):
+            _assert_nested_close(
+                getattr(ref_request, field, None),
+                getattr(request, field, None),
+                f"request {idx}.{field}",
+            )
+
+
+def _stress_snapshot(engine, first_group_hashes):
+    allocator = engine.context.kv_block_allocator
+    hashes = allocator.kv_hash_to_block_id
+    values = [
+        engine._prefix_cache_hits,
+        engine._prefix_cache_blocks_matched,
+        engine._prefill_tokens_skipped,
+        len(hashes),
+        int(all(h in hashes for h in first_group_hashes)),
+        int(not hashes and allocator.pool_avail == allocator.pool_size - 1),
+        int(bool(hashes) and allocator.pool_avail < allocator.pool_size - 1),
+    ]
+    state = torch.tensor(values, device="cuda", dtype=torch.int64)
+    dist.all_reduce(state)
+    allocated = torch.tensor([torch.cuda.memory_allocated()], device="cuda", dtype=torch.int64)
+    dist.all_reduce(allocated)
+    return state.tolist(), int(allocated.item())
 
 
 async def suspend_resume_cycle(client, engine, args, futures):
@@ -54,6 +113,9 @@ async def main(
     requests: List[Request],
     port: int | None = None,
     sampling_params: SamplingParams | None = None,
+    stress_cycles: int | None = None,
+    write_output: bool = True,
+    first_group_hashes=(),
 ):
     if sampling_params is not None:
         warnings.warn(
@@ -62,10 +124,6 @@ async def main(
             DeprecationWarning,
         )
 
-    # once you call engine.start_listening_to_data_parallel_coordinator,
-    # the engine will start accepting requests from the data parallel coordinator.
-    # and processing them in an asyncio coroutine.
-    # leaving inference_coordinator_port as None will find a free port automatically.
     args = get_args()
 
     dp_addr = await engine.start_listening_to_data_parallel_coordinator(
@@ -74,13 +132,38 @@ async def main(
         coordinator_schedule_output_path=args.coordinator_schedule_output_path,
     )
 
-    # All ranks agree on the number of suspend/resume cycles from args.
-    num_suspend_resume_cycles = len(requests) // args.suspend_resume_interval if args.suspend_resume_interval else 0
+    num_suspend_resume_cycles = (
+        len(requests) // args.suspend_resume_interval if args.suspend_resume_interval else 0
+    )
 
-    # Create client and run example.
+    client = None
+    result_cycles = []
+    stress_snapshots = []
+    results = None
     if dist.get_rank() == 0:
-        client = InferenceClient(dp_addr, deserialize=True)  # submits requests to the inference coordinator
+        client = InferenceClient(
+            dp_addr, deserialize=True
+        )  # submits requests to the inference coordinator
         client.start()
+    if stress_cycles is not None:
+        for cycle_idx in range(stress_cycles):
+            if dist.get_rank() == 0:
+                futures = [
+                    client.add_request(request.prompt_text, request.sampling_params)
+                    for request in copy.deepcopy(requests)
+                ]
+                results = await asyncio.gather(*futures)
+                result_cycles.append(results)
+                client.pause_engines()
+            await engine.wait_until(EngineState.PAUSED)
+            state, allocated = _stress_snapshot(engine, first_group_hashes)
+            previous_hits = stress_snapshots[-1][0][0] if stress_snapshots else 0
+            stress_snapshots.append((state, allocated, state[0] - previous_hits))
+            if cycle_idx + 1 < stress_cycles:
+                if dist.get_rank() == 0:
+                    client.unpause_engines()
+                await engine.wait_until(EngineState.RUNNING)
+    elif dist.get_rank() == 0:
         base_arrival_time = time.time_ns() / 10**9
         for request in requests:
             request.time_arrival = request.time_offset + base_arrival_time
@@ -105,7 +188,10 @@ async def main(
                     futures.append(client.add_request(request.prompt_text, request.sampling_params))
                     num_requests_added += 1
 
-                    if num_requests_added >= next_suspend_at and cycles_done < num_suspend_resume_cycles:
+                    if (
+                        num_requests_added >= next_suspend_at
+                        and cycles_done < num_suspend_resume_cycles
+                    ):
                         await suspend_resume_cycle(client, engine, args, futures)
                         cycles_done += 1
                         next_suspend_at += args.suspend_resume_interval
@@ -122,7 +208,10 @@ async def main(
                     futures.append(client.add_request(request.prompt_text, request.sampling_params))
                     num_requests_added += 1
 
-                    if num_requests_added >= next_suspend_at and cycles_done < num_suspend_resume_cycles:
+                    if (
+                        num_requests_added >= next_suspend_at
+                        and cycles_done < num_suspend_resume_cycles
+                    ):
                         await suspend_resume_cycle(client, engine, args, futures)
                         cycles_done += 1
                         next_suspend_at += args.suspend_resume_interval
@@ -142,7 +231,7 @@ async def main(
             await engine.wait_until(EngineState.RESUMED)
             await engine.wait_until(EngineState.RUNNING)
 
-    if dist.get_rank() == 0:
+    if dist.get_rank() == 0 and write_output:
         # Write results to JSON. Primarily used for functional testing.
         if args.output_path:
             json_results = {}
@@ -161,7 +250,7 @@ async def main(
                 throughputs.append(throughput)
                 if req.routing_indices is not None:
                     result_dict["routing_indices"] = req.routing_indices.tolist()
-                                
+
                 json_results[req.request_id] = result_dict
             throughput_dict = {"throughput": throughputs}
             if args.throughput_check_only:
@@ -185,6 +274,7 @@ async def main(
                     )
                 )
 
+    if stress_cycles is None and dist.get_rank() == 0:
         # Pause before stopping: STOP requires PAUSED or SUSPENDED state.
         client.pause_engines()
 
@@ -199,6 +289,7 @@ async def main(
         client.shutdown_coordinator()
         client.stop()
     logging.info(f"Rank: {dist.get_rank()} stopped their engine instance successfully.")
+    return result_cycles, stress_snapshots
 
 
 if __name__ == "__main__":
@@ -206,7 +297,7 @@ if __name__ == "__main__":
     # check for it.
     with torch.inference_mode():
         args = parse_and_validate_args(
-            extra_args_provider=add_inference_args,
+            extra_args_provider=add_runner_args,
             args_defaults={'no_load_rng': True, 'no_load_optim': True},
         )
         initialize_megatron()
@@ -233,7 +324,9 @@ if __name__ == "__main__":
                 output_dir=args.moe_routing_trace_path,
                 max_steps=max_steps,
                 rank=rank,
-                capture_hidden_states=getattr(args, 'moe_routing_trace_capture_hidden_states', False),
+                capture_hidden_states=getattr(
+                    args, 'moe_routing_trace_capture_hidden_states', False
+                ),
                 capture_logits=getattr(args, 'moe_routing_trace_capture_logits', False),
                 dump_router_weights=getattr(args, 'moe_routing_trace_dump_weights', False),
             )
@@ -247,12 +340,30 @@ if __name__ == "__main__":
             # that buffer into the tracer once per decode step. If router replay is not on,
             # use the forward hook method which allows for additionally saving hidden states.
             from megatron.core.utils import get_model_config
+
             if not get_model_config(model).moe_enable_routing_replay:
                 tracer.register_hooks(model)
 
         requests = build_requests(args, tokenizer, sampling_params)
-
-        engine = get_dynamic_inference_engine(model=model)
+        requests = build_prefix_cache_stress_requests(args, tokenizer, sampling_params, requests)
+        inference_config = get_inference_config_from_model_and_args(model, args)
+        context, engine = build_engine(model, inference_config, tokenizer)
+        first_group_hashes = ()
+        if args.prefix_cache_compare:
+            assert sampling_params.top_k == 1 and sampling_params.top_p == 0.0
+            assert args.prefix_cache_stress_copies > args.data_parallel_size
+            group_requests = requests[:: args.prefix_cache_stress_copies]
+            distinct_block_demand = sum(
+                len(request.prompt_tokens) // context.block_size_tokens
+                for request in group_requests
+            )
+            assert (
+                distinct_block_demand
+                > context.kv_block_allocator.pool_size * args.data_parallel_size
+            )
+            first_group_hashes = compute_block_hashes_batched(
+                torch.tensor(group_requests[0].prompt_tokens), context.block_size_tokens
+            )
 
         if dist.get_rank() == 0:
             setup_prefix = build_dynamic_engine_setup_prefix(args, model, engine.context, requests)
@@ -264,7 +375,58 @@ if __name__ == "__main__":
         if os.environ.get("NSIGHT_PREFIX"):
             torch.cuda.cudart().cudaProfilerStart()
 
-        asyncio.run(main(engine, requests, args.inference_coordinator_port))
+        if args.prefix_cache_compare:
+            assert inference_config.enable_prefix_caching
+            delete_cuda_graphs()
+            context.deallocate_inference_state_buffers()
+            del engine, context
+            gc.collect()
+            torch.cuda.empty_cache()
+            reference_config = replace(inference_config, enable_prefix_caching=False)
+            reference_context, reference_engine = build_engine(model, reference_config, tokenizer)
+            reference_cycles, _ = asyncio.run(
+                main(
+                    reference_engine,
+                    requests,
+                    args.inference_coordinator_port,
+                    stress_cycles=1,
+                    write_output=False,
+                )
+            )
+            delete_cuda_graphs()
+            reference_context.deallocate_inference_state_buffers()
+            del reference_engine, reference_context
+            gc.collect()
+            torch.cuda.empty_cache()
+            context, engine = build_engine(model, inference_config, tokenizer)
+            cache_cycles, snapshots = asyncio.run(
+                main(
+                    engine,
+                    requests,
+                    args.inference_coordinator_port,
+                    stress_cycles=args.inference_repeat_n,
+                    first_group_hashes=first_group_hashes,
+                )
+            )
+            if dist.get_rank() == 0:
+                for cycle in cache_cycles:
+                    _assert_result_parity(reference_cycles[0], cycle)
+                world_size = dist.get_world_size()
+                policy = inference_config.prefix_caching_eviction_policy.value
+                assert all(snapshot[2] > 0 for snapshot in snapshots)
+                if policy == "ref_zero":
+                    assert all(s[0][3] == 0 and s[0][5] == world_size for s in snapshots)
+                else:
+                    assert all(s[0][6] == world_size and s[0][4] < world_size for s in snapshots)
+                assert snapshots[-1][1] <= snapshots[-2][1] + 64 * 1024**2 * world_size
+                summary = {
+                    "cycles": args.inference_repeat_n,
+                    "hits_by_cycle": [snapshot[2] for snapshot in snapshots],
+                    "allocated_bytes_by_cycle": [snapshot[1] for snapshot in snapshots],
+                }
+                print("PREFIX_CACHE_STRESS: " + json.dumps(summary, sort_keys=True))
+        else:
+            asyncio.run(main(engine, requests, args.inference_coordinator_port))
 
         # Stop Nsight profiler.
         if os.environ.get("NSIGHT_PREFIX"):

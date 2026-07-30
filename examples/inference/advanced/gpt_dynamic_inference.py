@@ -1,19 +1,24 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-# pylint: disable=bad-builtin
+# pylint: disable=bad-builtin,protected-access
 
+import copy
+import gc
 import hashlib
 import io
 import json
+import math
 import os
 import sys
 import warnings
 from collections import defaultdict
+from dataclasses import replace
 from typing import Dict, List, Optional
 
-from megatron.training.arguments import parse_and_validate_args
 import torch
 from tqdm import tqdm
+
+from megatron.training.arguments import parse_and_validate_args
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
@@ -28,6 +33,7 @@ from examples.inference.utils import (
 )
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine, EngineSuspendedError
+from megatron.core.inference.inference_request import compute_block_hashes_batched
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
@@ -36,6 +42,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
+from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.inference.utils import (
     add_inference_args,
     get_inference_config_from_model_and_args,
@@ -54,6 +61,86 @@ from megatron.training import get_args, get_tokenizer, initialize_megatron
 torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
+
+
+def add_runner_args(parser):
+    parser = add_inference_args(parser)
+    group = parser.add_argument_group(title="Prefix-cache stress")
+    group.add_argument("--prefix-cache-compare", action="store_true")
+    group.add_argument("--prefix-cache-stress-groups", type=int, default=0)
+    group.add_argument("--prefix-cache-stress-copies", type=int, default=2)
+    group.add_argument("--prefix-cache-stress-prompt-tokens", type=int, default=512)
+    group.add_argument("--prefix-cache-stress-staged", action="store_true")
+    return parser
+
+
+def build_prefix_cache_stress_requests(args, tokenizer, sampling_params, requests):
+    if not args.prefix_cache_compare:
+        return requests
+    if args.inference_repeat_n < 3:
+        raise ValueError("--prefix-cache-compare requires --inference-repeat-n >= 3")
+    if args.prefix_cache_stress_groups < 2 or args.prefix_cache_stress_copies < 2:
+        raise ValueError("prefix-cache stress requires at least two groups and two copies")
+    if getattr(args, "prefix_cache_stress_staged", False):
+        args.incoming_requests_per_step = 1
+
+    stress_requests = []
+    for group_idx in range(args.prefix_cache_stress_groups):
+        marker = f"prefix cache pressure group {group_idx:04d}; deterministic shared text. "
+        prompt = marker
+        while len(tokenizer.tokenize(prompt)) < args.prefix_cache_stress_prompt_tokens:
+            prompt += marker
+        for _ in range(args.prefix_cache_stress_copies):
+            stress_requests.append(Request(prompt, -1, tokenizer, sampling_params))
+    return stress_requests
+
+
+def _global_allocated_bytes():
+    value = torch.tensor([torch.cuda.memory_allocated()], device="cuda", dtype=torch.int64)
+    torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.MAX)
+    return int(value.item())
+
+
+def _assert_nested_close(reference, actual, label):
+    if isinstance(reference, dict):
+        assert reference.keys() == actual.keys(), f"{label}: keys differ"
+        for key in reference:
+            _assert_nested_close(reference[key], actual[key], f"{label}.{key}")
+    elif isinstance(reference, (list, tuple)):
+        assert len(reference) == len(actual), f"{label}: lengths differ"
+        for idx, (ref_item, actual_item) in enumerate(zip(reference, actual)):
+            _assert_nested_close(ref_item, actual_item, f"{label}[{idx}]")
+    elif isinstance(reference, float):
+        assert math.isclose(reference, actual, abs_tol=1e-5, rel_tol=0)
+    else:
+        assert reference == actual, f"{label}: {reference!r} != {actual!r}"
+
+
+def assert_prefix_cache_parity(reference_requests, cached_requests):
+    assert len(reference_requests) == len(cached_requests)
+    for idx, (reference, cached) in enumerate(zip(reference_requests, cached_requests)):
+        assert reference.output_tokens == cached.output_tokens, f"request {idx}: token mismatch"
+        assert reference.output_text == cached.output_text, f"request {idx}: text mismatch"
+        if reference.routing_indices is not None:
+            assert reference.routing_indices.tolist() == cached.routing_indices.tolist()
+        for field in (
+            "prompt_log_probs",
+            "generated_log_probs",
+            "prompt_top_n_logprobs",
+            "generated_top_n_logprobs",
+        ):
+            _assert_nested_close(
+                getattr(reference, field, None),
+                getattr(cached, field, None),
+                f"request {idx}.{field}",
+            )
+
+
+def build_engine(model, inference_config, tokenizer):
+    context = DynamicInferenceContext(model.config, inference_config)
+    wrapped_model = GPTInferenceWrapper(model, context)
+    controller = TextGenerationController(wrapped_model, tokenizer)
+    return context, DynamicInferenceEngine(controller, context)
 
 
 def run_inference(
@@ -169,6 +256,8 @@ def run_inference(
                 # Get output tokens and text.
                 request.output_tokens = finished_request.generated_tokens
                 request.output_text = finished_request.generated_text
+                request.num_cached_tokens = finished_request.num_cached_tokens
+                request.routing_indices = finished_request.routing_indices
                 total_output_tokens += len(request.output_tokens)
 
                 # Log probs.
@@ -287,7 +376,7 @@ def main():
     """Run dynamic inference."""
     # Initialize Megatron.
     args = parse_and_validate_args(
-        extra_args_provider=add_inference_args,
+        extra_args_provider=add_runner_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
     initialize_megatron()
@@ -326,15 +415,17 @@ def main():
 
     # Requests, context, controller.
     requests = build_requests(args, tokenizer, sampling_params)
+    requests = build_prefix_cache_stress_requests(args, tokenizer, sampling_params, requests)
     inference_config = get_inference_config_from_model_and_args(model, args)
 
     # Calculate max_sequence_length from requests
     max_gen_length = sampling_params.num_tokens_to_generate
     max_context_length = max(len(r.prompt_tokens) for r in requests)
     inference_config.max_sequence_length = max_context_length + max_gen_length
-    context = DynamicInferenceContext(model.config, inference_config)
-    wrapped_model = GPTInferenceWrapper(model, context)
-    controller = TextGenerationController(wrapped_model, tokenizer)
+    reference_config = replace(inference_config, enable_prefix_caching=False)
+    context, engine = build_engine(
+        model, reference_config if args.prefix_cache_compare else inference_config, tokenizer
+    )
 
     # Validate all context_length's <= max_tokens.
     if not args.enable_chunked_prefill:
@@ -348,24 +439,46 @@ def main():
             f"{k}({v})" for k, v in invalid_prompt_length_map.items()
         )
 
-    # Inference engine.
-    engine = DynamicInferenceEngine(controller, context)
-
+    throughputs = []
+    hit_cycles = []
+    memory_cycles = []
+    reference_requests = None
+    if args.prefix_cache_compare:
+        assert inference_config.enable_prefix_caching
+        assert sampling_params.top_k == 1 and sampling_params.top_p == 0.0
+        assert (
+            min(len(request.prompt_tokens) for request in requests) >= 2 * context.block_size_tokens
+        )
+        group_requests = requests[:: args.prefix_cache_stress_copies]
+        distinct_block_demand = sum(
+            len(request.prompt_tokens) // context.block_size_tokens for request in group_requests
+        )
+        assert distinct_block_demand > context.kv_block_allocator.pool_size
+        first_group_hashes = compute_block_hashes_batched(
+            torch.tensor(group_requests[0].prompt_tokens), context.block_size_tokens
+        )
+        reference_requests = copy.deepcopy(requests)
+        run_inference(reference_requests, engine)
+        delete_cuda_graphs()
+        context.deallocate_inference_state_buffers()
+        del engine, context
+        gc.collect()
+        torch.cuda.empty_cache()
+        context, engine = build_engine(model, inference_config, tokenizer)
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
     print("~~~")
     print(setup_prefix)
     print("~~~")
-
-    # Run and time test, optionally `args.inference_repeat_n` times.
-    throughputs = []
     for _ in range(args.inference_repeat_n):
 
-        # Reset engine.
-        engine.reset()
+        if not args.prefix_cache_compare:
+            engine.reset()
+        else:
+            requests = copy.deepcopy(requests)
 
         torch.cuda.reset_peak_memory_stats()
+        hit_start = engine._prefix_cache_hits
 
-        # Trial.
         t = get_curr_time()
         result = run_inference(requests, engine)
         step_times = result["step_times"]
@@ -377,6 +490,48 @@ def main():
         stats = torch.cuda.memory_stats()
         throughput = total_output_tokens / total_time
         throughputs.append(throughput)
+        if args.prefix_cache_compare:
+            assert_prefix_cache_parity(reference_requests, requests)
+            hit_cycles.append(engine._prefix_cache_hits - hit_start)
+            assert hit_cycles[-1] > 0
+            allocator = context.kv_block_allocator
+            if inference_config.prefix_caching_eviction_policy.value == "ref_zero":
+                assert not allocator.kv_hash_to_block_id
+                assert allocator.pool_avail == allocator.pool_size - 1
+            else:
+                assert (
+                    allocator.kv_hash_to_block_id and allocator.pool_avail < allocator.pool_size - 1
+                )
+            memory_cycles.append(_global_allocated_bytes())
+
+    if args.prefix_cache_compare:
+        assert engine._prefix_cache_blocks_matched > 0
+        assert any(getattr(request, "num_cached_tokens", 0) > 0 for request in requests)
+        if inference_config.prefix_caching_eviction_policy.value == "lru":
+            assert any(
+                h not in context.kv_block_allocator.kv_hash_to_block_id for h in first_group_hashes
+            )
+        if 0 < (inference_config.prefix_caching_mamba_gb or 0) < 1:
+            mamba = context.mamba_slot_allocator
+            assert mamba is not None
+            assert engine._prefill_tokens_skipped > 0 and mamba.free_count == 0
+            assert any(h not in mamba.hash_to_block_id for h in first_group_hashes)
+        if args.cuda_graph_impl == "local":
+            assert engine.capture_stats and sum(result["cuda_graph_request_count_map"].values()) > 0
+        # Allow a small lazy-workspace margin while rejecting cycle-over-cycle leaks.
+        assert (
+            memory_cycles[-1] <= memory_cycles[-2] + 64 * 1024**2
+        ), "cache-on CUDA allocation grew by more than 64 MiB after warmup"
+        if torch.distributed.get_rank() == 0:
+            summary = {
+                "cycles": args.inference_repeat_n,
+                "prefix_cache_hits": engine._prefix_cache_hits,
+                "prefix_cache_blocks_matched": engine._prefix_cache_blocks_matched,
+                "prefill_tokens_skipped": engine._prefill_tokens_skipped,
+                "hits_by_cycle": hit_cycles,
+                "allocated_bytes_by_cycle": memory_cycles,
+            }
+            print("PREFIX_CACHE_STRESS: " + json.dumps(summary, sort_keys=True))
 
     # Validate all requests finished.
     for request in requests:
