@@ -1944,6 +1944,15 @@ class CudaGraphManager(torch.nn.Module):
                 If `inference_context` is provided, this gets set to the correct value.
         """
         is_inference_mode = 'inference_context' in kwargs.keys() and kwargs['inference_context']
+        if is_inference_mode:
+            inference_context = kwargs['inference_context']
+            if (
+                not inference_context.cuda_graphs_available
+                and not inference_context.is_creating_cuda_graphs
+            ):
+                if self.func is not None:
+                    return self.func(*args, **kwargs)
+                return super(MegatronModule, megatron_module).__call__(*args, **kwargs)
         if cache_key is None and is_inference_mode:
             inference_context = kwargs['inference_context']
             if inference_context.is_static_batching():

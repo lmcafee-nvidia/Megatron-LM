@@ -46,7 +46,7 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server.text
     stop_text_gen_server,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
+from megatron.core.transformer.cuda_graphs import CudaGraphManager, delete_cuda_graphs
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.inference.engines.test_dynamic_engine import (
@@ -2525,7 +2525,14 @@ PREFIX_CACHE_ENGINE_CASES = [
     ),
     pytest.param(dict(name="gpt-offload", model="gpt", feature="offload"), id="gpt-offload-resume"),
     pytest.param(
-        dict(name="hybrid-offload", model="hybrid", feature="offload"), id="hybrid-offload-resume"
+        dict(
+            name="hybrid-offload",
+            model="hybrid",
+            feature="offload",
+            chunked=True,
+            suspend_interval=1,
+        ),
+        id="hybrid-offload-chunked-resume",
     ),
     pytest.param(
         dict(name="gpt-recompute", model="gpt", feature="recompute"), id="gpt-recompute-resume"
@@ -2669,7 +2676,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             materialize_only_last_token_logits=(feature not in ("mtp", "logprobs")),
             return_log_probs=(feature in ("logprobs", "request-eviction")),
             skip_prompt_log_probs=(feature in ("logprobs", "request-eviction")),
-            enable_chunked_prefill=(feature == "chunked"),
+            enable_chunked_prefill=(feature == "chunked" or case.get("chunked", False)),
         )
         if feature == "chunked":
             kwargs["context_max_tokens"] = block_size + 8
@@ -2685,7 +2692,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             kwargs.update(
                 kv_cache_management_mode=feature,
                 static_kv_memory_pointers=False,
-                suspend_resume_interval=2,
+                suspend_resume_interval=case.get("suspend_interval", 2),
                 num_cuda_graphs=2,
                 force_build_cuda_graphs=True,
                 use_cuda_graphs_for_non_decode_steps=False,
@@ -2703,6 +2710,8 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 suspend_resume_interval=2,
             )
         config = DynamicEngineTestConfig(**kwargs)
+        if case.get("chunked", False):
+            config.context_max_tokens = block_size + 8
         if feature == "uvm":
             config.unified_memory_level = 1
         config.prefix_caching_eviction_policy = (
@@ -2813,6 +2822,9 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         saw_chunk = False
         cuda_graph_step_count = 0
         cuda_graph_post_resume_step_count = 0
+        deferred_graph_resume_count = 0
+        eager_deferred_graph_step_count = 0
+        hidden_chunk_resume_count = 0
         saw_mixed_batch = False
         suspend_count = 0
         uvm_pointer_stability_checks = 0
@@ -2872,6 +2884,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             uvm_memory_buffer_ptr = ctx.memory_buffer.data_ptr()
 
         for cycle in range(3):
+            chunked = config.enable_chunked_prefill
             block_size = ctx.block_size_tokens
             prompt_length = (
                 3 * block_size - 2 if case["feature"] == "request-eviction" else 2 * block_size + 5
@@ -2901,7 +2914,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
 
             # Cache-on needs seven blocks for producer + follower tail + pressure.
             # Cache-off needs nine unless chunked staging limits live demand to seven.
-            target_allocatable = 7 if enable_prefix_caching or case["feature"] == "chunked" else 9
+            target_allocatable = 7 if enable_prefix_caching or chunked else 9
             allocatable = alloc.get_allocatable_count()
             if allocatable > target_allocatable:
                 filler = alloc.allocate_memory_blocks(allocatable - target_allocatable)
@@ -2937,7 +2950,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 # during the first step. Mirror that execution order explicitly
                 # in the cache-off baseline so BF16 comparisons use equal batches.
                 engine._add_request(requests[0])
-                if case["feature"] != "chunked":
+                if not chunked:
                     engine._add_request(requests[2])
             baseline_follower_pending = not enable_prefix_caching
 
@@ -2951,10 +2964,10 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 result = engine.step_modern()
                 step_count += 1
                 if baseline_follower_pending and (
-                    case["feature"] != "chunked" or ctx.chunked_prefill_request_id == -1
+                    not chunked or ctx.chunked_prefill_request_id == -1
                 ):
                     engine._add_request(requests[1])
-                    if case["feature"] == "chunked":
+                    if chunked:
                         engine._add_request(requests[2])
                     baseline_follower_pending = False
                 min_pool_avail = min(min_pool_avail, alloc.pool_avail)
@@ -2964,6 +2977,12 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 using_cuda_graph = int(ctx.using_cuda_graph_this_step())
                 cuda_graph_step_count += using_cuda_graph
                 cuda_graph_post_resume_step_count += int(suspend_count > 0) * using_cuda_graph
+                if case["feature"] == "offload" and not ctx.cuda_graphs_available:
+                    assert not using_cuda_graph
+                    assert not any(
+                        manager.cudagraph_runners for manager in CudaGraphManager._instances
+                    )
+                    eager_deferred_graph_step_count += 1
                 saw_mixed_batch |= (
                     ctx.batch_dimensions.prefill_req_count > 0
                     and ctx.batch_dimensions.decode_req_count > 0
@@ -2995,6 +3014,13 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                     assert not ctx.is_tensor_state_allocated
                     engine.resume()
                     assert ctx.is_tensor_state_allocated
+                    if case["feature"] == "offload" and (
+                        ctx.total_request_count > 0 or ctx.chunked_prefill_request_id != -1
+                    ):
+                        assert engine._cuda_graph_rebuild_pending
+                        assert not ctx.cuda_graphs_available
+                        deferred_graph_resume_count += 1
+                        hidden_chunk_resume_count += int(ctx.chunked_prefill_request_id != -1)
                     if (config.num_cuda_graphs or 0) > 0:
                         assert engine.capture_stats["pool_reserved_bytes"] > 0
                     if case["feature"] == "uvm":
@@ -3058,6 +3084,9 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             saw_chunk=saw_chunk,
             cuda_graph_step_count=cuda_graph_step_count,
             cuda_graph_post_resume_step_count=cuda_graph_post_resume_step_count,
+            deferred_graph_resume_count=deferred_graph_resume_count,
+            eager_deferred_graph_step_count=eager_deferred_graph_step_count,
+            hidden_chunk_resume_count=hidden_chunk_resume_count,
             saw_mixed_batch=saw_mixed_batch,
             suspend_count=suspend_count,
             uvm_pointer_stability_checks=uvm_pointer_stability_checks,
@@ -3241,6 +3270,12 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             elif feature in ("offload", "recompute"):
                 assert stats["suspend_count"] >= 1
                 assert stats["cuda_graph_post_resume_step_count"] > 0
+                if feature == "offload":
+                    assert stats["deferred_graph_resume_count"] >= 1
+                    assert stats["eager_deferred_graph_step_count"] >= 1
+                    if case.get("chunked", False):
+                        assert stats["saw_chunk"]
+                        assert stats["hidden_chunk_resume_count"] >= 1
                 activations.add(f"{feature}-prefix-resume")
             elif feature == "uvm":
                 assert stats["config"].unified_memory_level == 1
