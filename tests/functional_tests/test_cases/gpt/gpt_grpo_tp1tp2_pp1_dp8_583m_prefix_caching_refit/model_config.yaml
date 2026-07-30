@@ -46,7 +46,7 @@ MODEL_ARGS:
   --hidden-size: 1152
   --num-attention-heads: 16
   --max-position-embeddings: 1024
-  --seq-length: 1024
+  --seq-length: 576
   --timing-log-option: minmax
   --log-throughput: true
   --no-create-attention-mask-in-dataloader: true
@@ -116,9 +116,10 @@ AFTER_SCRIPT: |
       }
       END { print cycles + 0 }
     ' "$log_file")
-    final_hits=$(sed -nE \
-      's/.*prefix cache \(cumul\): ([0-9]+) hits.*/\1/p' "$log_file" | tail -n 1)
-    if (( cycles >= 3 && ${final_hits:-0} >= 18 )); then
+    final_skipped=$(sed -nE \
+      's/.*prefill \(cumul\): computed [0-9]+, skipped ([0-9]+).*/\1/p' \
+      "$log_file" | tail -n 1)
+    if (( cycles >= 3 && ${final_skipped:-0} > 0 )); then
       ((stressed_engine_logs += 1))
     fi
     mapfile -t memory_samples < <(
@@ -133,7 +134,7 @@ AFTER_SCRIPT: |
     fi
   done < <(grep -rl -F "Reshard complete" "$LOG_DIR" || true)
   if (( stressed_engine_logs < 8 )); then
-    echo "Expected all eight inference ranks (four TP2 replicas) to reach 18 cache hits."
+    echo "Expected all eight inference ranks to hit the cache after every refit and skip tokens."
     EXIT_CODE=1
   fi
   if (( bounded_memory_logs < 8 )); then

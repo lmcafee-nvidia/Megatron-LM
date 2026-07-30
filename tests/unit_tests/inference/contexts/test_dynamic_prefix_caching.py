@@ -2812,7 +2812,6 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         elif feature in ("offload", "recompute"):
             kwargs.update(
                 kv_cache_management_mode=feature,
-                static_kv_memory_pointers=(feature == "offload"),
                 suspend_resume_interval=2,
                 num_cuda_graphs=2,
                 force_build_cuda_graphs=True,
