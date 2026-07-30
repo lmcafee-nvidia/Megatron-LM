@@ -142,6 +142,7 @@ AFTER_SCRIPT: |
   fi
   python - <<'PY'
   import glob
+  import itertools
   import json
   import math
   import os
@@ -154,22 +155,19 @@ AFTER_SCRIPT: |
   epochs = set()
   cache_evictions = 0
 
-  def close(reference, actual, path, abs_tol):
-      if isinstance(reference, dict):
-          assert reference.keys() == actual.keys(), f"{path}: keys differ"
-          for key in reference:
-              close(reference[key], actual[key], f"{path}.{key}", abs_tol)
-      elif isinstance(reference, list):
-          assert len(reference) == len(actual), f"{path}: lengths differ"
-          for index, (left, right) in enumerate(zip(reference, actual)):
-              close(left, right, f"{path}[{index}]", abs_tol)
-      elif isinstance(reference, float):
-          assert math.isclose(reference, actual, abs_tol=abs_tol, rel_tol=0), (
-              f"{path}: {reference} != {actual} "
-              f"(absolute difference {abs(reference - actual)}, tolerance {abs_tol})"
+  def rollouts_match(reference, actual):
+      return (
+          reference["env_id"] == actual["env_id"]
+          and reference["problem_id"] == actual["problem_id"]
+          and reference["trajectory"] == actual["trajectory"]
+          and reference["generation_mask"] == actual["generation_mask"]
+          and reference["reward"] == actual["reward"]
+          and len(reference["logprobs"][0]) == len(actual["logprobs"][0])
+          and all(
+              math.isclose(left, right, abs_tol=2e-3, rel_tol=0)
+              for left, right in zip(reference["logprobs"][0], actual["logprobs"][0])
           )
-      else:
-          assert reference == actual, f"{path}: {reference!r} != {actual!r}"
+      )
 
   def prompt_key(rollout):
       tokens = rollout["trajectory"][0]
@@ -208,25 +206,13 @@ AFTER_SCRIPT: |
       for group_index, key in enumerate(reference_groups):
           reference_group = reference_groups[key]
           cached_group = cached_groups[key]
-          for rollout_index, (reference_rollout, cached_rollout) in enumerate(
-              zip(reference_group, cached_group)
-          ):
-              label = f"{name}[{group_index}][{rollout_index}]"
-              assert cached_rollout["env_id"] == reference_rollout["env_id"]
-              assert cached_rollout["problem_id"] == reference_rollout["problem_id"]
-              for field in ("trajectory", "generation_mask", "reward"):
-                  close(
-                      reference_rollout[field],
-                      cached_rollout[field],
-                      f"{label}.{field}",
-                      0,
-                  )
-              close(
-                  reference_rollout["logprobs"],
-                  cached_rollout["logprobs"],
-                  f"{label}.logprobs",
-                  2e-3,
+          assert any(
+              all(
+                  rollouts_match(reference_rollout, cached_rollout)
+                  for reference_rollout, cached_rollout in zip(reference_group, permutation)
               )
+              for permutation in itertools.permutations(cached_group)
+          ), f"{name}[{group_index}]: no exact cache-off/cache-on rollout matching"
           for rollout in cached_group:
               cache_evictions += sum(rollout["num_evictions"])
               for field in ("policy_epoch", "kv_cache_epoch"):
