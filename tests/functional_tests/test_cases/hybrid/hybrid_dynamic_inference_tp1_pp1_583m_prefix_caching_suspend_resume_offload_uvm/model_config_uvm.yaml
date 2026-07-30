@@ -62,7 +62,7 @@ MODEL_ARGS:
   --num-tokens-to-generate: 30
   --max-tokens-to-oom: 3600000
   --inference-max-seq-length: 4096
-  --inference-dynamic-batching-buffer-size-gb: 0.2
+  --inference-dynamic-batching-buffer-size-gb: 0.25
   --inference-dynamic-batching-max-tokens: 1024
   --inference-dynamic-batching-max-requests: 4
   --cuda-graph-impl: local
@@ -74,6 +74,7 @@ MODEL_ARGS:
   --rl-kv-cache-management-mode: persist
   --rl-persist-cuda-graphs: true
   --suspend-resume-interval: 8
+  --inference-logging-step-interval: 1
   --prefix-cache-compare: true
   --prefix-cache-stress-groups: 20
   --prefix-cache-stress-copies: 2

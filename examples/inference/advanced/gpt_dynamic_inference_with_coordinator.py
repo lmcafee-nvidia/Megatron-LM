@@ -357,10 +357,8 @@ if __name__ == "__main__":
                 len(request.prompt_tokens) // context.block_size_tokens
                 for request in group_requests
             )
-            assert (
-                distinct_block_demand
-                > context.kv_block_allocator.pool_size * args.data_parallel_size
-            )
+            usable_blocks = (context.kv_block_allocator.pool_size - 1) * args.data_parallel_size
+            assert distinct_block_demand > usable_blocks, (distinct_block_demand, usable_blocks)
             first_group_hashes = compute_block_hashes_batched(
                 torch.tensor(group_requests[0].prompt_tokens), context.block_size_tokens
             )

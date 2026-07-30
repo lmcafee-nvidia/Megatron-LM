@@ -62,7 +62,7 @@ MODEL_ARGS:
   --num-tokens-to-generate: 30
   --max-tokens-to-oom: 3600000
   --inference-max-seq-length: 4096
-  --inference-dynamic-batching-buffer-size-gb: 0.2
+  --inference-dynamic-batching-buffer-size-gb: 0.25
   --inference-dynamic-batching-max-requests: 4
   --inference-dynamic-batching-max-tokens: 2048
   --inference-dynamic-batching-prefix-caching: true

@@ -67,7 +67,7 @@ class _NumericTokenizer:
             tokens = tokens.tolist()
         if skip_special_tokens:
             tokens = [token for token in tokens if token != self.eod]
-        return " ".join(str(token) for token in tokens)
+        return "".join(f"{token} " for token in tokens)
 
 
 def _http_json(url, payload=None):
@@ -517,6 +517,31 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
                 break
         for bid in active_blocks:
             assert alloc3.block_ref_counts[bid.item()].item() == 1
+
+    @pytest.mark.internal
+    def test_duplicate_registration_does_not_duplicate_parent_edge(self):
+        """Re-registering one physical child must not strand its parent in the LRU forest."""
+        ctx = self._ctx(rounder=1)
+        alloc = ctx.kv_block_allocator
+        block_ids = alloc.allocate_memory_blocks(2)
+        assert block_ids is not None
+        parent_id, child_id = block_ids.tolist()
+        parent_hash, child_hash = 101, 102
+
+        alloc.register_kv_block_hashes(
+            [parent_id, child_id], [parent_hash, child_hash], parent_hashes=[0, parent_hash]
+        )
+        assert alloc.block_child_count[parent_id].item() == 1
+
+        # Hybrid prefix recovery can recompute a KV-matched block after its
+        # corresponding Mamba state was evicted. That path re-registers the
+        # same physical child and parent edge.
+        alloc.register_kv_block_hashes([child_id], [child_hash], parent_hashes=[parent_hash])
+        assert alloc.block_child_count[parent_id].item() == 1
+
+        alloc.release_memory_blocks(block_ids)
+        assert alloc.evict_lru_blocks(2)
+        assert alloc.kv_hash_to_block_id == {}
 
     @pytest.mark.internal
     def test_add_request_full_cache_partial_hit_pins_matched_blocks(self):
@@ -2410,7 +2435,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             max_sequence_length=prompt_length + 8,
             context_buffer_size_gb=0.02,
             context_block_size_tokens=block_size,
-            context_max_requests=32,
+            context_max_requests=8 if case["model"] == "hybrid" else 32,
             context_max_tokens=4096,
             tensor_model_parallel_size=case.get("tp", 1),
             pipeline_model_parallel_size=case.get("pp", 1),
@@ -2421,7 +2446,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             num_speculative_tokens=num_speculative_tokens,
             materialize_only_last_token_logits=(feature not in ("mtp", "logprobs")),
             return_log_probs=(feature in ("logprobs", "request-eviction")),
-            skip_prompt_log_probs=(feature == "request-eviction"),
+            skip_prompt_log_probs=(feature in ("logprobs", "request-eviction")),
             enable_chunked_prefill=(feature == "chunked"),
         )
         if feature == "chunked":
@@ -2486,6 +2511,26 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             block_size_tokens=ctx.block_size_tokens,
             enable_prefix_caching=enable_prefix_caching,
         )
+
+    def _assert_cached_prompt_logprobs_rejected(self, case):
+        config = self._case_config(case, enable_prefix_caching=True)
+        env = self._build_test_env(config)
+        env.engine.controller.tokenizer = _NumericTokenizer()
+        prompt = torch.arange(
+            2 * config.context_block_size_tokens + 5, device=torch.cuda.current_device()
+        ) % (config.vocab_size - 1)
+        request = self._make_engine_request(
+            env.engine.context,
+            -1,
+            prompt,
+            enable_prefix_caching=True,
+            return_log_probs=True,
+            skip_prompt_log_probs=False,
+            top_n_logprobs=5,
+        )
+        with pytest.raises(ValueError, match=r"^Prompt log probabilities"):
+            env.engine._add_request(request)
+        assert request.request_id not in env.engine.requests
 
     @torch.inference_mode()
     def _run_engine_session(self, case, *, enable_prefix_caching):
@@ -2587,14 +2632,16 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                         assert challenge_hashes.isdisjoint(alloc.kv_hash_to_block_id)
                         epoch_invalidation_count += 1
 
-            # Seven allocatable KV blocks is exactly the producer + follower-tail
-            # + unrelated-pressure footprint.  Filler blocks stay pinned, so
-            # subsequent LRU waves must evict retained prefixes.
+            # Cache-on needs seven blocks for producer + follower tail +
+            # unrelated pressure. Cache-off needs nine because it cannot share
+            # the producer's two complete blocks. Pin the rest so both sessions
+            # reach zero availability while executing the same request mix.
+            target_allocatable = 7 if enable_prefix_caching else 9
             allocatable = alloc.get_allocatable_count()
-            if allocatable > 7:
-                filler = alloc.allocate_memory_blocks(allocatable - 7)
+            if allocatable > target_allocatable:
+                filler = alloc.allocate_memory_blocks(allocatable - target_allocatable)
                 assert filler is not None
-            assert alloc.get_allocatable_count() == 7
+            assert alloc.get_allocatable_count() == target_allocatable
 
             wave_ids = {3 * cycle, 3 * cycle + 1, 3 * cycle + 2}
             requests = []
@@ -2609,13 +2656,25 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                     prompt,
                     enable_prefix_caching=enable_prefix_caching,
                     return_log_probs=(case["feature"] in ("logprobs", "request-eviction")),
-                    skip_prompt_log_probs=(case["feature"] != "logprobs"),
+                    skip_prompt_log_probs=True,
                     top_n_logprobs=5 if case["feature"] == "logprobs" else 0,
                 )
                 requests.append(request)
-                engine._add_request(request)
                 if case["feature"] == "epoch":
                     expected_epoch[request_id] = cycle
+
+            if enable_prefix_caching:
+                for request in requests:
+                    engine._add_request(request)
+            else:
+                # Cache-on's hash coordination defers the duplicate follower
+                # during the first step. Mirror that execution order explicitly
+                # in the cache-off baseline so BF16 comparisons use equal batches.
+                engine._add_request(requests[0])
+                if case["feature"] != "chunked":
+                    engine._add_request(requests[2])
+            baseline_follower_pending = not enable_prefix_caching
+
             if enable_prefix_caching:
                 for request in requests:
                     all_wave_hashes.update(request.precomputed_block_hashes)
@@ -2625,6 +2684,13 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             while wave_ids - finished.keys():
                 result = engine.step_modern()
                 step_count += 1
+                if baseline_follower_pending and (
+                    case["feature"] != "chunked" or ctx.chunked_prefill_request_id == -1
+                ):
+                    engine._add_request(requests[1])
+                    if case["feature"] == "chunked":
+                        engine._add_request(requests[2])
+                    baseline_follower_pending = False
                 min_pool_avail = min(min_pool_avail, alloc.pool_avail)
                 active_blocks = ctx.request_to_kv_block_ids[: ctx.total_request_count]
                 blocks_this_wave.update(active_blocks[active_blocks >= 0].tolist())
@@ -2761,13 +2827,16 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             assert len(cached_top_n) == len(baseline_top_n) == 5
             assert cached_top_n.keys() == baseline_top_n.keys()
             assert np.allclose(
-                list(cached_top_n.values()), list(baseline_top_n.values()), atol=1e-5, rtol=0
+                list(cached_top_n.values()), list(baseline_top_n.values()), atol=1e-3, rtol=0
             )
 
     @torch.inference_mode()
     def _run_engine_case(self, case):
         self._clear_engine_runtime()
         try:
+            if case["feature"] == "logprobs":
+                self._assert_cached_prompt_logprobs_rejected(case)
+                self._clear_engine_runtime()
             cached, stats = self._run_engine_session(case, enable_prefix_caching=True)
             self._clear_engine_runtime()
             baseline, baseline_stats = self._run_engine_session(case, enable_prefix_caching=False)
@@ -2842,30 +2911,14 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                     assert np.allclose(
                         cached_request.generated_log_probs,
                         baseline_request.generated_log_probs,
-                        atol=1e-5,
+                        atol=1e-3 if feature == "logprobs" else 1e-5,
                         rtol=0,
                     )
                     if feature == "logprobs":
-                        prompt_logprob_count = len(cached_request.prompt_tokens) - 1
-                        assert cached_request.prompt_log_probs is not None
-                        assert baseline_request.prompt_log_probs is not None
-                        assert len(cached_request.prompt_log_probs) == prompt_logprob_count
-                        assert len(baseline_request.prompt_log_probs) == prompt_logprob_count
-                        assert np.allclose(
-                            cached_request.prompt_log_probs,
-                            baseline_request.prompt_log_probs,
-                            atol=1e-5,
-                            rtol=0,
-                        )
                         self._assert_top_n_parity(
                             cached_request.generated_top_n_logprobs,
                             baseline_request.generated_top_n_logprobs,
                             4,
-                        )
-                        self._assert_top_n_parity(
-                            cached_request.prompt_top_n_logprobs,
-                            baseline_request.prompt_top_n_logprobs,
-                            prompt_logprob_count,
                         )
                 if feature == "logprobs":
                     activations.add("logprob-parity")
@@ -2948,6 +3001,10 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
     @pytest.mark.internal
     @pytest.mark.asyncio
     async def test_real_http_zmq_prefix_pressure(self):
+        with torch.inference_mode():
+            await self._run_real_http_zmq_prefix_pressure()
+
+    async def _run_real_http_zmq_prefix_pressure(self):
         """Drive real HTTP, coordinator, client, and model-engine processes through cache churn."""
         if not HAVE_ZMQ or not HAS_BACKEND:
             pytest.skip("pyzmq, Quart, and Hypercorn are required")

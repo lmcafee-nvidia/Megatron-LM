@@ -29,6 +29,7 @@ MODEL_ARGS:
   --moe-enable-routing-replay: true
   --num-experts: 64
   --moe-router-topk: 6
+  --moe-router-dtype: fp32
   --moe-z-loss-coeff: 0
   --moe-router-load-balancing-type: seq_aux_loss
   --moe-aux-loss-coeff: 1e-3

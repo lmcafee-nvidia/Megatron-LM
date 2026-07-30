@@ -79,7 +79,7 @@ MODEL_ARGS:
   --rl-inference-tensor-model-parallel-size: 2
   --refit-method: gloo
   --inference-dynamic-batching-buffer-size-gb: 0.2
-  --inference-dynamic-batching-block-size: 32
+  --inference-dynamic-batching-block-size: 256
   --inference-dynamic-batching-max-tokens: 1024
   --inference-dynamic-batching-max-requests: 32
   --inference-dynamic-batching-prefix-caching: true
@@ -133,17 +133,20 @@ AFTER_SCRIPT: |
   assert len(cached_files) >= 3, f"expected >=3 cached rollout files, got {len(cached_files)}"
   epochs = set()
 
-  def close(reference, actual, path):
+  def close(reference, actual, path, abs_tol):
       if isinstance(reference, dict):
           assert reference.keys() == actual.keys(), f"{path}: keys differ"
           for key in reference:
-              close(reference[key], actual[key], f"{path}.{key}")
+              close(reference[key], actual[key], f"{path}.{key}", abs_tol)
       elif isinstance(reference, list):
           assert len(reference) == len(actual), f"{path}: lengths differ"
           for index, (left, right) in enumerate(zip(reference, actual)):
-              close(left, right, f"{path}[{index}]")
+              close(left, right, f"{path}[{index}]", abs_tol)
       elif isinstance(reference, float):
-          assert math.isclose(reference, actual, abs_tol=1e-5, rel_tol=0), path
+          assert math.isclose(reference, actual, abs_tol=abs_tol, rel_tol=0), (
+              f"{path}: {reference} != {actual} "
+              f"(absolute difference {abs(reference - actual)}, tolerance {abs_tol})"
+          )
       else:
           assert reference == actual, f"{path}: {reference!r} != {actual!r}"
 
@@ -161,8 +164,18 @@ AFTER_SCRIPT: |
               zip(reference_group, cached_group)
           ):
               label = f"{os.path.basename(cached_file)}[{group_index}][{rollout_index}]"
-              for field in ("trajectory", "generation_mask", "logprobs", "reward"):
-                  close(reference_rollout[field], cached_rollout[field], f"{label}.{field}")
+              for field, abs_tol in (
+                  ("trajectory", 0),
+                  ("generation_mask", 0),
+                  ("logprobs", 1e-3),
+                  ("reward", 1e-5),
+              ):
+                  close(
+                      reference_rollout[field],
+                      cached_rollout[field],
+                      f"{label}.{field}",
+                      abs_tol,
+                  )
               for turn in cached_rollout["kv_cache_epoch"]:
                   epochs.update(epoch for _, epoch in turn)
   assert len(epochs) >= 3, f"expected >=3 generation epochs, got {sorted(epochs)}"

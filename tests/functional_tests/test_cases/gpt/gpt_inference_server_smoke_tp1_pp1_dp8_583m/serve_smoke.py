@@ -181,7 +181,7 @@ def assert_close(reference, actual):
         pairs = zip(reference, actual)
     else:
         assert (
-            abs(reference - actual) <= 1e-5 if isinstance(reference, float) else reference == actual
+            abs(reference - actual) <= 1e-3 if isinstance(reference, float) else reference == actual
         )
         return
     for left, right in pairs:

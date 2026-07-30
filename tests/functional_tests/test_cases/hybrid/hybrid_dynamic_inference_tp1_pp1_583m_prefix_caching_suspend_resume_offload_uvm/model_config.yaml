@@ -62,18 +62,16 @@ MODEL_ARGS:
   --num-tokens-to-generate: 30
   --max-tokens-to-oom: 3600000
   --inference-max-seq-length: 4096
-  --inference-dynamic-batching-buffer-size-gb: 0.2
+  --inference-dynamic-batching-buffer-size-gb: 0.25
   --inference-dynamic-batching-max-tokens: 1024
   --inference-dynamic-batching-max-requests: 4
-  --cuda-graph-impl: local
-  --inference-cuda-graph-scope: block
   --inference-dynamic-batching-prefix-caching: true
   --inference-dynamic-batching-prefix-caching-eviction-policy: lru
   --inference-dynamic-batching-prefix-caching-mamba-gb: 2
   --inference-dynamic-batching-unified-memory-level: 0
   --rl-kv-cache-management-mode: offload
-  --rl-persist-cuda-graphs: true
   --suspend-resume-interval: 8
+  --inference-logging-step-interval: 1
   --prefix-cache-compare: true
   --prefix-cache-stress-groups: 20
   --prefix-cache-stress-copies: 2
@@ -91,8 +89,14 @@ METRICS:
   - "generated_text"
   - "logprobs"
 AFTER_SCRIPT: |
-  pause_count=$(grep -rh -F "torch_memory_saver: pausing" "$LOG_DIR" | wc -l || true)
-  resume_count=$(grep -rh -F "torch_memory_saver: resuming" "$LOG_DIR" | wc -l || true)
+  offload_count=$(
+    grep -rh -F "dynamic engine suspended, unified 0, deallocating" "$LOG_DIR" |
+      wc -l || true
+  )
+  restore_count=$(
+    grep -rh -F "dynamic engine resumed, unified 0, allocating" "$LOG_DIR" |
+      wc -l || true
+  )
   post_resume_hits=$(
     grep -rh -E "dynamic engine resumed, unified 0|prefix cache \\(cumul\\): [0-9]+ hits|prefix cache util:" "$LOG_DIR" |
       awk '
@@ -106,7 +110,7 @@ AFTER_SCRIPT: |
         END { print count+0 }
       '
   )
-  if (( pause_count < 3 || resume_count < 3 || post_resume_hits < 3 )); then
+  if (( offload_count < 3 || restore_count < 3 || post_resume_hits < 3 )); then
     echo "Expected OFFLOAD and new prefix-cache hits after at least 3 resume events."
     EXIT_CODE=1
   fi

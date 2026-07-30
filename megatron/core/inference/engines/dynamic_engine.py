@@ -1042,6 +1042,16 @@ class DynamicInferenceEngine(AbstractEngine):
 
         request_id = request.request_id
         self._validate_async_sched_support_for_request(request)
+        if (
+            self.context.enable_prefix_caching
+            and request.enable_prefix_caching
+            and request.sampling_params.return_log_probs
+            and not request.sampling_params.skip_prompt_log_probs
+        ):
+            raise ValueError(
+                "Prompt log probabilities are not supported for prefix-cached requests because "
+                "cached tokens do not retain logits."
+            )
 
         # Add request to self.requests. If the engine has previously been
         # suspended, then the request may already exist.

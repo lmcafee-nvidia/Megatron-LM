@@ -340,6 +340,7 @@ class KVBlockAllocator:
             return
         id_tensor = torch.tensor(block_ids, dtype=torch.int64, device=self.block_hashes.device)
         hash_tensor = torch.tensor(block_hashes, dtype=torch.int64, device=self.block_hashes.device)
+        new_registration_mask = self.block_hashes[id_tensor] == -1
         self.block_hashes[id_tensor] = hash_tensor
         if parent_hashes is not None:
             assert len(parent_hashes) == len(block_ids)
@@ -360,7 +361,7 @@ class KVBlockAllocator:
             ]
             parent_id_tensor = torch.tensor(parent_ids, dtype=torch.int64, device=id_tensor.device)
             self.block_parent_id[id_tensor] = parent_id_tensor
-            has_parent = parent_id_tensor >= 0
+            has_parent = (parent_id_tensor >= 0) & new_registration_mask
             if has_parent.any():
                 self.block_child_count.scatter_add_(
                     0,
