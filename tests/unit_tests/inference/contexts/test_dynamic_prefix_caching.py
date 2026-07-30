@@ -1,15 +1,38 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import gc
+import json
+import socket
+import time
+import urllib.request
 from collections import deque
 
 import numpy as np
 import pytest
 import torch
 
-from megatron.core.inference.config import InferenceConfig, PrefixCachingEvictionPolicy
-from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
-from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
+from megatron.core.inference.config import (
+    InferenceConfig,
+    KVCacheManagementMode,
+    PrefixCachingCoordinatorPolicy,
+    PrefixCachingEvictionPolicy,
+)
+from megatron.core.inference.contexts.dynamic_context import (
+    BlockOverflowError,
+    DynamicInferenceContext,
+)
+from megatron.core.inference.data_parallel_inference_coordinator.coordinator import (
+    DataParallelInferenceCoordinator,
+)
+from megatron.core.inference.data_parallel_inference_coordinator.handlers import (
+    handle_control_signal,
+)
+from megatron.core.inference.data_parallel_inference_coordinator.state import CoordinatorState
+from megatron.core.inference.engines.async_zmq_communicator import AsyncZMQCommunicator
+from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, EngineState
+from megatron.core.inference.headers import Headers
+from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
@@ -17,9 +40,59 @@ from megatron.core.inference.inference_request import (
     compute_block_hashes_batched,
 )
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.text_generation_server.dynamic_text_gen_server.text_generation_server import (
+    HAS_BACKEND,
+    start_text_gen_server,
+    stop_text_gen_server,
+)
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.cuda_graphs import CudaGraphManager, delete_cuda_graphs
+from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.inference.engines.test_dynamic_engine import (
+    DynamicEngineTestConfig,
+    DynamicInferenceEngineTestBase,
+)
 from tests.unit_tests.test_utilities import Utils
+
+try:
+    import zmq
+
+    HAVE_ZMQ = True
+except ImportError:
+    HAVE_ZMQ = False
+
+
+class _NumericTokenizer:
+    """Picklable tokenizer used by the real coordinator and HTTP subprocesses."""
+
+    vocab_size = 100
+    bos = None
+    eod = 0
+    pad = 0
+
+    def tokenize(self, prompt):
+        return [int(token) % self.vocab_size for token in prompt.split()]
+
+    def detokenize(self, tokens, skip_special_tokens=False):
+        if isinstance(tokens, torch.Tensor):
+            tokens = tokens.tolist()
+        if skip_special_tokens:
+            tokens = [token for token in tokens if token != self.eod]
+        return "".join(f"{token} " for token in tokens)
+
+
+def _http_json(url, payload=None):
+    """Issue one real HTTP request from a worker thread."""
+    data = None if payload is None else json.dumps(payload).encode()
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="GET" if data is None else "POST",
+    )
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return json.loads(response.read())
 
 
 class PrefixCachingTestBase:
@@ -58,6 +131,7 @@ class PrefixCachingTestBase:
         enable_prefix_caching=True,
         max_tokens=None,
         max_requests=None,
+        num_speculative_tokens=0,
         prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
         mamba_config=None,
         prefix_caching_mamba_gb=None,
@@ -83,6 +157,7 @@ class PrefixCachingTestBase:
             block_size_tokens=block_size_tokens,
             max_tokens=max_tokens,
             max_requests=max_requests,
+            num_speculative_tokens=num_speculative_tokens,
             mamba_inference_state_config=mamba_config,
             use_flashinfer_fused_rope=None,
             unified_memory_level=0,
@@ -95,11 +170,15 @@ class PrefixCachingTestBase:
         )
 
     @staticmethod
-    def _req(ctx, prompt_tokens, request_id=1, *, enable_prefix_caching=True):
+    def _req(ctx, prompt_tokens, request_id=1, *, enable_prefix_caching=True, sampling_params=None):
         return DynamicInferenceRequest(
             request_id=request_id,
             prompt_tokens=prompt_tokens,
-            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            sampling_params=(
+                sampling_params
+                if sampling_params is not None
+                else SamplingParams(num_tokens_to_generate=10)
+            ),
             block_size_tokens=ctx.block_size_tokens,
             enable_prefix_caching=enable_prefix_caching,
         )
@@ -147,6 +226,9 @@ class _StubEngine(DynamicInferenceEngine):
 
     def __init__(self, context: DynamicInferenceContext, *, enable_chunked_prefill=False):
         self.context = context
+        self.controller = type("Controller", (), {"tokenizer": _NumericTokenizer()})()
+        self.rank = 0
+        self.materialize_only_last_token_logits = False
         self.enable_chunked_prefill = enable_chunked_prefill
         self.cuda_graph_all_prefills = False
         self._prefix_coordination_waits = 0
@@ -452,6 +534,31 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
             assert alloc3.block_ref_counts[bid.item()].item() == 1
 
     @pytest.mark.internal
+    def test_duplicate_registration_does_not_duplicate_parent_edge(self):
+        """Re-registering one physical child must not strand its parent in the LRU forest."""
+        ctx = self._ctx(rounder=1)
+        alloc = ctx.kv_block_allocator
+        block_ids = alloc.allocate_memory_blocks(2)
+        assert block_ids is not None
+        parent_id, child_id = block_ids.tolist()
+        parent_hash, child_hash = 101, 102
+
+        alloc.register_kv_block_hashes(
+            [parent_id, child_id], [parent_hash, child_hash], parent_hashes=[0, parent_hash]
+        )
+        assert alloc.block_child_count[parent_id].item() == 1
+
+        # Hybrid prefix recovery can recompute a KV-matched block after its
+        # corresponding Mamba state was evicted. That path re-registers the
+        # same physical child and parent edge.
+        alloc.register_kv_block_hashes([child_id], [child_hash], parent_hashes=[parent_hash])
+        assert alloc.block_child_count[parent_id].item() == 1
+
+        alloc.release_memory_blocks(block_ids)
+        assert alloc.evict_lru_blocks(2)
+        assert alloc.kv_hash_to_block_id == {}
+
+    @pytest.mark.internal
     def test_add_request_full_cache_partial_hit_pins_matched_blocks(self):
         """On a partial prefix hit against a FULL cache, the matched
         blocks must be pinned before allocation so LRU eviction cannot reclaim
@@ -519,6 +626,86 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         assert alloc.block_parent_id[s1].item() == s0
         assert alloc.block_parent_id[sx].item() == s1
         assert alloc.kv_hash_to_block_id[h1] == s1
+
+    @pytest.mark.internal
+    def test_failed_partial_hit_admission_rolls_back_and_retries(self):
+        """A failed allocation must not pin or double-count a matched prefix."""
+        ctx = self._ctx()
+        alloc = ctx.kv_block_allocator
+        bs = ctx.block_size_tokens
+
+        producer = self._req(ctx, self._prompt(2 * bs))
+        ctx.add_request(producer)
+        matched_blocks = self._block_ids(ctx, 0, 2)
+        matched_hashes = list(producer.precomputed_block_hashes)
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+        ctx.total_request_count = 0
+
+        # Keep every raw pool block in use. The only allocatable blocks are the
+        # two cached matches, which the follower pins before requesting its tail.
+        drained = alloc.allocate_memory_blocks(alloc.pool_avail)
+        assert drained is not None
+        assert alloc.pool_avail == 0
+        assert int(alloc.get_evictable_block_count()) == 2
+
+        follower = self._req(ctx, self._prompt(3 * bs), request_id=2)
+        hits_before = ctx.prefix_cache_hits
+        blocks_before = ctx.prefix_cache_blocks_matched
+        with pytest.raises(BlockOverflowError):
+            ctx.add_request(follower)
+
+        assert ctx.total_request_count == 0
+        assert follower.num_cached_tokens == 0
+        assert ctx.prefix_cache_hits == hits_before
+        assert ctx.prefix_cache_blocks_matched == blocks_before
+        assert [alloc.block_ref_counts[block].item() for block in matched_blocks] == [0, 0]
+        assert all(
+            alloc.kv_hash_to_block_id[hash_] == block
+            for hash_, block in zip(matched_hashes, matched_blocks)
+        )
+
+        # Releasing one unregistered block makes the retry succeed. The prefix
+        # is counted once, and the cached blocks stay shared rather than evicted.
+        alloc.release_memory_blocks(drained[:1])
+        ctx.add_request(follower)
+        assert follower.num_cached_tokens == 2 * bs
+        assert ctx.prefix_cache_hits == hits_before + 1
+        assert ctx.prefix_cache_blocks_matched == blocks_before + 2
+        assert self._block_ids(ctx, 0, 2) == matched_blocks
+        assert len(set(self._block_ids(ctx, 0, 3))) == 3
+
+    @pytest.mark.internal
+    def test_reset_during_graph_warmup_keeps_block_bag_mutable(self):
+        """Reset must not replace normal allocator state with an inference tensor."""
+        ctx = self._ctx()
+        alloc = ctx.kv_block_allocator
+        block_bag = alloc.block_bag
+        assert not block_bag.is_inference()
+
+        with torch.inference_mode():
+            alloc.reset()
+
+        assert alloc.block_bag is block_bag
+        assert not alloc.block_bag.is_inference()
+
+        # Reproduce the later async LRU-admission path: retain one cached block,
+        # consume the raw pool, then allocate through eviction outside inference mode.
+        cached = alloc.allocate_memory_blocks(1)
+        assert cached is not None
+        cached_id = cached.item()
+        cached_hash = 101
+        alloc.register_kv_block_hashes([cached_id], [cached_hash], parent_hashes=[0])
+        alloc.release_memory_blocks(cached)
+        drained = alloc.allocate_memory_blocks(alloc.pool_avail)
+        assert drained is not None
+        assert alloc.pool_avail == 0
+        assert int(alloc.get_evictable_block_count()) == 1
+
+        replacement = alloc.allocate_memory_blocks(1)
+        assert replacement is not None and replacement.item() == cached_id
+        assert cached_hash not in alloc.kv_hash_to_block_id
+        assert alloc.pool_avail == 0
+        assert int(alloc.get_evictable_block_count()) == 0
 
     @pytest.mark.internal
     def test_check_availability_excludes_already_pinned_matches(self):
@@ -664,6 +851,78 @@ class TestDisabledAndEngineScheduling(PrefixCachingTestBase):
     def _engine(self, ctx, **kwargs):
         return _StubEngine(ctx, **kwargs)
 
+    @pytest.mark.internal
+    def test_generation_epoch_invalidates_coordinator_prefix_assignments(self):
+        client = b"client"
+        ranks = [f"rank-{index}".encode() for index in range(4)]
+        broadcasts = []
+        coordinator = DataParallelInferenceCoordinator.__new__(DataParallelInferenceCoordinator)
+        coordinator.known_clients = {client}
+        coordinator.state = CoordinatorState.RUNNING
+        coordinator._generation_epoch = None
+        coordinator._identities_list = ranks
+        coordinator.identity_to_rank_index = {rank: index for index, rank in enumerate(ranks)}
+        coordinator._pending_counts = np.zeros(len(ranks), dtype=np.int32)
+        coordinator.max_requests = 16
+        coordinator.enable_prefix_caching = True
+        coordinator.prefix_caching_coordinator_policy = (
+            PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
+        )
+        coordinator.prefix_caching_routing_alpha = 0.5
+        coordinator._hash_table = {}
+        coordinator._hash_assignment_counter = 0
+        coordinator._broadcast_to_engines = broadcasts.append
+
+        owners = []
+        for group in range(8):
+            hashes = [100 + 2 * group, 101 + 2 * group]
+            owner = coordinator.get_best_data_parallel_rank(hashes)
+            coordinator._update_rank_hashes(owner, hashes)
+            coordinator._pending_counts[coordinator.identity_to_rank_index[owner]] += 1
+            assert coordinator.get_best_data_parallel_rank(hashes) == owner
+            owners.append(owner)
+        assert set(owners) == set(ranks)
+        assert len(coordinator._hash_table) == 16
+
+        handle_control_signal(coordinator, client, [Headers.SET_GENERATION_EPOCH.value, 1])
+        assert coordinator._hash_table == {}
+        coordinator._update_rank_hashes(ranks[-1], [999])
+        handle_control_signal(coordinator, client, [Headers.SET_GENERATION_EPOCH.value, 1])
+        assert coordinator._hash_table == {999: {3: coordinator._hash_assignment_counter}}
+        handle_control_signal(coordinator, client, [Headers.SET_GENERATION_EPOCH.value, 2])
+        assert coordinator._hash_table == {}
+        assert len(broadcasts) == 3
+
+    @pytest.mark.internal
+    def test_epoch_change_keeps_unstarted_requests_cacheable(self):
+        ctx = self._ctx()
+        engine = self._engine(ctx)
+        before = self._req(ctx, self._prompt(ctx.block_size_tokens), request_id=1)
+        before_hashes = list(before.precomputed_block_hashes)
+        engine._add_request(before)
+
+        engine._set_generation_epoch(1)
+
+        assert before.enable_prefix_caching
+        assert before.precomputed_block_hashes == before_hashes
+        assert before.policy_epoch == [(0, 1)]
+        assert before.kv_cache_epoch == [(0, 1)]
+
+        after = self._req(ctx, before.prompt_tokens.clone(), request_id=2)
+        engine._add_request(after)
+        assert after.enable_prefix_caching
+        assert after.policy_epoch == [(0, 1)]
+        assert after.kv_cache_epoch == [(0, 1)]
+
+        engine._set_generation_epoch(1)
+        assert before.policy_epoch == after.policy_epoch == [(0, 1)]
+        assert before.kv_cache_epoch == after.kv_cache_epoch == [(0, 1)]
+        engine.schedule_non_chunked_prefill()
+        assert ctx.total_request_count == 1 and list(engine.waiting_request_ids) == [2]
+        engine.schedule_non_chunked_prefill()
+        assert ctx.total_request_count == 2
+        assert after.num_cached_tokens == ctx.block_size_tokens
+
     def _add_to_waiting(self, engine, ctx, req):
         request_id = req.request_id
         engine.requests[request_id] = type(
@@ -677,6 +936,172 @@ class TestDisabledAndEngineScheduling(PrefixCachingTestBase):
         req.status = Status.ACTIVE_AND_GENERATING_TOKENS
         req.sampling_params.num_tokens_to_generate = 10
         engine.waiting_request_ids.append(request_id)
+
+    @pytest.mark.internal
+    def test_epoch_change_disables_hidden_chunked_prefill_cache_publication(self):
+        ctx = self._ctx(
+            block_size_tokens=256,
+            max_sequence_length=1024,
+            max_tokens=256,
+            max_requests=4,
+            mamba_config=self._mamba_config(),
+            prefix_caching_mamba_gb=0.01,
+        )
+        engine = self._engine(ctx, enable_chunked_prefill=True)
+        request = self._req(ctx, self._prompt(512))
+        self._add_to_waiting(engine, ctx, request)
+
+        engine.schedule_chunked_prefill()
+        assert request.finished_chunk_token_count == 256
+        assert ctx.chunked_prefill_request_id == request.request_id
+        block_id = self._block_ids(ctx, 0, 1)[0]
+        self._mamba_allocate_and_register(ctx, [block_id])
+
+        # update_requests() hides an in-progress chunk at this boundary while
+        # retaining its KV and Mamba state for the next prefill chunk.
+        ctx.total_request_count = 0
+        ctx.active_token_count = 0
+        engine._set_generation_epoch(1)
+
+        assert not request.enable_prefix_caching
+        assert request.precomputed_block_hashes == []
+        assert not ctx.kv_block_allocator.kv_hash_to_block_id
+        assert not ctx.mamba_slot_allocator.hash_to_block_id
+
+        engine.schedule_chunked_prefill()
+        assert ctx.chunked_prefill_request_id == -1
+        assert len(request.remaining_prompt_tokens) == 0
+        assert not ctx.kv_block_allocator.kv_hash_to_block_id
+        assert not ctx.mamba_slot_allocator.hash_to_block_id
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("hybrid", [False, True], ids=["gpt", "hybrid"])
+    def test_epoch_change_invalidates_inference_tensors_outside_inference_mode(self, hybrid):
+        with torch.inference_mode():
+            ctx = self._ctx(
+                max_tokens=128,
+                max_requests=4,
+                mamba_config=self._mamba_config() if hybrid else None,
+                prefix_caching_mamba_gb=0.01 if hybrid else None,
+            )
+            alloc = ctx.kv_block_allocator
+            engine = self._engine(ctx)
+            request = self._req(ctx, self._prompt(ctx.block_size_tokens))
+            ctx.add_request(request)
+            (block_id,) = self._block_ids(ctx, 0, 1)
+            block_hash = request.precomputed_block_hashes[0]
+            if hybrid:
+                mamba = ctx.mamba_slot_allocator
+                (slot,) = self._mamba_allocate_and_register(ctx, [block_id])
+                mamba._intermediate_offsets_cpu[0, 0] = 1
+                mamba._intermediate_counts_cpu[0] = 1
+                mamba._intermediate_block_ids_cpu[0, 0] = block_id
+                mamba._eos_cache_block_id_cpu[0] = block_id
+                mamba._has_intermediates = True
+            ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+            pool_avail_before = alloc.pool_avail
+            assert alloc.block_bag.is_inference()
+            if hybrid:
+                assert mamba.block_to_slot.is_inference()
+                assert mamba.free_count == mamba.max_slots - 1
+
+        assert not torch.is_inference_mode_enabled()
+        engine._set_generation_epoch(1)
+
+        assert block_hash not in alloc.kv_hash_to_block_id
+        assert alloc.block_hashes[block_id].item() == -1
+        assert alloc.pool_avail == pool_avail_before + 1
+        if hybrid:
+            assert mamba.free_count == mamba.max_slots
+            assert not mamba.hash_to_block_id
+            assert mamba.block_to_slot[block_id].item() == -1
+            assert mamba.slot_to_block[slot].item() == -1
+            assert mamba._intermediate_offsets_cpu.count_nonzero().item() == 0
+            assert mamba._intermediate_counts_cpu.count_nonzero().item() == 0
+            assert torch.all(mamba._intermediate_block_ids_cpu == -1)
+            assert torch.all(mamba._eos_cache_block_id_cpu == -1)
+            assert not mamba._has_intermediates
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("hybrid", [False, True], ids=["gpt", "hybrid"])
+    @pytest.mark.parametrize(
+        "policy",
+        [PrefixCachingEvictionPolicy.LRU, PrefixCachingEvictionPolicy.REF_ZERO],
+        ids=["lru", "ref-zero"],
+    )
+    def test_epoch_change_invalidates_cache_without_disrupting_live_request(self, hybrid, policy):
+        ctx = self._ctx(
+            max_tokens=256,
+            max_requests=8,
+            mamba_config=self._mamba_config() if hybrid else None,
+            prefix_caching_mamba_gb=0.01 if hybrid else None,
+            prefix_caching_eviction_policy=policy,
+        )
+        alloc = ctx.kv_block_allocator
+        engine = self._engine(ctx)
+        bs = ctx.block_size_tokens
+
+        live = self._req(ctx, self._prompt(2 * bs), request_id=1)
+        ctx.add_request(live)
+        self._add_to_waiting(engine, ctx, live)
+        live_blocks = self._block_ids(ctx, 0, 2)
+        live_hashes = set(live.precomputed_block_hashes)
+
+        cached = self._req(ctx, self._prompt(bs, offset=10_000), request_id=2)
+        ctx.add_request(cached)
+        (cached_block,) = self._block_ids(ctx, 1, 1)
+        cached_hash = cached.precomputed_block_hashes[0]
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
+        assert alloc.block_ref_counts[cached_block].item() == 0
+        if policy == PrefixCachingEvictionPolicy.LRU:
+            assert alloc.kv_hash_to_block_id[cached_hash] == cached_block
+        else:
+            assert cached_hash not in alloc.kv_hash_to_block_id
+            assert alloc.block_hashes[cached_block].item() == -1
+
+        routing = np.ones((bs, 1, 1), dtype=np.int64)
+        alloc.block_routing[live_blocks[0]] = routing.copy()
+        if policy == PrefixCachingEvictionPolicy.LRU:
+            alloc.block_routing[cached_block] = routing.copy()
+        pool_avail_before = alloc.pool_avail
+        if hybrid:
+            mamba_alloc = ctx.mamba_slot_allocator
+            assert mamba_alloc._has_intermediates
+            free_slots = mamba_alloc.free_slots
+            assert not free_slots.is_inference()
+
+        engine._set_generation_epoch(1)
+
+        assert live.enable_prefix_caching is False
+        assert live.precomputed_block_hashes == []
+        assert live.kv_cache_epoch == [(0, 1)]
+        assert live_hashes.isdisjoint(alloc.kv_hash_to_block_id)
+        assert cached_hash not in alloc.kv_hash_to_block_id
+        assert all(alloc.block_hashes[block_id].item() == -1 for block_id in live_blocks)
+        assert all(alloc.block_ref_counts[block_id].item() == 1 for block_id in live_blocks)
+        expected_reclaimed = int(policy == PrefixCachingEvictionPolicy.LRU)
+        assert alloc.pool_avail == pool_avail_before + expected_reclaimed
+        assert live_blocks[0] in alloc.block_routing
+        assert cached_block not in alloc.block_routing
+        replacement = alloc.allocate_memory_blocks(1)
+        assert replacement is not None and replacement.item() == cached_block
+
+        if hybrid:
+            assert mamba_alloc.free_slots is free_slots
+            assert not mamba_alloc.free_slots.is_inference()
+            assert not mamba_alloc._has_intermediates
+            assert mamba_alloc.free_count == mamba_alloc.max_slots
+            (slot,) = mamba_alloc.allocate_slots_batch(replacement.tolist())
+            mamba_alloc.invalidate_block(replacement.item())
+            assert mamba_alloc.free_slots[-1].item() == slot
+            durable_free_before = mamba_alloc.free_count
+            uncacheable = self._req(
+                ctx, self._prompt(2 * bs, offset=20_000), request_id=3, enable_prefix_caching=False
+            )
+            ctx.add_request(uncacheable)
+            assert not mamba_alloc._has_intermediates
+            mamba_alloc.commit_intermediate_states()
+            assert mamba_alloc.free_count == durable_free_before
 
     @pytest.mark.internal
     def test_disabled_mode(self):
@@ -1512,6 +1937,77 @@ class TestPerBlockRouting(PrefixCachingTestBase):
     """Tests for per-block routing storage and reconstruction."""
 
     @pytest.mark.internal
+    def test_finished_checkpointed_request_reconstructs_full_routing(self):
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        generated = [bs + 1, bs + 2, bs + 3, bs + 4]
+        prompt = self._prompt(2 * bs)
+        producer = self._req(ctx, prompt.clone(), request_id=99)
+        ctx.add_request(producer)
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+        request = self._req(
+            ctx,
+            prompt,
+            request_id=0,
+            sampling_params=SamplingParams(
+                num_tokens_to_generate=4,
+                termination_id=-1,
+                return_log_probs=True,
+                skip_prompt_log_probs=True,
+            ),
+        )
+        ctx.add_request(request)
+        assert request.num_cached_tokens == 2 * bs
+        engine = _StubEngine(ctx)
+        future = engine._add_request(request)
+        engine.waiting_request_ids.clear()
+        record = engine.requests[request.request_id].record
+        record.checkpoint()
+        current = record[-1]
+        current.generated_tokens = generated[:3]
+        current.generated_log_probs = [-0.1, -0.2, -0.3]
+        assert len(record.requests) == 2
+        assert all(part.routing_indices is None for part in record.requests)
+
+        block_ids = self._block_ids(ctx, 1, 2)
+        block_ids += ctx.kv_block_allocator.allocate_memory_blocks(1).tolist()
+        routing = np.arange(3 * bs * 4, dtype=np.int16).reshape(3 * bs, 2, 2)
+        for block_idx, block_id in enumerate(block_ids):
+            start = block_idx * bs
+            ctx.kv_block_allocator.store_block_routing(
+                block_id, np.arange(bs), routing[start : start + bs]
+            )
+
+        engine.finished_request_count = 0
+        engine.evicted_request_count = 0
+        engine.track_generated_token_events = False
+        engine.num_speculative_tokens = 0
+        engine.stop_word_being_finished_ids = set()
+        active_ids, finished_records = engine.post_process_requests(
+            request_ids=torch.tensor([request.request_id]),
+            finished_request_ids=torch.tensor([request.request_id]),
+            evict_request_ids=torch.empty(0, dtype=torch.int64),
+            step_time=0.0,
+            sample=torch.tensor(generated[3:]),
+            accepted_tokens=None,
+            log_probs=[[-0.4]],
+            finished_routing_block_ids={request.request_id: block_ids},
+        )
+
+        expected = routing[: 2 * bs + 3]
+        merged = record.merge()
+        assert active_ids == []
+        assert finished_records == [record]
+        assert future.result() is record
+        assert merged.generated_tokens == generated
+        assert merged.generated_log_probs == [-0.1, -0.2, -0.3, -0.4]
+        np.testing.assert_array_equal(current.routing_indices, expected)
+        np.testing.assert_array_equal(merged.routing_indices, expected)
+        assert merged.routing_indices.shape[0] == (
+            len(merged.prompt_tokens) + len(merged.generated_tokens) - 1
+        )
+
+    @pytest.mark.internal
     def test_store_and_get_block_routing(self):
         """Verify store_block_routing / get_block_routing round-trip."""
         ctx = self._ctx()
@@ -1826,3 +2322,1384 @@ class TestPrefixCacheReuse(PrefixCachingTestBase):
             msa._intermediate_block_ids_cpu[0, idx].item()
             == ctx.request_to_kv_block_ids[0][last_aligned_abs // bs - 1].item()
         )
+
+    @pytest.mark.internal
+    def test_mamba_aligned_chunk_endpoint_commits_and_restores(self):
+        # A block boundary exactly at a non-final chunk end is not an extractable
+        # interior offset. Commit it from the live state, then prove that a
+        # matching request skips to and restores that exact boundary.
+        ctx = self._ctx(
+            mamba_config=self._mamba_config(),
+            prefix_caching_mamba_gb=0.01,
+            block_size_tokens=256,
+            max_sequence_length=4096,
+        )
+        bs = ctx.block_size_tokens
+        prompt = self._prompt(2 * bs + 7)
+        seed = self._req(ctx, prompt.clone())
+        ctx.add_request(seed)
+        msa = ctx.mamba_slot_allocator
+
+        seed.finished_chunk_token_count = bs
+        msa.compute_and_store_offsets(
+            seed,
+            current_id=0,
+            skip_tokens=0,
+            prefill_chunk_length=bs,
+            num_matched_blocks=0,
+            matched_block_ids=[],
+            overall_required_blocks=ctx.request_kv_block_counts[0].item(),
+        )
+        seed.finished_chunk_token_count = 0
+
+        endpoint_block = ctx.request_to_kv_block_ids[0][1].item()
+        assert msa._intermediate_counts_cpu[0].item() == 0
+        assert msa._eos_cache_block_id_cpu[0].item() == endpoint_block
+
+        ctx.initialize_attention_state()
+        seed_mamba_idx = ctx.mamba_metadata.request_to_mamba_state_idx[0].item()
+        ctx.mamba_conv_states[:, seed_mamba_idx].fill_(17)
+        ctx.mamba_ssm_states[:, seed_mamba_idx].fill_(23)
+        msa.commit_intermediate_states()
+
+        endpoint_hash = seed.precomputed_block_hashes[1]
+        endpoint_slot = msa.block_to_slot[endpoint_block].item()
+        assert msa.hash_to_block_id[endpoint_hash] == endpoint_block
+        assert torch.all(msa.conv_states[:, endpoint_slot] == 17)
+        assert torch.all(msa.ssm_states[:, endpoint_slot] == 23)
+
+        follower = self._req(ctx, prompt.clone(), request_id=2)
+        matched, _, _, _, prefix_skip, _ = ctx._compute_prefix_match(follower, len(prompt))
+        assert len(matched) == 2 and prefix_skip == 2 * bs
+        ctx.add_request(follower)
+        assert follower._mamba_num_matched_blocks == 2
+        ctx.initialize_attention_state()
+
+        follower_mamba_idx = ctx.mamba_metadata.request_to_mamba_state_idx[1].item()
+        assert torch.all(ctx.mamba_conv_states[:, follower_mamba_idx] == 17)
+        assert torch.all(ctx.mamba_ssm_states[:, follower_mamba_idx] == 23)
+
+
+# Each ownership entry names an assertion returned by the executed row.  Keeping
+# this table beside the matrix makes additions reviewable: a feature/policy pair
+# is not owned merely because a flag was passed to a constructor.
+PREFIX_CACHE_CONTEXT_PAIR_OWNERS = {
+    "exact-prefix×lru": "exact-prefix-hit-and-full-block-clamp",
+    "exact-prefix×ref-zero": "exact-prefix-hit-and-full-block-clamp",
+    "partial-prefix×lru": "partial-prefix-hit",
+    "partial-prefix×ref-zero": "partial-prefix-hit",
+    "missing-prefix×lru": "missing-prefix-observed",
+    "missing-prefix×ref-zero": "missing-prefix-observed",
+    "concurrent-sharing×lru": "concurrent-refcounts-churned",
+    "concurrent-sharing×ref-zero": "concurrent-refcounts-churned",
+    "mixed-cached-fresh×lru": "mixed-query-lengths-executed",
+    "mixed-cached-fresh×ref-zero": "mixed-query-lengths-executed",
+}
+
+PREFIX_CACHE_CONTEXT_CASES = [
+    pytest.param(feature, policy, id=f"{feature}-{policy.name.lower()}")
+    for feature in (
+        "exact-prefix",
+        "partial-prefix",
+        "missing-prefix",
+        "concurrent-sharing",
+        "mixed-cached-fresh",
+    )
+    for policy in (PrefixCachingEvictionPolicy.LRU, PrefixCachingEvictionPolicy.REF_ZERO)
+]
+
+
+class TestPrefixCachePolicyStressMatrix(PrefixCachingTestBase):
+    """Small allocator matrix; real-model combinations live in the engine matrix below."""
+
+    def _apply_local_churn(self, ctx, producer, producer_blocks):
+        """Force a policy-specific block recycle after a feature assertion."""
+        alloc = ctx.kv_block_allocator
+        policy = alloc.prefix_caching_eviction_policy
+        live_indexes = torch.arange(ctx.total_request_count)
+        ctx.release_memory_blocks_from_request_indexes(live_indexes)
+
+        if policy == PrefixCachingEvictionPolicy.LRU:
+            cached_before = dict(alloc.kv_hash_to_block_id)
+            assert cached_before
+            filler = alloc.allocate_memory_blocks(alloc.pool_avail)
+            assert filler is not None and alloc.pool_avail == 0
+        else:
+            assert alloc.kv_hash_to_block_id == {}
+            assert all(alloc.block_hashes[bid].item() == -1 for bid in producer_blocks)
+            filler = alloc.allocate_memory_blocks(alloc.pool_avail)
+            assert filler is not None and alloc.pool_avail == 0
+            producer_tensor = torch.tensor(producer_blocks, dtype=torch.int32)
+            assert set(producer_blocks) <= set(filler.tolist())
+            alloc.release_memory_blocks(producer_tensor)
+            assert alloc.pool_avail == len(producer_blocks)
+
+        pressure = self._req(
+            ctx, self._prompt(3 * ctx.block_size_tokens, offset=200_000), request_id=100
+        )
+        pressure_idx = ctx.total_request_count
+        ctx.add_request(pressure)
+        pressure_blocks = set(self._block_ids(ctx, pressure_idx, 3))
+
+        if policy == PrefixCachingEvictionPolicy.LRU:
+            removed_ids = {
+                block_id
+                for block_hash, block_id in cached_before.items()
+                if block_hash not in alloc.kv_hash_to_block_id
+            }
+            assert pressure_blocks == removed_ids
+            return "lru-local-eviction"
+
+        assert pressure_blocks == set(producer_blocks)
+        assert not any(
+            block_hash in alloc.kv_hash_to_block_id
+            for block_hash in producer.precomputed_block_hashes
+        )
+        return "ref-zero-local-recycle"
+
+    def _run_feature_probe(self, feature, policy):
+        ctx = self._ctx(
+            buffer_size_gb=0.001,
+            rounder=1,
+            max_requests=12,
+            max_tokens=512,
+            prefix_caching_eviction_policy=policy,
+        )
+        alloc = ctx.kv_block_allocator
+        bs = ctx.block_size_tokens
+        prompt = self._prompt(3 * bs)
+        producer = self._req(ctx, prompt.clone())
+        ctx.add_request(producer)
+        producer_blocks = self._block_ids(ctx, 0, 3)
+        if policy == PrefixCachingEvictionPolicy.LRU:
+            ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+
+        if feature == "exact-prefix":
+            probe = self._req(ctx, prompt.clone(), request_id=2)
+            matched, _, _, _, skipped, effective = ctx._compute_prefix_match(probe, len(prompt))
+            assert matched == producer_blocks
+            assert skipped == 2 * bs and effective == bs
+            ctx.add_request(probe)
+            assert probe.num_cached_tokens == 3 * bs
+            activation = "exact-prefix-hit-and-full-block-clamp"
+
+        elif feature == "partial-prefix":
+            partial = torch.cat((prompt[: 2 * bs], self._prompt(bs, offset=50_000)))
+            probe = self._req(ctx, partial, request_id=2)
+            matched, *_ = ctx._compute_prefix_match(probe, len(partial))
+            assert matched == producer_blocks[:2]
+            ctx.add_request(probe)
+            assert probe.num_cached_tokens == 2 * bs
+            activation = "partial-prefix-hit"
+
+        elif feature == "missing-prefix":
+            probe = self._req(ctx, self._prompt(3 * bs, offset=50_000), request_id=2)
+            matched, *_ = ctx._compute_prefix_match(probe, 3 * bs)
+            assert matched == []
+            ctx.add_request(probe)
+            assert probe.num_cached_tokens == 0
+            activation = "missing-prefix-observed"
+
+        elif feature == "concurrent-sharing":
+            for request_id in range(2, 5):
+                ctx.add_request(self._req(ctx, prompt.clone(), request_id=request_id))
+            expected_refs = 3 + int(policy == PrefixCachingEvictionPolicy.REF_ZERO)
+            assert all(
+                alloc.block_ref_counts[bid].item() == expected_refs for bid in producer_blocks
+            )
+            ctx.release_memory_blocks_from_request_indexes(torch.tensor([1, 2, 3]))
+            remaining_refs = int(policy == PrefixCachingEvictionPolicy.REF_ZERO)
+            assert all(
+                alloc.block_ref_counts[bid].item() == remaining_refs for bid in producer_blocks
+            )
+            activation = "concurrent-refcounts-churned"
+
+        else:
+            assert feature == "mixed-cached-fresh"
+            cached = self._req(ctx, prompt.clone(), request_id=2)
+            fresh = self._req(ctx, self._prompt(3 * bs, offset=50_000), request_id=3)
+            ctx.add_request(cached)
+            ctx.add_request(fresh)
+            assert ctx.request_query_lengths[1].item() == bs
+            assert ctx.request_query_lengths[2].item() == 3 * bs
+            assert cached.num_cached_tokens == 3 * bs
+            assert fresh.num_cached_tokens == 0
+            activation = "mixed-query-lengths-executed"
+
+        churn = self._apply_local_churn(ctx, producer, producer_blocks)
+        return activation, churn
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("feature,policy", PREFIX_CACHE_CONTEXT_CASES)
+    def test_context_policy_matrix(self, feature, policy):
+        activation, churn = self._run_feature_probe(feature, policy)
+        pair = f"{feature}×{'lru' if policy == PrefixCachingEvictionPolicy.LRU else 'ref-zero'}"
+        assert PREFIX_CACHE_CONTEXT_PAIR_OWNERS[pair] == activation
+        expected_churn = (
+            "lru-local-eviction"
+            if policy == PrefixCachingEvictionPolicy.LRU
+            else "ref-zero-local-recycle"
+        )
+        assert churn == expected_churn
+
+
+PREFIX_CACHE_ENGINE_CASES = [
+    pytest.param(dict(name="gpt-tp4", model="gpt", feature="tp", tp=4), id="gpt-tp4"),
+    pytest.param(dict(name="hybrid-tp4", model="hybrid", feature="tp", tp=4), id="hybrid-tp4"),
+    pytest.param(dict(name="gpt-pp4", model="gpt", feature="pp", pp=4), id="gpt-pp4"),
+    pytest.param(
+        dict(name="hybrid-pp2", model="hybrid", feature="pp", pp=2, num_tokens_to_generate=3),
+        id="hybrid-pp2",
+    ),
+    pytest.param(
+        dict(name="gpt-tp2-pp2-sp", model="gpt", feature="mixed-parallel", tp=2, pp=2, sp=True),
+        id="gpt-tp2-pp2-sp",
+    ),
+    pytest.param(
+        dict(
+            name="hybrid-tp2-pp2-sp", model="hybrid", feature="mixed-parallel", tp=2, pp=2, sp=True
+        ),
+        id="hybrid-tp2-pp2-sp",
+    ),
+    pytest.param(dict(name="gpt-ep4", model="gpt", feature="moe", ep=4), id="gpt-ep4-moe"),
+    pytest.param(dict(name="hybrid-ep2", model="hybrid", feature="moe", ep=2), id="hybrid-ep2-moe"),
+    pytest.param(dict(name="gpt-chunked", model="gpt", feature="chunked"), id="gpt-chunked"),
+    pytest.param(
+        dict(name="hybrid-chunked", model="hybrid", feature="chunked"), id="hybrid-chunked"
+    ),
+    pytest.param(
+        dict(name="gpt-cuda-graph", model="gpt", feature="cuda-graph"), id="gpt-cuda-graph"
+    ),
+    pytest.param(
+        dict(name="hybrid-cuda-graph", model="hybrid", feature="cuda-graph"), id="hybrid-cuda-graph"
+    ),
+    pytest.param(dict(name="gpt-mtp", model="gpt", feature="mtp"), id="gpt-mtp"),
+    pytest.param(dict(name="hybrid-mtp", model="hybrid", feature="mtp"), id="hybrid-mtp"),
+    pytest.param(dict(name="gpt-logprobs", model="gpt", feature="logprobs"), id="gpt-logprobs"),
+    pytest.param(
+        dict(name="hybrid-logprobs", model="hybrid", feature="logprobs"), id="hybrid-logprobs"
+    ),
+    pytest.param(dict(name="gpt-offload", model="gpt", feature="offload"), id="gpt-offload-resume"),
+    pytest.param(
+        dict(
+            name="hybrid-offload",
+            model="hybrid",
+            feature="offload",
+            chunked=True,
+            suspend_interval=1,
+        ),
+        id="hybrid-offload-chunked-resume",
+    ),
+    pytest.param(
+        dict(name="gpt-recompute", model="gpt", feature="recompute"), id="gpt-recompute-resume"
+    ),
+    pytest.param(
+        dict(name="hybrid-recompute", model="hybrid", feature="recompute"),
+        id="hybrid-recompute-resume",
+    ),
+    pytest.param(dict(name="gpt-epoch", model="gpt", feature="epoch"), id="gpt-epoch-invalidation"),
+    pytest.param(
+        dict(name="hybrid-epoch", model="hybrid", feature="epoch"), id="hybrid-epoch-invalidation"
+    ),
+    pytest.param(
+        dict(name="gpt-request-eviction", model="gpt", feature="request-eviction"),
+        id="gpt-request-eviction-checkpoint-resume",
+    ),
+    pytest.param(
+        dict(name="hybrid-request-eviction", model="hybrid", feature="request-eviction"),
+        id="hybrid-request-eviction-checkpoint-resume",
+    ),
+    pytest.param(dict(name="gpt-uvm", model="gpt", feature="uvm"), id="gpt-uvm-backed-lifecycle"),
+    pytest.param(
+        dict(name="hybrid-uvm", model="hybrid", feature="uvm"), id="hybrid-uvm-backed-lifecycle"
+    ),
+]
+
+PREFIX_CACHE_ENGINE_LRU_CASES = {
+    "hybrid-tp4",
+    "gpt-pp4",
+    "hybrid-tp2-pp2-sp",
+    "gpt-ep4",
+    "hybrid-chunked",
+    "gpt-cuda-graph",
+    "hybrid-mtp",
+    "gpt-logprobs",
+    "hybrid-offload",
+    "gpt-recompute",
+    "gpt-epoch",
+    "gpt-request-eviction",
+    "gpt-uvm",
+    "gpt-http-zmq",
+}
+
+PREFIX_CACHE_ENGINE_PAIR_OWNERS = {
+    "gpt-tp4×ref-zero": "tensor-parallel-prefix-hit",
+    "hybrid-tp4×lru": "tensor-parallel-prefix-hit",
+    "gpt-pp4×lru": "pipeline-parallel-prefix-hit",
+    "hybrid-pp2×ref-zero": "pipeline-parallel-prefix-hit",
+    "gpt-tp2-pp2-sp×ref-zero": "mixed-parallel-prefix-hit",
+    "hybrid-tp2-pp2-sp×lru": "mixed-parallel-prefix-hit",
+    "gpt-ep4×lru": "moe-expert-parallel-forward-with-prefix-hits",
+    "hybrid-ep2×ref-zero": "moe-expert-parallel-forward-with-prefix-hits",
+    "gpt-chunked×ref-zero": "chunked-prefix-reuse",
+    "hybrid-chunked×lru": "chunked-prefix-reuse",
+    "gpt-cuda-graph×lru": "cuda-graph-replay-with-prefix-hits",
+    "hybrid-cuda-graph×ref-zero": "cuda-graph-replay-with-prefix-hits",
+    "gpt-mtp×ref-zero": "mtp-speculative-proposals-with-prefix-hits",
+    "hybrid-mtp×lru": "mtp-speculative-proposals-with-prefix-hits",
+    "gpt-logprobs×lru": "generated-logprob-hit-and-prompt-logprob-bypass-parity",
+    "hybrid-logprobs×ref-zero": "generated-logprob-hit-and-prompt-logprob-bypass-parity",
+    "gpt-offload×ref-zero": "offload-prefix-resume",
+    "hybrid-offload×lru": "offload-prefix-resume",
+    "gpt-recompute×lru": "recompute-prefix-resume",
+    "hybrid-recompute×ref-zero": "recompute-prefix-resume",
+    "gpt-epoch×lru": "epoch-signal-invalidation-rebuild",
+    "hybrid-epoch×ref-zero": "epoch-signal-with-prefix-hits",
+    "gpt-request-eviction×lru": "request-eviction-checkpoint-resume",
+    "hybrid-request-eviction×ref-zero": "request-eviction-checkpoint-resume",
+    "gpt-uvm×lru": "uvm-backed-prefix-lifecycle",
+    "hybrid-uvm×ref-zero": "uvm-backed-prefix-lifecycle",
+    "gpt-http-zmq×lru": "http-zmq-lru-pressure-epoch-parity",
+}
+
+
+class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
+    """Real model/engine pair coverage; every row executes three sharing waves."""
+
+    @classmethod
+    def _build_inference_context(
+        cls, test_config, transformer_config, requests, mamba_inference_state_config=None
+    ):
+        # The shared engine harness intentionally defaults hybrid prefix caching
+        # to KV-only mode.  This matrix supplies a durable Mamba budget so the
+        # hybrid rows execute KV matching, state extraction, and state restore.
+        return DynamicInferenceContext(
+            model_config=transformer_config,
+            inference_config=InferenceConfig(
+                max_sequence_length=test_config.max_sequence_length,
+                num_cuda_graphs=test_config.num_cuda_graphs,
+                use_cuda_graphs_for_non_decode_steps=test_config.use_cuda_graphs_for_non_decode_steps,
+                cuda_graph_all_prefills=test_config.cuda_graph_all_prefills,
+                buffer_size_gb=test_config.context_buffer_size_gb,
+                paused_buffer_size_gb=test_config.context_paused_buffer_size_gb,
+                block_size_tokens=test_config.context_block_size_tokens,
+                max_requests=test_config.context_max_requests,
+                max_tokens=test_config.context_max_tokens,
+                mamba_inference_state_config=mamba_inference_state_config,
+                materialize_only_last_token_logits=test_config.materialize_only_last_token_logits,
+                kv_cache_management_mode=KVCacheManagementMode(
+                    test_config.kv_cache_management_mode
+                ),
+                static_kv_memory_pointers=test_config.static_kv_memory_pointers,
+                enable_chunked_prefill=test_config.enable_chunked_prefill,
+                enable_prefix_caching=test_config.enable_prefix_caching,
+                prefix_caching_eviction_policy=test_config.prefix_caching_eviction_policy,
+                prefix_caching_mamba_gb=(
+                    0.02 if mamba_inference_state_config is not None else None
+                ),
+                use_flashinfer_fused_rope=None,
+                unified_memory_level=getattr(test_config, "unified_memory_level", 0),
+                track_generated_token_events=test_config.track_generated_token_events,
+                num_speculative_tokens=test_config.num_speculative_tokens,
+                sampling_backend=test_config.sampling_backend,
+                async_sched_mode=test_config.async_sched_mode,
+            ),
+        )
+
+    @staticmethod
+    def _case_config(case, *, enable_prefix_caching):
+        feature = case["feature"]
+        block_size = 256  # FlashAttention requires paged KV blocks divisible by 256.
+        prompt_length = 3 * block_size - 2 if feature == "request-eviction" else 2 * block_size + 5
+        num_speculative_tokens = 2 if feature == "mtp" else 0
+        kwargs = dict(
+            num_requests=0,
+            min_prompt_length=prompt_length,
+            max_prompt_length=prompt_length,
+            num_tokens_to_generate=case.get("num_tokens_to_generate", 4),
+            max_sequence_length=prompt_length + 8,
+            context_buffer_size_gb=0.02,
+            context_block_size_tokens=block_size,
+            context_max_requests=8 if case["model"] == "hybrid" else 32,
+            context_max_tokens=4096,
+            tensor_model_parallel_size=case.get("tp", 1),
+            pipeline_model_parallel_size=case.get("pp", 1),
+            expert_model_parallel_size=case.get("ep", 1),
+            sequence_parallel=case.get("sp", False),
+            model_provider=case["model"],
+            enable_prefix_caching=enable_prefix_caching,
+            num_speculative_tokens=num_speculative_tokens,
+            materialize_only_last_token_logits=(feature not in ("mtp", "logprobs")),
+            return_log_probs=(feature in ("logprobs", "request-eviction")),
+            skip_prompt_log_probs=(feature in ("logprobs", "request-eviction")),
+            enable_chunked_prefill=(feature == "chunked" or case.get("chunked", False)),
+        )
+        if feature == "chunked":
+            kwargs["context_max_tokens"] = block_size + 8
+            kwargs["use_cuda_graphs_for_non_decode_steps"] = False
+        elif feature == "cuda-graph":
+            kwargs.update(
+                num_cuda_graphs=2,
+                force_build_cuda_graphs=True,
+                use_cuda_graphs_for_non_decode_steps=False,
+                inference_cuda_graph_scope=InferenceCudaGraphScope.block,
+            )
+        elif feature in ("offload", "recompute"):
+            kwargs.update(
+                kv_cache_management_mode=feature,
+                static_kv_memory_pointers=False,
+                suspend_resume_interval=case.get("suspend_interval", 2),
+                num_cuda_graphs=2,
+                force_build_cuda_graphs=True,
+                use_cuda_graphs_for_non_decode_steps=False,
+                inference_cuda_graph_scope=InferenceCudaGraphScope.block,
+            )
+        elif feature == "request-eviction":
+            kwargs["context_paused_buffer_size_gb"] = 0
+        elif feature == "uvm":
+            # PERSIST does not migrate KV storage during suspend/resume.  This
+            # row verifies UVM-backed allocation plus repeated lifecycle state
+            # transitions and stable backing storage, not offload/restore.
+            kwargs.update(
+                kv_cache_management_mode="persist",
+                static_kv_memory_pointers=True,
+                suspend_resume_interval=2,
+            )
+        config = DynamicEngineTestConfig(**kwargs)
+        if case.get("chunked", False):
+            config.context_max_tokens = block_size + 8
+        if feature == "uvm":
+            config.unified_memory_level = 1
+        config.prefix_caching_eviction_policy = (
+            PrefixCachingEvictionPolicy.LRU
+            if case["name"] in PREFIX_CACHE_ENGINE_LRU_CASES
+            else PrefixCachingEvictionPolicy.REF_ZERO
+        )
+        return config
+
+    @staticmethod
+    def _make_engine_request(
+        ctx,
+        request_id,
+        prompt,
+        *,
+        enable_prefix_caching,
+        return_log_probs,
+        skip_prompt_log_probs=True,
+        top_n_logprobs=0,
+        num_tokens_to_generate=4,
+    ):
+        return DynamicInferenceRequest(
+            request_id=request_id,
+            prompt_tokens=prompt,
+            sampling_params=SamplingParams(
+                num_tokens_to_generate=num_tokens_to_generate,
+                termination_id=-1,
+                top_k=1,
+                return_log_probs=return_log_probs,
+                skip_prompt_log_probs=skip_prompt_log_probs,
+                top_n_logprobs=top_n_logprobs,
+            ),
+            block_size_tokens=ctx.block_size_tokens,
+            enable_prefix_caching=enable_prefix_caching,
+        )
+
+    def _run_prompt_logprob_request(self, case, *, enable_prefix_caching):
+        config = self._case_config(case, enable_prefix_caching=enable_prefix_caching)
+        env = self._build_test_env(config)
+        engine = env.engine
+        engine.controller.tokenizer = _NumericTokenizer()
+        prompt = torch.arange(
+            2 * config.context_block_size_tokens + 5, device=torch.cuda.current_device()
+        ) % (config.vocab_size - 1)
+
+        donor = self._make_engine_request(
+            engine.context,
+            100,
+            prompt.clone(),
+            enable_prefix_caching=enable_prefix_caching,
+            return_log_probs=False,
+            num_tokens_to_generate=8,
+        )
+        engine._add_request(donor)
+        engine.step_modern()
+        if enable_prefix_caching:
+            assert set(donor.precomputed_block_hashes) <= (
+                engine.context.kv_block_allocator.kv_hash_to_block_id.keys()
+            )
+
+        request = self._make_engine_request(
+            engine.context,
+            101,
+            prompt,
+            enable_prefix_caching=enable_prefix_caching,
+            return_log_probs=True,
+            skip_prompt_log_probs=False,
+            top_n_logprobs=5,
+        )
+        hits_before = engine._prefix_cache_hits
+        engine._add_request(request)
+        assert not request.enable_prefix_caching
+        assert request.precomputed_block_hashes == []
+
+        output = None
+        for _ in range(32):
+            result = engine.step_modern()
+            for record in result["finished_request_records"]:
+                merged = record.merge()
+                if merged.request_id == request.request_id:
+                    output = merged
+            if output is not None:
+                break
+        assert output is not None, "prompt-logprob request did not finish"
+        assert engine._prefix_cache_hits == hits_before
+        assert output.num_cached_tokens == 0
+        assert len(output.prompt_log_probs) == len(prompt) - 1
+        return output
+
+    @torch.inference_mode()
+    def _run_engine_session(self, case, *, enable_prefix_caching):
+        config = self._case_config(case, enable_prefix_caching=enable_prefix_caching)
+        env = self._build_test_env(config)
+        engine = env.engine
+        engine.controller.tokenizer = _NumericTokenizer()
+        ctx = engine.context
+        alloc = ctx.kv_block_allocator
+        kv_pool_size = alloc.pool_size
+        kv_storage_bytes = ctx.memory_buffer.untyped_storage().nbytes()
+        mamba_cache_slots = (
+            ctx.mamba_slot_allocator.max_slots if ctx.mamba_slot_allocator is not None else 0
+        )
+        finished = {}
+        expected_epoch = {}
+        wave_allocated_blocks = []
+        all_wave_hashes = set()
+        min_pool_avail = alloc.pool_avail
+        saw_chunk = False
+        cuda_graph_step_count = 0
+        cuda_graph_post_resume_step_count = 0
+        deferred_graph_resume_count = 0
+        eager_deferred_graph_step_count = 0
+        hidden_chunk_resume_count = 0
+        awaiting_post_drain_graph_replay = False
+        saw_mixed_batch = False
+        suspend_count = 0
+        uvm_pointer_stability_checks = 0
+        step_count = 0
+        mamba_commit_calls = 0
+        mamba_restore_hits = 0
+        tracked_mamba_allocator = None
+        instrumented_mamba_allocators = []
+        paused_overflow_calls = 0
+        checkpointed_records = 0
+        checkpoint_configs = []
+        epoch_invalidation_count = 0
+        epoch_rebuild_count = 0
+        prior_ref_zero_blocks = None
+        ref_zero_reuse_transitions = 0
+
+        original_evict_overflow = ctx.evict_overflow_paused_requests
+
+        def tracked_evict_overflow(*args, **kwargs):
+            nonlocal paused_overflow_calls
+            paused_overflow_calls += int(ctx.paused_request_count > 0)
+            return original_evict_overflow(*args, **kwargs)
+
+        ctx.evict_overflow_paused_requests = tracked_evict_overflow
+
+        def instrument_mamba_allocator():
+            nonlocal tracked_mamba_allocator
+            allocator = ctx.mamba_slot_allocator
+            if allocator is None or allocator is tracked_mamba_allocator:
+                return
+            tracked_mamba_allocator = allocator
+            original_commit = allocator.commit_intermediate_states
+            original_restore = allocator.restore_to_live
+            instrumented_mamba_allocators.append((allocator, original_commit, original_restore))
+
+            def tracked_commit():
+                nonlocal mamba_commit_calls
+                mamba_commit_calls += 1
+                return original_commit()
+
+            def tracked_restore(request_idx, block_id):
+                nonlocal mamba_restore_hits
+                restored = original_restore(request_idx, block_id)
+                mamba_restore_hits += int(restored)
+                return restored
+
+            allocator.commit_intermediate_states = tracked_commit
+            allocator.restore_to_live = tracked_restore
+
+        instrument_mamba_allocator()
+        if case["feature"] == "uvm":
+            if ctx.unified_memory_level != 1 or not hasattr(ctx, "unified_memory_mempool"):
+                pytest.fail(
+                    "UVM-backed prefix-cache coverage is required on DFW, but the context "
+                    "fell back to GPU memory because the UVM allocator was unavailable"
+                )
+            uvm_memory_buffer_ptr = ctx.memory_buffer.data_ptr()
+
+        for cycle in range(3):
+            chunked = config.enable_chunked_prefill
+            block_size = ctx.block_size_tokens
+            prompt_length = (
+                3 * block_size - 2 if case["feature"] == "request-eviction" else 2 * block_size + 5
+            )
+            prompt_offset = 0 if case["feature"] == "epoch" else cycle * 17
+            base = (
+                torch.arange(prompt_length, device=torch.cuda.current_device()) + prompt_offset
+            ) % (config.vocab_size - 1)
+            pressure = (base + 37) % (config.vocab_size - 1)
+
+            if case["feature"] == "epoch":
+                if cycle > 0:
+                    if (
+                        enable_prefix_caching
+                        and config.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU
+                    ):
+                        challenge_hashes = set(compute_block_hashes_batched(base, block_size))
+                        assert challenge_hashes <= alloc.kv_hash_to_block_id.keys()
+                engine._set_generation_epoch(cycle)
+                if cycle > 0:
+                    if (
+                        enable_prefix_caching
+                        and config.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU
+                    ):
+                        assert challenge_hashes.isdisjoint(alloc.kv_hash_to_block_id)
+                        epoch_invalidation_count += 1
+
+            # Cache-on needs seven blocks for producer + follower tail + pressure.
+            # Cache-off needs nine unless chunked staging limits live demand to seven.
+            target_allocatable = 7 if enable_prefix_caching or chunked else 9
+            allocatable = alloc.get_allocatable_count()
+            if allocatable > target_allocatable:
+                filler = alloc.allocate_memory_blocks(allocatable - target_allocatable)
+                assert filler is not None
+            assert alloc.get_allocatable_count() == target_allocatable
+
+            wave_ids = {3 * cycle, 3 * cycle + 1, 3 * cycle + 2}
+            requests = []
+            for request_id, prompt in (
+                (3 * cycle, base),
+                (3 * cycle + 1, base.clone()),
+                (3 * cycle + 2, pressure),
+            ):
+                request = self._make_engine_request(
+                    ctx,
+                    request_id,
+                    prompt,
+                    enable_prefix_caching=enable_prefix_caching,
+                    return_log_probs=(case["feature"] in ("logprobs", "request-eviction")),
+                    skip_prompt_log_probs=True,
+                    top_n_logprobs=5 if case["feature"] == "logprobs" else 0,
+                    num_tokens_to_generate=case.get("num_tokens_to_generate", 4),
+                )
+                requests.append(request)
+                if case["feature"] == "epoch":
+                    expected_epoch[request_id] = cycle
+
+            if enable_prefix_caching:
+                for request in requests:
+                    engine._add_request(request)
+            else:
+                # Cache-on's hash coordination defers the duplicate follower
+                # during the first step. Mirror that execution order explicitly
+                # in the cache-off baseline so BF16 comparisons use equal batches.
+                engine._add_request(requests[0])
+                if not chunked:
+                    engine._add_request(requests[2])
+            baseline_follower_pending = not enable_prefix_caching
+
+            if enable_prefix_caching:
+                for request in requests:
+                    all_wave_hashes.update(request.precomputed_block_hashes)
+
+            hits_before = engine._prefix_cache_hits
+            blocks_this_wave = set()
+            while wave_ids - finished.keys():
+                result = engine.step_modern()
+                if case["feature"] == "offload" and cycle == 0 and step_count == 0:
+                    assert ctx.total_request_count > 0 or ctx.chunked_prefill_request_id != -1
+                    with pytest.raises(AssertionError, match="empty inference context"):
+                        engine.create_cuda_graphs()
+                step_count += 1
+                if baseline_follower_pending and (
+                    not chunked or ctx.chunked_prefill_request_id == -1
+                ):
+                    engine._add_request(requests[1])
+                    if chunked:
+                        engine._add_request(requests[2])
+                    baseline_follower_pending = False
+                min_pool_avail = min(min_pool_avail, alloc.pool_avail)
+                active_blocks = ctx.request_to_kv_block_ids[: ctx.total_request_count]
+                blocks_this_wave.update(active_blocks[active_blocks >= 0].tolist())
+                saw_chunk |= ctx.chunked_prefill_request_id != -1
+                using_cuda_graph = int(ctx.using_cuda_graph_this_step())
+                cuda_graph_step_count += using_cuda_graph
+                cuda_graph_post_resume_step_count += int(suspend_count > 0) * using_cuda_graph
+                if case["feature"] == "offload" and not ctx.cuda_graphs_available:
+                    assert not using_cuda_graph
+                    assert not any(
+                        manager.cudagraph_runners for manager in CudaGraphManager._instances
+                    )
+                    eager_deferred_graph_step_count += 1
+                if awaiting_post_drain_graph_replay and using_cuda_graph:
+                    assert ctx.cuda_graphs_available
+                    assert not engine._cuda_graph_rebuild_pending
+                    assert any(manager.cudagraph_runners for manager in CudaGraphManager._instances)
+                    awaiting_post_drain_graph_replay = False
+                saw_mixed_batch |= (
+                    ctx.batch_dimensions.prefill_req_count > 0
+                    and ctx.batch_dimensions.decode_req_count > 0
+                )
+                for record in result["finished_request_records"]:
+                    if len(record.requests) > 1:
+                        checkpointed_records += 1
+                        for request in record.requests[1:]:
+                            checkpoint_configs.append(
+                                (request.enable_prefix_caching, request.block_size_tokens)
+                            )
+                            expected_hashes = (
+                                compute_block_hashes_batched(
+                                    request.prompt_tokens, request.block_size_tokens
+                                )
+                                if request.enable_prefix_caching
+                                else []
+                            )
+                            assert request.precomputed_block_hashes == expected_hashes
+                    merged = record.merge()
+                    finished[merged.request_id] = merged
+
+                if (
+                    config.suspend_resume_interval is not None
+                    and engine.has_unfinished_requests()
+                    and step_count % config.suspend_resume_interval == 0
+                    and not awaiting_post_drain_graph_replay
+                ):
+                    engine.suspend()
+                    assert not ctx.is_tensor_state_allocated
+                    engine.resume()
+                    assert ctx.is_tensor_state_allocated
+                    if case["feature"] == "offload" and (
+                        ctx.total_request_count > 0 or ctx.chunked_prefill_request_id != -1
+                    ):
+                        assert engine._cuda_graph_rebuild_pending
+                        assert not ctx.cuda_graphs_available
+                        deferred_graph_resume_count += 1
+                        hidden_chunk_resume_count += int(ctx.chunked_prefill_request_id != -1)
+                        awaiting_post_drain_graph_replay = True
+                    if (config.num_cuda_graphs or 0) > 0:
+                        assert engine.capture_stats["pool_reserved_bytes"] > 0
+                    if case["feature"] == "uvm":
+                        assert ctx.memory_buffer.data_ptr() == uvm_memory_buffer_ptr
+                        uvm_pointer_stability_checks += 1
+                    alloc = ctx.kv_block_allocator
+                    instrument_mamba_allocator()
+                    suspend_count += 1
+                assert step_count < 512, f"{case['name']} did not converge"
+
+            torch.cuda.synchronize()
+            used_blocks = alloc.get_total_used()
+            assert alloc.pool_size == kv_pool_size
+            assert ctx.memory_buffer.untyped_storage().nbytes() == kv_storage_bytes
+            assert (
+                ctx.mamba_slot_allocator.max_slots if ctx.mamba_slot_allocator is not None else 0
+            ) == mamba_cache_slots
+            assert alloc.pool_avail + used_blocks == alloc.pool_size - 1
+            assert 0 <= used_blocks <= alloc.pool_size - 1
+            wave_allocated_blocks.append(used_blocks)
+            if enable_prefix_caching:
+                assert engine._prefix_cache_hits > hits_before
+                if config.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO:
+                    assert alloc.kv_hash_to_block_id == {}
+                    assert all(alloc.block_hashes[bid].item() == -1 for bid in blocks_this_wave)
+                    assert all(alloc.block_ref_counts[bid].item() == 0 for bid in blocks_this_wave)
+                    free_ids = set(alloc.block_bag[: alloc.pool_avail].tolist())
+                    assert blocks_this_wave <= free_ids
+                    if prior_ref_zero_blocks is not None:
+                        assert len(blocks_this_wave & prior_ref_zero_blocks) >= 2
+                        ref_zero_reuse_transitions += 1
+                    prior_ref_zero_blocks = blocks_this_wave
+                elif case["feature"] == "epoch":
+                    challenge_hashes = set(compute_block_hashes_batched(base, block_size))
+                    assert challenge_hashes <= alloc.kv_hash_to_block_id.keys()
+                    assert requests[0].num_cached_tokens == 0
+                    assert requests[1].num_cached_tokens >= 2 * block_size
+                    epoch_rebuild_count += 1
+
+        assert len(finished) == 9
+        assert len(wave_allocated_blocks) == 3
+        assert max(wave_allocated_blocks) <= alloc.pool_size - 1
+        if enable_prefix_caching:
+            assert min_pool_avail == 0
+            assert engine._prefix_cache_hits >= 3
+            assert engine._prefix_cache_blocks_matched >= 6
+            assert engine._prefix_coordination_waits >= 3
+            if config.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
+                if case["feature"] == "epoch":
+                    assert epoch_invalidation_count == 2
+                else:
+                    assert all_wave_hashes - alloc.kv_hash_to_block_id.keys()
+            else:
+                assert ref_zero_reuse_transitions == 2
+        else:
+            assert min_pool_avail <= 1
+            assert engine._prefix_cache_hits == 0
+
+        stats = dict(
+            config=config,
+            saw_chunk=saw_chunk,
+            cuda_graph_step_count=cuda_graph_step_count,
+            cuda_graph_post_resume_step_count=cuda_graph_post_resume_step_count,
+            deferred_graph_resume_count=deferred_graph_resume_count,
+            eager_deferred_graph_step_count=eager_deferred_graph_step_count,
+            hidden_chunk_resume_count=hidden_chunk_resume_count,
+            saw_mixed_batch=saw_mixed_batch,
+            suspend_count=suspend_count,
+            uvm_pointer_stability_checks=uvm_pointer_stability_checks,
+            mamba_commit_calls=mamba_commit_calls,
+            mamba_restore_hits=mamba_restore_hits,
+            paused_overflow_calls=paused_overflow_calls,
+            checkpointed_records=checkpointed_records,
+            checkpoint_configs=checkpoint_configs,
+            evicted_request_count=engine.evicted_request_count,
+            expected_epoch=expected_epoch,
+            epoch_invalidation_count=epoch_invalidation_count,
+            epoch_rebuild_count=epoch_rebuild_count,
+            ref_zero_reuse_transitions=ref_zero_reuse_transitions,
+            mtp_tokens_proposed=int(engine._spec_tokens_proposed_per_pos.sum()),
+            mtp_num_layers=engine.controller.inference_wrapped_model.model.config.mtp_num_layers,
+            num_moe_experts=engine.controller.inference_wrapped_model.model.config.num_moe_experts,
+        )
+        ctx.evict_overflow_paused_requests = original_evict_overflow
+        for allocator, original_commit, original_restore in instrumented_mamba_allocators:
+            allocator.commit_intermediate_states = original_commit
+            allocator.restore_to_live = original_restore
+        return finished, stats
+
+    @staticmethod
+    def _clear_engine_runtime():
+        torch.cuda.synchronize()
+        delete_cuda_graphs()
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    @staticmethod
+    def _assert_top_n_parity(cached_values, baseline_values, expected_length, atol):
+        assert cached_values is not None and baseline_values is not None
+        assert len(cached_values) == len(baseline_values) == expected_length
+        for cached_top_n, baseline_top_n in zip(cached_values, baseline_values):
+            assert isinstance(cached_top_n, dict) and isinstance(baseline_top_n, dict)
+            assert len(cached_top_n) == len(baseline_top_n) == 5
+            assert tuple(cached_top_n) == tuple(baseline_top_n)
+            assert np.allclose(
+                list(cached_top_n.values()), list(baseline_top_n.values()), atol=atol, rtol=0
+            )
+
+    @torch.inference_mode()
+    def _run_engine_case(self, case):
+        self._clear_engine_runtime()
+        try:
+            if case["feature"] == "logprobs":
+                cached_prompt = self._run_prompt_logprob_request(case, enable_prefix_caching=True)
+                self._clear_engine_runtime()
+                baseline_prompt = self._run_prompt_logprob_request(
+                    case, enable_prefix_caching=False
+                )
+                atol = 1e-3 if case["model"] == "hybrid" else 1e-5
+                assert cached_prompt.generated_tokens == baseline_prompt.generated_tokens
+                assert np.allclose(
+                    cached_prompt.prompt_log_probs,
+                    baseline_prompt.prompt_log_probs,
+                    atol=atol,
+                    rtol=0,
+                )
+                assert np.allclose(
+                    cached_prompt.generated_log_probs,
+                    baseline_prompt.generated_log_probs,
+                    atol=atol,
+                    rtol=0,
+                )
+                self._assert_top_n_parity(
+                    cached_prompt.prompt_top_n_logprobs,
+                    baseline_prompt.prompt_top_n_logprobs,
+                    len(cached_prompt.prompt_tokens) - 1,
+                    atol,
+                )
+                self._clear_engine_runtime()
+            cached, stats = self._run_engine_session(case, enable_prefix_caching=True)
+            self._clear_engine_runtime()
+            baseline, baseline_stats = self._run_engine_session(case, enable_prefix_caching=False)
+
+            tokenizer = _NumericTokenizer()
+            num_tokens_to_generate = case.get("num_tokens_to_generate", 4)
+            for request_id in range(9):
+                cached_request = cached[request_id]
+                baseline_request = baseline[request_id]
+                assert cached_request.generated_tokens == baseline_request.generated_tokens
+                assert cached_request.generated_text == baseline_request.generated_text
+                assert cached_request.generated_text == tokenizer.detokenize(
+                    cached_request.generated_tokens, skip_special_tokens=True
+                )
+                assert len(cached_request.generated_tokens) == num_tokens_to_generate
+
+            activations = {
+                "cache-off-on-output-parity",
+                "real-engine-output-parity",
+                "three-engine-sharing-waves",
+                "forced-kv-pool-pressure",
+                "kv-pool-capacity-bounded-under-pressure",
+                "prefix-scheduling-deferrals-observed",
+            }
+            config = stats["config"]
+            policy = config.prefix_caching_eviction_policy
+            if policy == PrefixCachingEvictionPolicy.LRU:
+                activations.add("lru-retained-prefix-evicted")
+            else:
+                assert stats["ref_zero_reuse_transitions"] == 2
+                activations.add("ref-zero-physical-block-reuse")
+
+            if case["model"] == "hybrid":
+                assert stats["mamba_commit_calls"] > 0
+                assert stats["mamba_restore_hits"] >= 3
+                activations.add("hybrid-kv-mamba-reuse")
+            feature = case["feature"]
+            if feature == "tp":
+                assert config.tensor_model_parallel_size > 1
+                activations.add("tensor-parallel-prefix-hit")
+            elif feature == "pp":
+                assert config.pipeline_model_parallel_size > 1
+                activations.add("pipeline-parallel-prefix-hit")
+            elif feature == "mixed-parallel":
+                assert config.sequence_parallel
+                assert config.tensor_model_parallel_size > 1
+                assert config.pipeline_model_parallel_size > 1
+                activations.add("mixed-parallel-prefix-hit")
+            elif feature == "moe":
+                assert config.expert_model_parallel_size > 1
+                assert stats["num_moe_experts"] == config.expert_model_parallel_size
+                activations.add("moe-expert-parallel-forward-with-prefix-hits")
+            elif feature == "chunked":
+                assert stats["saw_chunk"]
+                activations.add("chunked-prefix-reuse")
+            elif feature == "cuda-graph":
+                assert config.num_cuda_graphs == 2
+                assert config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+                assert stats["cuda_graph_step_count"] > 0
+                activations.add("cuda-graph-replay-with-prefix-hits")
+            elif feature == "mtp":
+                assert stats["mtp_num_layers"] == config.num_speculative_tokens == 2
+                assert stats["mtp_tokens_proposed"] > 0
+                activations.add("mtp-speculative-proposals-with-prefix-hits")
+            elif feature in ("logprobs", "request-eviction"):
+                # Prefix restore changes hybrid BF16 batch shapes; the observed drift is < 0.0041.
+                logprob_atol = 5e-3 if case["model"] == "hybrid" else 1e-3
+                for request_id in range(9):
+                    cached_request = cached[request_id]
+                    baseline_request = baseline[request_id]
+                    assert cached_request.generated_log_probs is not None
+                    assert baseline_request.generated_log_probs is not None
+                    assert len(cached_request.generated_log_probs) == num_tokens_to_generate
+                    assert len(baseline_request.generated_log_probs) == num_tokens_to_generate
+                    assert np.allclose(
+                        cached_request.generated_log_probs,
+                        baseline_request.generated_log_probs,
+                        atol=(
+                            logprob_atol
+                            if case["model"] == "hybrid" or feature == "logprobs"
+                            else 1e-5
+                        ),
+                        rtol=0,
+                    )
+                    if feature == "logprobs":
+                        self._assert_top_n_parity(
+                            cached_request.generated_top_n_logprobs,
+                            baseline_request.generated_top_n_logprobs,
+                            num_tokens_to_generate,
+                            logprob_atol,
+                        )
+                if feature == "logprobs":
+                    activations.add("generated-logprob-hit-and-prompt-logprob-bypass-parity")
+                else:
+                    assert stats["paused_overflow_calls"] > 0
+                    assert baseline_stats["paused_overflow_calls"] > 0
+                    assert stats["evicted_request_count"] > 0
+                    assert baseline_stats["evicted_request_count"] > 0
+                    assert stats["checkpointed_records"] > 0
+                    assert baseline_stats["checkpointed_records"] > 0
+                    assert all(
+                        enabled and block_size == stats["config"].context_block_size_tokens
+                        for enabled, block_size in stats["checkpoint_configs"]
+                    )
+                    assert all(not enabled for enabled, _ in baseline_stats["checkpoint_configs"])
+                    activations.add("request-eviction-checkpoint-resume")
+            elif feature in ("offload", "recompute"):
+                assert stats["suspend_count"] >= 1
+                assert stats["cuda_graph_post_resume_step_count"] > 0
+                if feature == "offload":
+                    assert stats["deferred_graph_resume_count"] >= 1
+                    assert stats["eager_deferred_graph_step_count"] >= 1
+                    if case.get("chunked", False):
+                        assert stats["saw_chunk"]
+                        assert stats["hidden_chunk_resume_count"] >= 1
+                activations.add(f"{feature}-prefix-resume")
+            elif feature == "uvm":
+                assert stats["config"].unified_memory_level == 1
+                assert stats["suspend_count"] >= 3
+                assert stats["uvm_pointer_stability_checks"] == stats["suspend_count"]
+                activations.add("uvm-backed-prefix-lifecycle")
+            elif feature == "epoch":
+                if policy == PrefixCachingEvictionPolicy.LRU:
+                    assert stats["epoch_invalidation_count"] == 2
+                    assert stats["epoch_rebuild_count"] == 3
+                    activations.add("epoch-signal-invalidation-rebuild")
+                else:
+                    assert stats["ref_zero_reuse_transitions"] == 2
+                    activations.add("epoch-signal-with-prefix-hits")
+                for request_id, request in cached.items():
+                    assert request.kv_cache_epoch == [(0, stats["expected_epoch"][request_id])]
+
+            assert stats["saw_mixed_batch"]
+            return activations
+        finally:
+            self._clear_engine_runtime()
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("case", PREFIX_CACHE_ENGINE_CASES)
+    def test_real_engine_pair_matrix(self, case):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=case.get("tp", 1),
+            pipeline_model_parallel_size=case.get("pp", 1),
+            expert_model_parallel_size=case.get("ep", 1),
+            expert_tensor_parallel_size=1,
+        )
+        try:
+            activations = self._run_engine_case(case)
+            policy = (
+                PrefixCachingEvictionPolicy.LRU
+                if case["name"] in PREFIX_CACHE_ENGINE_LRU_CASES
+                else PrefixCachingEvictionPolicy.REF_ZERO
+            )
+            policy_name = "lru" if policy == PrefixCachingEvictionPolicy.LRU else "ref-zero"
+            owner = PREFIX_CACHE_ENGINE_PAIR_OWNERS[f"{case['name']}×{policy_name}"]
+            assert owner in activations
+            assert "three-engine-sharing-waves" in activations
+            expected_policy_activation = (
+                "lru-retained-prefix-evicted"
+                if policy == PrefixCachingEvictionPolicy.LRU
+                else "ref-zero-physical-block-reuse"
+            )
+            assert expected_policy_activation in activations
+        finally:
+            delete_cuda_graphs()
+            DynamicInferenceContext.ROUNDER = 64
+            DynamicInferenceContext.TOKEN_ROUNDER = 64
+            DynamicInferenceContext.REQUEST_ROUNDER = 64
+            Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.asyncio
+    async def test_real_http_zmq_prefix_pressure(self):
+        with torch.inference_mode():
+            await self._run_real_http_zmq_prefix_pressure()
+
+    async def _run_real_http_zmq_prefix_pressure(self):
+        """Drive real HTTP, coordinator, client, and model-engine processes through cache churn."""
+        if not HAVE_ZMQ or not HAS_BACKEND:
+            pytest.skip("pyzmq, Quart, and Hypercorn are required")
+
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+        )
+        rank = torch.distributed.get_rank()
+        sync_context = zmq.Context()
+        sync = AsyncZMQCommunicator(sync_context, process_group=None, hostname="127.0.0.1")
+        engine = None
+        control_client = None
+        control_ready = False
+        server_socket = None
+        server_started = False
+        try:
+            self._clear_engine_runtime()
+            case = dict(name="gpt-http-zmq", model="gpt", feature="base")
+            baseline_config = self._case_config(case, enable_prefix_caching=False)
+            baseline_env = self._build_test_env(baseline_config)
+            baseline_env.engine.controller.tokenizer = _NumericTokenizer()
+            prompt = [
+                (index % 89) + 1
+                for index in range(2 * baseline_config.context_block_size_tokens + 5)
+            ]
+            baseline_request = self._make_engine_request(
+                baseline_env.engine.context,
+                0,
+                torch.tensor(prompt, device=torch.cuda.current_device()),
+                enable_prefix_caching=False,
+                return_log_probs=True,
+            )
+            baseline_env.engine._add_request(baseline_request)
+            baseline_output = None
+            while baseline_output is None:
+                result = await baseline_env.engine.async_step()
+                if result["finished_request_records"]:
+                    baseline_output = result["finished_request_records"][0].merge()
+            baseline_tokens = list(baseline_output.generated_tokens)
+            baseline_log_probs = list(baseline_output.generated_log_probs)
+            del baseline_output, baseline_request, baseline_env
+            self._clear_engine_runtime()
+
+            config = self._case_config(case, enable_prefix_caching=True)
+            assert config.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU
+            config.prefix_caching_coordinator_policy = (
+                PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
+            )
+            env = self._build_test_env(config)
+            engine = env.engine
+            tokenizer = _NumericTokenizer()
+            engine.controller.tokenizer = tokenizer
+
+            allocator = engine.context.kv_block_allocator
+            filler = allocator.allocate_memory_blocks(allocator.get_allocatable_count() - 7)
+            assert filler is not None
+            assert allocator.get_allocatable_count() == 7
+
+            coordinator_addr = await engine.start_listening_to_data_parallel_coordinator(
+                launch_inference_coordinator=True, hostname="127.0.0.1"
+            )
+            control_error = None
+            if rank == 0:
+                try:
+                    control_client = InferenceClient(coordinator_addr)
+                    control_client.start()
+                    control_ready = True
+                except Exception as error:
+                    control_error = error
+            control_status = torch.tensor(
+                int(control_ready), dtype=torch.int64, device=torch.cuda.current_device()
+            )
+            torch.distributed.broadcast(control_status, src=0)
+            control_ready = bool(control_status.item())
+            if control_error is not None:
+                raise control_error
+            if not control_ready:
+                raise RuntimeError("rank 0 could not start the coordinator control client")
+            await asyncio.wait_for(sync.all_reduce_max(1), timeout=30)
+
+            prompt_hashes = compute_block_hashes_batched(
+                torch.tensor(prompt), config.context_block_size_tokens
+            )
+            reference_choices = []
+            if rank == 0:
+                server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                server_socket.bind(("127.0.0.1", 0))
+                server_port = server_socket.getsockname()[1]
+                start_text_gen_server(
+                    coordinator_addr,
+                    tokenizer,
+                    rank,
+                    server_port,
+                    num_replicas=1,
+                    hostname="127.0.0.1",
+                    sock=server_socket,
+                )
+                server_started = True
+                base_url = f"http://127.0.0.1:{server_port}"
+                deadline = time.monotonic() + 30
+                while True:
+                    try:
+                        assert (await asyncio.to_thread(_http_json, f"{base_url}/v1/health"))[
+                            "ready"
+                        ]
+                        break
+                    except Exception:
+                        if time.monotonic() >= deadline:
+                            raise
+                        await asyncio.sleep(0.1)
+
+                request = {
+                    "prompt": prompt,
+                    "max_tokens": 4,
+                    "temperature": 0,
+                    "logprobs": 5,
+                    "ignore_eos": True,
+                }
+                for _ in range(2):
+                    response = await asyncio.to_thread(
+                        _http_json, f"{base_url}/v1/completions", request
+                    )
+                    assert response["usage"]["prompt_tokens"] == len(prompt)
+                    reference_choices.append(response["choices"][0])
+
+            await asyncio.wait_for(sync.all_reduce_max(1), timeout=90)
+            cached_before_epoch = torch.tensor(
+                int(
+                    any(block_hash in allocator.kv_hash_to_block_id for block_hash in prompt_hashes)
+                ),
+                dtype=torch.int64,
+                device=torch.cuda.current_device(),
+            )
+            torch.distributed.all_reduce(cached_before_epoch)
+            assert cached_before_epoch.item() >= 1
+            initial_hits = torch.tensor(
+                engine._prefix_cache_hits, dtype=torch.int64, device=torch.cuda.current_device()
+            )
+            torch.distributed.all_reduce(initial_hits)
+            assert initial_hits.item() >= 1
+
+            if rank == 0:
+                control_client.set_generation_epoch(7)
+            deadline = time.monotonic() + 30
+            while engine._generation_epoch != 7:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("SET_GENERATION_EPOCH did not reach every engine")
+                await asyncio.sleep(0.02)
+            assert all(
+                block_hash not in allocator.kv_hash_to_block_id for block_hash in prompt_hashes
+            )
+            await asyncio.wait_for(sync.all_reduce_max(1), timeout=90)
+
+            if rank == 0:
+                for _ in range(2):
+                    response = await asyncio.to_thread(
+                        _http_json, f"{base_url}/v1/completions", request
+                    )
+                    choice = response["choices"][0]
+                    assert choice["kv_cache_epoch"] == [[0, 7]]
+                    reference_choices.append(choice)
+
+            await asyncio.wait_for(sync.all_reduce_max(1), timeout=90)
+            rebuilt_after_epoch = torch.tensor(
+                int(
+                    any(block_hash in allocator.kv_hash_to_block_id for block_hash in prompt_hashes)
+                ),
+                dtype=torch.int64,
+                device=torch.cuda.current_device(),
+            )
+            torch.distributed.all_reduce(rebuilt_after_epoch)
+            assert rebuilt_after_epoch.item() >= 1
+
+            if rank == 0:
+                pressure_prompts = [
+                    [((index + 3 * group) % 89) + 1 for index in range(len(prompt))]
+                    for group in range(1, 33)
+                ]
+                pressure = dict(request, prompt=pressure_prompts, logprobs=None)
+                response = await asyncio.to_thread(
+                    _http_json, f"{base_url}/v1/completions", pressure
+                )
+                assert len(response["choices"]) == len(pressure_prompts)
+
+            await asyncio.wait_for(sync.all_reduce_max(1), timeout=90)
+            pressure_stats = torch.tensor(
+                [
+                    engine._prefix_cache_hits,
+                    engine._prefix_cache_blocks_matched,
+                    int(
+                        any(
+                            block_hash in allocator.kv_hash_to_block_id
+                            for block_hash in prompt_hashes
+                        )
+                    ),
+                ],
+                dtype=torch.int64,
+                device=torch.cuda.current_device(),
+            )
+            torch.distributed.all_reduce(pressure_stats)
+            assert pressure_stats[0].item() >= 1
+            assert pressure_stats[1].item() >= len(prompt_hashes)
+            assert pressure_stats[2].item() == 0, "pressure did not evict the original prefix"
+
+            if rank == 0:
+                for _ in range(2):
+                    response = await asyncio.to_thread(
+                        _http_json, f"{base_url}/v1/completions", request
+                    )
+                    reference_choices.append(response["choices"][0])
+                expected = reference_choices[0]
+                assert expected["generation_token_ids"] == baseline_tokens
+                assert np.allclose(
+                    expected["generation_log_probs"], baseline_log_probs, atol=1e-5, rtol=0
+                )
+                for choice in reference_choices[1:]:
+                    assert choice["generation_token_ids"] == expected["generation_token_ids"]
+                    assert np.allclose(
+                        choice["generation_log_probs"],
+                        expected["generation_log_probs"],
+                        atol=1e-5,
+                        rtol=0,
+                    )
+
+            await asyncio.wait_for(sync.all_reduce_max(1), timeout=90)
+            final_hits = torch.tensor(
+                engine._prefix_cache_hits, dtype=torch.int64, device=torch.cuda.current_device()
+            )
+            torch.distributed.all_reduce(final_hits)
+            assert final_hits.item() >= pressure_stats[0].item() + 1
+            assert (
+                PREFIX_CACHE_ENGINE_PAIR_OWNERS["gpt-http-zmq×lru"]
+                == "http-zmq-lru-pressure-epoch-parity"
+            )
+        finally:
+            if rank == 0 and server_started:
+                try:
+                    stop_text_gen_server()
+                except Exception:
+                    pass
+            if server_socket is not None and server_socket.fileno() != -1:
+                server_socket.close()
+            task = getattr(engine, "engine_loop_task", None) if engine is not None else None
+            if task is not None and not task.done():
+                graceful_stop = control_ready
+                if rank == 0 and control_client is not None:
+                    try:
+                        control_client.pause_engines()
+                    except Exception:
+                        graceful_stop = False
+                if graceful_stop:
+                    try:
+                        if engine.state not in (EngineState.PAUSED, EngineState.STOPPED):
+                            await asyncio.wait_for(
+                                engine.wait_until(EngineState.PAUSED), timeout=15
+                            )
+                        if rank == 0 and control_client is not None and not task.done():
+                            control_client.stop_engines()
+                        await asyncio.wait_for(asyncio.shield(task), timeout=15)
+                    except Exception:
+                        graceful_stop = False
+                if not graceful_stop and not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+            if rank == 0 and control_client is not None:
+                try:
+                    control_client.shutdown_coordinator()
+                except Exception:
+                    pass
+            if (
+                rank == 0
+                and engine is not None
+                and hasattr(engine, "inference_coordinator_process")
+            ):
+                process = engine.inference_coordinator_process
+                process.join(timeout=5)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5)
+            if rank == 0 and control_client is not None:
+                try:
+                    control_client.stop()
+                except Exception:
+                    pass
+            try:
+                sync.close()
+            finally:
+                sync_context.term()
+            self._clear_engine_runtime()
+            DynamicInferenceContext.ROUNDER = 64
+            DynamicInferenceContext.TOKEN_ROUNDER = 64
+            DynamicInferenceContext.REQUEST_ROUNDER = 64
+            Utils.destroy_model_parallel()

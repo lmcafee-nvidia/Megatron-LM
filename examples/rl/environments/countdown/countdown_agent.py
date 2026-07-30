@@ -11,11 +11,12 @@ from .countdown import compute_score
 
 class CountdownAgent(RewardOnlyAgent, HFDatasetAgent):
     env_id: str = "countdown"
+    prompt_suffix: str = ""
 
     def make_prefix(self, target, nums) -> str:
         prefix = f"""Using the numbers {nums}, create an equation that equals {target}. You can use basic arithmetic operations (+, -, *, /) and each number can only be used once. 
         Return the final answer in <answer> </answer> tags, for example <answer> (1 + 2) / 3 </answer>. Do not include an = sign."""
-        return prefix
+        return f"{prefix}\n{self.prompt_suffix}" if self.prompt_suffix else prefix
 
     def get_dataset(self, validation: bool = False):
         TRAIN_SIZE = 327680

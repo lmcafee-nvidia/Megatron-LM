@@ -36,22 +36,95 @@ MODEL_ARGS:
   --num-layers: 24
   --hidden-size: 1152
   --num-attention-heads: 16
-  --max-position-embeddings: 1024
-  --seq-length: 1024
+  --max-position-embeddings: 4096
+  --seq-length: 4096
   --temperature: 1.0
   --top_k: 1
+  --top_p: 0
   --return-log-probs: true
-  --num-tokens-to-generate: 30
-  --inference-dynamic-batching-buffer-size-gb: 20
+  --skip-prompt-log-probs: true
+  --num-tokens-to-generate: 4
+  --inference-dynamic-batching-buffer-size-gb: 0.25
+  --inference-dynamic-batching-max-requests: 16
+  --inference-dynamic-batching-max-tokens: 4096
   --inference-dynamic-batching-prefix-caching: true
+  --inference-dynamic-batching-prefix-caching-eviction-policy: lru
   --inference-dynamic-batching-prefix-caching-coordinator-policy: longest_prefix
+  --coordinator-schedule-output-path: ${OUTPUT_PATH}/coordinator_schedule.json
+  --prefix-cache-compare: true
+  --prefix-cache-stress-groups: 16
+  --prefix-cache-stress-copies: 9
+  --prefix-cache-stress-prompt-tokens: 1024
   --dist-ckpt-strictness: log_unexpected
   --inference-ckpt-non-strict: true # To handle the extra_state errors
   --output-path: ${INFERENCE_OUTPUT_PATH}
   --prompts: "Time travel to 2008, and go to a bar or a club or one of the myriad disco-basements on the Lower East Side that does not quite know which of those it is. Dance awkwardly in a room full of other glittered-up nerds, and wait for something to happen, buoyed on the feeling that this is the big swollen heart of life, that this is New York like the movies."
-  --incoming-requests-per-step: 32
+  --incoming-requests-per-sec: -1
+  --inference-repeat-n: 3
   --use-flashinfer-fused-rope: true
   --inference-logging-step-interval: 1
 METRICS:
   - "generated_tokens"
+  - "generated_text"
   - "logprobs"
+AFTER_SCRIPT: |
+  python - <<'PY'
+  import json
+  import os
+
+  path = os.path.join(os.environ["OUTPUT_PATH"], "coordinator_schedule.json")
+  with open(path) as stream:
+      schedule = json.load(stream)
+
+  copies = 9
+  groups = 16
+  cycles = 3
+  records = schedule["records"]
+  assert schedule["policy"] == "longest_prefix"
+  assert schedule["data_parallel_size"] == 8
+  assert len(records) == copies * groups * cycles
+  assert [record["request_id"] for record in records] == list(range(len(records)))
+  cycle_groups = [
+      [
+          records[(cycle * groups + group) * copies : (cycle * groups + group + 1) * copies]
+          for group in range(groups)
+      ]
+      for cycle in range(cycles)
+  ]
+  assert all(
+      {record["num_hashes"] for record in group} == {4 * (1 + group_idx % 2)}
+      for cycle in cycle_groups
+      for group_idx, group in enumerate(cycle)
+  )
+
+  def assigned_ranks(group):
+      return {record["rank_index"] for record in group}
+
+  first_cycle = [next(iter(assigned_ranks(group))) for group in cycle_groups[0]]
+  assert all(len(assigned_ranks(group)) == 1 for group in cycle_groups[0])
+  for short_idx in range(0, 8, 2):
+      long_idx = short_idx + 1
+      assert first_cycle[short_idx] != first_cycle[long_idx]
+      owners = {first_cycle[short_idx], first_cycle[long_idx]}
+      # The short prefix now has two equal-depth owners, so later copies balance
+      # between them while the deeper continuation stays with its original owner.
+      for cycle in cycle_groups[1:]:
+          assert assigned_ranks(cycle[short_idx]) == owners
+          counts = {
+              owner: sum(record["rank_index"] == owner for record in cycle[short_idx])
+              for owner in owners
+          }
+          assert counts == {
+              first_cycle[short_idx]: copies // 2,
+              first_cycle[long_idx]: copies - copies // 2,
+          }
+          assert assigned_ranks(cycle[long_idx]) == {first_cycle[long_idx]}
+  for group_idx in range(8, groups):
+      assert all(
+          assigned_ranks(cycle[group_idx]) == {first_cycle[group_idx]}
+          for cycle in cycle_groups[1:]
+      )
+  assert {record["rank_index"] for record in records} == set(
+      range(schedule["data_parallel_size"])
+  )
+  PY

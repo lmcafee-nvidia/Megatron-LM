@@ -1,0 +1,231 @@
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NVTE_ALLOW_UNSAFE_PICKLE_EXTRA_STATE: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+  NCCL_ALGO: Ring
+  CUBLAS_WORKSPACE_CONFIG: :4096:8
+  LANGRL_LOG_DIR: ${OUTPUT_PATH}/rollouts
+BEFORE_SCRIPT: |
+  mkdir -p "$LANGRL_LOG_DIR"
+  PREFIX_CACHE_PROMPT_SUFFIX=$(printf \
+    ' This shared context is intentionally repeated for prefix cache stress.%.0s' {1..32})
+  export PREFIX_CACHE_PROMPT_SUFFIX
+  /usr/local/bin/yq \
+    '.[0].agent_args.prompt_suffix = strenv(PREFIX_CACHE_PROMPT_SUFFIX)' \
+    tests/functional_tests/test_cases/gpt/gpt_grpo_tp1tp2_pp1_dp8_583m_throughputtest/env_config.yaml \
+    > "$OUTPUT_PATH/prefix_cache_env_config.yaml"
+TEST_TYPE: frozen-start
+MODE: rl
+MODEL_ARGS:
+  --tiktoken-pattern: v2
+  --use-mcore-models: true
+  --tokenizer-type: TikTokenizer
+  --tokenizer-model: ${CHECKPOINT_LOAD_PATH}/model/mcore_mistral/nemo_minitron-0.5b/v1/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
+  --load: ${CHECKPOINT_LOAD_PATH}/model/mcore_mistral/nemo_minitron-0.5b/v1/
+  --auto-detect-ckpt-format: true
+  --max-tokens-to-oom: 3600000
+  --inference-max-seq-length: 576
+  --attention-backend: flash
+  --mock-data: true
+  --micro-batch-size: 1
+  --no-load-optim: true
+  --no-use-tokenizer-model-from-checkpoint-args: true
+  --distributed-backend: nccl
+  --log-interval: 1
+  --log-progress: true
+  --transformer-impl: transformer_engine
+  --tensor-model-parallel-size: 1
+  --pipeline-model-parallel-size: 1
+  --ckpt-format: torch_dist
+  --bf16: true
+  --log-memory-to-tensorboard: true
+  --log-num-zeros-in-grad: true
+  --log-validation-ppl-to-tensorboard: true
+  --log-timers-to-tensorboard: true
+  --num-layers: 24
+  --hidden-size: 1152
+  --num-attention-heads: 16
+  --max-position-embeddings: 1024
+  --seq-length: 576
+  --timing-log-option: minmax
+  --log-throughput: true
+  --no-create-attention-mask-in-dataloader: true
+  --straggler-minmax-count: 16
+  --tensorboard-log-interval: 1
+  --empty-unused-memory-level: 2
+  --seed: 42
+  --deterministic-mode: true
+  --calculate-per-token-loss: true
+  --rl-use-sequence-packing: true
+  --rl-sequence-packing-algo: fifo
+  --rl-offload-optimizer-during-inference: true
+  --timing-log-level: 1
+  --cuda-graph-impl: local
+  --global-batch-size: 32
+  --grpo-group-size: 4
+  --grpo-prompts-per-step: 8
+  --grpo-iterations: 1
+  --rl-default-temperature: 0.0
+  --grpo-clamp-eps-lower: 0.2
+  --grpo-clamp-eps-upper: 0.2
+  --grpo-kl-beta: 0.0
+  --grpo-entropy-term-weight: 0.0
+  --langrl-env-config: ${OUTPUT_PATH}/prefix_cache_env_config.yaml
+  --rl-partial-rollouts: true
+  --lr: 0.000001
+  --lr-warmup-samples: 0
+  --clip-grad: 1.0
+  --use-checkpoint-args: true
+  --dist-ckpt-strictness: log_unexpected
+  --perform-rl-step: true
+  --train-samples: 48828125
+  --exit-interval: 3
+  --tensorboard-dir: ${TENSORBOARD_PATH}
+  --save-interval: 1000000
+  --eval-interval: 1000000
+  --finetune: true
+  --inference-logging-step-interval: 1
+  --rl-inference-tensor-model-parallel-size: 2
+  --refit-method: gloo
+  --inference-dynamic-batching-buffer-size-gb: 0.2
+  --inference-dynamic-batching-block-size: 256
+  --inference-dynamic-batching-max-tokens: 576
+  --inference-dynamic-batching-max-requests: 32
+  --inference-dynamic-batching-prefix-caching: true
+  --inference-dynamic-batching-prefix-caching-eviction-policy: lru
+  --inference-dynamic-batching-prefix-caching-coordinator-policy: first_prefix_block
+METRICS:
+  - "iteration-time"
+  - "num-zeros"
+  - "mem-allocated-bytes"
+  - "mem-max-allocated-bytes"
+AFTER_SCRIPT: |
+  stressed_engine_logs=0
+  bounded_memory_logs=0
+  while IFS= read -r log_file; do
+    cycles=$(awk '
+      /Reshard complete/ { waiting = 1; baseline = hits; next }
+      match($0, /prefix cache \(cumul\): [0-9]+ hits/) {
+        value = substr($0, RSTART, RLENGTH)
+        gsub(/[^0-9]/, "", value)
+        hits = value + 0
+        if (waiting && hits > baseline) {
+          cycles += 1
+          waiting = 0
+        }
+      }
+      END { print cycles + 0 }
+    ' "$log_file")
+    final_skipped=$(sed -nE \
+      's/.*prefill \(cumul\): computed [0-9]+, skipped ([0-9]+).*/\1/p' \
+      "$log_file" | tail -n 1)
+    if (( cycles >= 3 && ${final_skipped:-0} > 0 )); then
+      ((stressed_engine_logs += 1))
+    fi
+    mapfile -t memory_samples < <(
+      grep -E "prefix cache \\(cumul\\): [1-9][0-9]* hits" "$log_file" \
+        | sed -nE 's/.*alloc ([0-9.]+) gb.*/\1/p' \
+        | tail -n 2 || true
+    )
+    if (( ${#memory_samples[@]} == 2 )) && \
+      awk -v previous="${memory_samples[0]}" -v final="${memory_samples[1]}" \
+        'BEGIN { exit !(final <= previous + 0.1) }'; then
+      ((bounded_memory_logs += 1))
+    fi
+  done < <(grep -rl -F "Reshard complete" "$LOG_DIR" || true)
+  if (( stressed_engine_logs < 8 )); then
+    echo "Expected all eight inference ranks to hit the cache after every refit and skip tokens."
+    EXIT_CODE=1
+  fi
+  if (( bounded_memory_logs < 8 )); then
+    echo "Expected bounded warmed memory on all eight inference ranks."
+    EXIT_CODE=1
+  fi
+  python - <<'PY'
+  import glob
+  import itertools
+  import json
+  import math
+  import os
+  import re
+
+  reference_dir = os.environ["PREFIX_CACHE_REFERENCE_ROLLOUT_DIR"]
+  cached_dir = os.environ["LANGRL_LOG_DIR"]
+  cached_files = sorted(glob.glob(os.path.join(cached_dir, "rollouts_*.json")))
+  assert len(cached_files) == 6, f"expected 3 epochs from both TP ranks, got {cached_files}"
+  epochs = set()
+  cache_evictions = 0
+
+  def rollouts_match(reference, actual):
+      return (
+          reference["env_id"] == actual["env_id"]
+          and reference["problem_id"] == actual["problem_id"]
+          and reference["trajectory"] == actual["trajectory"]
+          and reference["generation_mask"] == actual["generation_mask"]
+          and reference["reward"] == actual["reward"]
+          and len(reference["logprobs"][0]) == len(actual["logprobs"][0])
+          and all(
+              math.isclose(left, right, abs_tol=2e-3, rel_tol=0)
+              for left, right in zip(reference["logprobs"][0], actual["logprobs"][0])
+          )
+      )
+
+  def prompt_key(rollout):
+      tokens = rollout["trajectory"][0]
+      generated = rollout["generation_mask"][0]
+      assert len(tokens) == len(generated)
+      return tuple(token for token, is_generated in zip(tokens, generated) if not is_generated)
+
+  def groups_by_prompt(rollouts, label):
+      groups = {}
+      for group in rollouts:
+          assert len(group) == 4, f"{label}: expected 4 rollouts per group"
+          keys = {prompt_key(rollout) for rollout in group}
+          assert len(keys) == 1, f"{label}: group contains different prompts"
+          key = keys.pop()
+          assert key not in groups, f"{label}: duplicate prompt group"
+          groups[key] = group
+      assert len(groups) == 8, f"{label}: expected 8 prompt groups"
+      assert all(len(key) > 256 for key in groups), f"{label}: prompts are not cacheable"
+      assert len({key[:256] for key in groups}) == 8, (
+          f"{label}: first cache blocks must differ across prompt groups"
+      )
+      return groups
+
+  for cached_file in cached_files:
+      reference_file = os.path.join(reference_dir, os.path.basename(cached_file))
+      assert os.path.exists(reference_file), f"missing cache-off rollout {reference_file}"
+      with open(reference_file) as stream:
+          reference = json.load(stream)
+      with open(cached_file) as stream:
+          cached = json.load(stream)
+      name = os.path.basename(cached_file)
+      expected_epoch = int(re.search(r"iteration([0-9]+)", name).group(1))
+      reference_groups = groups_by_prompt(reference, f"{name}:cache-off")
+      cached_groups = groups_by_prompt(cached, f"{name}:cache-on")
+      assert reference_groups.keys() == cached_groups.keys()
+      for group_index, key in enumerate(reference_groups):
+          reference_group = reference_groups[key]
+          cached_group = cached_groups[key]
+          assert any(
+              all(
+                  rollouts_match(reference_rollout, cached_rollout)
+                  for reference_rollout, cached_rollout in zip(reference_group, permutation)
+              )
+              for permutation in itertools.permutations(cached_group)
+          ), f"{name}[{group_index}]: no exact cache-off/cache-on rollout matching"
+          for rollout in cached_group:
+              cache_evictions += sum(rollout["num_evictions"])
+              for field in ("policy_epoch", "kv_cache_epoch"):
+                  for turn in rollout[field]:
+                      turn_epochs = {epoch for _, epoch in turn}
+                      assert turn_epochs == {expected_epoch}, (
+                          f"{name}.{field}: expected epoch {expected_epoch}, got {turn_epochs}"
+                      )
+                      epochs.update(turn_epochs)
+  assert len(epochs) >= 3, f"expected >=3 generation epochs, got {sorted(epochs)}"
+  assert epochs == {0, 1, 2}
+  assert cache_evictions > 0, "expected request checkpoint/resume under cache pressure"
+  PY
+THROUGHPUT_TEST_PARAMS:
+  --start_step: 1

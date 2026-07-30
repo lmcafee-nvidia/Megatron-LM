@@ -1,27 +1,16 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Smoke test for ``examples/inference/launch_inference_server.py``.
-
-Spawns the high-level-API server as a subprocess (TP=1, DP=8 on Mistral 0.5B),
-tails its stdout for the readiness banner, sends one OpenAI-compatible
-``/v1/completions`` request, and asserts on a 200 response with a non-empty
-``choices[0].text``. Server is then SIGTERM'd and joined.
-
-No golden values: this is a pass/fail HTTP smoke. It validates the daemon-thread
-CUDA-device fix, coordinator startup, frontend replicas, and request/response
-round-trip end-to-end.
-"""
-
 import argparse
 import json
+import math
 import os
 import signal
 import subprocess
 import sys
 import threading
 import time
-import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 READINESS_MARKER = "Running on http"
 READINESS_TIMEOUT_S = 600
@@ -29,19 +18,17 @@ REQUEST_TIMEOUT_S = 60
 SHUTDOWN_TIMEOUT_S = 60
 SERVER_HOST = "0.0.0.0"
 SERVER_PORT = 5000
+LOGPROB_P95_ATOL = 0.048790164169432  # A 5% probability ratio in log space.
+LOGPROB_MAX_ATOL = 0.182321556793955  # A 20% probability ratio in log space.
 
 
 def build_server_cmd(
-    checkpoint_dir: str, tokenizer_model: str, server_log_dir: str = None
+    checkpoint_dir: str,
+    tokenizer_model: str,
+    server_log_dir: str = None,
+    prefix_cache: bool = False,
+    stress_mode: bool = False,
 ) -> list[str]:
-    """Build the torchrun command for ``launch_inference_server.py`` (Mistral 0.5B,
-    TP=1 DP=8). Mirrors gpt_dynamic_inference_tp1_pp1_dp8_583m_logitsmatch_zmq's
-    model_config.yaml so the same checkpoint that legacy dp8 inference tests use
-    is reused here.
-    """
-    # ``--tee "3"`` writes per-rank stdout+stderr files under ``--log-dir`` (which
-    # the JET harness expects at ``logs/*/*/attempt_0/*/std*.log``) while still
-    # echoing to this driver's captured stdout so the readiness watcher works.
     log_args = ["--log-dir", server_log_dir, "--tee", "3"] if server_log_dir else []
     return [
         sys.executable,
@@ -60,7 +47,7 @@ def build_server_cmd(
         tokenizer_model,
         "--auto-detect-ckpt-format",
         "--max-tokens-to-oom",
-        "3600000",
+        "1024" if stress_mode else "3600000",
         "--inference-max-seq-length",
         "4096",
         "--attention-backend",
@@ -95,8 +82,9 @@ def build_server_cmd(
         "1024",
         "--seq-length",
         "1024",
+        "--inference-logging-step-interval=1",
         "--inference-dynamic-batching-buffer-size-gb",
-        "20",
+        "0.25" if stress_mode else "20",
         "--dist-ckpt-strictness",
         "log_unexpected",
         "--inference-ckpt-non-strict",
@@ -104,13 +92,21 @@ def build_server_cmd(
         str(SERVER_PORT),
         "--host",
         SERVER_HOST,
+        *(
+            [
+                "--inference-dynamic-batching-prefix-caching",
+                "--inference-dynamic-batching-prefix-caching-eviction-policy",
+                "lru",
+                "--inference-dynamic-batching-prefix-caching-coordinator-policy",
+                "load_balanced",
+            ]
+            if prefix_cache
+            else []
+        ),
     ]
 
 
 def cleaned_env() -> dict:
-    """Strip torchrun-specific env vars so the spawned server's torchrun
-    starts a fresh distributed setup instead of inheriting a stale one.
-    """
     env = os.environ.copy()
     for v in (
         "RANK",
@@ -129,7 +125,7 @@ def cleaned_env() -> dict:
     env["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
     env["NCCL_ALGO"] = "Ring"
     env["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
-    env["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    env.update(CUBLAS_WORKSPACE_CONFIG=":4096:8", MEGATRON_LOGGING_LEVEL="20")
     return env
 
 
@@ -149,19 +145,67 @@ def post_completion() -> dict:
         return json.loads(resp.read())
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint-dir", required=True)
-    parser.add_argument("--tokenizer-model", required=True)
-    parser.add_argument(
-        "--server-log-dir",
-        default=None,
-        help="torchrun --log-dir for the spawned server; CI passes the JET assets "
-        "dir so per-rank logs land where the harness expects them.",
+def post_chat(prompt: str) -> dict:
+    body = json.dumps(
+        {
+            "model": "EMPTY",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 10,
+            "temperature": 0.0,
+            "logprobs": True,
+            "top_logprobs": 1,
+            "return_tokenized_data": True,
+        }
+    ).encode()
+    req = urllib.request.Request(
+        f"http://localhost:{SERVER_PORT}/v1/chat/completions",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
     )
-    args = parser.parse_args()
+    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_S) as resp:
+        assert resp.status == 200
+        return json.loads(resp.read())
 
-    cmd = build_server_cmd(args.checkpoint_dir, args.tokenizer_model, args.server_log_dir)
+
+def collect_numeric_pairs(reference, actual, label, pairs):
+    if isinstance(reference, dict):
+        assert tuple(reference) == tuple(actual)
+        for key in reference:
+            collect_numeric_pairs(reference[key], actual[key], f"{label}.{key}", pairs)
+    elif isinstance(reference, list):
+        assert len(reference) == len(actual)
+        for idx, (left, right) in enumerate(zip(reference, actual)):
+            collect_numeric_pairs(left, right, f"{label}.{idx}", pairs)
+    elif isinstance(reference, float):
+        assert isinstance(actual, float)
+        pairs.append((label, reference, actual))
+    else:
+        assert reference == actual
+
+
+def assert_numeric_pairs(pairs):
+    assert all(math.isfinite(value) for _, left, right in pairs for value in (left, right))
+    differences = [abs(left - right) for _, left, right in pairs]
+    p95 = sorted(differences)[math.ceil(0.95 * len(differences)) - 1]
+    worst = max(range(len(pairs)), key=differences.__getitem__)
+    stats = (
+        f"count={len(pairs)}, mean={sum(differences) / len(pairs):.6g}, p95={p95:.6g}, "
+        f"max={differences[worst]:.6g}, "
+        f"over_5pct={sum(value > LOGPROB_P95_ATOL for value in differences)}, "
+        f"worst={pairs[worst]!r}"
+    )
+    assert p95 <= LOGPROB_P95_ATOL and differences[worst] <= LOGPROB_MAX_ATOL, stats
+
+
+def run_server(args, prefix_cache=False):
+    cmd = build_server_cmd(
+        args.checkpoint_dir,
+        args.tokenizer_model,
+        args.server_log_dir,
+        prefix_cache,
+        args.prefix_cache_compare,
+    )
     print(f"[smoke] spawning server: {' '.join(cmd)}", flush=True)
 
     proc = subprocess.Popen(
@@ -184,29 +228,44 @@ def main() -> int:
     watcher = threading.Thread(target=watch, daemon=True)
     watcher.start()
 
-    rc = 1
     try:
         if not ready.wait(READINESS_TIMEOUT_S):
-            print(f"[smoke] FAIL: readiness banner not seen in {READINESS_TIMEOUT_S}s", flush=True)
-            return rc
+            raise AssertionError(f"readiness banner not seen in {READINESS_TIMEOUT_S}s")
 
-        # Allow a beat after the readiness banner for all 4 frontend replicas
-        # to be reachable.
         time.sleep(2)
 
-        print("[smoke] sending /v1/completions request", flush=True)
-        body = post_completion()
-        choices = body.get("choices") or []
-        if not choices:
-            print(f"[smoke] FAIL: no choices in response: {body}", flush=True)
-            return rc
-        text = choices[0].get("text", "")
-        if not text:
-            print(f"[smoke] FAIL: empty completion text: {body}", flush=True)
-            return rc
-
-        print(f"[smoke] PASS: completion={text!r}", flush=True)
-        rc = 0
+        if not args.prefix_cache_compare:
+            body = post_completion()
+            assert (body.get("choices") or [{}])[0].get("text")
+        else:
+            outputs, cached_by_wave, memory = [], [], []
+            for cycle in range(args.prefix_cache_stress_cycles):
+                shared = (f"deterministic shared prefix {cycle} for cache stress. " * 80).strip()
+                for wave in (
+                    [shared],
+                    [shared] * 8,
+                    [shared] * 8,
+                    [(f"pressure {cycle:02d} {idx:03d}. " * 120).strip() for idx in range(32)],
+                    [shared] * 8,
+                    [shared] * 8,
+                ):
+                    cached = []
+                    with ThreadPoolExecutor(max_workers=len(wave)) as executor:
+                        responses = executor.map(post_chat, wave)
+                    for response in responses:
+                        choice = response["choices"][0]
+                        message = choice["message"]
+                        token_ids = message["generation_token_ids"]
+                        outputs.append((token_ids, message["content"], choice["logprobs"]))
+                        cached.append(response["usage"]["prompt_tokens_details"]["cached_tokens"])
+                    cached_by_wave.append((min(cached), max(cached)))
+                output = subprocess.check_output(
+                    "nvidia-smi --query-compute-apps=used_memory "
+                    "--format=csv,noheader,nounits".split(),
+                    text=True,
+                )
+                memory.append(sum(map(int, output.split())))
+            return outputs, cached_by_wave, memory
     finally:
         if proc.poll() is None:
             proc.send_signal(signal.SIGTERM)
@@ -216,7 +275,36 @@ def main() -> int:
                 print("[smoke] server didn't exit on SIGTERM; SIGKILL", flush=True)
                 proc.kill()
                 proc.wait()
-    return rc
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint-dir", required=True)
+    parser.add_argument("--tokenizer-model", required=True)
+    parser.add_argument("--server-log-dir", default=None)
+    parser.add_argument("--prefix-cache-compare", action="store_true")
+    parser.add_argument("--prefix-cache-stress-cycles", type=int, default=3)
+    args = parser.parse_args()
+    if not args.prefix_cache_compare:
+        run_server(args)
+        print("[smoke] PASS", flush=True)
+        return 0
+
+    assert args.prefix_cache_stress_cycles >= 3
+    reference, _, reference_memory = run_server(args, prefix_cache=False)
+    cached, activation, memory = run_server(args, prefix_cache=True)
+    pairs = []
+    for idx, (ref_output, cached_output) in enumerate(zip(reference, cached, strict=True)):
+        assert ref_output[:2] == cached_output[:2], f"HTTP output mismatch at request {idx}"
+        assert len(ref_output[2]["content"]) == len(ref_output[0])
+        collect_numeric_pairs(ref_output[2], cached_output[2], f"request {idx}.logprobs", pairs)
+    assert_numeric_pairs(pairs)
+    assert all(low == 0 < high for low, high in activation[1::6])
+    assert all(value == (0, 0) for value in activation[4::6])
+    assert all(low > 0 for wave in (activation[2::6], activation[5::6]) for low, _ in wave)
+    assert max(memory) <= max(reference_memory) + 64 * 8
+    assert memory[-1] <= memory[-2] + 64 * 8  # Allow 64 MiB/GPU for lazy workspaces.
+    return 0
 
 
 if __name__ == "__main__":

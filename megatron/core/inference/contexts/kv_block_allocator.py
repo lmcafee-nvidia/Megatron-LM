@@ -262,7 +262,7 @@ class KVBlockAllocator:
         # Without resetting the block bag, context request memory will clash and
         # requests will point to each other's memory blocks, resulting in faulty
         # generations.
-        self.block_bag = torch.arange(self.pool_size, dtype=torch.int32, device='cpu')
+        self.block_bag.copy_(torch.arange(self.pool_size, dtype=torch.int32, device='cpu'))
 
         self.pool_avail = self.pool_size - 1
 
@@ -285,6 +285,41 @@ class KVBlockAllocator:
     # Prefix caching methods
     # =========================================================================
 
+    def invalidate_prefix_cache(self) -> None:
+        """Make all cached prefixes undiscoverable without disrupting live requests.
+
+        Evictable blocks are returned to the free pool immediately. Blocks that
+        are still referenced by live requests keep their storage until those
+        requests release them, but their hashes and replay metadata are cleared
+        so a new request cannot reuse state computed by an older model.
+        """
+        if not self.enable_prefix_caching:
+            return
+
+        registered_mask = self.block_hashes != -1
+        registered_ids = torch.nonzero(registered_mask, as_tuple=True)[0]
+        if registered_ids.numel() == 0:
+            return
+
+        registered_hashes = set(self.block_hashes[registered_ids].tolist())
+        self.kv_hash_to_block_id.clear()
+        if self.on_blocks_deregistered is not None:
+            self.on_blocks_deregistered(registered_ids.tolist(), registered_hashes)
+
+        evictable_ids = registered_ids[self.block_ref_counts[registered_ids] == 0]
+        if evictable_ids.numel() > 0:
+            count = evictable_ids.numel()
+            self.block_bag[self.pool_avail : self.pool_avail + count] = evictable_ids
+            self.pool_avail += count
+            routed_ids = set(evictable_ids.tolist()) & self.block_routing.keys()
+            deque(map(self.block_routing.pop, routed_ids), maxlen=0)
+
+        self.block_hashes[registered_ids] = -1
+        if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
+            self.block_timestamps[registered_ids] = 0
+            self.block_parent_id[registered_ids] = -1
+            self.block_child_count[registered_ids] = 0
+
     def register_kv_block_hashes(
         self,
         block_ids: list[int],
@@ -305,6 +340,7 @@ class KVBlockAllocator:
             return
         id_tensor = torch.tensor(block_ids, dtype=torch.int64, device=self.block_hashes.device)
         hash_tensor = torch.tensor(block_hashes, dtype=torch.int64, device=self.block_hashes.device)
+        new_registration_mask = self.block_hashes[id_tensor] == -1
         self.block_hashes[id_tensor] = hash_tensor
         if parent_hashes is not None:
             assert len(parent_hashes) == len(block_ids)
@@ -325,7 +361,7 @@ class KVBlockAllocator:
             ]
             parent_id_tensor = torch.tensor(parent_ids, dtype=torch.int64, device=id_tensor.device)
             self.block_parent_id[id_tensor] = parent_id_tensor
-            has_parent = parent_id_tensor >= 0
+            has_parent = (parent_id_tensor >= 0) & new_registration_mask
             if has_parent.any():
                 self.block_child_count.scatter_add_(
                     0,

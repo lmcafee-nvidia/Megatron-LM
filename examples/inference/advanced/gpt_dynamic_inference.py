@@ -1,7 +1,9 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-# pylint: disable=bad-builtin
+# pylint: disable=bad-builtin,protected-access
 
+import copy
+import gc
 import hashlib
 import io
 import json
@@ -9,11 +11,14 @@ import os
 import sys
 import warnings
 from collections import defaultdict
+from dataclasses import replace
 from typing import Dict, List, Optional
+from unittest.mock import Mock
 
-from megatron.training.arguments import parse_and_validate_args
 import torch
 from tqdm import tqdm
+
+from megatron.training.arguments import parse_and_validate_args
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
@@ -28,6 +33,7 @@ from examples.inference.utils import (
 )
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine, EngineSuspendedError
+from megatron.core.inference.inference_request import compute_block_hashes_batched
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
@@ -36,6 +42,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
+from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.inference.utils import (
     add_inference_args,
     get_inference_config_from_model_and_args,
@@ -54,6 +61,122 @@ from megatron.training import get_args, get_tokenizer, initialize_megatron
 torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
+PREFIX_CACHE_LOGPROB_P95_ATOL = 0.048790164169432  # A 5% probability ratio in log space.
+PREFIX_CACHE_LOGPROB_MAX_ATOL = 0.182321556793955  # A 20% probability ratio in log space.
+
+
+def add_runner_args(parser):
+    parser = add_inference_args(parser)
+    group = parser.add_argument_group(title="Prefix-cache stress")
+    group.add_argument("--prefix-cache-compare", action="store_true")
+    group.add_argument("--prefix-cache-stress-groups", type=int, default=0)
+    group.add_argument("--prefix-cache-stress-copies", type=int, default=2)
+    group.add_argument("--prefix-cache-stress-prompt-tokens", type=int, default=512)
+    group.add_argument("--prefix-cache-stress-staged", action="store_true")
+    return parser
+
+
+def build_prefix_cache_stress_requests(args, tokenizer, sampling_params, requests):
+    if not args.prefix_cache_compare:
+        return requests
+    if args.inference_repeat_n < 3:
+        raise ValueError("--prefix-cache-compare requires --inference-repeat-n >= 3")
+    if args.prefix_cache_stress_groups < 2 or args.prefix_cache_stress_copies < 2:
+        raise ValueError("prefix-cache stress requires at least two groups and two copies")
+    if getattr(args, "prefix_cache_stress_staged", False):
+        args.incoming_requests_per_step = 1
+    coordinator_policy = args.inference_dynamic_batching_prefix_caching_coordinator_policy
+    longest_prefix = coordinator_policy == "longest_prefix"
+    stress_requests = []
+    for group_idx in range(args.prefix_cache_stress_groups):
+        routing_group = group_idx // 2 if longest_prefix else group_idx
+        marker = f"prefix cache pressure group {routing_group:04d}; deterministic shared text. "
+        prompt = marker
+        length_factor = 1 + int(longest_prefix and group_idx % 2)
+        target_tokens = args.prefix_cache_stress_prompt_tokens * length_factor
+        while len(tokenizer.tokenize(prompt)) < target_tokens:
+            prompt += marker
+        for _ in range(args.prefix_cache_stress_copies):
+            stress_requests.append(Request(prompt, -1, tokenizer, sampling_params))
+    return stress_requests
+
+
+def _collect_nested_pairs(reference, actual, label, pairs):
+    if isinstance(reference, dict):
+        assert tuple(reference) == tuple(actual), f"{label}: keys differ"
+        for key in reference:
+            _collect_nested_pairs(reference[key], actual[key], f"{label}.{key}", pairs)
+    elif isinstance(reference, (list, tuple)):
+        assert len(reference) == len(actual), f"{label}: lengths differ"
+        for idx, (ref_item, actual_item) in enumerate(zip(reference, actual)):
+            _collect_nested_pairs(ref_item, actual_item, f"{label}[{idx}]", pairs)
+    elif isinstance(reference, float):
+        assert isinstance(actual, float), f"{label}: expected a float"
+        pairs.append((label, reference, actual))
+    else:
+        assert reference == actual, f"{label}: {reference!r} != {actual!r}"
+
+
+def _assert_numeric_pairs(
+    pairs, p95_atol=PREFIX_CACHE_LOGPROB_P95_ATOL, max_atol=PREFIX_CACHE_LOGPROB_MAX_ATOL
+):
+    assert pairs, "no logprobs to compare"
+    values = torch.tensor([pair[1:] for pair in pairs], dtype=torch.float64)
+    assert torch.isfinite(values).all(), "non-finite logprob"
+    differences = (values[:, 0] - values[:, 1]).abs()
+    (max_difference, worst), p95 = differences.max(dim=0), torch.quantile(differences, 0.95)
+    stats = (
+        f"count={len(pairs)}, mean={float(differences.mean()):.6g}, p95={float(p95):.6g}, "
+        f"max={float(max_difference):.6g}, "
+        f"over_p95_atol={int((differences > p95_atol).sum())}, "
+        f"worst={pairs[int(worst)]!r}"
+    )
+    assert p95 <= p95_atol and max_difference <= max_atol, stats
+
+
+def assert_prefix_cache_parity(reference_requests, cached_requests):
+    assert len(reference_requests) == len(cached_requests)
+    pairs = []
+    for idx, (reference, cached) in enumerate(zip(reference_requests, cached_requests)):
+        assert reference.output_tokens == cached.output_tokens, f"request {idx}: token mismatch"
+        assert reference.output_text == cached.output_text, f"request {idx}: text mismatch"
+        assert (reference.routing_indices is None) == (cached.routing_indices is None)
+        assert not get_args().moe_enable_routing_replay or reference.routing_indices is not None
+        if reference.routing_indices is not None:
+            assert len(cached.routing_indices) == (
+                len(cached.prompt_tokens) + len(cached.output_tokens) - 1
+            )
+        for field in (
+            "prompt_log_probs",
+            "generated_log_probs",
+            "prompt_top_n_logprobs",
+            "generated_top_n_logprobs",
+        ):
+            _collect_nested_pairs(
+                getattr(reference, field, None),
+                getattr(cached, field, None),
+                f"request {idx}.{field}",
+                pairs,
+            )
+    copies = get_args().prefix_cache_stress_copies
+    for start in range(0, len(cached_requests), copies):
+        donor, *followers = cached_requests[start : start + copies]
+        if donor.routing_indices is None:
+            continue
+        for follower in followers:
+            matched = follower.num_cached_tokens
+            assert matched > 0
+            donor_routing = torch.from_numpy(donor.routing_indices[:matched]).sort(dim=-1).values
+            routes = torch.from_numpy(follower.routing_indices[:matched]).sort(dim=-1).values
+            assert torch.equal(donor_routing, routes)
+    _assert_numeric_pairs(pairs)
+
+
+def build_engine(model, inference_config, tokenizer):
+    context = DynamicInferenceContext(model.config, inference_config)
+    wrapped_model = GPTInferenceWrapper(model, context)
+    controller = TextGenerationController(wrapped_model, tokenizer)
+    return context, DynamicInferenceEngine(controller, context)
 
 
 def run_inference(
@@ -169,6 +292,8 @@ def run_inference(
                 # Get output tokens and text.
                 request.output_tokens = finished_request.generated_tokens
                 request.output_text = finished_request.generated_text
+                request.num_cached_tokens = finished_request.num_cached_tokens
+                request.routing_indices = finished_request.routing_indices
                 total_output_tokens += len(request.output_tokens)
 
                 # Log probs.
@@ -287,7 +412,7 @@ def main():
     """Run dynamic inference."""
     # Initialize Megatron.
     args = parse_and_validate_args(
-        extra_args_provider=add_inference_args,
+        extra_args_provider=add_runner_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
     initialize_megatron()
@@ -305,8 +430,6 @@ def main():
     # Build tokenizer
     tokenizer = build_tokenizer(args)
 
-    # Reset peak memory stats so functional tests measure this run and not
-    # whatever happened earlier during initialization.
     torch.cuda.reset_peak_memory_stats()
 
     # Sampling params.
@@ -326,15 +449,17 @@ def main():
 
     # Requests, context, controller.
     requests = build_requests(args, tokenizer, sampling_params)
+    requests = build_prefix_cache_stress_requests(args, tokenizer, sampling_params, requests)
     inference_config = get_inference_config_from_model_and_args(model, args)
 
     # Calculate max_sequence_length from requests
     max_gen_length = sampling_params.num_tokens_to_generate
     max_context_length = max(len(r.prompt_tokens) for r in requests)
     inference_config.max_sequence_length = max_context_length + max_gen_length
-    context = DynamicInferenceContext(model.config, inference_config)
-    wrapped_model = GPTInferenceWrapper(model, context)
-    controller = TextGenerationController(wrapped_model, tokenizer)
+    reference_config = replace(inference_config, enable_prefix_caching=False)
+    context, engine = build_engine(
+        model, reference_config if args.prefix_cache_compare else inference_config, tokenizer
+    )
 
     # Validate all context_length's <= max_tokens.
     if not args.enable_chunked_prefill:
@@ -348,24 +473,45 @@ def main():
             f"{k}({v})" for k, v in invalid_prompt_length_map.items()
         )
 
-    # Inference engine.
-    engine = DynamicInferenceEngine(controller, context)
-
+    throughputs, memory_cycles = [], []
+    if args.prefix_cache_compare:
+        assert inference_config.enable_prefix_caching
+        assert sampling_params.top_k == 1 and sampling_params.top_p == 0.0
+        assert (
+            min(len(request.prompt_tokens) for request in requests) >= 2 * context.block_size_tokens
+        )
+        group_requests = requests[:: args.prefix_cache_stress_copies]
+        distinct_block_demand = sum(
+            len(request.prompt_tokens) // context.block_size_tokens for request in group_requests
+        )
+        usable_blocks = context.kv_block_allocator.pool_size - 1
+        assert distinct_block_demand > usable_blocks, (distinct_block_demand, usable_blocks)
+        first_group_hashes = compute_block_hashes_batched(
+            torch.tensor(group_requests[0].prompt_tokens), context.block_size_tokens
+        )
+        reference_requests = copy.deepcopy(requests)
+        run_inference(reference_requests, engine)
+        delete_cuda_graphs()
+        context.deallocate_inference_state_buffers()
+        del engine, context
+        gc.collect()
+        torch.cuda.empty_cache()
+        context, engine = build_engine(model, inference_config, tokenizer)
+        mamba = context.mamba_slot_allocator
+        if mamba is not None:
+            mamba._evict_lru_slots_batch = Mock(wraps=mamba._evict_lru_slots_batch)
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
-    print("~~~")
-    print(setup_prefix)
-    print("~~~")
-
-    # Run and time test, optionally `args.inference_repeat_n` times.
-    throughputs = []
+    print("~~~", setup_prefix, "~~~", sep="\n")
     for _ in range(args.inference_repeat_n):
 
-        # Reset engine.
-        engine.reset()
+        if not args.prefix_cache_compare:
+            engine.reset()
+        else:
+            requests = copy.deepcopy(requests)
 
         torch.cuda.reset_peak_memory_stats()
+        hit_start = engine._prefix_cache_hits
 
-        # Trial.
         t = get_curr_time()
         result = run_inference(requests, engine)
         step_times = result["step_times"]
@@ -375,9 +521,37 @@ def main():
         torch.cuda.synchronize()
         total_time = get_curr_time() - t
         stats = torch.cuda.memory_stats()
-        throughput = total_output_tokens / total_time
-        throughputs.append(throughput)
+        throughputs.append(total_output_tokens / total_time)
+        if args.prefix_cache_compare:
+            assert_prefix_cache_parity(reference_requests, requests)
+            assert engine._prefix_cache_hits > hit_start
+            allocator = context.kv_block_allocator
+            if inference_config.prefix_caching_eviction_policy.value == "ref_zero":
+                assert not allocator.kv_hash_to_block_id
+                assert allocator.pool_avail == allocator.pool_size - 1
+            else:
+                assert (
+                    allocator.kv_hash_to_block_id and allocator.pool_avail < allocator.pool_size - 1
+                )
+            allocated = torch.tensor(torch.cuda.max_memory_allocated(), device="cuda")
+            torch.distributed.all_reduce(allocated, op=torch.distributed.ReduceOp.MAX)
+            memory_cycles.append(int(allocated))
 
+    if args.prefix_cache_compare:
+        assert engine._prefix_cache_blocks_matched > 0
+        assert any(getattr(request, "num_cached_tokens", 0) > 0 for request in requests)
+        if inference_config.prefix_caching_eviction_policy.value == "lru":
+            assert any(
+                h not in context.kv_block_allocator.kv_hash_to_block_id for h in first_group_hashes
+            )
+        if 0 < (inference_config.prefix_caching_mamba_gb or 0) < 1:
+            assert mamba is not None
+            assert engine._prefill_tokens_skipped > 0 and mamba._evict_lru_slots_batch.called
+        if args.cuda_graph_impl == "local":
+            assert engine.capture_stats and sum(result["cuda_graph_request_count_map"].values()) > 0
+        assert (
+            memory_cycles[-1] <= memory_cycles[-2] + 64 * 1024**2
+        ), "cache-on CUDA allocation grew by more than 64 MiB after warmup"
     # Validate all requests finished.
     for request in requests:
         assert request.state == "finished", f"request.state == '{request.state}' != 'finished'."
