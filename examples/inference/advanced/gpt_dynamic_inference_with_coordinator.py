@@ -52,7 +52,8 @@ def _assert_result_parity(reference, actual):
     for idx, (ref_request, request) in enumerate(zip(reference, actual)):
         expected_length = ref_request.sampling_params.num_tokens_to_generate
         assert len(ref_request.generated_tokens) == expected_length
-        assert ref_request.generated_tokens == request.generated_tokens
+        mismatch = (idx, ref_request.generated_tokens, request.generated_tokens)
+        assert ref_request.generated_tokens == request.generated_tokens, mismatch
         assert ref_request.generated_text == request.generated_text
         for field in (
             "prompt_log_probs",
@@ -163,15 +164,11 @@ async def main(
         while True:
             current_time = time.time_ns() / 10**9
             if args.incoming_requests_per_step is None:
-                # Only add requests that have arrived at the current time.
                 while (
                     num_requests_added < num_requests_total
                     and requests[num_requests_added].time_arrival <= current_time
                 ):
                     request = requests[num_requests_added]
-                    # These add-request calls will queue up the request on a zmq socket and return
-                    # instantaneously. They will return an asyncio future which can be awaited for
-                    # request completion.
                     futures.append(client.add_request(request.prompt_text, request.sampling_params))
                     num_requests_added += 1
 
@@ -371,6 +368,8 @@ if __name__ == "__main__":
             torch.cuda.empty_cache()
             reference_config = replace(inference_config, enable_prefix_caching=False)
             reference_context, reference_engine = build_engine(model, reference_config, tokenizer)
+            schedule_output_path = args.coordinator_schedule_output_path
+            args.coordinator_schedule_output_path = None
             reference_cycles, _ = asyncio.run(
                 main(reference_engine, requests, args.inference_coordinator_port, stress_cycles=1)
             )
@@ -379,6 +378,7 @@ if __name__ == "__main__":
             del reference_engine, reference_context
             gc.collect()
             torch.cuda.empty_cache()
+            args.coordinator_schedule_output_path = schedule_output_path
             context, engine = build_engine(model, inference_config, tokenizer)
             cache_cycles, snapshots = asyncio.run(
                 main(

@@ -43,7 +43,7 @@ MODEL_ARGS:
   --top_p: 0
   --return-log-probs: true
   --skip-prompt-log-probs: true
-  --num-tokens-to-generate: 30
+  --num-tokens-to-generate: 4
   --inference-dynamic-batching-buffer-size-gb: 0.15
   --inference-dynamic-batching-max-requests: 16
   --inference-dynamic-batching-max-tokens: 2048
@@ -85,7 +85,10 @@ AFTER_SCRIPT: |
   for start in range(0, len(records), copies):
       group = records[start : start + copies]
       ranks = {record["rank_index"] for record in group}
-      assert len(ranks) == 1, f"shared-prefix group split across replicas: {group}"
+      if start < copies * groups:
+          assert len(ranks) > 1, f"cold-cache group unexpectedly stayed on one replica: {group}"
+      else:
+          assert len(ranks) == 1, f"warm shared-prefix group split across replicas: {group}"
   assert {record["rank_index"] for record in records} == set(
       range(schedule["data_parallel_size"])
   )

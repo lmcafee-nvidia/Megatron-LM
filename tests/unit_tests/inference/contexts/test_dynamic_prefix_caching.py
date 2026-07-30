@@ -223,6 +223,9 @@ class _StubEngine(DynamicInferenceEngine):
 
     def __init__(self, context: DynamicInferenceContext, *, enable_chunked_prefill=False):
         self.context = context
+        self.controller = type("Controller", (), {"tokenizer": _NumericTokenizer()})()
+        self.rank = 0
+        self.materialize_only_last_token_logits = False
         self.enable_chunked_prefill = enable_chunked_prefill
         self.cuda_graph_all_prefills = False
         self._prefix_coordination_waits = 0
@@ -2809,7 +2812,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         elif feature in ("offload", "recompute"):
             kwargs.update(
                 kv_cache_management_mode=feature,
-                static_kv_memory_pointers=False,
+                static_kv_memory_pointers=(feature == "offload"),
                 suspend_resume_interval=2,
                 num_cuda_graphs=2,
                 force_build_cuda_graphs=True,
@@ -2906,8 +2909,10 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         output = None
         while output is None:
             result = engine.step_modern()
-            if result["finished_request_records"]:
-                output = result["finished_request_records"][0].merge()
+            for record in result["finished_request_records"]:
+                merged = record.merge()
+                if merged.request_id == request.request_id:
+                    output = merged
         assert engine._prefix_cache_hits == hits_before
         assert output.num_cached_tokens == 0
         assert len(output.prompt_log_probs) == len(prompt) - 1
@@ -3116,7 +3121,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                     assert not ctx.is_tensor_state_allocated
                     engine.resume()
                     assert ctx.is_tensor_state_allocated
-                    if config.num_cuda_graphs > 0:
+                    if (config.num_cuda_graphs or 0) > 0:
                         assert engine.capture_stats["pool_reserved_bytes"] > 0
                     if case["feature"] == "uvm":
                         assert ctx.memory_buffer.data_ptr() == uvm_memory_buffer_ptr
