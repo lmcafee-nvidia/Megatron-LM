@@ -60,7 +60,7 @@ from megatron.training import get_args, get_tokenizer, initialize_megatron
 torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
-PREFIX_CACHE_LOGPROB_P95_ATOL = 0.058268908123976  # A 6% probability ratio in log space.
+PREFIX_CACHE_LOGPROB_P95_ATOL = 0.048790164169432  # A 5% probability ratio in log space.
 PREFIX_CACHE_LOGPROB_MAX_ATOL = 0.182321556793955  # A 20% probability ratio in log space.
 
 
@@ -116,7 +116,9 @@ def _collect_nested_pairs(reference, actual, label, pairs):
         assert reference == actual, f"{label}: {reference!r} != {actual!r}"
 
 
-def _assert_numeric_pairs(pairs):
+def _assert_numeric_pairs(
+    pairs, p95_atol=PREFIX_CACHE_LOGPROB_P95_ATOL, max_atol=PREFIX_CACHE_LOGPROB_MAX_ATOL
+):
     assert pairs, "no logprobs to compare"
     values = torch.tensor([pair[1:] for pair in pairs], dtype=torch.float64)
     assert torch.isfinite(values).all(), "non-finite logprob"
@@ -125,12 +127,10 @@ def _assert_numeric_pairs(pairs):
     stats = (
         f"count={len(pairs)}, mean={float(differences.mean()):.6g}, p95={float(p95):.6g}, "
         f"max={float(max_difference):.6g}, "
-        f"over_p95_atol={int((differences > PREFIX_CACHE_LOGPROB_P95_ATOL).sum())}, "
+        f"over_p95_atol={int((differences > p95_atol).sum())}, "
         f"worst={pairs[int(worst)]!r}"
     )
-    assert (
-        p95 <= PREFIX_CACHE_LOGPROB_P95_ATOL and max_difference <= PREFIX_CACHE_LOGPROB_MAX_ATOL
-    ), stats
+    assert p95 <= p95_atol and max_difference <= max_atol, stats
 
 
 def assert_prefix_cache_parity(reference_requests, cached_requests):

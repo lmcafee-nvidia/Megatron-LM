@@ -67,7 +67,7 @@ def _assert_result_parity(reference, actual):
                 f"request {idx}.{field}",
                 pairs,
             )
-    _assert_numeric_pairs(pairs)
+    _assert_numeric_pairs(pairs, 0.058268908123976, 0.095310179804325)  # log(1.06), log(1.10).
 
 
 def _stress_snapshot(engine, first_group_hashes):
@@ -273,8 +273,8 @@ async def main(
     if dist.get_rank() == 0:
         client.shutdown_coordinator()
         await asyncio.to_thread(engine.inference_coordinator_process.join, 30)
-        assert engine.inference_coordinator_process.exitcode == 0
         client.stop()
+        assert engine.inference_coordinator_process.exitcode == 0
     dist.barrier()
     logging.info(f"Rank: {dist.get_rank()} stopped their engine instance successfully.")
     return result_cycles, stress_snapshots
