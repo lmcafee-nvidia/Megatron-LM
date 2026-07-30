@@ -2635,7 +2635,6 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 enable_chunked_prefill=test_config.enable_chunked_prefill,
                 enable_prefix_caching=test_config.enable_prefix_caching,
                 prefix_caching_eviction_policy=test_config.prefix_caching_eviction_policy,
-                prefix_caching_coordinator_policy=test_config.prefix_caching_coordinator_policy,
                 prefix_caching_mamba_gb=(
                     0.02 if mamba_inference_state_config is not None else None
                 ),
