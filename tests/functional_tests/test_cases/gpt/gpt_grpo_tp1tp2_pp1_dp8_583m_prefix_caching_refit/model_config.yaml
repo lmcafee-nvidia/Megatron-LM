@@ -93,10 +93,15 @@ AFTER_SCRIPT: |
   transition_hit_cycles=0
   while IFS= read -r log_file; do
     cycles=$(awk '
-      /Reshard complete/ { after_refit = 1; next }
-      after_refit && /prefix cache \(cumul\): [1-9][0-9]* hits/ {
-        cycles += 1
-        after_refit = 0
+      /Reshard complete/ { waiting = 1; baseline = hits; next }
+      match($0, /prefix cache \(cumul\): [0-9]+ hits/) {
+        value = substr($0, RSTART, RLENGTH)
+        gsub(/[^0-9]/, "", value)
+        hits = value + 0
+        if (waiting && hits > baseline) {
+          cycles += 1
+          waiting = 0
+        }
       }
       END { print cycles + 0 }
     ' "$log_file")

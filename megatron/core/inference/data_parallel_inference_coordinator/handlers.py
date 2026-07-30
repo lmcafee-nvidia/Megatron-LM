@@ -159,7 +159,7 @@ def handle_control_signal(coordinator, sender_identity, payload):
 
     if header == Headers.SET_GENERATION_EPOCH:
         generation_epoch = payload[1]
-        if generation_epoch != getattr(coordinator, "_generation_epoch", None):
+        if generation_epoch != coordinator._generation_epoch:
             coordinator._hash_table.clear()
             coordinator._generation_epoch = generation_epoch
 

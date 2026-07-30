@@ -15,11 +15,20 @@ import torch
 from megatron.core.inference.config import (
     InferenceConfig,
     KVCacheManagementMode,
+    PrefixCachingCoordinatorPolicy,
     PrefixCachingEvictionPolicy,
 )
-from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+from megatron.core.inference.contexts.dynamic_context import (
+    BlockOverflowError,
+    DynamicInferenceContext,
+)
+from megatron.core.inference.data_parallel_inference_coordinator.handlers import (
+    handle_control_signal,
+)
+from megatron.core.inference.data_parallel_inference_coordinator.state import CoordinatorState
 from megatron.core.inference.engines.async_zmq_communicator import AsyncZMQCommunicator
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, EngineState
+from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
@@ -613,6 +622,86 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         assert alloc.kv_hash_to_block_id[h1] == s1
 
     @pytest.mark.internal
+    def test_failed_partial_hit_admission_rolls_back_and_retries(self):
+        """A failed allocation must not pin or double-count a matched prefix."""
+        ctx = self._ctx()
+        alloc = ctx.kv_block_allocator
+        bs = ctx.block_size_tokens
+
+        producer = self._req(ctx, self._prompt(2 * bs))
+        ctx.add_request(producer)
+        matched_blocks = self._block_ids(ctx, 0, 2)
+        matched_hashes = list(producer.precomputed_block_hashes)
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+        ctx.total_request_count = 0
+
+        # Keep every raw pool block in use. The only allocatable blocks are the
+        # two cached matches, which the follower pins before requesting its tail.
+        drained = alloc.allocate_memory_blocks(alloc.pool_avail)
+        assert drained is not None
+        assert alloc.pool_avail == 0
+        assert int(alloc.get_evictable_block_count()) == 2
+
+        follower = self._req(ctx, self._prompt(3 * bs), request_id=2)
+        hits_before = ctx.prefix_cache_hits
+        blocks_before = ctx.prefix_cache_blocks_matched
+        with pytest.raises(BlockOverflowError):
+            ctx.add_request(follower)
+
+        assert ctx.total_request_count == 0
+        assert follower.num_cached_tokens == 0
+        assert ctx.prefix_cache_hits == hits_before
+        assert ctx.prefix_cache_blocks_matched == blocks_before
+        assert [alloc.block_ref_counts[block].item() for block in matched_blocks] == [0, 0]
+        assert all(
+            alloc.kv_hash_to_block_id[hash_] == block
+            for hash_, block in zip(matched_hashes, matched_blocks)
+        )
+
+        # Releasing one unregistered block makes the retry succeed. The prefix
+        # is counted once, and the cached blocks stay shared rather than evicted.
+        alloc.release_memory_blocks(drained[:1])
+        ctx.add_request(follower)
+        assert follower.num_cached_tokens == 2 * bs
+        assert ctx.prefix_cache_hits == hits_before + 1
+        assert ctx.prefix_cache_blocks_matched == blocks_before + 2
+        assert self._block_ids(ctx, 0, 2) == matched_blocks
+        assert len(set(self._block_ids(ctx, 0, 3))) == 3
+
+    @pytest.mark.internal
+    def test_reset_during_graph_warmup_keeps_block_bag_mutable(self):
+        """Reset must not replace normal allocator state with an inference tensor."""
+        ctx = self._ctx()
+        alloc = ctx.kv_block_allocator
+        block_bag = alloc.block_bag
+        assert not block_bag.is_inference()
+
+        with torch.inference_mode():
+            alloc.reset()
+
+        assert alloc.block_bag is block_bag
+        assert not alloc.block_bag.is_inference()
+
+        # Reproduce the later async LRU-admission path: retain one cached block,
+        # consume the raw pool, then allocate through eviction outside inference mode.
+        cached = alloc.allocate_memory_blocks(1)
+        assert cached is not None
+        cached_id = cached.item()
+        cached_hash = 101
+        alloc.register_kv_block_hashes([cached_id], [cached_hash], parent_hashes=[0])
+        alloc.release_memory_blocks(cached)
+        drained = alloc.allocate_memory_blocks(alloc.pool_avail)
+        assert drained is not None
+        assert alloc.pool_avail == 0
+        assert int(alloc.get_evictable_block_count()) == 1
+
+        replacement = alloc.allocate_memory_blocks(1)
+        assert replacement is not None and replacement.item() == cached_id
+        assert cached_hash not in alloc.kv_hash_to_block_id
+        assert alloc.pool_avail == 0
+        assert int(alloc.get_evictable_block_count()) == 0
+
+    @pytest.mark.internal
     def test_check_availability_excludes_already_pinned_matches(self):
         """check_availability reserves only matched blocks that are currently
         evictable (ref_count == 0). A matched prefix already pinned by an
@@ -756,6 +845,34 @@ class TestDisabledAndEngineScheduling(PrefixCachingTestBase):
     def _engine(self, ctx, **kwargs):
         return _StubEngine(ctx, **kwargs)
 
+    @pytest.mark.internal
+    def test_generation_epoch_invalidates_coordinator_prefix_assignments(self):
+        client = b"client"
+        broadcasts = []
+        coordinator = type("Coordinator", (), {})()
+        coordinator.known_clients = {client}
+        coordinator.state = CoordinatorState.RUNNING
+        coordinator._generation_epoch = None
+        coordinator._hash_table = {101: {0: 1}, 202: {1: 2}}
+        coordinator._broadcast_to_engines = broadcasts.append
+
+        handle_control_signal(coordinator, client, [Headers.SET_GENERATION_EPOCH.value, 1])
+        assert coordinator._generation_epoch == 1
+        assert coordinator._hash_table == {}
+
+        coordinator._hash_table = {303: {0: 3}}
+        handle_control_signal(coordinator, client, [Headers.SET_GENERATION_EPOCH.value, 1])
+        assert coordinator._hash_table == {303: {0: 3}}
+
+        handle_control_signal(coordinator, client, [Headers.SET_GENERATION_EPOCH.value, 2])
+        assert coordinator._generation_epoch == 2
+        assert coordinator._hash_table == {}
+        assert broadcasts == [
+            [Headers.SET_GENERATION_EPOCH.value, 1],
+            [Headers.SET_GENERATION_EPOCH.value, 1],
+            [Headers.SET_GENERATION_EPOCH.value, 2],
+        ]
+
     def _add_to_waiting(self, engine, ctx, req):
         request_id = req.request_id
         engine.requests[request_id] = type(
@@ -820,12 +937,18 @@ class TestDisabledAndEngineScheduling(PrefixCachingTestBase):
 
     @pytest.mark.internal
     @pytest.mark.parametrize("hybrid", [False, True], ids=["gpt", "hybrid"])
-    def test_epoch_change_invalidates_cache_without_disrupting_live_request(self, hybrid):
+    @pytest.mark.parametrize(
+        "policy",
+        [PrefixCachingEvictionPolicy.LRU, PrefixCachingEvictionPolicy.REF_ZERO],
+        ids=["lru", "ref-zero"],
+    )
+    def test_epoch_change_invalidates_cache_without_disrupting_live_request(self, hybrid, policy):
         ctx = self._ctx(
             max_tokens=256,
             max_requests=8,
             mamba_config=self._mamba_config() if hybrid else None,
             prefix_caching_mamba_gb=0.01 if hybrid else None,
+            prefix_caching_eviction_policy=policy,
         )
         alloc = ctx.kv_block_allocator
         engine = self._engine(ctx)
@@ -843,10 +966,16 @@ class TestDisabledAndEngineScheduling(PrefixCachingTestBase):
         cached_hash = cached.precomputed_block_hashes[0]
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
         assert alloc.block_ref_counts[cached_block].item() == 0
+        if policy == PrefixCachingEvictionPolicy.LRU:
+            assert alloc.kv_hash_to_block_id[cached_hash] == cached_block
+        else:
+            assert cached_hash not in alloc.kv_hash_to_block_id
+            assert alloc.block_hashes[cached_block].item() == -1
 
         routing = np.ones((bs, 1, 1), dtype=np.int64)
         alloc.block_routing[live_blocks[0]] = routing.copy()
-        alloc.block_routing[cached_block] = routing.copy()
+        if policy == PrefixCachingEvictionPolicy.LRU:
+            alloc.block_routing[cached_block] = routing.copy()
         pool_avail_before = alloc.pool_avail
         if hybrid:
             mamba_alloc = ctx.mamba_slot_allocator
@@ -861,7 +990,8 @@ class TestDisabledAndEngineScheduling(PrefixCachingTestBase):
         assert cached_hash not in alloc.kv_hash_to_block_id
         assert all(alloc.block_hashes[block_id].item() == -1 for block_id in live_blocks)
         assert all(alloc.block_ref_counts[block_id].item() == 1 for block_id in live_blocks)
-        assert alloc.pool_avail == pool_avail_before + 1
+        expected_reclaimed = int(policy == PrefixCachingEvictionPolicy.LRU)
+        assert alloc.pool_avail == pool_avail_before + expected_reclaimed
         assert live_blocks[0] in alloc.block_routing
         assert cached_block not in alloc.block_routing
         replacement = alloc.allocate_memory_blocks(1)
@@ -1713,6 +1843,63 @@ class TestPerBlockRouting(PrefixCachingTestBase):
     """Tests for per-block routing storage and reconstruction."""
 
     @pytest.mark.internal
+    def test_finished_checkpointed_request_reconstructs_full_routing(self):
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        generated = [bs + 1, bs + 2, bs + 3, bs + 4]
+        request = self._req(
+            ctx,
+            self._prompt(bs),
+            sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=-1),
+        )
+        request.generated_tokens = generated[:2]
+        engine = _StubEngine(ctx)
+        future = engine._add_request(request)
+        engine.waiting_request_ids.clear()
+        record = engine.requests[request.request_id].record
+        record.checkpoint()
+        current = record[-1]
+        current.generated_tokens = generated[2:3]
+        assert len(record.requests) == 2
+        assert all(part.routing_indices is None for part in record.requests)
+
+        block_ids = ctx.kv_block_allocator.allocate_memory_blocks(2).tolist()
+        routing = np.arange(2 * bs * 4, dtype=np.int16).reshape(2 * bs, 2, 2)
+        for block_idx, block_id in enumerate(block_ids):
+            start = block_idx * bs
+            ctx.kv_block_allocator.store_block_routing(
+                block_id, np.arange(bs), routing[start : start + bs]
+            )
+
+        engine.finished_request_count = 0
+        engine.evicted_request_count = 0
+        engine.track_generated_token_events = False
+        engine.num_speculative_tokens = 0
+        engine.stop_word_being_finished_ids = set()
+        active_ids, finished_records = engine.post_process_requests(
+            request_ids=torch.tensor([request.request_id]),
+            finished_request_ids=torch.tensor([request.request_id]),
+            evict_request_ids=torch.empty(0, dtype=torch.int64),
+            step_time=0.0,
+            sample=torch.tensor(generated[3:]),
+            accepted_tokens=None,
+            log_probs=[],
+            finished_routing_block_ids={request.request_id: block_ids},
+        )
+
+        expected = routing[: bs + 3]
+        merged = record.merge()
+        assert active_ids == []
+        assert finished_records == [record]
+        assert future.result() is record
+        assert merged.generated_tokens == generated
+        np.testing.assert_array_equal(current.routing_indices, expected)
+        np.testing.assert_array_equal(merged.routing_indices, expected)
+        assert merged.routing_indices.shape[0] == (
+            len(merged.prompt_tokens) + len(merged.generated_tokens) - 1
+        )
+
+    @pytest.mark.internal
     def test_store_and_get_block_routing(self):
         """Verify store_block_routing / get_block_routing round-trip."""
         ctx = self._ctx()
@@ -2377,7 +2564,14 @@ PREFIX_CACHE_ENGINE_CASES = [
         dict(name="gpt-request-eviction", model="gpt", feature="request-eviction"),
         id="gpt-request-eviction-checkpoint-resume",
     ),
+    pytest.param(
+        dict(name="hybrid-request-eviction", model="hybrid", feature="request-eviction"),
+        id="hybrid-request-eviction-checkpoint-resume",
+    ),
     pytest.param(dict(name="gpt-uvm", model="gpt", feature="uvm"), id="gpt-uvm-backed-lifecycle"),
+    pytest.param(
+        dict(name="hybrid-uvm", model="hybrid", feature="uvm"), id="hybrid-uvm-backed-lifecycle"
+    ),
 ]
 
 PREFIX_CACHE_ENGINE_LRU_CASES = {
@@ -2393,7 +2587,6 @@ PREFIX_CACHE_ENGINE_LRU_CASES = {
     "hybrid-offload",
     "gpt-recompute",
     "gpt-epoch",
-    "hybrid-epoch",
     "gpt-request-eviction",
     "gpt-uvm",
     "gpt-http-zmq",
@@ -2423,9 +2616,11 @@ PREFIX_CACHE_ENGINE_PAIR_OWNERS = {
     "gpt-recompute×lru": "recompute-prefix-resume",
     "hybrid-recompute×ref-zero": "recompute-prefix-resume",
     "gpt-epoch×lru": "epoch-signal-invalidation-rebuild",
-    "hybrid-epoch×lru": "epoch-signal-invalidation-rebuild",
+    "hybrid-epoch×ref-zero": "epoch-signal-with-prefix-hits",
     "gpt-request-eviction×lru": "request-eviction-checkpoint-resume",
+    "hybrid-request-eviction×ref-zero": "request-eviction-checkpoint-resume",
     "gpt-uvm×lru": "uvm-backed-prefix-lifecycle",
+    "hybrid-uvm×ref-zero": "uvm-backed-prefix-lifecycle",
 }
 
 
@@ -2460,6 +2655,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 enable_chunked_prefill=test_config.enable_chunked_prefill,
                 enable_prefix_caching=test_config.enable_prefix_caching,
                 prefix_caching_eviction_policy=test_config.prefix_caching_eviction_policy,
+                prefix_caching_coordinator_policy=test_config.prefix_caching_coordinator_policy,
                 prefix_caching_mamba_gb=(
                     0.02 if mamba_inference_state_config is not None else None
                 ),
@@ -2535,6 +2731,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             if case["name"] in PREFIX_CACHE_ENGINE_LRU_CASES
             else PrefixCachingEvictionPolicy.REF_ZERO
         )
+        config.prefix_caching_coordinator_policy = PrefixCachingCoordinatorPolicy.LOAD_BALANCED
         return config
 
     @staticmethod
@@ -2675,12 +2872,18 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
 
             if case["feature"] == "epoch":
                 if cycle > 0:
-                    if enable_prefix_caching:
+                    if (
+                        enable_prefix_caching
+                        and config.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU
+                    ):
                         challenge_hashes = set(compute_block_hashes_batched(base, block_size))
                         assert challenge_hashes <= alloc.kv_hash_to_block_id.keys()
                 engine._set_generation_epoch(cycle)
                 if cycle > 0:
-                    if enable_prefix_caching:
+                    if (
+                        enable_prefix_caching
+                        and config.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU
+                    ):
                         assert challenge_hashes.isdisjoint(alloc.kv_hash_to_block_id)
                         epoch_invalidation_count += 1
 
@@ -2999,11 +3202,15 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 assert stats["uvm_pointer_stability_checks"] == stats["suspend_count"]
                 activations.add("uvm-backed-prefix-lifecycle")
             elif feature == "epoch":
-                assert stats["epoch_invalidation_count"] == 2
-                assert stats["epoch_rebuild_count"] == 3
+                if policy == PrefixCachingEvictionPolicy.LRU:
+                    assert stats["epoch_invalidation_count"] == 2
+                    assert stats["epoch_rebuild_count"] == 3
+                    activations.add("epoch-signal-invalidation-rebuild")
+                else:
+                    assert stats["ref_zero_reuse_transitions"] == 2
+                    activations.add("epoch-signal-with-prefix-hits")
                 for request_id, request in cached.items():
                     assert request.kv_cache_epoch == [(0, stats["expected_epoch"][request_id])]
-                activations.add("epoch-signal-invalidation-rebuild")
 
             assert stats["saw_mixed_batch"]
             return activations
@@ -3030,6 +3237,48 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 matrix_pairs.append(f"{matrix_case['name']}×{matrix_policy}")
             assert len(matrix_pairs) == len(set(matrix_pairs))
             assert set(matrix_pairs) == PREFIX_CACHE_ENGINE_PAIR_OWNERS.keys()
+            required_features = {
+                "base",
+                "tp",
+                "pp",
+                "mixed-parallel",
+                "moe",
+                "chunked",
+                "cuda-graph",
+                "mtp",
+                "logprobs",
+                "offload",
+                "recompute",
+                "epoch",
+                "request-eviction",
+                "uvm",
+            }
+            actual_features = {
+                parameter.values[0]["feature"] for parameter in PREFIX_CACHE_ENGINE_CASES
+            }
+            assert actual_features == required_features
+            feature_models = {
+                feature: {
+                    parameter.values[0]["model"]
+                    for parameter in PREFIX_CACHE_ENGINE_CASES
+                    if parameter.values[0]["feature"] == feature
+                }
+                for feature in required_features
+            }
+            feature_policies = {
+                feature: {
+                    (
+                        "lru"
+                        if parameter.values[0]["name"] in PREFIX_CACHE_ENGINE_LRU_CASES
+                        else "ref-zero"
+                    )
+                    for parameter in PREFIX_CACHE_ENGINE_CASES
+                    if parameter.values[0]["feature"] == feature
+                }
+                for feature in required_features
+            }
+            assert all(models == {"gpt", "hybrid"} for models in feature_models.values())
+            assert all(policies == {"lru", "ref-zero"} for policies in feature_policies.values())
 
             policy = (
                 PrefixCachingEvictionPolicy.LRU
@@ -3108,6 +3357,9 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
 
             config = self._case_config(case, enable_prefix_caching=True)
             assert config.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU
+            config.prefix_caching_coordinator_policy = (
+                PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
+            )
             env = self._build_test_env(config)
             engine = env.engine
             tokenizer = _NumericTokenizer()
@@ -3196,6 +3448,11 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             )
             torch.distributed.all_reduce(cached_before_epoch)
             assert cached_before_epoch.item() >= 1
+            initial_hits = torch.tensor(
+                engine._prefix_cache_hits, dtype=torch.int64, device=torch.cuda.current_device()
+            )
+            torch.distributed.all_reduce(initial_hits)
+            assert initial_hits.item() >= 1
 
             if rank == 0:
                 control_client.set_generation_epoch(7)

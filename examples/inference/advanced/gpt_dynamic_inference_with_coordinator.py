@@ -69,7 +69,7 @@ def _assert_result_parity(reference, actual):
 
 def _stress_snapshot(engine, first_group_hashes):
     allocator = engine.context.kv_block_allocator
-    hashes = allocator.kv_hash_to_block_id
+    hashes = allocator.kv_hash_to_block_id if engine.context.enable_prefix_caching else {}
     values = [
         engine._prefix_cache_hits,
         engine._prefix_cache_blocks_matched,
@@ -78,12 +78,11 @@ def _stress_snapshot(engine, first_group_hashes):
         int(all(h in hashes for h in first_group_hashes)),
         int(not hashes and allocator.pool_avail == allocator.pool_size - 1),
         int(bool(hashes) and allocator.pool_avail < allocator.pool_size - 1),
+        torch.cuda.memory_allocated(),
     ]
     state = torch.tensor(values, device="cuda", dtype=torch.int64)
     dist.all_reduce(state)
-    allocated = torch.tensor([torch.cuda.memory_allocated()], device="cuda", dtype=torch.int64)
-    dist.all_reduce(allocated)
-    return state.tolist(), int(allocated.item())
+    return state[:-1].tolist(), int(state[-1])
 
 
 async def suspend_resume_cycle(client, engine, args, futures):
@@ -108,7 +107,6 @@ async def main(
     port: int | None = None,
     sampling_params: SamplingParams | None = None,
     stress_cycles: int | None = None,
-    write_output: bool = True,
     first_group_hashes=(),
 ):
     if sampling_params is not None:
@@ -132,9 +130,7 @@ async def main(
 
     result_cycles, stress_snapshots = [], []
     if dist.get_rank() == 0:
-        client = InferenceClient(
-            dp_addr, deserialize=True
-        )  # submits requests to the inference coordinator
+        client = InferenceClient(dp_addr, deserialize=True)
         client.start()
     if stress_cycles is not None:
         for cycle_idx in range(stress_cycles):
@@ -222,7 +218,7 @@ async def main(
             await engine.wait_until(EngineState.RESUMED)
             await engine.wait_until(EngineState.RUNNING)
 
-    if dist.get_rank() == 0 and write_output:
+    if dist.get_rank() == 0 and (stress_cycles is None or first_group_hashes):
         # Write results to JSON. Primarily used for functional testing.
         if args.output_path:
             json_results = {}
@@ -375,13 +371,7 @@ if __name__ == "__main__":
             reference_config = replace(inference_config, enable_prefix_caching=False)
             reference_context, reference_engine = build_engine(model, reference_config, tokenizer)
             reference_cycles, _ = asyncio.run(
-                main(
-                    reference_engine,
-                    requests,
-                    args.inference_coordinator_port,
-                    stress_cycles=1,
-                    write_output=False,
-                )
+                main(reference_engine, requests, args.inference_coordinator_port, stress_cycles=1)
             )
             delete_cuda_graphs()
             reference_context.deallocate_inference_state_buffers()

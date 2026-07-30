@@ -262,7 +262,7 @@ class KVBlockAllocator:
         # Without resetting the block bag, context request memory will clash and
         # requests will point to each other's memory blocks, resulting in faulty
         # generations.
-        self.block_bag = torch.arange(self.pool_size, dtype=torch.int32, device='cpu')
+        self.block_bag.copy_(torch.arange(self.pool_size, dtype=torch.int32, device='cpu'))
 
         self.pool_avail = self.pool_size - 1
 

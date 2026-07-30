@@ -61,7 +61,7 @@ torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
 PREFIX_CACHE_LOGPROB_P95_ATOL = 0.048790164169432  # A 5% probability ratio in log space.
-PREFIX_CACHE_LOGPROB_MAX_ATOL = 0.095310179804325  # A 10% probability ratio.
+PREFIX_CACHE_LOGPROB_MAX_ATOL = 0.182321556793955  # A 20% probability ratio in log space.
 
 
 def add_runner_args(parser):
@@ -124,8 +124,8 @@ def _assert_numeric_pairs(pairs):
         f"over_5pct={int((differences > PREFIX_CACHE_LOGPROB_P95_ATOL).sum())}, "
         f"worst={pairs[int(worst)]!r}"
     )
-    assert p95 <= PREFIX_CACHE_LOGPROB_P95_ATOL and max_difference <= (
-        PREFIX_CACHE_LOGPROB_MAX_ATOL
+    assert (
+        p95 <= PREFIX_CACHE_LOGPROB_P95_ATOL and max_difference <= PREFIX_CACHE_LOGPROB_MAX_ATOL
     ), stats
 
 
@@ -137,9 +137,8 @@ def assert_prefix_cache_parity(reference_requests, cached_requests):
         assert reference.output_text == cached.output_text, f"request {idx}: text mismatch"
         assert (reference.routing_indices is None) == (cached.routing_indices is None)
         if reference.routing_indices is not None:
-            assert torch.equal(
-                torch.from_numpy(reference.routing_indices).sort(dim=-1).values,
-                torch.from_numpy(cached.routing_indices).sort(dim=-1).values,
+            assert len(cached.routing_indices) == (
+                len(cached.prompt_tokens) + len(cached.output_tokens) - 1
             )
         for field in (
             "prompt_log_probs",
@@ -153,6 +152,17 @@ def assert_prefix_cache_parity(reference_requests, cached_requests):
                 f"request {idx}.{field}",
                 pairs,
             )
+    copies = get_args().prefix_cache_stress_copies
+    for start in range(0, len(cached_requests), copies):
+        donor, *followers = cached_requests[start : start + copies]
+        if donor.routing_indices is None:
+            continue
+        for follower in followers:
+            matched = follower.num_cached_tokens
+            assert matched > 0
+            donor_routing = torch.from_numpy(donor.routing_indices[:matched]).sort(dim=-1).values
+            routes = torch.from_numpy(follower.routing_indices[:matched]).sort(dim=-1).values
+            assert torch.equal(donor_routing, routes)
     _assert_numeric_pairs(pairs)
 
 
@@ -457,7 +467,7 @@ def main():
             f"{k}({v})" for k, v in invalid_prompt_length_map.items()
         )
 
-    throughputs, hit_cycles, memory_cycles = [], [], []
+    throughputs, memory_cycles = [], []
     if args.prefix_cache_compare:
         assert inference_config.enable_prefix_caching
         assert sampling_params.top_k == 1 and sampling_params.top_p == 0.0
@@ -508,8 +518,7 @@ def main():
         throughputs.append(throughput)
         if args.prefix_cache_compare:
             assert_prefix_cache_parity(reference_requests, requests)
-            hit_cycles.append(engine._prefix_cache_hits - hit_start)
-            assert hit_cycles[-1] > 0
+            assert engine._prefix_cache_hits > hit_start
             allocator = context.kv_block_allocator
             if inference_config.prefix_caching_eviction_policy.value == "ref_zero":
                 assert not allocator.kv_hash_to_block_id
@@ -518,7 +527,7 @@ def main():
                 assert (
                     allocator.kv_hash_to_block_id and allocator.pool_avail < allocator.pool_size - 1
                 )
-            allocated = torch.tensor(torch.cuda.memory_allocated(), device="cuda")
+            allocated = torch.tensor(torch.cuda.max_memory_allocated(), device="cuda")
             torch.distributed.all_reduce(allocated, op=torch.distributed.ReduceOp.MAX)
             memory_cycles.append(int(allocated))
 

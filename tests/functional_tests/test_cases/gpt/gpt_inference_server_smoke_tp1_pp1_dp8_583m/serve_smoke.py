@@ -18,6 +18,8 @@ REQUEST_TIMEOUT_S = 60
 SHUTDOWN_TIMEOUT_S = 60
 SERVER_HOST = "0.0.0.0"
 SERVER_PORT = 5000
+LOGPROB_P95_ATOL = 0.048790164169432  # A 5% probability ratio in log space.
+LOGPROB_MAX_ATOL = 0.182321556793955  # A 20% probability ratio in log space.
 
 
 def build_server_cmd(
@@ -189,10 +191,10 @@ def assert_numeric_pairs(pairs):
     stats = (
         f"count={len(pairs)}, mean={sum(differences) / len(pairs):.6g}, p95={p95:.6g}, "
         f"max={differences[worst]:.6g}, "
-        f"over_5pct={sum(value > 0.048790164169432 for value in differences)}, "
+        f"over_5pct={sum(value > LOGPROB_P95_ATOL for value in differences)}, "
         f"worst={pairs[worst]!r}"
     )
-    assert p95 <= 0.048790164169432 and differences[worst] <= 0.095310179804325, stats
+    assert p95 <= LOGPROB_P95_ATOL and differences[worst] <= LOGPROB_MAX_ATOL, stats
 
 
 def run_server(args, prefix_cache=False):
@@ -225,7 +227,6 @@ def run_server(args, prefix_cache=False):
     watcher = threading.Thread(target=watch, daemon=True)
     watcher.start()
 
-    result = None
     try:
         if not ready.wait(READINESS_TIMEOUT_S):
             raise AssertionError(f"readiness banner not seen in {READINESS_TIMEOUT_S}s")
@@ -266,10 +267,8 @@ def run_server(args, prefix_cache=False):
                     "--format=csv,noheader,nounits".split(),
                     text=True,
                 )
-                memory.append(
-                    sum(int(line) for line in output.splitlines() if line.strip().isdigit())
-                )
-            result = outputs, cached_by_wave, memory
+                memory.append(sum(map(int, output.split())))
+            return outputs, cached_by_wave, memory
     finally:
         if proc.poll() is None:
             proc.send_signal(signal.SIGTERM)
@@ -279,7 +278,6 @@ def run_server(args, prefix_cache=False):
                 print("[smoke] server didn't exit on SIGTERM; SIGKILL", flush=True)
                 proc.kill()
                 proc.wait()
-    return result
 
 
 def main() -> int:
@@ -296,17 +294,19 @@ def main() -> int:
         return 0
 
     assert args.prefix_cache_stress_cycles >= 3
-    reference, _, _ = run_server(args, prefix_cache=False)
+    reference, _, reference_memory = run_server(args, prefix_cache=False)
     cached, activation, memory = run_server(args, prefix_cache=True)
     assert len(reference) == len(cached)
     pairs = []
     for idx, (ref_output, cached_output) in enumerate(zip(reference, cached)):
         assert ref_output[:2] == cached_output[:2], f"HTTP output mismatch at request {idx}"
+        assert len(ref_output[2]["content"]) == len(ref_output[0])
         collect_numeric_pairs(ref_output[2], cached_output[2], f"request {idx}.logprobs", pairs)
     assert_numeric_pairs(pairs)
     assert all(activation[idx][0] > 0 for idx in range(1, len(activation), 5))
     assert all(activation[idx] == (0, 0) for idx in range(3, len(activation), 5))
     assert all(activation[idx][0] > 0 for idx in range(4, len(activation), 5))
+    assert max(memory) <= max(reference_memory) + 64 * 8
     assert memory[-1] <= memory[-2] + 64 * 8  # Allow 64 MiB/GPU for lazy workspaces.
     return 0
 

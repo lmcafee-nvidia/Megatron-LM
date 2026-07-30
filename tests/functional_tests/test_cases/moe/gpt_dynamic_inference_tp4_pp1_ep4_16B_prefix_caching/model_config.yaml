@@ -81,14 +81,18 @@ MODEL_ARGS:
   --incoming-requests-per-step: 1
   --inference-repeat-n: 3
   --inference-dynamic-batching-buffer-size-gb: 0.2
-  --inference-dynamic-batching-max-requests: 8
-  --inference-dynamic-batching-max-tokens: 1024
+  --inference-dynamic-batching-max-requests: 4
+  --inference-dynamic-batching-max-tokens: 512
+  --enable-chunked-prefill: true
   --inference-dynamic-batching-prefix-caching: true
+  --inference-dynamic-batching-prefix-caching-eviction-policy: lru
   --prefix-cache-compare: true
-  --prefix-cache-stress-groups: 20
+  --prefix-cache-stress-groups: 8
   --prefix-cache-stress-copies: 2
   --prefix-cache-stress-prompt-tokens: 512
   --prefix-cache-stress-staged: true
+  --drain-between-batches: true
+  --batch-boundaries: "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
 METRICS:
   - "generated_tokens"
   - "generated_text"
