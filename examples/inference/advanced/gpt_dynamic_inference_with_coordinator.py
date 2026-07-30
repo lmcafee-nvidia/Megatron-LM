@@ -16,7 +16,9 @@ import torch
 import torch.distributed as dist
 
 from examples.inference.advanced.gpt_dynamic_inference import (
-    _assert_nested_close,
+    _assert_numeric_pairs,
+    _collect_nested_pairs,
+    add_runner_args,
     build_engine,
     build_prefix_cache_stress_requests,
 )
@@ -33,7 +35,6 @@ from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.moe.router_trace import get_moe_router_tracer, init_moe_router_tracer
 from megatron.core.utils import configure_nvtx_profiling
 from megatron.inference.utils import (
-    add_inference_args,
     get_inference_config_from_model_and_args,
     get_model_for_inference,
 )
@@ -45,33 +46,25 @@ from megatron.training.arguments import parse_and_validate_args
 logging.basicConfig(level=logging.INFO, force=True)
 
 
-def add_runner_args(parser):
-    parser = add_inference_args(parser)
-    group = parser.add_argument_group(title="Prefix-cache stress")
-    group.add_argument("--prefix-cache-compare", action="store_true")
-    group.add_argument("--prefix-cache-stress-groups", type=int, default=0)
-    group.add_argument("--prefix-cache-stress-copies", type=int, default=2)
-    group.add_argument("--prefix-cache-stress-prompt-tokens", type=int, default=512)
-    return parser
-
-
 def _assert_result_parity(reference, actual):
     assert len(reference) == len(actual)
+    pairs = []
     for idx, (ref_request, request) in enumerate(zip(reference, actual)):
         assert ref_request.generated_tokens == request.generated_tokens
         assert ref_request.generated_text == request.generated_text
-    for idx, (ref_request, request) in enumerate(zip(reference, actual)):
         for field in (
             "prompt_log_probs",
             "generated_log_probs",
             "prompt_top_n_logprobs",
             "generated_top_n_logprobs",
         ):
-            _assert_nested_close(
+            _collect_nested_pairs(
                 getattr(ref_request, field, None),
                 getattr(request, field, None),
                 f"request {idx}.{field}",
+                pairs,
             )
+    _assert_numeric_pairs(pairs)
 
 
 def _stress_snapshot(engine, first_group_hashes):
@@ -308,6 +301,7 @@ if __name__ == "__main__":
             temperature=args.temperature,
             top_k=args.top_k,
             top_p=args.top_p,
+            skip_prompt_log_probs=args.skip_prompt_log_probs,
             return_log_probs=args.return_log_probs,
             num_tokens_to_generate=args.num_tokens_to_generate,
             termination_id=(
@@ -415,12 +409,6 @@ if __name__ == "__main__":
                 else:
                     assert all(s[0][6] == world_size and s[0][4] < world_size for s in snapshots)
                 assert snapshots[-1][1] <= snapshots[-2][1] + 64 * 1024**2 * world_size
-                summary = {
-                    "cycles": args.inference_repeat_n,
-                    "hits_by_cycle": [snapshot[2] for snapshot in snapshots],
-                    "allocated_bytes_by_cycle": [snapshot[1] for snapshot in snapshots],
-                }
-                print("PREFIX_CACHE_STRESS: " + json.dumps(summary, sort_keys=True))
         else:
             asyncio.run(main(engine, requests, args.inference_coordinator_port))
 

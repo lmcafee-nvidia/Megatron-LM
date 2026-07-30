@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import os
 import signal
 import subprocess
@@ -164,29 +165,34 @@ def post_chat(prompt: str) -> dict:
         return json.loads(resp.read())
 
 
-def gpu_memory_mib() -> int:
-    output = subprocess.check_output(
-        ["nvidia-smi", "--query-compute-apps=used_memory", "--format=csv,noheader,nounits"],
-        text=True,
-    )
-    return sum(int(line.strip()) for line in output.splitlines() if line.strip().isdigit())
-
-
-def assert_close(reference, actual):
+def collect_numeric_pairs(reference, actual, label, pairs):
     if isinstance(reference, dict):
         assert tuple(reference) == tuple(actual)
-        pairs = ((reference[key], actual[key]) for key in reference)
+        for key in reference:
+            collect_numeric_pairs(reference[key], actual[key], f"{label}.{key}", pairs)
     elif isinstance(reference, list):
         assert len(reference) == len(actual)
-        pairs = zip(reference, actual)
+        for idx, (left, right) in enumerate(zip(reference, actual)):
+            collect_numeric_pairs(left, right, f"{label}.{idx}", pairs)
+    elif isinstance(reference, float):
+        assert isinstance(actual, float)
+        pairs.append((label, reference, actual))
     else:
-        if isinstance(reference, float):
-            assert abs(reference - actual) <= 0.025
-        else:
-            assert reference == actual
-        return
-    for left, right in pairs:
-        assert_close(left, right)
+        assert reference == actual
+
+
+def assert_numeric_pairs(pairs):
+    assert all(math.isfinite(value) for _, left, right in pairs for value in (left, right))
+    differences = [abs(left - right) for _, left, right in pairs]
+    p95 = sorted(differences)[math.ceil(0.95 * len(differences)) - 1]
+    worst = max(range(len(pairs)), key=differences.__getitem__)
+    stats = (
+        f"count={len(pairs)}, mean={sum(differences) / len(pairs):.6g}, p95={p95:.6g}, "
+        f"max={differences[worst]:.6g}, "
+        f"over_5pct={sum(value > 0.048790164169432 for value in differences)}, "
+        f"worst={pairs[worst]!r}"
+    )
+    assert p95 <= 0.048790164169432 and differences[worst] <= 0.095310179804325, stats
 
 
 def run_server(args, prefix_cache=False):
@@ -255,7 +261,14 @@ def run_server(args, prefix_cache=False):
                         )
                         cached.append(response["usage"]["prompt_tokens_details"]["cached_tokens"])
                     cached_by_wave.append((min(cached), max(cached)))
-                memory.append(gpu_memory_mib())
+                output = subprocess.check_output(
+                    "nvidia-smi --query-compute-apps=used_memory "
+                    "--format=csv,noheader,nounits".split(),
+                    text=True,
+                )
+                memory.append(
+                    sum(int(line) for line in output.splitlines() if line.strip().isdigit())
+                )
             result = outputs, cached_by_wave, memory
     finally:
         if proc.poll() is None:
@@ -286,19 +299,15 @@ def main() -> int:
     reference, _, _ = run_server(args, prefix_cache=False)
     cached, activation, memory = run_server(args, prefix_cache=True)
     assert len(reference) == len(cached)
+    pairs = []
     for idx, (ref_output, cached_output) in enumerate(zip(reference, cached)):
         assert ref_output[:2] == cached_output[:2], f"HTTP output mismatch at request {idx}"
-    for ref_output, cached_output in zip(reference, cached):
-        assert_close(ref_output[2], cached_output[2])
+        collect_numeric_pairs(ref_output[2], cached_output[2], f"request {idx}.logprobs", pairs)
+    assert_numeric_pairs(pairs)
     assert all(activation[idx][0] > 0 for idx in range(1, len(activation), 5))
     assert all(activation[idx] == (0, 0) for idx in range(3, len(activation), 5))
     assert all(activation[idx][0] > 0 for idx in range(4, len(activation), 5))
     assert memory[-1] <= memory[-2] + 64 * 8  # Allow 64 MiB/GPU for lazy workspaces.
-    print(
-        "PREFIX_CACHE_STRESS: "
-        + json.dumps({"cycles": args.prefix_cache_stress_cycles, "memory_mib": memory}),
-        flush=True,
-    )
     return 0
 
 

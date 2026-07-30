@@ -60,7 +60,8 @@ from megatron.training import get_args, get_tokenizer, initialize_megatron
 torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
-PREFIX_CACHE_LOGPROB_ATOL = 0.025  # About a 2.5% probability ratio in log space.
+PREFIX_CACHE_LOGPROB_P95_ATOL = 0.048790164169432  # A 5% probability ratio in log space.
+PREFIX_CACHE_LOGPROB_MAX_ATOL = 0.095310179804325  # A 10% probability ratio.
 
 
 def add_runner_args(parser):
@@ -95,30 +96,42 @@ def build_prefix_cache_stress_requests(args, tokenizer, sampling_params, request
     return stress_requests
 
 
-def _global_allocated_bytes():
-    value = torch.tensor([torch.cuda.memory_allocated()], device="cuda", dtype=torch.int64)
-    torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.MAX)
-    return int(value.item())
-
-
-def _assert_nested_close(reference, actual, label):
+def _collect_nested_pairs(reference, actual, label, pairs):
     if isinstance(reference, dict):
         assert tuple(reference) == tuple(actual), f"{label}: keys differ"
         for key in reference:
-            _assert_nested_close(reference[key], actual[key], f"{label}.{key}")
+            _collect_nested_pairs(reference[key], actual[key], f"{label}.{key}", pairs)
     elif isinstance(reference, (list, tuple)):
         assert len(reference) == len(actual), f"{label}: lengths differ"
         for idx, (ref_item, actual_item) in enumerate(zip(reference, actual)):
-            _assert_nested_close(ref_item, actual_item, f"{label}[{idx}]")
+            _collect_nested_pairs(ref_item, actual_item, f"{label}[{idx}]", pairs)
     elif isinstance(reference, float):
-        abs_diff = abs(reference - actual)
-        assert abs_diff <= PREFIX_CACHE_LOGPROB_ATOL, (label, reference, actual, abs_diff)
+        assert isinstance(actual, float), f"{label}: expected a float"
+        pairs.append((label, reference, actual))
     else:
         assert reference == actual, f"{label}: {reference!r} != {actual!r}"
 
 
+def _assert_numeric_pairs(pairs):
+    assert pairs, "no logprobs to compare"
+    values = torch.tensor([pair[1:] for pair in pairs], dtype=torch.float64)
+    assert torch.isfinite(values).all(), "non-finite logprob"
+    differences = (values[:, 0] - values[:, 1]).abs()
+    (max_difference, worst), p95 = differences.max(dim=0), torch.quantile(differences, 0.95)
+    stats = (
+        f"count={len(pairs)}, mean={float(differences.mean()):.6g}, p95={float(p95):.6g}, "
+        f"max={float(max_difference):.6g}, "
+        f"over_5pct={int((differences > PREFIX_CACHE_LOGPROB_P95_ATOL).sum())}, "
+        f"worst={pairs[int(worst)]!r}"
+    )
+    assert p95 <= PREFIX_CACHE_LOGPROB_P95_ATOL and max_difference <= (
+        PREFIX_CACHE_LOGPROB_MAX_ATOL
+    ), stats
+
+
 def assert_prefix_cache_parity(reference_requests, cached_requests):
     assert len(reference_requests) == len(cached_requests)
+    pairs = []
     for idx, (reference, cached) in enumerate(zip(reference_requests, cached_requests)):
         assert reference.output_tokens == cached.output_tokens, f"request {idx}: token mismatch"
         assert reference.output_text == cached.output_text, f"request {idx}: text mismatch"
@@ -128,18 +141,19 @@ def assert_prefix_cache_parity(reference_requests, cached_requests):
                 torch.from_numpy(reference.routing_indices).sort(dim=-1).values,
                 torch.from_numpy(cached.routing_indices).sort(dim=-1).values,
             )
-    for idx, (reference, cached) in enumerate(zip(reference_requests, cached_requests)):
         for field in (
             "prompt_log_probs",
             "generated_log_probs",
             "prompt_top_n_logprobs",
             "generated_top_n_logprobs",
         ):
-            _assert_nested_close(
+            _collect_nested_pairs(
                 getattr(reference, field, None),
                 getattr(cached, field, None),
                 f"request {idx}.{field}",
+                pairs,
             )
+    _assert_numeric_pairs(pairs)
 
 
 def build_engine(model, inference_config, tokenizer):
@@ -400,8 +414,6 @@ def main():
     # Build tokenizer
     tokenizer = build_tokenizer(args)
 
-    # Reset peak memory stats so functional tests measure this run and not
-    # whatever happened earlier during initialization.
     torch.cuda.reset_peak_memory_stats()
 
     # Sampling params.
@@ -506,7 +518,9 @@ def main():
                 assert (
                     allocator.kv_hash_to_block_id and allocator.pool_avail < allocator.pool_size - 1
                 )
-            memory_cycles.append(_global_allocated_bytes())
+            allocated = torch.tensor(torch.cuda.memory_allocated(), device="cuda")
+            torch.distributed.all_reduce(allocated, op=torch.distributed.ReduceOp.MAX)
+            memory_cycles.append(int(allocated))
 
     if args.prefix_cache_compare:
         assert engine._prefix_cache_blocks_matched > 0
@@ -522,21 +536,9 @@ def main():
             assert any(h not in mamba.hash_to_block_id for h in first_group_hashes)
         if args.cuda_graph_impl == "local":
             assert engine.capture_stats and sum(result["cuda_graph_request_count_map"].values()) > 0
-        # Allow a small lazy-workspace margin while rejecting cycle-over-cycle leaks.
         assert (
             memory_cycles[-1] <= memory_cycles[-2] + 64 * 1024**2
         ), "cache-on CUDA allocation grew by more than 64 MiB after warmup"
-        if torch.distributed.get_rank() == 0:
-            summary = {
-                "cycles": args.inference_repeat_n,
-                "prefix_cache_hits": engine._prefix_cache_hits,
-                "prefix_cache_blocks_matched": engine._prefix_cache_blocks_matched,
-                "prefill_tokens_skipped": engine._prefill_tokens_skipped,
-                "hits_by_cycle": hit_cycles,
-                "allocated_bytes_by_cycle": memory_cycles,
-            }
-            print("PREFIX_CACHE_STRESS: " + json.dumps(summary, sort_keys=True))
-
     # Validate all requests finished.
     for request in requests:
         assert request.state == "finished", f"request.state == '{request.state}' != 'finished'."

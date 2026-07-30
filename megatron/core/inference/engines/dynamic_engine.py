@@ -2416,6 +2416,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return finished_request_records_list
 
+    @torch.inference_mode()
     def _set_generation_epoch(self, generation_epoch: int) -> None:
         """Apply a model-generation epoch received from the inference client."""
         epoch_changed = generation_epoch != self._generation_epoch

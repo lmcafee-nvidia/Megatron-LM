@@ -772,6 +772,54 @@ class TestDisabledAndEngineScheduling(PrefixCachingTestBase):
 
     @pytest.mark.internal
     @pytest.mark.parametrize("hybrid", [False, True], ids=["gpt", "hybrid"])
+    def test_epoch_change_invalidates_inference_tensors_outside_inference_mode(self, hybrid):
+        with torch.inference_mode():
+            ctx = self._ctx(
+                max_tokens=128,
+                max_requests=4,
+                mamba_config=self._mamba_config() if hybrid else None,
+                prefix_caching_mamba_gb=0.01 if hybrid else None,
+            )
+            alloc = ctx.kv_block_allocator
+            engine = self._engine(ctx)
+            request = self._req(ctx, self._prompt(ctx.block_size_tokens))
+            ctx.add_request(request)
+            (block_id,) = self._block_ids(ctx, 0, 1)
+            block_hash = request.precomputed_block_hashes[0]
+            if hybrid:
+                mamba = ctx.mamba_slot_allocator
+                (slot,) = self._mamba_allocate_and_register(ctx, [block_id])
+                mamba._intermediate_offsets_cpu[0, 0] = 1
+                mamba._intermediate_counts_cpu[0] = 1
+                mamba._intermediate_block_ids_cpu[0, 0] = block_id
+                mamba._eos_cache_block_id_cpu[0] = block_id
+                mamba._has_intermediates = True
+            ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+            pool_avail_before = alloc.pool_avail
+            assert alloc.block_bag.is_inference()
+            if hybrid:
+                assert mamba.block_to_slot.is_inference()
+                assert mamba.free_count == mamba.max_slots - 1
+
+        assert not torch.is_inference_mode_enabled()
+        engine._set_generation_epoch(1)
+
+        assert block_hash not in alloc.kv_hash_to_block_id
+        assert alloc.block_hashes[block_id].item() == -1
+        assert alloc.pool_avail == pool_avail_before + 1
+        if hybrid:
+            assert mamba.free_count == mamba.max_slots
+            assert not mamba.hash_to_block_id
+            assert mamba.block_to_slot[block_id].item() == -1
+            assert mamba.slot_to_block[slot].item() == -1
+            assert mamba._intermediate_offsets_cpu.count_nonzero().item() == 0
+            assert mamba._intermediate_counts_cpu.count_nonzero().item() == 0
+            assert torch.all(mamba._intermediate_block_ids_cpu == -1)
+            assert torch.all(mamba._eos_cache_block_id_cpu == -1)
+            assert not mamba._has_intermediates
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("hybrid", [False, True], ids=["gpt", "hybrid"])
     def test_epoch_change_invalidates_cache_without_disrupting_live_request(self, hybrid):
         ctx = self._ctx(
             max_tokens=256,
