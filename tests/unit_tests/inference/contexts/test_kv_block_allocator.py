@@ -274,8 +274,8 @@ def test_release_shared_block_decrements_once_per_owner():
     # block mixed into the final batch.
     a = KVBlockAllocator(
         _make_context(),
-        total_count=8,
-        paused_count=2,
+        pool_size=8,
+        paused_limit=2,
         enable_prefix_caching=True,
         prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO,
     )
@@ -283,12 +283,12 @@ def test_release_shared_block_decrements_once_per_owner():
     shared, private = int(ids[0]), int(ids[1])
     a.register_kv_block_hashes(block_ids=[shared], block_hashes=[111])
     a.block_ref_counts[shared] += 2  # two more owners pin the shared block -> ref 3
-    avail0 = a.total_avail
+    avail0 = a.pool_avail
 
     # One owner finishes alone: ref 3 -> 2, nothing freed yet.
     a.release_memory_blocks(torch.tensor([shared], dtype=torch.int32))
     assert a.block_ref_counts[shared].item() == 2
-    assert a.total_avail == avail0
+    assert a.pool_avail == avail0
     assert 111 in a.kv_hash_to_block_id
 
     # The final two owners and the private request finish in one batch: the
@@ -297,9 +297,9 @@ def test_release_shared_block_decrements_once_per_owner():
     assert a.block_ref_counts[shared].item() == 0
     assert a.block_ref_counts[private].item() == 0
     # Two distinct blocks return to the pool; the shared one only once (not twice).
-    assert a.total_avail == avail0 + 2
+    assert a.pool_avail == avail0 + 2
     assert 111 not in a.kv_hash_to_block_id  # deregistered exactly once
-    free_region = a.block_bag[: a.total_avail].tolist()
+    free_region = a.block_bag[: a.pool_avail].tolist()
     assert len(set(free_region)) == len(free_region)  # no double-returned id
 
     # LRU: a hashed shared block released by both owners in one batch must hit
@@ -307,8 +307,8 @@ def test_release_shared_block_decrements_once_per_owner():
     # block stays cached for reuse rather than returning to the pool.
     lru = KVBlockAllocator(
         _make_context(),
-        total_count=8,
-        paused_count=2,
+        pool_size=8,
+        paused_limit=2,
         enable_prefix_caching=True,
         prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
     )

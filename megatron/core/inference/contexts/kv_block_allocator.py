@@ -331,12 +331,9 @@ class KVBlockAllocator:
         already_registered = current_hashes == hash_tensor
         conflict_mask = (current_hashes != -1) & ~already_registered
         conflicting = torch.nonzero(conflict_mask, as_tuple=True)[0].tolist()
-        assert not conflicting, (
-            "block re-registered under a different hash: "
-            + ", ".join(
-                f"block {block_ids[i]} holds {int(current_hashes[i])}, given {block_hashes[i]}"
-                for i in conflicting
-            )
+        assert not conflicting, "block re-registered under a different hash: " + ", ".join(
+            f"block {block_ids[i]} holds {int(current_hashes[i])}, given {block_hashes[i]}"
+            for i in conflicting
         )
         if already_registered.any():
             keep = torch.nonzero(~already_registered, as_tuple=True)[0]

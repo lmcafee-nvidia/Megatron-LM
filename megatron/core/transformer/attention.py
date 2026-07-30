@@ -62,7 +62,9 @@ except ImportError:
     rearrange = None
 
 try:
-    from flash_attn_3.flash_attn_interface import _flash_attn_forward
+    from flash_attn_3.flash_attn_interface import (
+        _flash_attn_forward,
+    )
     from flash_attn_3.flash_attn_interface import (
         flash_attn_with_kvcache as flash_attn3_with_kvcache,
     )
@@ -73,7 +75,9 @@ except ImportError as e:
 
 if not HAVE_FA3:
     try:
-        from flashattn_hopper.flash_attn_interface import _flash_attn_forward
+        from flashattn_hopper.flash_attn_interface import (
+            _flash_attn_forward,
+        )
         from flashattn_hopper.flash_attn_interface import (
             flash_attn_with_kvcache as flash_attn3_with_kvcache,
         )
@@ -955,7 +959,7 @@ class Attention(MegatronModule, ABC):
             "window_size_right": window_size[1],
             "rotary_interleaved": True,
             "scheduler_metadata": None,
-            "num_splits": 0 if not self.batch_invariant_mode else 1,
+            "num_splits": 1,  # DEBUG: force single split to test batch-invariance
             "pack_gqa": None,
             "sm_margin": 0,
         }
@@ -1099,7 +1103,7 @@ class Attention(MegatronModule, ABC):
                     softmax_scale=softmax_scale,
                     causal=True,
                     window_size=window_size,
-                    num_splits=0 if not self.batch_invariant_mode else 1,
+                    num_splits=1,  # DEBUG: force single split to test batch-invariance
                 )
             elif use_fa3:
                 # TODO(ksanthanam): Replace with call to flash_attn_varlen_func once
@@ -1221,7 +1225,7 @@ class Attention(MegatronModule, ABC):
                         softmax_scale=softmax_scale,
                         causal=True,
                         window_size=window_size,
-                        num_splits=0 if not self.batch_invariant_mode else 1,
+                        num_splits=1,  # DEBUG: force single split to test batch-invariance
                     )
                     if need_lse:
                         # output_total: (B*S, H, D); softmax_lse: (H, B*S)
@@ -1246,7 +1250,7 @@ class Attention(MegatronModule, ABC):
                         "causal": True,
                         "window_size": window_size,
                         "page_table" if use_fa3 else "block_table": block_table,
-                        "num_splits": 0 if not self.batch_invariant_mode else 1,
+                        "num_splits": 1,  # DEBUG: force single split to test batch-invariance
                     }
                     if need_lse:
                         flash_attn_args["return_softmax_lse"] = True
