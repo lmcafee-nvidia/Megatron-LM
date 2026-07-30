@@ -2828,7 +2828,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         for cached_top_n, baseline_top_n in zip(cached_values, baseline_values):
             assert isinstance(cached_top_n, dict) and isinstance(baseline_top_n, dict)
             assert len(cached_top_n) == len(baseline_top_n) == 5
-            assert cached_top_n.keys() == baseline_top_n.keys()
+            assert tuple(cached_top_n) == tuple(baseline_top_n)
             assert np.allclose(
                 list(cached_top_n.values()), list(baseline_top_n.values()), atol=atol, rtol=0
             )
@@ -2905,6 +2905,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 assert stats["mtp_tokens_proposed"] > 0
                 activations.add("mtp-speculative-proposals-with-prefix-hits")
             elif feature in ("logprobs", "request-eviction"):
+                # Prefix restore changes hybrid BF16 batch shapes; the observed drift is < 0.0041.
                 logprob_atol = 5e-3 if case["model"] == "hybrid" else 1e-3
                 for request_id in range(9):
                     cached_request = cached[request_id]

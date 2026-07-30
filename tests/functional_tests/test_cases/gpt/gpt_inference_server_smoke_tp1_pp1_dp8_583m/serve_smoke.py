@@ -174,17 +174,16 @@ def gpu_memory_mib() -> int:
 
 def assert_close(reference, actual):
     if isinstance(reference, dict):
-        assert reference.keys() == actual.keys()
+        assert tuple(reference) == tuple(actual)
         pairs = ((reference[key], actual[key]) for key in reference)
     elif isinstance(reference, list):
         assert len(reference) == len(actual)
         pairs = zip(reference, actual)
     else:
-        assert (
-            abs(reference - actual) <= 0.025
-            if isinstance(reference, float)
-            else reference == actual
-        )
+        if isinstance(reference, float):
+            assert abs(reference - actual) <= 0.025
+        else:
+            assert reference == actual
         return
     for left, right in pairs:
         assert_close(left, right)

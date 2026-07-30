@@ -137,7 +137,6 @@ async def main(
         len(requests) // args.suspend_resume_interval if args.suspend_resume_interval else 0
     )
 
-    client = results = None
     result_cycles, stress_snapshots = [], []
     if dist.get_rank() == 0:
         client = InferenceClient(

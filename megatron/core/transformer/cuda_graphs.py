@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import time
+import weakref
 from collections import defaultdict
 from contextlib import nullcontext
 from copy import deepcopy
@@ -703,6 +704,9 @@ def delete_cuda_graphs():
     _CudagraphGlobalRecord.cudagraph_record = []
     _CudagraphGlobalRecord.cudagraph_inference_record = []
     _GTP_RUNNER_STREAMS.clear()
+    for manager in list(CudaGraphManager._instances):
+        manager.cudagraph_runners.clear()
+        manager.custom_cudagraphs_lookup_table.clear()
 
     # TODO: Optional?: Force garbage collection to clean up memory
     gc.collect()
@@ -1765,6 +1769,7 @@ class CudaGraphManager(torch.nn.Module):
 
     """A global mempool for when 'cuda_graph_use_single_mempool' is used."""
     global_mempool = None
+    _instances = weakref.WeakSet()
 
     def __init__(
         self,
@@ -1829,6 +1834,7 @@ class CudaGraphManager(torch.nn.Module):
         self.cudagraph_runners: list[_CudaGraphRunner] = []
         self.custom_cudagraphs_lookup_table: dict = defaultdict(lambda: None)
         self.is_first_microbatch = False
+        self._instances.add(self)
 
         # Without pipeline parallelism, microbatches execute one at a time.
         # Therefore modules will always execute in the same order, so cudagraphs
@@ -1874,14 +1880,6 @@ class CudaGraphManager(torch.nn.Module):
         if reuse_cudagraphs:
             if cache_key is not None:
                 runner = self.custom_cudagraphs_lookup_table[cache_key]
-                # Deleted graphs can be recaptured with a different inference context.
-                if (
-                    runner is not None
-                    and not runner.fwd_graph_recorded
-                    and runner.get_mismatch_errors(args, kwargs)
-                ):
-                    self.cudagraph_runners.remove(runner)
-                    runner = None
             else:
                 # Todo: For training, we could also cache runners based on input shape.
                 # If autograd is currently disabled, it doesnt matter if a runner was created

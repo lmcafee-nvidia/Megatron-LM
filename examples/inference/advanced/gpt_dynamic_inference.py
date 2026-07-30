@@ -103,7 +103,7 @@ def _global_allocated_bytes():
 
 def _assert_nested_close(reference, actual, label):
     if isinstance(reference, dict):
-        assert reference.keys() == actual.keys(), f"{label}: keys differ"
+        assert tuple(reference) == tuple(actual), f"{label}: keys differ"
         for key in reference:
             _assert_nested_close(reference[key], actual[key], f"{label}.{key}")
     elif isinstance(reference, (list, tuple)):
@@ -122,8 +122,9 @@ def assert_prefix_cache_parity(reference_requests, cached_requests):
     for idx, (reference, cached) in enumerate(zip(reference_requests, cached_requests)):
         assert reference.output_tokens == cached.output_tokens, f"request {idx}: token mismatch"
         assert reference.output_text == cached.output_text, f"request {idx}: text mismatch"
+        assert (reference.routing_indices is None) == (cached.routing_indices is None)
         if reference.routing_indices is not None:
-            assert cached.routing_indices is not None and torch.equal(
+            assert torch.equal(
                 torch.from_numpy(reference.routing_indices).sort(dim=-1).values,
                 torch.from_numpy(cached.routing_indices).sort(dim=-1).values,
             )
@@ -445,7 +446,6 @@ def main():
         )
 
     throughputs, hit_cycles, memory_cycles = [], [], []
-    reference_requests = None
     if args.prefix_cache_compare:
         assert inference_config.enable_prefix_caching
         assert sampling_params.top_k == 1 and sampling_params.top_p == 0.0
