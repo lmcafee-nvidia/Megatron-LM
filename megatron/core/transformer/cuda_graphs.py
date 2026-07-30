@@ -1874,6 +1874,14 @@ class CudaGraphManager(torch.nn.Module):
         if reuse_cudagraphs:
             if cache_key is not None:
                 runner = self.custom_cudagraphs_lookup_table[cache_key]
+                # Deleted graphs can be recaptured with a different inference context.
+                if (
+                    runner is not None
+                    and not runner.fwd_graph_recorded
+                    and runner.get_mismatch_errors(args, kwargs)
+                ):
+                    self.cudagraph_runners.remove(runner)
+                    runner = None
             else:
                 # Todo: For training, we could also cache runners based on input shape.
                 # If autograd is currently disabled, it doesnt matter if a runner was created

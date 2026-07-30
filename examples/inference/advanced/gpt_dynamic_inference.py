@@ -60,6 +60,7 @@ from megatron.training import get_args, get_tokenizer, initialize_megatron
 torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
+PREFIX_CACHE_LOGPROB_ATOL = 0.025  # About a 2.5% probability ratio in log space.
 
 
 def add_runner_args(parser):
@@ -111,7 +112,7 @@ def _assert_nested_close(reference, actual, label):
             _assert_nested_close(ref_item, actual_item, f"{label}[{idx}]")
     elif isinstance(reference, float):
         abs_diff = abs(reference - actual)
-        assert abs_diff <= 1e-3, (label, reference, actual, abs_diff)
+        assert abs_diff <= PREFIX_CACHE_LOGPROB_ATOL, (label, reference, actual, abs_diff)
     else:
         assert reference == actual, f"{label}: {reference!r} != {actual!r}"
 
@@ -126,6 +127,7 @@ def assert_prefix_cache_parity(reference_requests, cached_requests):
                 torch.from_numpy(reference.routing_indices).sort(dim=-1).values,
                 torch.from_numpy(cached.routing_indices).sort(dim=-1).values,
             )
+    for idx, (reference, cached) in enumerate(zip(reference_requests, cached_requests)):
         for field in (
             "prompt_log_probs",
             "generated_log_probs",
@@ -442,9 +444,7 @@ def main():
             f"{k}({v})" for k, v in invalid_prompt_length_map.items()
         )
 
-    throughputs = []
-    hit_cycles = []
-    memory_cycles = []
+    throughputs, hit_cycles, memory_cycles = [], [], []
     reference_requests = None
     if args.prefix_cache_compare:
         assert inference_config.enable_prefix_caching

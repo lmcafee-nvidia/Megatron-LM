@@ -60,6 +60,7 @@ def _assert_result_parity(reference, actual):
     for idx, (ref_request, request) in enumerate(zip(reference, actual)):
         assert ref_request.generated_tokens == request.generated_tokens
         assert ref_request.generated_text == request.generated_text
+    for idx, (ref_request, request) in enumerate(zip(reference, actual)):
         for field in (
             "prompt_log_probs",
             "generated_log_probs",
@@ -136,10 +137,8 @@ async def main(
         len(requests) // args.suspend_resume_interval if args.suspend_resume_interval else 0
     )
 
-    client = None
-    result_cycles = []
-    stress_snapshots = []
-    results = None
+    client = results = None
+    result_cycles, stress_snapshots = [], []
     if dist.get_rank() == 0:
         client = InferenceClient(
             dp_addr, deserialize=True

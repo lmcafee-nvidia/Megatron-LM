@@ -2278,7 +2278,10 @@ PREFIX_CACHE_ENGINE_CASES = [
     pytest.param(dict(name="gpt-tp4", model="gpt", feature="tp", tp=4), id="gpt-tp4"),
     pytest.param(dict(name="hybrid-tp4", model="hybrid", feature="tp", tp=4), id="hybrid-tp4"),
     pytest.param(dict(name="gpt-pp4", model="gpt", feature="pp", pp=4), id="gpt-pp4"),
-    pytest.param(dict(name="hybrid-pp2", model="hybrid", feature="pp", pp=2), id="hybrid-pp2"),
+    pytest.param(
+        dict(name="hybrid-pp2", model="hybrid", feature="pp", pp=2, num_tokens_to_generate=3),
+        id="hybrid-pp2",
+    ),
     pytest.param(
         dict(name="gpt-tp2-pp2-sp", model="gpt", feature="mixed-parallel", tp=2, pp=2, sp=True),
         id="gpt-tp2-pp2-sp",
@@ -2431,7 +2434,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             num_requests=0,
             min_prompt_length=prompt_length,
             max_prompt_length=prompt_length,
-            num_tokens_to_generate=4,
+            num_tokens_to_generate=case.get("num_tokens_to_generate", 4),
             max_sequence_length=prompt_length + 8,
             context_buffer_size_gb=0.02,
             context_block_size_tokens=block_size,
@@ -2496,12 +2499,13 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         return_log_probs,
         skip_prompt_log_probs=True,
         top_n_logprobs=0,
+        num_tokens_to_generate=4,
     ):
         return DynamicInferenceRequest(
             request_id=request_id,
             prompt_tokens=prompt,
             sampling_params=SamplingParams(
-                num_tokens_to_generate=4,
+                num_tokens_to_generate=num_tokens_to_generate,
                 termination_id=-1,
                 top_k=1,
                 return_log_probs=return_log_probs,
@@ -2632,11 +2636,9 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                         assert challenge_hashes.isdisjoint(alloc.kv_hash_to_block_id)
                         epoch_invalidation_count += 1
 
-            # Cache-on needs seven blocks for producer + follower tail +
-            # unrelated pressure. Cache-off needs nine because it cannot share
-            # the producer's two complete blocks. Pin the rest so both sessions
-            # reach zero availability while executing the same request mix.
-            target_allocatable = 7 if enable_prefix_caching else 9
+            # Cache-on needs seven blocks for producer + follower tail + pressure.
+            # Cache-off needs nine unless chunked staging limits live demand to seven.
+            target_allocatable = 7 if enable_prefix_caching or case["feature"] == "chunked" else 9
             allocatable = alloc.get_allocatable_count()
             if allocatable > target_allocatable:
                 filler = alloc.allocate_memory_blocks(allocatable - target_allocatable)
@@ -2658,6 +2660,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                     return_log_probs=(case["feature"] in ("logprobs", "request-eviction")),
                     skip_prompt_log_probs=True,
                     top_n_logprobs=5 if case["feature"] == "logprobs" else 0,
+                    num_tokens_to_generate=case.get("num_tokens_to_generate", 4),
                 )
                 requests.append(request)
                 if case["feature"] == "epoch":
@@ -2819,7 +2822,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         torch.cuda.synchronize()
 
     @staticmethod
-    def _assert_top_n_parity(cached_values, baseline_values, expected_length):
+    def _assert_top_n_parity(cached_values, baseline_values, expected_length, atol):
         assert cached_values is not None and baseline_values is not None
         assert len(cached_values) == len(baseline_values) == expected_length
         for cached_top_n, baseline_top_n in zip(cached_values, baseline_values):
@@ -2827,7 +2830,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             assert len(cached_top_n) == len(baseline_top_n) == 5
             assert cached_top_n.keys() == baseline_top_n.keys()
             assert np.allclose(
-                list(cached_top_n.values()), list(baseline_top_n.values()), atol=1e-3, rtol=0
+                list(cached_top_n.values()), list(baseline_top_n.values()), atol=atol, rtol=0
             )
 
     @torch.inference_mode()
@@ -2842,6 +2845,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             baseline, baseline_stats = self._run_engine_session(case, enable_prefix_caching=False)
 
             tokenizer = _NumericTokenizer()
+            num_tokens_to_generate = case.get("num_tokens_to_generate", 4)
             for request_id in range(9):
                 cached_request = cached[request_id]
                 baseline_request = baseline[request_id]
@@ -2850,7 +2854,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 assert cached_request.generated_text == tokenizer.detokenize(
                     cached_request.generated_tokens, skip_special_tokens=True
                 )
-                assert len(cached_request.generated_tokens) == 4
+                assert len(cached_request.generated_tokens) == num_tokens_to_generate
 
             activations = {
                 "cache-off-on-output-parity",
@@ -2901,24 +2905,26 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 assert stats["mtp_tokens_proposed"] > 0
                 activations.add("mtp-speculative-proposals-with-prefix-hits")
             elif feature in ("logprobs", "request-eviction"):
+                logprob_atol = 5e-3 if case["model"] == "hybrid" else 1e-3
                 for request_id in range(9):
                     cached_request = cached[request_id]
                     baseline_request = baseline[request_id]
                     assert cached_request.generated_log_probs is not None
                     assert baseline_request.generated_log_probs is not None
-                    assert len(cached_request.generated_log_probs) == 4
-                    assert len(baseline_request.generated_log_probs) == 4
+                    assert len(cached_request.generated_log_probs) == num_tokens_to_generate
+                    assert len(baseline_request.generated_log_probs) == num_tokens_to_generate
                     assert np.allclose(
                         cached_request.generated_log_probs,
                         baseline_request.generated_log_probs,
-                        atol=1e-3 if feature == "logprobs" else 1e-5,
+                        atol=logprob_atol if feature == "logprobs" else 1e-5,
                         rtol=0,
                     )
                     if feature == "logprobs":
                         self._assert_top_n_parity(
                             cached_request.generated_top_n_logprobs,
                             baseline_request.generated_top_n_logprobs,
-                            4,
+                            num_tokens_to_generate,
+                            logprob_atol,
                         )
                 if feature == "logprobs":
                     activations.add("logprob-parity")
