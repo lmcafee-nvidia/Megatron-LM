@@ -57,6 +57,7 @@ MODEL_ARGS:
   --grpo-group-size: 4
   --grpo-prompts-per-step: 8
   --grpo-iterations: 1
+  --rl-default-temperature: 0.0
   --grpo-clamp-eps-lower: 0.2
   --grpo-clamp-eps-upper: 0.2
   --grpo-kl-beta: 0.0
@@ -79,18 +80,20 @@ MODEL_ARGS:
   --rl-inference-tensor-model-parallel-size: 2
   --refit-method: gloo
   --inference-dynamic-batching-buffer-size-gb: 0.2
-  --inference-dynamic-batching-block-size: 256
+  --inference-dynamic-batching-block-size: 64
   --inference-dynamic-batching-max-tokens: 1024
   --inference-dynamic-batching-max-requests: 32
   --inference-dynamic-batching-prefix-caching: true
   --inference-dynamic-batching-prefix-caching-eviction-policy: lru
+  --inference-dynamic-batching-prefix-caching-coordinator-policy: first_prefix_block
 METRICS:
   - "iteration-time"
   - "num-zeros"
   - "mem-allocated-bytes"
   - "mem-max-allocated-bytes"
 AFTER_SCRIPT: |
-  transition_hit_cycles=0
+  stressed_engine_logs=0
+  bounded_memory_logs=0
   while IFS= read -r log_file; do
     cycles=$(awk '
       /Reshard complete/ { waiting = 1; baseline = hits; next }
@@ -105,25 +108,28 @@ AFTER_SCRIPT: |
       }
       END { print cycles + 0 }
     ' "$log_file")
-    if (( cycles > transition_hit_cycles )); then
-      transition_hit_cycles=$cycles
+    final_hits=$(sed -nE \
+      's/.*prefix cache \(cumul\): ([0-9]+) hits.*/\1/p' "$log_file" | tail -n 1)
+    if (( cycles >= 3 && ${final_hits:-0} >= 18 )); then
+      ((stressed_engine_logs += 1))
+    fi
+    mapfile -t memory_samples < <(
+      grep -E "prefix cache \\(cumul\\): [1-9][0-9]* hits" "$log_file" \
+        | sed -nE 's/.*alloc ([0-9.]+) gb.*/\1/p' \
+        | tail -n 2 || true
+    )
+    if (( ${#memory_samples[@]} == 2 )) && \
+      awk -v previous="${memory_samples[0]}" -v final="${memory_samples[1]}" \
+        'BEGIN { exit !(final <= previous + 0.1) }'; then
+      ((bounded_memory_logs += 1))
     fi
   done < <(grep -rl -F "Reshard complete" "$LOG_DIR" || true)
-  if (( transition_hit_cycles < 3 )); then
-    echo "Expected prefix-cache hits after at least 3 refit/epoch transitions."
+  if (( stressed_engine_logs < 8 )); then
+    echo "Expected all eight inference ranks (four TP2 replicas) to reach 18 cache hits."
     EXIT_CODE=1
   fi
-  mapfile -t memory_samples < <(
-    grep -rh -E "prefix cache \\(cumul\\): [1-9][0-9]* hits" "$LOG_DIR" \
-      | sed -nE 's/.*alloc ([0-9.]+) gb.*/\1/p' \
-      | tail -n 2 || true
-  )
-  if (( ${#memory_samples[@]} < 2 )); then
-    echo "Expected two warmed memory observations."
-    EXIT_CODE=1
-  elif ! awk -v previous="${memory_samples[0]}" -v final="${memory_samples[1]}" \
-    'BEGIN { exit !(final <= previous + 0.1) }'; then
-    echo "RL/refit inference memory grew across the final warmed transitions."
+  if (( bounded_memory_logs < 8 )); then
+    echo "Expected bounded warmed memory on all eight inference ranks."
     EXIT_CODE=1
   fi
   python - <<'PY'
@@ -131,12 +137,14 @@ AFTER_SCRIPT: |
   import json
   import math
   import os
+  import re
 
   reference_dir = os.environ["PREFIX_CACHE_REFERENCE_ROLLOUT_DIR"]
   cached_dir = os.environ["LANGRL_LOG_DIR"]
   cached_files = sorted(glob.glob(os.path.join(cached_dir, "rollouts_*.json")))
-  assert len(cached_files) >= 3, f"expected >=3 cached rollout files, got {len(cached_files)}"
+  assert len(cached_files) == 6, f"expected 3 epochs from both TP ranks, got {cached_files}"
   epochs = set()
+  cache_evictions = 0
 
   def close(reference, actual, path, abs_tol):
       if isinstance(reference, dict):
@@ -155,6 +163,24 @@ AFTER_SCRIPT: |
       else:
           assert reference == actual, f"{path}: {reference!r} != {actual!r}"
 
+  def prompt_key(rollout):
+      tokens = rollout["trajectory"][0]
+      generated = rollout["generation_mask"][0]
+      assert len(tokens) == len(generated)
+      return tuple(token for token, is_generated in zip(tokens, generated) if not is_generated)
+
+  def groups_by_prompt(rollouts, label):
+      groups = {}
+      for group in rollouts:
+          assert len(group) == 4, f"{label}: expected 4 rollouts per group"
+          keys = {prompt_key(rollout) for rollout in group}
+          assert len(keys) == 1, f"{label}: group contains different prompts"
+          key = keys.pop()
+          assert key not in groups, f"{label}: duplicate prompt group"
+          groups[key] = group
+      assert len(groups) == 8, f"{label}: expected 8 prompt groups"
+      return groups
+
   for cached_file in cached_files:
       reference_file = os.path.join(reference_dir, os.path.basename(cached_file))
       assert os.path.exists(reference_file), f"missing cache-off rollout {reference_file}"
@@ -162,28 +188,35 @@ AFTER_SCRIPT: |
           reference = json.load(stream)
       with open(cached_file) as stream:
           cached = json.load(stream)
-      assert len(reference) == len(cached)
-      for group_index, (reference_group, cached_group) in enumerate(zip(reference, cached)):
-          assert len(reference_group) == len(cached_group)
-          for rollout_index, (reference_rollout, cached_rollout) in enumerate(
-              zip(reference_group, cached_group)
-          ):
-              label = f"{os.path.basename(cached_file)}[{group_index}][{rollout_index}]"
-              for field, abs_tol in (
-                  ("trajectory", 0),
-                  ("generation_mask", 0),
-                  ("logprobs", 1e-3),
-                  ("reward", 1e-5),
-              ):
-                  close(
-                      reference_rollout[field],
-                      cached_rollout[field],
-                      f"{label}.{field}",
-                      abs_tol,
-                  )
-              for turn in cached_rollout["kv_cache_epoch"]:
-                  epochs.update(epoch for _, epoch in turn)
+      name = os.path.basename(cached_file)
+      expected_epoch = int(re.search(r"iteration([0-9]+)", name).group(1))
+      reference_groups = groups_by_prompt(reference, f"{name}:cache-off")
+      cached_groups = groups_by_prompt(cached, f"{name}:cache-on")
+      assert reference_groups.keys() == cached_groups.keys()
+      for group_index, key in enumerate(reference_groups):
+          reference_group = reference_groups[key]
+          cached_group = cached_groups[key]
+          expected = reference_group[0]
+          for source, group in (("cache-off", reference_group), ("cache-on", cached_group)):
+              for rollout_index, rollout in enumerate(group):
+                  label = f"{name}.{source}[{group_index}][{rollout_index}]"
+                  assert rollout["env_id"] == expected["env_id"]
+                  assert rollout["problem_id"] == expected["problem_id"]
+                  for field in ("trajectory", "generation_mask", "reward"):
+                      close(expected[field], rollout[field], f"{label}.{field}", 0)
+                  close(expected["logprobs"], rollout["logprobs"], f"{label}.logprobs", 1e-3)
+          for rollout in cached_group:
+              cache_evictions += sum(rollout["num_evictions"])
+              for field in ("policy_epoch", "kv_cache_epoch"):
+                  for turn in rollout[field]:
+                      turn_epochs = {epoch for _, epoch in turn}
+                      assert turn_epochs == {expected_epoch}, (
+                          f"{name}.{field}: expected epoch {expected_epoch}, got {turn_epochs}"
+                      )
+                      epochs.update(turn_epochs)
   assert len(epochs) >= 3, f"expected >=3 generation epochs, got {sorted(epochs)}"
+  assert epochs == {0, 1, 2}
+  assert cache_evictions > 0, "expected request checkpoint/resume under cache pressure"
   PY
 THROUGHPUT_TEST_PARAMS:
   --start_step: 1

@@ -873,6 +873,50 @@ class TestDisabledAndEngineScheduling(PrefixCachingTestBase):
             [Headers.SET_GENERATION_EPOCH.value, 2],
         ]
 
+    @pytest.mark.internal
+    def test_epoch_change_keeps_mamba_free_slots_mutable(self):
+        ctx = self._ctx(mamba_config=self._mamba_config(), prefix_caching_mamba_gb=0.01)
+        mamba = ctx.mamba_slot_allocator
+        free_slots = mamba.free_slots
+        assert not free_slots.is_inference()
+
+        self._engine(ctx)._set_generation_epoch(1)
+
+        assert mamba.free_slots is free_slots
+        assert not mamba.free_slots.is_inference()
+        block = ctx.kv_block_allocator.allocate_memory_blocks(1)
+        assert block is not None
+        (slot,) = mamba.allocate_slots_batch(block.tolist())
+        assert mamba.free_count == mamba.max_slots - 1
+        mamba.invalidate_block(block.item())
+        assert mamba.free_count == mamba.max_slots
+        assert mamba.free_slots[-1].item() == slot
+
+    @pytest.mark.internal
+    def test_epoch_change_keeps_unstarted_requests_cacheable(self):
+        ctx = self._ctx()
+        engine = self._engine(ctx)
+        before = self._req(ctx, self._prompt(ctx.block_size_tokens), request_id=1)
+        before_hashes = list(before.precomputed_block_hashes)
+        engine._add_request(before)
+
+        engine._set_generation_epoch(1)
+
+        assert before.enable_prefix_caching
+        assert before.precomputed_block_hashes == before_hashes
+        assert before.policy_epoch == [(0, 1)]
+        assert before.kv_cache_epoch == [(0, 1)]
+
+        after = self._req(ctx, self._prompt(ctx.block_size_tokens, offset=1000), request_id=2)
+        engine._add_request(after)
+        assert after.enable_prefix_caching
+        assert after.policy_epoch == [(0, 1)]
+        assert after.kv_cache_epoch == [(0, 1)]
+
+        engine._set_generation_epoch(1)
+        assert before.policy_epoch == after.policy_epoch == [(0, 1)]
+        assert before.kv_cache_epoch == after.kv_cache_epoch == [(0, 1)]
+
     def _add_to_waiting(self, engine, ctx, req):
         request_id = req.request_id
         engine.requests[request_id] = type(
@@ -886,6 +930,43 @@ class TestDisabledAndEngineScheduling(PrefixCachingTestBase):
         req.status = Status.ACTIVE_AND_GENERATING_TOKENS
         req.sampling_params.num_tokens_to_generate = 10
         engine.waiting_request_ids.append(request_id)
+
+    @pytest.mark.internal
+    def test_epoch_change_disables_hidden_chunked_prefill_cache_publication(self):
+        ctx = self._ctx(
+            block_size_tokens=256,
+            max_sequence_length=1024,
+            max_tokens=256,
+            max_requests=4,
+            mamba_config=self._mamba_config(),
+            prefix_caching_mamba_gb=0.01,
+        )
+        engine = self._engine(ctx, enable_chunked_prefill=True)
+        request = self._req(ctx, self._prompt(512))
+        self._add_to_waiting(engine, ctx, request)
+
+        engine.schedule_chunked_prefill()
+        assert request.finished_chunk_token_count == 256
+        assert ctx.chunked_prefill_request_id == request.request_id
+        block_id = self._block_ids(ctx, 0, 1)[0]
+        self._mamba_allocate_and_register(ctx, [block_id])
+
+        # update_requests() hides an in-progress chunk at this boundary while
+        # retaining its KV and Mamba state for the next prefill chunk.
+        ctx.total_request_count = 0
+        ctx.active_token_count = 0
+        engine._set_generation_epoch(1)
+
+        assert not request.enable_prefix_caching
+        assert request.precomputed_block_hashes == []
+        assert not ctx.kv_block_allocator.kv_hash_to_block_id
+        assert not ctx.mamba_slot_allocator.hash_to_block_id
+
+        engine.schedule_chunked_prefill()
+        assert ctx.chunked_prefill_request_id == -1
+        assert len(request.remaining_prompt_tokens) == 0
+        assert not ctx.kv_block_allocator.kv_hash_to_block_id
+        assert not ctx.mamba_slot_allocator.hash_to_block_id
 
     @pytest.mark.internal
     @pytest.mark.parametrize("hybrid", [False, True], ids=["gpt", "hybrid"])
@@ -1839,6 +1920,25 @@ class TestMambaSlotAllocator(PrefixCachingTestBase):
         assert not msa._has_intermediates
 
 
+class TestRequestRecordCheckpoint:
+
+    @pytest.mark.internal
+    def test_merge_preserves_logprobs_generated_after_an_empty_checkpoint(self):
+        request = DynamicInferenceRequest(
+            request_id=0,
+            prompt_tokens=torch.tensor([1, 2]),
+            sampling_params=SamplingParams(num_tokens_to_generate=2),
+        )
+        record = DynamicInferenceRequestRecord.from_request(request)
+        record.checkpoint()
+        record[-1].generated_tokens = [3]
+        record[-1].generated_log_probs = [-0.25]
+
+        merged = record.merge()
+        assert merged.generated_tokens == [3]
+        assert merged.generated_log_probs == [-0.25]
+
+
 class TestPerBlockRouting(PrefixCachingTestBase):
     """Tests for per-block routing storage and reconstruction."""
 
@@ -2711,6 +2811,10 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 kv_cache_management_mode=feature,
                 static_kv_memory_pointers=False,
                 suspend_resume_interval=2,
+                num_cuda_graphs=2,
+                force_build_cuda_graphs=True,
+                use_cuda_graphs_for_non_decode_steps=False,
+                inference_cuda_graph_scope=InferenceCudaGraphScope.block,
             )
         elif feature == "request-eviction":
             kwargs["context_paused_buffer_size_gb"] = 0
@@ -2761,25 +2865,53 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             enable_prefix_caching=enable_prefix_caching,
         )
 
-    def _assert_cached_prompt_logprobs_rejected(self, case):
-        config = self._case_config(case, enable_prefix_caching=True)
+    def _run_prompt_logprob_request(self, case, *, enable_prefix_caching):
+        config = self._case_config(case, enable_prefix_caching=enable_prefix_caching)
         env = self._build_test_env(config)
-        env.engine.controller.tokenizer = _NumericTokenizer()
+        engine = env.engine
+        engine.controller.tokenizer = _NumericTokenizer()
         prompt = torch.arange(
             2 * config.context_block_size_tokens + 5, device=torch.cuda.current_device()
         ) % (config.vocab_size - 1)
+
+        donor = self._make_engine_request(
+            engine.context,
+            -2,
+            prompt.clone(),
+            enable_prefix_caching=enable_prefix_caching,
+            return_log_probs=False,
+            num_tokens_to_generate=8,
+        )
+        engine._add_request(donor)
+        engine.step_modern()
+        if enable_prefix_caching:
+            assert set(donor.precomputed_block_hashes) <= (
+                engine.context.kv_block_allocator.kv_hash_to_block_id.keys()
+            )
+
         request = self._make_engine_request(
-            env.engine.context,
+            engine.context,
             -1,
             prompt,
-            enable_prefix_caching=True,
+            enable_prefix_caching=enable_prefix_caching,
             return_log_probs=True,
             skip_prompt_log_probs=False,
             top_n_logprobs=5,
         )
-        with pytest.raises(ValueError, match=r"^Prompt log probabilities"):
-            env.engine._add_request(request)
-        assert request.request_id not in env.engine.requests
+        hits_before = engine._prefix_cache_hits
+        engine._add_request(request)
+        assert not request.enable_prefix_caching
+        assert request.precomputed_block_hashes == []
+
+        output = None
+        while output is None:
+            result = engine.step_modern()
+            if result["finished_request_records"]:
+                output = result["finished_request_records"][0].merge()
+        assert engine._prefix_cache_hits == hits_before
+        assert output.num_cached_tokens == 0
+        assert len(output.prompt_log_probs) == len(prompt) - 1
+        return output
 
     @torch.inference_mode()
     def _run_engine_session(self, case, *, enable_prefix_caching):
@@ -2801,6 +2933,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         min_pool_avail = alloc.pool_avail
         saw_chunk = False
         cuda_graph_step_count = 0
+        cuda_graph_post_resume_step_count = 0
         saw_mixed_batch = False
         suspend_count = 0
         uvm_pointer_stability_checks = 0
@@ -2949,7 +3082,9 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 active_blocks = ctx.request_to_kv_block_ids[: ctx.total_request_count]
                 blocks_this_wave.update(active_blocks[active_blocks >= 0].tolist())
                 saw_chunk |= ctx.chunked_prefill_request_id != -1
-                cuda_graph_step_count += int(ctx.using_cuda_graph_this_step())
+                using_cuda_graph = int(ctx.using_cuda_graph_this_step())
+                cuda_graph_step_count += using_cuda_graph
+                cuda_graph_post_resume_step_count += int(suspend_count > 0) * using_cuda_graph
                 saw_mixed_batch |= (
                     ctx.batch_dimensions.prefill_req_count > 0
                     and ctx.batch_dimensions.decode_req_count > 0
@@ -2981,6 +3116,8 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                     assert not ctx.is_tensor_state_allocated
                     engine.resume()
                     assert ctx.is_tensor_state_allocated
+                    if config.num_cuda_graphs > 0:
+                        assert engine.capture_stats["pool_reserved_bytes"] > 0
                     if case["feature"] == "uvm":
                         assert ctx.memory_buffer.data_ptr() == uvm_memory_buffer_ptr
                         uvm_pointer_stability_checks += 1
@@ -3041,6 +3178,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             config=config,
             saw_chunk=saw_chunk,
             cuda_graph_step_count=cuda_graph_step_count,
+            cuda_graph_post_resume_step_count=cuda_graph_post_resume_step_count,
             saw_mixed_batch=saw_mixed_batch,
             suspend_count=suspend_count,
             uvm_pointer_stability_checks=uvm_pointer_stability_checks,
@@ -3089,7 +3227,31 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         self._clear_engine_runtime()
         try:
             if case["feature"] == "logprobs":
-                self._assert_cached_prompt_logprobs_rejected(case)
+                cached_prompt = self._run_prompt_logprob_request(case, enable_prefix_caching=True)
+                self._clear_engine_runtime()
+                baseline_prompt = self._run_prompt_logprob_request(
+                    case, enable_prefix_caching=False
+                )
+                atol = 1e-3 if case["model"] == "hybrid" else 1e-5
+                assert cached_prompt.generated_tokens == baseline_prompt.generated_tokens
+                assert np.allclose(
+                    cached_prompt.prompt_log_probs,
+                    baseline_prompt.prompt_log_probs,
+                    atol=atol,
+                    rtol=0,
+                )
+                assert np.allclose(
+                    cached_prompt.generated_log_probs,
+                    baseline_prompt.generated_log_probs,
+                    atol=atol,
+                    rtol=0,
+                )
+                self._assert_top_n_parity(
+                    cached_prompt.prompt_top_n_logprobs,
+                    baseline_prompt.prompt_top_n_logprobs,
+                    len(cached_prompt.prompt_tokens) - 1,
+                    atol,
+                )
                 self._clear_engine_runtime()
             cached, stats = self._run_engine_session(case, enable_prefix_caching=True)
             self._clear_engine_runtime()
@@ -3199,6 +3361,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                     activations.add("request-eviction-checkpoint-resume")
             elif feature in ("offload", "recompute"):
                 assert stats["suspend_count"] >= 1
+                assert stats["cuda_graph_post_resume_step_count"] > 0
                 activations.add(f"{feature}-prefix-resume")
             elif feature == "uvm":
                 assert stats["config"].unified_memory_level == 1

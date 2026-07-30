@@ -50,6 +50,8 @@ def _assert_result_parity(reference, actual):
     assert len(reference) == len(actual)
     pairs = []
     for idx, (ref_request, request) in enumerate(zip(reference, actual)):
+        expected_length = ref_request.sampling_params.num_tokens_to_generate
+        assert len(ref_request.generated_tokens) == expected_length
         assert ref_request.generated_tokens == request.generated_tokens
         assert ref_request.generated_text == request.generated_text
         for field in (
@@ -72,9 +74,7 @@ def _stress_snapshot(engine, first_group_hashes):
     hashes = allocator.kv_hash_to_block_id if engine.context.enable_prefix_caching else {}
     values = [
         engine._prefix_cache_hits,
-        engine._prefix_cache_blocks_matched,
         engine._prefill_tokens_skipped,
-        len(hashes),
         int(all(h in hashes for h in first_group_hashes)),
         int(not hashes and allocator.pool_avail == allocator.pool_size - 1),
         int(bool(hashes) and allocator.pool_avail < allocator.pool_size - 1),
@@ -232,7 +232,8 @@ async def main(
                     "latency": req.latency,  # InferenceClient populates this field in the returned future.
                 }
                 if req.sampling_params.return_log_probs:
-                    result_dict["logprobs"] = req.prompt_log_probs + req.generated_log_probs
+                    prompt, generated = req.prompt_log_probs, req.generated_log_probs
+                    result_dict["logprobs"] = (prompt or []) + (generated or [])
                 throughput = len(req.generated_tokens) / req.latency
                 throughputs.append(throughput)
                 if req.routing_indices is not None:
@@ -393,11 +394,11 @@ if __name__ == "__main__":
                     _assert_result_parity(reference_cycles[0], cycle)
                 world_size = dist.get_world_size()
                 policy = inference_config.prefix_caching_eviction_policy.value
-                assert all(snapshot[2] > 0 for snapshot in snapshots)
+                assert all(s[2] > 0 and s[0][1] > 0 for s in snapshots)
                 if policy == "ref_zero":
-                    assert all(s[0][3] == 0 and s[0][5] == world_size for s in snapshots)
+                    assert all(s[0][3] == world_size for s in snapshots)
                 else:
-                    assert all(s[0][6] == world_size and s[0][4] < world_size for s in snapshots)
+                    assert all(s[0][4] == world_size and s[0][2] < world_size for s in snapshots)
                 assert snapshots[-1][1] <= snapshots[-2][1] + 64 * 1024**2 * world_size
         else:
             asyncio.run(main(engine, requests, args.inference_coordinator_port))

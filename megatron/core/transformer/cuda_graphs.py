@@ -1771,6 +1771,16 @@ class CudaGraphManager(torch.nn.Module):
     global_mempool = None
     _instances = weakref.WeakSet()
 
+    @classmethod
+    def _ensure_global_mempool(cls):
+        if cls.global_mempool is None:
+            cls.global_mempool = torch.cuda.graph_pool_handle()
+            if HAVE_GTP:
+                set_cuda_graph_mempool(torch.cuda.current_device(), cls.global_mempool)
+            # Capture requires no prior work on the default stream.
+            torch.cuda.set_stream(torch.cuda.Stream())
+        return cls.global_mempool
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -1840,15 +1850,7 @@ class CudaGraphManager(torch.nn.Module):
         # Therefore modules will always execute in the same order, so cudagraphs
         # can both be reused and share a single mempool.
         self.reuse_cudagraphs = self.pg_collection.pp.size() == 1
-        if CudaGraphManager.global_mempool is None:
-            CudaGraphManager.global_mempool = torch.cuda.graph_pool_handle()
-            # Register the pool so GTP allocates GRAPHED-chain buffers + quantized
-            # storage directly into it (created before the first graphed forward).
-            if HAVE_GTP:
-                set_cuda_graph_mempool(torch.cuda.current_device(), CudaGraphManager.global_mempool)
-            # Cudagraph stream capture requires no operations on the default stream prior to the
-            # capture, so change to a side stream.
-            torch.cuda.set_stream(torch.cuda.Stream())
+        self._ensure_global_mempool()
 
         # Enable one hook for the eager recording phase. Repeated manager construction is
         # idempotent, and graph creation removes the hook before capture begins.
@@ -1877,6 +1879,7 @@ class CudaGraphManager(torch.nn.Module):
         length of 'self.cudagraph_runners'.
         Otherwise, we assign a mempool per microbatch, which allows cudagraphs to be reused
         over different microbatches by tracking their respective fwd and bwd passes.'''
+        mempool = self._ensure_global_mempool()
         if reuse_cudagraphs:
             if cache_key is not None:
                 runner = self.custom_cudagraphs_lookup_table[cache_key]
@@ -1906,12 +1909,7 @@ class CudaGraphManager(torch.nn.Module):
                     )
                 else:
                     runner = _CudaGraphRunner(
-                        megatron_module,
-                        CudaGraphManager.global_mempool,
-                        args,
-                        kwargs,
-                        self.func,
-                        self.need_backward,
+                        megatron_module, mempool, args, kwargs, self.func, self.need_backward
                     )
                     if self._num_warmup_steps is not None:
                         runner.num_warmup_steps = self._num_warmup_steps
@@ -1926,12 +1924,7 @@ class CudaGraphManager(torch.nn.Module):
                 self.cudagraph_runners = self.cudagraph_runners[1:] + self.cudagraph_runners[:1]
             else:
                 runner = _CudaGraphRunner(
-                    megatron_module,
-                    CudaGraphManager.global_mempool,
-                    args,
-                    kwargs,
-                    self.func,
-                    self.need_backward,
+                    megatron_module, mempool, args, kwargs, self.func, self.need_backward
                 )
                 self.cudagraph_runners.append(runner)
 

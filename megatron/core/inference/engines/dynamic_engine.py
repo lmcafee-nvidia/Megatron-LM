@@ -1048,10 +1048,11 @@ class DynamicInferenceEngine(AbstractEngine):
             and request.sampling_params.return_log_probs
             and not request.sampling_params.skip_prompt_log_probs
         ):
-            raise ValueError(
-                "Prompt log probabilities are not supported for prefix-cached requests because "
-                "cached tokens do not retain logits."
-            )
+            # Cached tokens do not retain logits. Compute this request normally so
+            # prompt log probabilities stay complete while other requests can still
+            # use the shared prefix cache.
+            request.enable_prefix_caching = False
+            request.precomputed_block_hashes = []
 
         # Add request to self.requests. If the engine has previously been
         # suspended, then the request may already exist.
@@ -2415,18 +2416,31 @@ class DynamicInferenceEngine(AbstractEngine):
     @torch.inference_mode()
     def _set_generation_epoch(self, generation_epoch: int) -> None:
         """Apply a model-generation epoch received from the inference client."""
-        epoch_changed = generation_epoch != self._generation_epoch
-        if epoch_changed:
-            self.context.kv_block_allocator.invalidate_prefix_cache()
-            if self.context.mamba_slot_allocator is not None:
-                self.context.mamba_slot_allocator.invalidate_cache()
+        if generation_epoch == self._generation_epoch:
+            return
+
+        self.context.kv_block_allocator.invalidate_prefix_cache()
+        if self.context.mamba_slot_allocator is not None:
+            self.context.mamba_slot_allocator.invalidate_cache()
         self._generation_epoch = generation_epoch
 
-        # Stamp all active requests with the new epoch. Each field stores a
+        # RECOMPUTE suspension deletes tensor attributes, and no request owns live
+        # KV in that state. OFFLOAD and PERSIST retain their bookkeeping tensors.
+        if hasattr(self.context, "request_ids"):
+            context_request_ids = set(
+                self.context.request_ids[: self.context.total_request_count].tolist()
+            )
+            if self.context.chunked_prefill_request_id != -1:
+                context_request_ids.add(self.context.chunked_prefill_request_id)
+        else:
+            context_request_ids = set()
+
+        # Stamp all requests with the new epoch. Each field stores a
         # sparse list of (start_token_index, epoch) boundaries.
-        for entry in self.requests.values():
+        for request_id, entry in self.requests.items():
             request = entry.record[-1]
-            if epoch_changed and request.enable_prefix_caching:
+            owns_live_kv = request_id in context_request_ids
+            if owns_live_kv and request.enable_prefix_caching:
                 # This request may still own KV computed by the prior model.
                 # Let it finish, but do not publish any more of its blocks for
                 # reuse by requests that start in the new epoch.
@@ -2435,11 +2449,12 @@ class DynamicInferenceEngine(AbstractEngine):
             total = len(request.prompt_tokens) + len(request.generated_tokens)
             if total > 0:
                 boundary = (total - 1, generation_epoch)
-                if request.policy_epoch is None:
+                never_started = not owns_live_kv and len(entry.record.requests) == 1
+                if request.policy_epoch is None or never_started:
                     request.policy_epoch = [(0, generation_epoch)]
                 else:
                     request.policy_epoch.append(boundary)
-                if request.kv_cache_epoch is None:
+                if request.kv_cache_epoch is None or not owns_live_kv:
                     request.kv_cache_epoch = [(0, generation_epoch)]
                 else:
                     request.kv_cache_epoch.append(boundary)

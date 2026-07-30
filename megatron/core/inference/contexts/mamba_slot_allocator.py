@@ -651,7 +651,7 @@ class MambaSlotAllocator:
         """Discard durable and pending prefix state without touching GPU storage."""
         self.block_to_slot.fill_(-1)
         self.slot_to_block.fill_(-1)
-        self.free_slots = torch.arange(self.max_slots, dtype=torch.int32, device='cpu')
+        self.free_slots.copy_(torch.arange(self.max_slots, dtype=torch.int32, device='cpu'))
         self.free_count = self.max_slots
         self.hash_to_block_id.clear()
         self._intermediate_offsets_cpu.fill_(0)

@@ -44,12 +44,13 @@ MODEL_ARGS:
   --return-log-probs: true
   --skip-prompt-log-probs: true
   --num-tokens-to-generate: 30
-  --inference-dynamic-batching-buffer-size-gb: 0.1
+  --inference-dynamic-batching-buffer-size-gb: 0.15
   --inference-dynamic-batching-max-requests: 16
   --inference-dynamic-batching-max-tokens: 2048
   --inference-dynamic-batching-prefix-caching: true
   --inference-dynamic-batching-prefix-caching-eviction-policy: lru
   --inference-dynamic-batching-prefix-caching-coordinator-policy: longest_prefix
+  --coordinator-schedule-output-path: ${OUTPUT_PATH}/coordinator_schedule.json
   --prefix-cache-compare: true
   --prefix-cache-stress-groups: 16
   --prefix-cache-stress-copies: 9
@@ -66,3 +67,26 @@ METRICS:
   - "generated_tokens"
   - "generated_text"
   - "logprobs"
+AFTER_SCRIPT: |
+  python - <<'PY'
+  import json
+  import os
+
+  path = os.path.join(os.environ["OUTPUT_PATH"], "coordinator_schedule.json")
+  with open(path) as stream:
+      schedule = json.load(stream)
+
+  copies = 9
+  groups = 16
+  cycles = 3
+  records = schedule["records"]
+  assert schedule["policy"] == "longest_prefix"
+  assert len(records) == copies * groups * cycles
+  for start in range(0, len(records), copies):
+      group = records[start : start + copies]
+      ranks = {record["rank_index"] for record in group}
+      assert len(ranks) == 1, f"shared-prefix group split across replicas: {group}"
+  assert {record["rank_index"] for record in records} == set(
+      range(schedule["data_parallel_size"])
+  )
+  PY

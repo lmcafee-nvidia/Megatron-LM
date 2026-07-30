@@ -136,6 +136,7 @@ def assert_prefix_cache_parity(reference_requests, cached_requests):
         assert reference.output_tokens == cached.output_tokens, f"request {idx}: token mismatch"
         assert reference.output_text == cached.output_text, f"request {idx}: text mismatch"
         assert (reference.routing_indices is None) == (cached.routing_indices is None)
+        assert not get_args().moe_enable_routing_replay or reference.routing_indices is not None
         if reference.routing_indices is not None:
             assert len(cached.routing_indices) == (
                 len(cached.prompt_tokens) + len(cached.output_tokens) - 1
