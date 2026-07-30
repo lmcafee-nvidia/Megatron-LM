@@ -231,15 +231,13 @@ async def main(
                 if req.sampling_params.return_log_probs:
                     prompt, generated = req.prompt_log_probs, req.generated_log_probs
                     result_dict["logprobs"] = (prompt or []) + (generated or [])
-                throughput = len(req.generated_tokens) / req.latency
-                throughputs.append(throughput)
+                throughputs.append(len(req.generated_tokens) / req.latency)
                 if req.routing_indices is not None:
                     result_dict["routing_indices"] = req.routing_indices.tolist()
 
                 json_results[req.request_id] = result_dict
-            throughput_dict = {"throughput": throughputs}
             if args.throughput_check_only:
-                json_results = throughput_dict
+                json_results = {"throughput": throughputs}
             with open(args.output_path, "w") as fp:
                 json.dump(json_results, fp, indent=4)
         else:
@@ -270,12 +268,17 @@ async def main(
 
     await engine.wait_until(EngineState.STOPPED)
 
-    if dist.get_rank() == 0:
+    process = engine.inference_coordinator_process if dist.get_rank() == 0 else None
+    if process is not None:
         client.shutdown_coordinator()
-        await asyncio.to_thread(engine.inference_coordinator_process.join, 30)
+        await asyncio.to_thread(process.join, 30)
+        for stop in (process.terminate, process.kill):
+            if process.is_alive():
+                stop()
+                await asyncio.to_thread(process.join, 10)
         client.stop()
-        assert engine.inference_coordinator_process.exitcode == 0
-    dist.barrier()
+    dist.broadcast_object_list(status := [process.exitcode if process else 0], src=0)
+    assert status[0] == 0
     logging.info(f"Rank: {dist.get_rank()} stopped their engine instance successfully.")
     return result_cycles, stress_snapshots
 
@@ -394,12 +397,10 @@ if __name__ == "__main__":
                 for cycle in cache_cycles:
                     _assert_result_parity(reference_cycles[0], cycle)
                 world_size = dist.get_world_size()
-                policy = inference_config.prefix_caching_eviction_policy.value
+                ref_zero = inference_config.prefix_caching_eviction_policy.value == "ref_zero"
                 assert all(s[2] > 0 and s[0][1] > 0 for s in snapshots)
-                if policy == "ref_zero":
-                    assert all(s[0][3] == world_size for s in snapshots)
-                else:
-                    assert all(s[0][4] == world_size and s[0][2] == 0 for s in snapshots)
+                assert all(s[0][3 if ref_zero else 4] == world_size for s in snapshots)
+                assert ref_zero or all(s[0][2] == 0 for s in snapshots)
                 assert snapshots[-1][1] <= snapshots[-2][1] + 64 * 1024**2 * world_size
         else:
             asyncio.run(main(engine, requests, args.inference_coordinator_port))

@@ -2323,6 +2323,62 @@ class TestPrefixCacheReuse(PrefixCachingTestBase):
             == ctx.request_to_kv_block_ids[0][last_aligned_abs // bs - 1].item()
         )
 
+    @pytest.mark.internal
+    def test_mamba_aligned_chunk_endpoint_commits_and_restores(self):
+        # A block boundary exactly at a non-final chunk end is not an extractable
+        # interior offset. Commit it from the live state, then prove that a
+        # matching request skips to and restores that exact boundary.
+        ctx = self._ctx(
+            mamba_config=self._mamba_config(),
+            prefix_caching_mamba_gb=0.01,
+            block_size_tokens=256,
+            max_sequence_length=4096,
+        )
+        bs = ctx.block_size_tokens
+        prompt = self._prompt(2 * bs + 7)
+        seed = self._req(ctx, prompt.clone())
+        ctx.add_request(seed)
+        msa = ctx.mamba_slot_allocator
+
+        seed.finished_chunk_token_count = bs
+        msa.compute_and_store_offsets(
+            seed,
+            current_id=0,
+            skip_tokens=0,
+            prefill_chunk_length=bs,
+            num_matched_blocks=0,
+            matched_block_ids=[],
+            overall_required_blocks=ctx.request_kv_block_counts[0].item(),
+        )
+        seed.finished_chunk_token_count = 0
+
+        endpoint_block = ctx.request_to_kv_block_ids[0][1].item()
+        assert msa._intermediate_counts_cpu[0].item() == 0
+        assert msa._eos_cache_block_id_cpu[0].item() == endpoint_block
+
+        ctx.initialize_attention_state()
+        seed_mamba_idx = ctx.mamba_metadata.request_to_mamba_state_idx[0].item()
+        ctx.mamba_conv_states[:, seed_mamba_idx].fill_(17)
+        ctx.mamba_ssm_states[:, seed_mamba_idx].fill_(23)
+        msa.commit_intermediate_states()
+
+        endpoint_hash = seed.precomputed_block_hashes[1]
+        endpoint_slot = msa.block_to_slot[endpoint_block].item()
+        assert msa.hash_to_block_id[endpoint_hash] == endpoint_block
+        assert torch.all(msa.conv_states[:, endpoint_slot] == 17)
+        assert torch.all(msa.ssm_states[:, endpoint_slot] == 23)
+
+        follower = self._req(ctx, prompt.clone(), request_id=2)
+        matched, _, _, _, prefix_skip, _ = ctx._compute_prefix_match(follower, len(prompt))
+        assert len(matched) == 2 and prefix_skip == 2 * bs
+        ctx.add_request(follower)
+        assert follower._mamba_num_matched_blocks == 2
+        ctx.initialize_attention_state()
+
+        follower_mamba_idx = ctx.mamba_metadata.request_to_mamba_state_idx[1].item()
+        assert torch.all(ctx.mamba_conv_states[:, follower_mamba_idx] == 17)
+        assert torch.all(ctx.mamba_ssm_states[:, follower_mamba_idx] == 23)
+
 
 # Each ownership entry names an assertion returned by the executed row.  Keeping
 # this table beside the matrix makes additions reviewable: a feature/policy pair
@@ -2963,6 +3019,10 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             blocks_this_wave = set()
             while wave_ids - finished.keys():
                 result = engine.step_modern()
+                if case["feature"] == "offload" and cycle == 0 and step_count == 0:
+                    assert ctx.total_request_count > 0 or ctx.chunked_prefill_request_id != -1
+                    with pytest.raises(AssertionError, match="empty inference context"):
+                        engine.create_cuda_graphs()
                 step_count += 1
                 if baseline_follower_pending and (
                     not chunked or ctx.chunked_prefill_request_id == -1

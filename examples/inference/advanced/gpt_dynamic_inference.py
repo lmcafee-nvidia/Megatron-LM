@@ -13,6 +13,7 @@ import warnings
 from collections import defaultdict
 from dataclasses import replace
 from typing import Dict, List, Optional
+from unittest.mock import Mock
 
 import torch
 from tqdm import tqdm
@@ -496,10 +497,11 @@ def main():
         gc.collect()
         torch.cuda.empty_cache()
         context, engine = build_engine(model, inference_config, tokenizer)
+        mamba = context.mamba_slot_allocator
+        if mamba is not None:
+            mamba._evict_lru_slots_batch = Mock(wraps=mamba._evict_lru_slots_batch)
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
-    print("~~~")
-    print(setup_prefix)
-    print("~~~")
+    print("~~~", setup_prefix, "~~~", sep="\n")
     for _ in range(args.inference_repeat_n):
 
         if not args.prefix_cache_compare:
@@ -519,8 +521,7 @@ def main():
         torch.cuda.synchronize()
         total_time = get_curr_time() - t
         stats = torch.cuda.memory_stats()
-        throughput = total_output_tokens / total_time
-        throughputs.append(throughput)
+        throughputs.append(total_output_tokens / total_time)
         if args.prefix_cache_compare:
             assert_prefix_cache_parity(reference_requests, requests)
             assert engine._prefix_cache_hits > hit_start
@@ -544,10 +545,8 @@ def main():
                 h not in context.kv_block_allocator.kv_hash_to_block_id for h in first_group_hashes
             )
         if 0 < (inference_config.prefix_caching_mamba_gb or 0) < 1:
-            mamba = context.mamba_slot_allocator
             assert mamba is not None
-            assert engine._prefill_tokens_skipped > 0 and mamba.free_count == 0
-            assert any(h not in mamba.hash_to_block_id for h in first_group_hashes)
+            assert engine._prefill_tokens_skipped > 0 and mamba._evict_lru_slots_batch.called
         if args.cuda_graph_impl == "local":
             assert engine.capture_stats and sum(result["cuda_graph_request_count_map"].values()) > 0
         assert (

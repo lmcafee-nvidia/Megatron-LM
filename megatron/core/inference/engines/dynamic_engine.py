@@ -390,6 +390,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         context = self.context
         controller = self.controller
+        assert (
+            context.total_request_count == 0 and context.chunked_prefill_request_id == -1
+        ), "CUDA graph capture requires an empty inference context"
 
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()
