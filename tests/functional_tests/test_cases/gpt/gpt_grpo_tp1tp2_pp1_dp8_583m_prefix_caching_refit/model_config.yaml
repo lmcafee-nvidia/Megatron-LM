@@ -7,6 +7,13 @@ ENV_VARS:
   LANGRL_LOG_DIR: ${OUTPUT_PATH}/rollouts
 BEFORE_SCRIPT: |
   mkdir -p "$LANGRL_LOG_DIR"
+  PREFIX_CACHE_PROMPT_SUFFIX=$(printf \
+    ' This shared context is intentionally repeated for prefix cache stress.%.0s' {1..32})
+  export PREFIX_CACHE_PROMPT_SUFFIX
+  /usr/local/bin/yq \
+    '.[0].agent_args.prompt_suffix = strenv(PREFIX_CACHE_PROMPT_SUFFIX)' \
+    tests/functional_tests/test_cases/gpt/gpt_grpo_tp1tp2_pp1_dp8_583m_throughputtest/env_config.yaml \
+    > "$OUTPUT_PATH/prefix_cache_env_config.yaml"
 TEST_TYPE: frozen-start
 MODE: rl
 MODEL_ARGS:
@@ -63,7 +70,7 @@ MODEL_ARGS:
   --grpo-clamp-eps-upper: 0.2
   --grpo-kl-beta: 0.0
   --grpo-entropy-term-weight: 0.0
-  --langrl-env-config: tests/functional_tests/test_cases/gpt/gpt_grpo_tp1tp2_pp1_dp8_583m_throughputtest/env_config.yaml
+  --langrl-env-config: ${OUTPUT_PATH}/prefix_cache_env_config.yaml
   --rl-partial-rollouts: true
   --lr: 0.000001
   --lr-warmup-samples: 0
@@ -81,7 +88,7 @@ MODEL_ARGS:
   --rl-inference-tensor-model-parallel-size: 2
   --refit-method: gloo
   --inference-dynamic-batching-buffer-size-gb: 0.2
-  --inference-dynamic-batching-block-size: 64
+  --inference-dynamic-batching-block-size: 256
   --inference-dynamic-batching-max-tokens: 1024
   --inference-dynamic-batching-max-requests: 32
   --inference-dynamic-batching-prefix-caching: true
@@ -180,6 +187,10 @@ AFTER_SCRIPT: |
           assert key not in groups, f"{label}: duplicate prompt group"
           groups[key] = group
       assert len(groups) == 8, f"{label}: expected 8 prompt groups"
+      assert all(len(key) > 256 for key in groups), f"{label}: prompts are not cacheable"
+      assert len({key[:256] for key in groups}) == 8, (
+          f"{label}: first cache blocks must differ across prompt groups"
+      )
       return groups
 
   for cached_file in cached_files:
