@@ -879,7 +879,10 @@ class DynamicInferenceEngine(AbstractEngine):
             if (
                 self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST
                 and not self.context.static_kv_memory_pointers
+                and self.context.total_request_count == 0
             ):
+                # OFFLOAD preserves live request metadata. Dummy graph capture resets the
+                # context, so let matching graphs be captured lazily as those requests resume.
                 self.create_cuda_graphs()
             capture_time = time.time() - capture_time
 

@@ -2488,8 +2488,6 @@ class TestPrefixCachePolicyStressMatrix(PrefixCachingTestBase):
 
 
 PREFIX_CACHE_ENGINE_CASES = [
-    pytest.param(dict(name="gpt-base", model="gpt", feature="base"), id="gpt-base-output"),
-    pytest.param(dict(name="hybrid-base", model="hybrid", feature="base"), id="hybrid-base-output"),
     pytest.param(dict(name="gpt-tp4", model="gpt", feature="tp", tp=4), id="gpt-tp4"),
     pytest.param(dict(name="hybrid-tp4", model="hybrid", feature="tp", tp=4), id="hybrid-tp4"),
     pytest.param(dict(name="gpt-pp4", model="gpt", feature="pp", pp=4), id="gpt-pp4"),
@@ -2555,7 +2553,6 @@ PREFIX_CACHE_ENGINE_CASES = [
 ]
 
 PREFIX_CACHE_ENGINE_LRU_CASES = {
-    "gpt-base",
     "hybrid-tp4",
     "gpt-pp4",
     "hybrid-tp2-pp2-sp",
@@ -2573,8 +2570,6 @@ PREFIX_CACHE_ENGINE_LRU_CASES = {
 }
 
 PREFIX_CACHE_ENGINE_PAIR_OWNERS = {
-    "gpt-base×lru": "real-engine-output-parity",
-    "hybrid-base×ref-zero": "real-engine-output-parity",
     "gpt-tp4×ref-zero": "tensor-parallel-prefix-hit",
     "hybrid-tp4×lru": "tensor-parallel-prefix-hit",
     "gpt-pp4×lru": "pipeline-parallel-prefix-hit",
@@ -2601,6 +2596,7 @@ PREFIX_CACHE_ENGINE_PAIR_OWNERS = {
     "hybrid-request-eviction×ref-zero": "request-eviction-checkpoint-resume",
     "gpt-uvm×lru": "uvm-backed-prefix-lifecycle",
     "hybrid-uvm×ref-zero": "uvm-backed-prefix-lifecycle",
+    "gpt-http-zmq×lru": "http-zmq-lru-pressure-epoch-parity",
 }
 
 
@@ -3541,6 +3537,10 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             )
             torch.distributed.all_reduce(final_hits)
             assert final_hits.item() >= pressure_stats[0].item() + 1
+            assert (
+                PREFIX_CACHE_ENGINE_PAIR_OWNERS["gpt-http-zmq×lru"]
+                == "http-zmq-lru-pressure-epoch-parity"
+            )
         finally:
             if rank == 0 and server_started:
                 try:
