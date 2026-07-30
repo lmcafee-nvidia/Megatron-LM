@@ -44,7 +44,7 @@ MODEL_ARGS:
   --return-log-probs: true
   --skip-prompt-log-probs: true
   --num-tokens-to-generate: 4
-  --inference-dynamic-batching-buffer-size-gb: 0.15
+  --inference-dynamic-batching-buffer-size-gb: 0.25
   --inference-dynamic-batching-max-requests: 16
   --inference-dynamic-batching-max-tokens: 4096
   --inference-dynamic-batching-prefix-caching: true

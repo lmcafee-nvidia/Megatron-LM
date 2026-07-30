@@ -125,7 +125,7 @@ def cleaned_env() -> dict:
     env["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
     env["NCCL_ALGO"] = "Ring"
     env["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
-    env["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    env.update(CUBLAS_WORKSPACE_CONFIG=":4096:8", MEGATRON_LOGGING_LEVEL="20")
     return env
 
 
