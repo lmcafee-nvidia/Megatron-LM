@@ -41,6 +41,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
+from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.inference.utils import (
     add_inference_args,
     get_inference_config_from_model_and_args,
@@ -493,6 +494,7 @@ def main():
 
         reference_requests = copy.deepcopy(requests)
         run_inference(reference_requests, engine)
+        delete_cuda_graphs()
         context.deallocate_inference_state_buffers()
         del engine, context
         gc.collect()
@@ -552,6 +554,8 @@ def main():
                 block_hash not in context.kv_block_allocator.kv_hash_to_block_id
                 for block_hash in first_group_hashes
             )
+        if args.cuda_graph_impl == "local":
+            assert engine.capture_stats and sum(result["cuda_graph_request_count_map"].values()) > 0
         assert memory_cycles[-1] <= memory_cycles[-2] + 64 * 1024**2, (
             "cache-on CUDA allocation grew by more than 64 MiB after warmup: "
             f"{memory_cycles[-2:]}"
