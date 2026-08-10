@@ -7,7 +7,7 @@ spec:
   model: '{model}'
   build: mcore-pyt-{environment}
   nodes: 1
-  gpus: 1
+  gpus: '{gpus}'
   n_repeat: 1
   platforms: dgx_h100
   time_limit: 3600
@@ -45,46 +45,112 @@ spec:
     set -euo pipefail
     cd /opt/megatron-lm
 
-    ARGUMENTS=(
-        "CHECKPOINT_LOAD_PATH=/mnt/artifacts"
-        "CHECKPOINT_SAVE_PATH=/tmp/checkpoints"
-        "DATA_PATH=/mnt/artifacts"
-        "DATA_CACHE_PATH=/workspace/data/cache"
-        "TRAINING_SCRIPT_PATH=examples/inference/advanced/gpt_dynamic_inference.py"
-        "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
-        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
-        "OUTPUT_PATH={assets_dir}"
-        "TENSORBOARD_PATH={assets_dir}/tensorboard"
-        "INFERENCE_OUTPUT_PATH={assets_dir}/golden_values_{environment}_{platforms}.json"
-        "N_REPEAT={n_repeat}"
-        "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE:-}}"
-        "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS:-}}"
-    )
+    run_stress_variant() {{
+      local params_file=$1
+      local golden_file=$2
+      local output_dir=$3
 
-    bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
+      ARGUMENTS=(
+          "CHECKPOINT_LOAD_PATH=/mnt/artifacts"
+          "CHECKPOINT_SAVE_PATH=/tmp/checkpoints"
+          "DATA_PATH=/mnt/artifacts"
+          "DATA_CACHE_PATH=/workspace/data/cache"
+          "TRAINING_SCRIPT_PATH={runner}"
+          "TRAINING_PARAMS_PATH=${{params_file}}"
+          "GOLDEN_VALUES_PATH=${{golden_file}}"
+          "OUTPUT_PATH=${{output_dir}}"
+          "TENSORBOARD_PATH=${{output_dir}}/tensorboard"
+          "INFERENCE_OUTPUT_PATH=${{output_dir}}/golden_values_{environment}_{platforms}.json"
+          "PREFIX_CACHE_REFERENCE_ROLLOUT_DIR={assets_dir}/cache_off/rollouts"
+          "N_REPEAT={n_repeat}"
+          "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE:-}}"
+          "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS:-}}"
+      )
+
+      bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
+    }}
+
+    case_dir=./tests/functional_tests/test_cases/{model}/{test_case}
+    if [[ "{test_case}" == "gpt_dynamic_inference_tp1_pp1_dp8_583m_prefix_caching_longest_prefix_zmq" ]]; then
+      run_stress_variant \
+        "${{case_dir}}/model_config.yaml" \
+        "${{case_dir}}/golden_values_{environment}_{platforms}.json" \
+        {assets_dir}/longest_prefix
+      /usr/local/bin/yq \
+        '.MODEL_ARGS."--inference-dynamic-batching-prefix-caching-coordinator-policy" = "load_balanced" |
+         .METRICS = [.METRICS[] | select(. != "logprobs")]' \
+        "${{case_dir}}/model_config.yaml" > /tmp/prefix-cache-coordinator-load-balanced.yaml
+      run_stress_variant \
+        /tmp/prefix-cache-coordinator-load-balanced.yaml \
+        "${{case_dir}}/golden_values_{environment}_{platforms}.json" \
+        {assets_dir}/load_balanced
+    elif [[ "{test_case}" == "gpt_grpo_tp1tp2_pp1_dp8_583m_prefix_caching_refit" ]]; then
+      /usr/local/bin/yq \
+        'del(.MODEL_ARGS."--inference-dynamic-batching-prefix-caching") |
+         del(.MODEL_ARGS."--inference-dynamic-batching-prefix-caching-eviction-policy") |
+         del(.AFTER_SCRIPT)' \
+        "${{case_dir}}/model_config.yaml" > /tmp/prefix-cache-refit-cache-off.yaml
+      run_stress_variant \
+        /tmp/prefix-cache-refit-cache-off.yaml \
+        "${{case_dir}}/golden_values_cache_off_{environment}_{platforms}.json" \
+        {assets_dir}/cache_off
+      run_stress_variant \
+        "${{case_dir}}/model_config.yaml" \
+        "${{case_dir}}/golden_values_{environment}_{platforms}.json" \
+        {assets_dir}
+    else
+      run_stress_variant \
+        "${{case_dir}}/model_config.yaml" \
+        "${{case_dir}}/golden_values_{environment}_{platforms}.json" \
+        {assets_dir}
+    fi
 
 products:
   - test_case: [gpt_dynamic_inference_tp1_pp1_583m_prefix_caching]
     products:
       - model: [gpt]
+        runner: [examples/inference/advanced/gpt_dynamic_inference.py]
+        gpus: [1]
         environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp1_pp1_583m_prefix_caching_lru]
     products:
       - model: [gpt]
+        runner: [examples/inference/advanced/gpt_dynamic_inference.py]
+        gpus: [1]
         environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
   - test_case: [hybrid_dynamic_inference_tp1_pp1_583m_prefix_caching_refzero_no_mtp]
     products:
       - model: [hybrid]
+        runner: [examples/inference/advanced/gpt_dynamic_inference.py]
+        gpus: [1]
         environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
   - test_case: [hybrid_dynamic_inference_tp1_pp1_583m_prefix_caching_lru_chunked_mamba_pressure]
     products:
       - model: [hybrid]
+        runner: [examples/inference/advanced/gpt_dynamic_inference.py]
+        gpus: [1]
+        environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp1_pp1_dp8_583m_prefix_caching_longest_prefix_zmq]
+    products:
+      - model: [gpt]
+        runner: [examples/inference/advanced/gpt_dynamic_inference_with_coordinator.py]
+        gpus: [8]
+        environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt_grpo_tp1tp2_pp1_dp8_583m_prefix_caching_refit]
+    products:
+      - model: [gpt]
+        runner: [train_rl.py]
+        gpus: [8]
         environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]

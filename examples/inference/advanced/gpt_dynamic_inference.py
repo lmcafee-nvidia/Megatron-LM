@@ -90,11 +90,16 @@ def build_prefix_cache_stress_requests(args, tokenizer, sampling_params, request
     if args.prefix_cache_stress_staged:
         args.incoming_requests_per_step = 1
 
+    coordinator_policy = args.inference_dynamic_batching_prefix_caching_coordinator_policy
+    nested_prefixes = coordinator_policy in {"longest_prefix", "load_balanced"}
     stress_requests = []
     for group_idx in range(args.prefix_cache_stress_groups):
-        marker = f"prefix cache pressure group {group_idx:04d}; deterministic shared text. "
+        routing_group = group_idx // 2 if nested_prefixes else group_idx
+        marker = f"prefix cache pressure group {routing_group:04d}; deterministic shared text. "
         prompt = marker
-        while len(tokenizer.tokenize(prompt)) < args.prefix_cache_stress_prompt_tokens:
+        length_factor = 1 + int(nested_prefixes and group_idx % 2)
+        target_tokens = args.prefix_cache_stress_prompt_tokens * length_factor
+        while len(tokenizer.tokenize(prompt)) < target_tokens:
             prompt += marker
         for _ in range(args.prefix_cache_stress_copies):
             stress_requests.append(Request(prompt, -1, tokenizer, sampling_params))
