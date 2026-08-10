@@ -93,33 +93,7 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
-  - test_case: [gpt_dynamic_inference_tp1_pp1_583m_prefix_caching_chunked_prefill]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
-  - test_case: [gpt_dynamic_inference_tp1_pp1_583m_prefix_caching_cuda_graphs]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp1_pp1_583m_chunked_prefill_cuda_graphs]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
-  # ===== Round 2 (Tier 2) - parallelism x feature, 3-way combos, sampling, memory variants =====
-  - test_case: [gpt_dynamic_inference_tp2_pp2_583m_prefix_caching]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
-  - test_case: [gpt_dynamic_inference_tp8_pp1_583m_prefix_caching]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
-  - test_case: [gpt_dynamic_inference_tp1_pp8_583m_prefix_caching]
     products:
       - environment: [dev]
         scope: [mr]
@@ -135,21 +109,6 @@ products:
         scope: [mr]
         platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp2_pp2_583m_cuda_graphs]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
-  - test_case: [gpt_dynamic_inference_tp1_pp1_583m_prefix_caching_chunked_prefill_cuda_graphs]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
-  - test_case: [gpt_dynamic_inference_tp2_pp2_583m_prefix_caching_cuda_graphs]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
-  - test_case: [gpt_dynamic_inference_tp1_pp1_583m_prefix_caching_chunked_prefill_flashinfer]
     products:
       - environment: [dev]
         scope: [mr]
