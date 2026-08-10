@@ -65,3 +65,4 @@ METRICS:
   - "generated_tokens"
   - "generated_text"
   - "logprobs"
+LAUNCHER: ft_launcher
