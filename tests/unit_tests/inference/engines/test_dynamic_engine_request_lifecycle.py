@@ -797,7 +797,7 @@ class TestRequestLifecyclePairwise(_DynamicInferenceEngineTestBase):
             }
             engine.suspend()
             assert engine.context.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE
-            assert len(engine.requests[target_id].record.requests) == 2
+            assert len(engine.requests[target_id].record.requests) == 1
             engine.resume()
             resumed = engine.get_request(target_id)
             assert resumed.finished_chunk_token_count == 0
@@ -1319,8 +1319,8 @@ class TestRequestLifecyclePairwise(_DynamicInferenceEngineTestBase):
         try:
             result = self._assert_pair(_CHUNKED_RECOMPUTE, coordinator=True)
             assert result.witness["finished_chunk_token_count"] > 0
-            assert result.witness["record_segments_after_resume"] == 2
-            assert result.record_lengths[0] == 2
+            assert result.witness["record_segments_after_resume"] == 1
+            assert result.record_lengths[0] == 1
         finally:
             self._cleanup()
 

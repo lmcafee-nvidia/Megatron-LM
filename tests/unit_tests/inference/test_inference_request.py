@@ -394,9 +394,9 @@ def test_repeated_checkpoints_bound_reachable_cuda_prompt_storage():
         record[0].prompt_tokens.untyped_storage().nbytes()
         + record[-1].prompt_tokens.untyped_storage().nbytes()
     )
-    serialized = record.merge().serialize()
+    serialized = msgpack.unpackb(msgpack.packb(record.merge().serialize()), raw=False)
     round_trip = DynamicInferenceRequest.deserialize(serialized)
-    assert list(round_trip.prompt_tokens) == [1, 2, 3, 4]
+    assert round_trip.prompt_tokens.tolist() == [1, 2, 3, 4]
     assert round_trip.generated_tokens == [5, 6, 7, 8]
 
 
