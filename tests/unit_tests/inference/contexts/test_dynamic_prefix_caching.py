@@ -5,6 +5,7 @@ import gc
 from collections import deque
 from types import SimpleNamespace
 
+import msgpack
 import numpy as np
 import pytest
 import torch
@@ -724,6 +725,12 @@ class TestDisabledAndEngineScheduling(PrefixCachingTestBase):
 
     @pytest.mark.internal
     def test_generation_epoch_invalidates_coordinator_prefix_assignments(self):
+        def serialized_epoch_payload(epoch):
+            wire_payload = msgpack.packb(
+                [Headers.SET_GENERATION_EPOCH.value, epoch], use_bin_type=True
+            )
+            return msgpack.unpackb(wire_payload, raw=False)
+
         client = b"client"
         ranks = [f"rank-{index}".encode() for index in range(4)]
         broadcasts = []
@@ -755,14 +762,16 @@ class TestDisabledAndEngineScheduling(PrefixCachingTestBase):
         assert set(owners) == set(ranks)
         assert len(coordinator._hash_table) == 16
 
-        handle_control_signal(coordinator, client, [Headers.SET_GENERATION_EPOCH.value, 1])
+        epoch_one = serialized_epoch_payload(1)
+        handle_control_signal(coordinator, client, epoch_one)
         assert coordinator._hash_table == {}
         coordinator._update_rank_hashes(ranks[-1], [999])
-        handle_control_signal(coordinator, client, [Headers.SET_GENERATION_EPOCH.value, 1])
+        handle_control_signal(coordinator, client, serialized_epoch_payload(1))
         assert coordinator._hash_table == {999: {3: coordinator._hash_assignment_counter}}
-        handle_control_signal(coordinator, client, [Headers.SET_GENERATION_EPOCH.value, 2])
+        epoch_two = serialized_epoch_payload(2)
+        handle_control_signal(coordinator, client, epoch_two)
         assert coordinator._hash_table == {}
-        assert len(broadcasts) == 3
+        assert broadcasts == [epoch_one, epoch_one, epoch_two]
 
     @pytest.mark.internal
     def test_epoch_change_keeps_unstarted_requests_cacheable(self):
