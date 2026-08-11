@@ -368,17 +368,25 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_end_event = torch.cuda.Event(enable_timing=True)
         self.capture_stats = None
 
-        # Runtime state.
+        # Runtime state. A coordinator owns the loop, condition, and state
+        # events across drained runs. Replacing them breaks outstanding waiters
+        # and makes a reset engine silently leave coordinator mode.
         self.decode_only = DecodeOnly(consumed=None, launched=None)
-        self._loop = get_asyncio_loop(getattr(self, "_loop", None))
-        self._cond = asyncio.Condition()
-        self._state_events = {k: asyncio.Event() for k in self._STATE_EVENTS}
+        if not hasattr(self, "_loop"):
+            self._loop = get_asyncio_loop()
+        if not hasattr(self, "_cond"):
+            self._cond = asyncio.Condition()
+        if not hasattr(self, "_state_events"):
+            self._state_events = {k: asyncio.Event() for k in self._STATE_EVENTS}
+        else:
+            for state in self._STATE_EVENTS:
+                self._state_events.setdefault(state, asyncio.Event()).clear()
         self.state = EngineState.RUNNING
         self._state_events[EngineState.RUNNING].set()
         self._pending_signals = deque()
 
         self.resume_request_ids = None
-        self._cuda_graph_rebuild_pending = not self.context.cuda_graphs_available
+        self._cuda_graph_rebuild_pending = not getattr(self.context, "cuda_graphs_available", False)
 
         # Speculative decoding acceptance tracking (per-position).
         # Each tensor has length num_speculative_tokens; index i tracks position i+1
@@ -398,8 +406,8 @@ class DynamicInferenceEngine(AbstractEngine):
         self._prefill_tokens_skipped = 0
         self._prefix_coordination_waits = 0
 
-        # Coordinator state.
-        self.use_coordinator = False
+        # Keep coordinator ownership when resetting a drained coordinator.
+        self.use_coordinator = getattr(self, "use_coordinator", False)
 
     async def wait_until(self, state: EngineState):
         """Wait until the engine reaches the given state.
@@ -902,7 +910,13 @@ class DynamicInferenceEngine(AbstractEngine):
         waiting_request_ids = list(self.waiting_request_ids)
         active_request_ids = set(self.requests.keys()) - set(waiting_request_ids)
         if self.context.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
-            self.controller._async_sched_logits.clear()
+            # A fully initialized engine always has a controller. Keep the
+            # lifecycle helper usable by focused request-record tests that
+            # construct the engine shell directly, without weakening the real
+            # engine's pending-logit cleanup.
+            controller = getattr(self, "controller", None)
+            if controller is not None:
+                controller._async_sched_logits.clear()
             recompute_active_ids = active_request_ids
 
             # Reset any partially prefilled requests so they recompute from the start
@@ -1053,7 +1067,11 @@ class DynamicInferenceEngine(AbstractEngine):
 
     def has_unfinished_requests(self) -> bool:
         """Test if context contains unfinished requests."""
-        return self.context.has_unfinished_requests() or len(self.waiting_request_ids) > 0
+        return (
+            self.context.has_unfinished_requests()
+            or len(self.waiting_request_ids) > 0
+            or len(self.failed_request_ids) > 0
+        )
 
     def get_request(self, request_id: int) -> DynamicInferenceRequest:
         """Get most recent request from a request record.
@@ -1220,6 +1238,11 @@ class DynamicInferenceEngine(AbstractEngine):
         Return:
             Returns an asyncio `Future[DynamicInferenceRequest]` for the user to wait on.
         """
+        if request_id in self.requests:
+            raise ValueError(f"Request ID {request_id} is already live in this inference engine.")
+        if sampling_params is None:
+            sampling_params = SamplingParams()
+
         prompt_str = None
         # Tokenize prompt if text.
         if isinstance(prompt, str):
