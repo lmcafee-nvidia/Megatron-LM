@@ -55,11 +55,10 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         # Things that may be problematic when doing this switch
         # - Add BOS token
         # - Skip prompt logprobs
-        temperature = request.generation_args.temperature
         response = await client.chat.completions.create(
             model="",
             messages=[message.model_dump() for message in request.prompt],
-            temperature=1.0 if temperature is None else temperature,
+            temperature=request.generation_args.temperature or 1.0,
             top_p=request.generation_args.top_p or 0.0,
             n=1,
             logprobs=True,
