@@ -2194,6 +2194,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                     test_config.kv_cache_management_mode
                 ),
                 static_kv_memory_pointers=test_config.static_kv_memory_pointers,
+                unified_memory_level=test_config.unified_memory_level,
                 enable_chunked_prefill=test_config.enable_chunked_prefill,
                 enable_prefix_caching=test_config.enable_prefix_caching,
                 prefix_caching_eviction_policy=test_config.prefix_caching_eviction_policy,
@@ -2818,6 +2819,224 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 assert captured_cache
             else:
                 assert not saw_unavailable_step
+        finally:
+            self._clear_engine_runtime()
+            DynamicInferenceContext.ROUNDER = 64
+            DynamicInferenceContext.TOKEN_ROUNDER = 64
+            DynamicInferenceContext.REQUEST_ROUNDER = 64
+            Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _live_cuda_graph_manager_state():
+        """Return stable identities for every currently populated graph manager."""
+        state = {}
+        for manager in list(CudaGraphManager._instances):
+            if not manager.cudagraph_runners:
+                continue
+            state[id(manager)] = (
+                tuple(id(runner) for runner in manager.cudagraph_runners),
+                tuple(
+                    sorted(
+                        (repr(key), id(runner))
+                        for key, runner in manager.custom_cudagraphs_lookup_table.items()
+                    )
+                ),
+            )
+        assert state
+        return state
+
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_static_uvm_preserves_hybrid_state_cache_and_graphs(self):
+        """Static UVM pointers keep live KV/Mamba state and captured graphs valid."""
+        available, reason = _check_mamba_sequence_packing_support()
+        if not available:
+            pytest.skip(reason)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        self._clear_engine_runtime()
+        try:
+            case = {
+                "feature": "cuda-graph",
+                "model_provider": "hybrid",
+                "policy": PrefixCachingEvictionPolicy.LRU,
+            }
+            config = self._case_config(case, enable_prefix_caching=True)
+            config.num_cuda_graphs = 2
+            config.force_build_cuda_graphs = True
+            config.use_cuda_graphs_for_non_decode_steps = False
+            config.inference_cuda_graph_scope = InferenceCudaGraphScope.block
+            config.kv_cache_management_mode = "offload"
+            config.static_kv_memory_pointers = True
+            config.unified_memory_level = 1
+            config.context_max_requests = 1
+
+            env = self._build_test_env(config)
+            engine = env.engine
+            context = engine.context
+            assert context.is_hybrid_model
+            assert context.unified_memory_level == 1
+            assert context.static_kv_memory_pointers
+            assert context.mamba_slot_allocator is not None
+            graph_state = self._live_cuda_graph_manager_state()
+
+            block_size = context.block_size_tokens
+            prompt = torch.arange(
+                2 * block_size + 5, dtype=torch.int64, device=torch.cuda.current_device()
+            ) % (config.vocab_size - 1)
+            requests = [
+                self._make_request(context, request_id, prompt.clone(), True)
+                for request_id in range(2)
+            ]
+            engine._add_request(requests[0])
+            first_result = engine.step_modern()
+            assert not first_result["finished_request_records"]
+            assert context.total_request_count == 1
+            engine._add_request(requests[1])
+            assert list(engine.waiting_request_ids) == [1]
+
+            block_ids = context.request_to_kv_block_ids[: context.total_request_count]
+            block_ids = torch.unique(block_ids[block_ids >= 0]).to(torch.long)
+            assert block_ids.numel() > 0
+            kv_pointer = context.memory_buffer.data_ptr()
+            kv_data = context.memory_buffer.index_select(2, block_ids).clone()
+
+            mamba_index = int(context.mamba_metadata.request_to_mamba_state_idx[0])
+            assert mamba_index >= 0
+            mamba_pointers = (
+                context.mamba_conv_states.data_ptr(),
+                context.mamba_ssm_states.data_ptr(),
+            )
+            mamba_data = (
+                context.mamba_conv_states[:, mamba_index].clone(),
+                context.mamba_ssm_states[:, mamba_index].clone(),
+            )
+            kv_hashes = dict(context.kv_block_allocator.kv_hash_to_block_id)
+            mamba_hashes = dict(context.mamba_slot_allocator.hash_to_block_id)
+            assert kv_hashes
+            assert mamba_hashes
+
+            engine.suspend()
+            assert context.cuda_graphs_available
+            assert not engine._cuda_graph_rebuild_pending
+            engine.resume()
+
+            assert context.memory_buffer.data_ptr() == kv_pointer
+            assert torch.equal(context.memory_buffer.index_select(2, block_ids), kv_data)
+            assert (
+                context.mamba_conv_states.data_ptr(),
+                context.mamba_ssm_states.data_ptr(),
+            ) == mamba_pointers
+            assert torch.equal(context.mamba_conv_states[:, mamba_index], mamba_data[0])
+            assert torch.equal(context.mamba_ssm_states[:, mamba_index], mamba_data[1])
+            assert context.kv_block_allocator.kv_hash_to_block_id == kv_hashes
+            assert context.mamba_slot_allocator.hash_to_block_id == mamba_hashes
+            assert self._live_cuda_graph_manager_state() == graph_state
+
+            finished = {}
+            saw_graph_replay = False
+            for _ in range(64):
+                result = engine.step_modern()
+                saw_graph_replay |= context.using_cuda_graph_this_step()
+                for record in result["finished_request_records"]:
+                    merged = record.merge()
+                    finished[merged.request_id] = merged
+                if not engine.has_unfinished_requests():
+                    break
+            else:
+                pytest.fail("static UVM hybrid graph lifecycle did not converge")
+
+            assert saw_graph_replay
+            assert len(finished) == 2
+            assert requests[1].num_cached_tokens >= 2 * block_size
+            assert self._live_cuda_graph_manager_state() == graph_state
+        finally:
+            self._clear_engine_runtime()
+            DynamicInferenceContext.ROUNDER = 64
+            DynamicInferenceContext.TOKEN_ROUNDER = 64
+            DynamicInferenceContext.REQUEST_ROUNDER = 64
+            Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_persist_tp2_pp2_replays_same_graphs_after_resume(self):
+        """PERSIST leaves TP2/PP2 graph runners and KV storage live across resume."""
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=2, pipeline_model_parallel_size=2
+        )
+        self._clear_engine_runtime()
+        try:
+            case = {"feature": "cuda-graph", "policy": PrefixCachingEvictionPolicy.LRU}
+            config = self._case_config(case, enable_prefix_caching=True)
+            config.num_cuda_graphs = 2
+            config.force_build_cuda_graphs = True
+            config.use_cuda_graphs_for_non_decode_steps = False
+            config.inference_cuda_graph_scope = InferenceCudaGraphScope.block
+            config.kv_cache_management_mode = "persist"
+            config.static_kv_memory_pointers = True
+            config.context_max_requests = 1
+            config.tensor_model_parallel_size = 2
+            config.pipeline_model_parallel_size = 2
+            config.sequence_parallel = True
+
+            env = self._build_test_env(config)
+            engine = env.engine
+            context = engine.context
+            assert context.kv_cache_management_mode == KVCacheManagementMode.PERSIST
+            assert torch.distributed.get_world_size() >= 4
+            graph_state = self._live_cuda_graph_manager_state()
+
+            block_size = context.block_size_tokens
+            prompt = torch.arange(
+                2 * block_size + 5, dtype=torch.int64, device=torch.cuda.current_device()
+            ) % (config.vocab_size - 1)
+            requests = [
+                self._make_request(context, request_id, prompt.clone(), True)
+                for request_id in range(2)
+            ]
+            engine._add_request(requests[0])
+            engine.step_modern()
+            engine._add_request(requests[1])
+
+            saw_graph_before = False
+            for _ in range(8):
+                result = engine.step_modern()
+                saw_graph_before |= context.using_cuda_graph_this_step()
+                if result["finished_request_records"]:
+                    break
+            assert saw_graph_before
+            assert context.total_request_count == 0
+            assert list(engine.waiting_request_ids) == [1]
+
+            kv_pointer = context.memory_buffer.data_ptr()
+            kv_hashes = dict(context.kv_block_allocator.kv_hash_to_block_id)
+            assert kv_hashes
+            engine.suspend()
+            engine.resume()
+
+            assert context.memory_buffer.data_ptr() == kv_pointer
+            assert context.kv_block_allocator.kv_hash_to_block_id == kv_hashes
+            assert context.cuda_graphs_available
+            assert not engine._cuda_graph_rebuild_pending
+            assert self._live_cuda_graph_manager_state() == graph_state
+
+            finished = {}
+            saw_graph_after = False
+            for _ in range(32):
+                result = engine.step_modern()
+                saw_graph_after |= context.using_cuda_graph_this_step()
+                for record in result["finished_request_records"]:
+                    merged = record.merge()
+                    finished[merged.request_id] = merged
+                if not engine.has_unfinished_requests():
+                    break
+            else:
+                pytest.fail("PERSIST TP2/PP2 graph replay did not converge")
+
+            assert saw_graph_after
+            assert requests[1].num_cached_tokens >= 2 * block_size
+            assert self._live_cuda_graph_manager_state() == graph_state
         finally:
             self._clear_engine_runtime()
             DynamicInferenceContext.ROUNDER = 64
