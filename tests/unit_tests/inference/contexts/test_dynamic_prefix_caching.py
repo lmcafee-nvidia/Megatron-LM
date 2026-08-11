@@ -2992,7 +2992,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             config.inference_cuda_graph_scope = InferenceCudaGraphScope.block
             config.kv_cache_management_mode = "persist"
             config.static_kv_memory_pointers = True
-            config.context_max_requests = 1
+            config.context_max_requests = 2
             config.tensor_model_parallel_size = 2
             config.pipeline_model_parallel_size = 2
             config.sequence_parallel = True
@@ -3013,17 +3013,20 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 for request_id in range(2)
             ]
             engine._add_request(requests[0])
-            engine.step_modern()
-            engine._add_request(requests[1])
 
             saw_graph_before = False
-            for _ in range(8):
+            donor_finished = False
+            for _ in range(16):
                 result = engine.step_modern()
                 saw_graph_before |= context.using_cuda_graph_this_step()
-                if result["finished_request_records"]:
+                donor_finished |= bool(result["finished_request_records"])
+                if donor_finished:
                     break
             assert saw_graph_before
+            assert donor_finished
             assert context.total_request_count == 0
+
+            engine._add_request(requests[1])
             assert list(engine.waiting_request_ids) == [1]
 
             kv_pointer = context.memory_buffer.data_ptr()
