@@ -377,6 +377,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self._pending_signals = deque()
 
         self.resume_request_ids = None
+        self._cuda_graph_rebuild_pending = not self.context.cuda_graphs_available
 
         # Speculative decoding acceptance tracking (per-position).
         # Each tensor has length num_speculative_tokens; index i tracks position i+1
@@ -429,6 +430,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         context = self.context
         controller = self.controller
+        assert (
+            context.total_request_count == 0 and context.chunked_prefill_request_id == -1
+        ), "CUDA graph capture requires an empty inference context"
 
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()
@@ -533,7 +537,7 @@ class DynamicInferenceEngine(AbstractEngine):
                                 cache_key=("mtp", n, depth),
                             )
 
-                context.reset()
+                context.reset(preserve_prefix_cache=True, preserve_counters=True)
 
             # Per-iteration memory accounting, scoped to the CUDA-graph mempool.
             # This isolates pool growth from process-wide scratch churn (KV cache,
@@ -577,6 +581,16 @@ class DynamicInferenceEngine(AbstractEngine):
         )
 
         self.capture_stats = capture_stats
+        context.cuda_graphs_available = True
+        self._cuda_graph_rebuild_pending = False
+
+    def _can_rebuild_cuda_graphs(self) -> bool:
+        """Return whether dummy graph capture cannot overwrite live request state."""
+        return (
+            self._cuda_graph_rebuild_pending
+            and self.context.total_request_count == 0
+            and self.context.chunked_prefill_request_id == -1
+        )
 
     @internal_api
     async def start_listening_to_data_parallel_coordinator(
@@ -874,6 +888,12 @@ class DynamicInferenceEngine(AbstractEngine):
             and not self.context.static_kv_memory_pointers
         ):
             delete_cuda_graphs()
+            if (
+                self.inference_cuda_graph_scope != InferenceCudaGraphScope.none
+                and self.cuda_graph_impl == "local"
+            ):
+                self.context.cuda_graphs_available = False
+                self._cuda_graph_rebuild_pending = True
 
         # Build the list of requests to re-add on resume.
         # All waiting requests are always included; active requests are included
@@ -930,6 +950,7 @@ class DynamicInferenceEngine(AbstractEngine):
             if (
                 self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST
                 and not self.context.static_kv_memory_pointers
+                and self._can_rebuild_cuda_graphs()
             ):
                 self.create_cuda_graphs()
             capture_time = time.time() - capture_time
@@ -2090,6 +2111,11 @@ class DynamicInferenceEngine(AbstractEngine):
         # If suspended, no stepping.
         if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             raise EngineSuspendedError(self.context.step_count)
+
+        # OFFLOAD keeps live KV/Mamba state, so dummy graph capture must wait until
+        # those requests drain. Rebuild before admitting the next waiting request.
+        if self._can_rebuild_cuda_graphs():
+            self.create_cuda_graphs()
 
         # Discard registrations left by an interrupted prior step before this
         # step's scheduling queues new registrations.
