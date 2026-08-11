@@ -341,8 +341,10 @@ class DynamicInferenceEngine(AbstractEngine):
         self.create_cuda_graphs()
 
     def reset(self) -> None:
-        """Reset by removing all requests and reset all state."""
+        """Reset per-run state after all requests have drained."""
 
+        use_coordinator = getattr(self, "use_coordinator", False)
+        initialize_runtime_state = not hasattr(self, "_state_events")
         self.context.reset()
         self.controller._async_sched_logits.clear()
 
@@ -370,12 +372,13 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Runtime state.
         self.decode_only = DecodeOnly(consumed=None, launched=None)
-        self._loop = get_asyncio_loop(getattr(self, "_loop", None))
-        self._cond = asyncio.Condition()
-        self._state_events = {k: asyncio.Event() for k in self._STATE_EVENTS}
-        self.state = EngineState.RUNNING
-        self._state_events[EngineState.RUNNING].set()
-        self._pending_signals = deque()
+        if initialize_runtime_state:
+            self._loop = get_asyncio_loop(getattr(self, "_loop", None))
+            self._cond = asyncio.Condition()
+            self._state_events = {k: asyncio.Event() for k in self._STATE_EVENTS}
+            self.state = EngineState.RUNNING
+            self._state_events[EngineState.RUNNING].set()
+            self._pending_signals = deque()
 
         self.resume_request_ids = None
         self._cuda_graph_rebuild_pending = not self.context.cuda_graphs_available
@@ -398,8 +401,9 @@ class DynamicInferenceEngine(AbstractEngine):
         self._prefill_tokens_skipped = 0
         self._prefix_coordination_waits = 0
 
-        # Coordinator state.
-        self.use_coordinator = False
+        # Coordinator mode and its long-lived runtime objects survive a drained
+        # reset; replacing them can strand waiters on the old asyncio objects.
+        self.use_coordinator = use_coordinator
 
     async def wait_until(self, state: EngineState):
         """Wait until the engine reaches the given state.
@@ -961,7 +965,7 @@ class DynamicInferenceEngine(AbstractEngine):
             add_time = time.time()
             torch.cuda.synchronize()
             for request_id in self.resume_request_ids:
-                self._add_request(self.get_request(request_id))
+                self._add_request(self.get_request(request_id), is_resume=True)
 
             # Ensure chunked prefill request remains at the head of the waiting queue
             if self.context.chunked_prefill_request_id != -1:
@@ -1051,6 +1055,31 @@ class DynamicInferenceEngine(AbstractEngine):
                 request.generated_text = ""
         request_entry.future.set_result(request_entry.record)
 
+    def _collect_failed_request_records(
+        self, request_ids: Optional[set[int]] = None
+    ) -> List[DynamicInferenceRequestRecord]:
+        """Remove and return a snapshot of synchronously failed requests.
+
+        Args:
+            request_ids: Optional ownership filter. Failed requests outside this
+                set remain queued for their caller.
+
+        Returns:
+            Failed request records selected from the current queue snapshot.
+        """
+        failed_request_ids, self.failed_request_ids = self.failed_request_ids, []
+        failed_request_records = []
+        for failed_request_id in failed_request_ids:
+            if request_ids is not None and failed_request_id not in request_ids:
+                self.failed_request_ids.append(failed_request_id)
+                continue
+            failed_entry = self.requests.pop(failed_request_id)
+            failed_request_records.append(failed_entry.record)
+            assert (
+                failed_entry.future.done()
+            ), f"Failed request {failed_request_id} future has not been properly resolved."
+        return failed_request_records
+
     def has_unfinished_requests(self) -> bool:
         """Test if context contains unfinished requests."""
         return self.context.has_unfinished_requests() or len(self.waiting_request_ids) > 0
@@ -1084,12 +1113,14 @@ class DynamicInferenceEngine(AbstractEngine):
             raise ValueError("Async scheduling does not support routing replay.")
 
     def _add_request(
-        self, request: DynamicInferenceRequest
+        self, request: DynamicInferenceRequest, *, is_resume: bool = False
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Add a request to the engine.
 
         Args:
             request (DynamicInferenceRequest): Request to add.
+            is_resume (bool): Whether an existing record is being explicitly
+                re-admitted after suspend/resume.
 
         Returns:
             asyncio.Future[DynamicInferenceRequest]: Future completed when the request finishes.
@@ -1097,9 +1128,12 @@ class DynamicInferenceEngine(AbstractEngine):
 
         request_id = request.request_id
 
-        # Add request to self.requests. If the engine has previously been
-        # suspended, then the request may already exist.
-        if request_id not in self.requests:
+        if is_resume:
+            if request_id not in self.requests or self.get_request(request_id) is not request:
+                raise ValueError(f"Cannot resume unknown request ID {request_id}.")
+        elif request_id in self.requests:
+            raise ValueError(f"Request ID {request_id} is already active.")
+        else:
             self.requests[request_id] = RequestEntry(
                 record=DynamicInferenceRequestRecord.from_request(request),
                 future=self._loop.create_future(),
@@ -1220,6 +1254,11 @@ class DynamicInferenceEngine(AbstractEngine):
         Return:
             Returns an asyncio `Future[DynamicInferenceRequest]` for the user to wait on.
         """
+        if request_id in self.requests:
+            raise ValueError(f"Request ID {request_id} is already active.")
+        if sampling_params is None:
+            sampling_params = SamplingParams()
+
         prompt_str = None
         # Tokenize prompt if text.
         if isinstance(prompt, str):
@@ -2318,15 +2357,9 @@ class DynamicInferenceEngine(AbstractEngine):
             active_request_ids: list[int] = []
             finished_request_records: list[DynamicInferenceRequestRecord] = []
 
-        # Failed requests. Status and events were already set in _handle_failed_request;
-        # here we just clean up the entry and include it in finished_request_records.
-        for failed_request_id in self.failed_request_ids:
-            failed_entry = self.requests.pop(failed_request_id)
-            finished_request_records.append(failed_entry.record)
-            assert (
-                failed_entry.future.done()
-            ), f"Failed request {failed_request_id} future has not been properly resolved."
-        self.failed_request_ids.clear()
+        # Failed requests. Take the current queue snapshot so a later admission
+        # cannot be erased by this bookkeeping pass.
+        finished_request_records.extend(self._collect_failed_request_records())
 
         nvtx_range_pop("bookkeeping")
 
@@ -2625,14 +2658,21 @@ class DynamicInferenceEngine(AbstractEngine):
     ) -> List[DynamicInferenceRequest]:
         """Generates completions for a static list of prompts."""
 
+        request_futures = []
+        submitted_request_ids = set()
         for prompt in prompts:
             request_id = int(next(self.request_counter))
-            _ = self.add_request(request_id, prompt, sampling_params)
+            submitted_request_ids.add(request_id)
+            request_futures.append(self.add_request(request_id, prompt, sampling_params))
 
-        finished_request_records_list = []
-        while self.has_unfinished_requests():
-            result = self.step_modern()
-            finished_request_records_list.extend(result["finished_request_records"])
+        # Admission failures resolve their futures synchronously. Remove only
+        # this call's failed entries, and do not run an empty model step solely
+        # to make bookkeeping observe them.
+        self._collect_failed_request_records(submitted_request_ids)
+        while any(not future.done() for future in request_futures):
+            self.step_modern()
+
+        finished_request_records_list = [future.result() for future in request_futures]
 
         # Ensure requests are returned in the same order they were passed in.
         finished_request_records_list.sort(key=lambda r: r.request_id)

@@ -1923,7 +1923,7 @@ def _controller_with_pending_logits():
 def test_async_reset_clears_pending_logits():
     """Engine reset cannot expose logits produced for the previous request batch."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
-    engine.context = SimpleNamespace(reset=mock.Mock())
+    engine.context = SimpleNamespace(reset=mock.Mock(), cuda_graphs_available=True)
     engine.controller = _controller_with_pending_logits()
     engine.num_speculative_tokens = 1
     engine._loop = None

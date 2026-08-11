@@ -753,6 +753,9 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
     engine.requests = {request.request_id: types.SimpleNamespace(record=record)}
     engine.waiting_request_ids = deque()
     engine.state = EngineState.RUNNING
+    engine.controller = types.SimpleNamespace(
+        _async_sched_logits=types.SimpleNamespace(clear=mock.Mock())
+    )
     engine.unified_memory_level = 0
     engine.use_coordinator = False
     engine._add_request = mock.Mock()
@@ -780,6 +783,188 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
     assert engine.state == EngineState.RUNNING
     assert engine._add_request.call_count == 1
     assert engine._add_request.call_args.args[0] is checkpointed
+    assert engine._add_request.call_args.kwargs == {"is_resume": True}
+
+
+def test_add_request_defaults_sampling_params():
+    """The public optional sampling argument constructs a fresh default before token handling."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.requests = {}
+    engine.context = types.SimpleNamespace(block_size_tokens=4, enable_prefix_caching=False)
+    expected_future = object()
+    engine._add_request = mock.Mock(return_value=expected_future)
+    tokens = torch.tensor([1, 2], dtype=torch.int64)
+
+    with mock.patch(
+        "megatron.core.inference.engines.dynamic_engine.torch.tensor", return_value=tokens
+    ):
+        result = engine.add_request(3, [1, 2])
+        engine.add_request(4, [1, 2])
+
+    first_request = engine._add_request.call_args_list[0].args[0]
+    second_request = engine._add_request.call_args_list[1].args[0]
+    assert result is expected_future
+    assert isinstance(first_request.sampling_params, SamplingParams)
+    assert first_request.sampling_params is not second_request.sampling_params
+    assert first_request.sampling_params.add_BOS is False
+
+
+def test_add_request_rejects_duplicate_id_before_mutation():
+    """An external duplicate fails before tokenization or request-state mutation."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.requests = {7: object()}
+    engine.controller = types.SimpleNamespace(tokenize_prompt=mock.Mock())
+    engine._add_request = mock.Mock()
+
+    with pytest.raises(ValueError, match="Request ID 7 is already active"):
+        engine.add_request(7, "duplicate")
+
+    engine.controller.tokenize_prompt.assert_not_called()
+    engine._add_request.assert_not_called()
+
+    duplicate = DynamicInferenceRequest(
+        request_id=7,
+        prompt_tokens=torch.tensor([1, 2]),
+        sampling_params=SamplingParams(num_tokens_to_generate=1),
+    )
+    with pytest.raises(ValueError, match="Request ID 7 is already active"):
+        DynamicInferenceEngine._add_request(engine, duplicate)
+    assert duplicate.status is None
+
+
+def _make_resolved_record_future(loop, request_id: int, status: Status):
+    request = DynamicInferenceRequest(
+        request_id=request_id,
+        prompt_tokens=torch.tensor([1, 2]),
+        sampling_params=SamplingParams(num_tokens_to_generate=1),
+        status=status,
+    )
+    record = DynamicInferenceRequestRecord.from_request(request)
+    future = loop.create_future()
+    future.set_result(record)
+    return record, future
+
+
+def test_generate_collects_own_invalid_batch_without_model_step():
+    """A synchronous all-invalid call returns its failures without taking unrelated ones."""
+    loop = asyncio.new_event_loop()
+    try:
+        engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+        engine.request_counter = iter(range(10))
+        engine.requests = {}
+        engine.failed_request_ids = []
+        engine.step_modern = mock.Mock()
+
+        unrelated_record, unrelated_future = _make_resolved_record_future(loop, 9, Status.FAILED)
+        engine.requests[9] = types.SimpleNamespace(record=unrelated_record, future=unrelated_future)
+        engine.failed_request_ids.append(9)
+
+        def reject_request(request_id, _prompt, _sampling_params):
+            record, future = _make_resolved_record_future(loop, request_id, Status.FAILED)
+            engine.requests[request_id] = types.SimpleNamespace(record=record, future=future)
+            engine.failed_request_ids.append(request_id)
+            return future
+
+        engine.add_request = mock.Mock(side_effect=reject_request)
+
+        results = engine.generate(["bad-a", "bad-b"], SamplingParams())
+
+        assert [record.request_id for record in results] == [0, 1]
+        assert all(record[-1].status == Status.FAILED for record in results)
+        engine.step_modern.assert_not_called()
+        assert engine.failed_request_ids == [9]
+        assert set(engine.requests) == {9}
+    finally:
+        loop.close()
+
+
+def test_generate_mixed_batch_waits_only_for_its_pending_future():
+    """Mixed admission returns failed and completed records without an extra empty step."""
+    loop = asyncio.new_event_loop()
+    try:
+        engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+        engine.request_counter = iter(range(10))
+        engine.requests = {}
+        engine.failed_request_ids = []
+        pending_future = None
+
+        def add_request(request_id, _prompt, _sampling_params):
+            nonlocal pending_future
+            status = Status.FAILED if request_id == 0 else Status.ACTIVE_AND_GENERATING_TOKENS
+            record, future = _make_resolved_record_future(loop, request_id, status)
+            if request_id == 1:
+                pending_future = loop.create_future()
+                future = pending_future
+            engine.requests[request_id] = types.SimpleNamespace(record=record, future=future)
+            if request_id == 0:
+                engine.failed_request_ids.append(request_id)
+            return future
+
+        def finish_pending_request():
+            entry = engine.requests.pop(1)
+            entry.record[-1].status = Status.COMPLETED
+            pending_future.set_result(entry.record)
+            return {"finished_request_records": [entry.record]}
+
+        engine.add_request = mock.Mock(side_effect=add_request)
+        engine.step_modern = mock.Mock(side_effect=finish_pending_request)
+
+        results = engine.generate(["bad", "good"], SamplingParams())
+
+        assert [record.request_id for record in results] == [0, 1]
+        assert [record[-1].status for record in results] == [Status.FAILED, Status.COMPLETED]
+        engine.step_modern.assert_called_once_with()
+        assert engine.failed_request_ids == []
+        assert engine.requests == {}
+    finally:
+        loop.close()
+
+
+def test_drained_reset_preserves_coordinator_runtime_state():
+    """A drained reset clears batch data without rebinding coordinator-loop state."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.context = types.SimpleNamespace(reset=mock.Mock(), cuda_graphs_available=True)
+    engine.controller = types.SimpleNamespace(
+        _async_sched_logits=types.SimpleNamespace(clear=mock.Mock())
+    )
+    engine.num_speculative_tokens = 0
+    engine.requests = {}
+    engine.use_coordinator = True
+    engine._loop = object()
+    engine._cond = asyncio.Condition()
+    engine._state_events = {state: asyncio.Event() for state in engine._STATE_EVENTS}
+    engine.state = EngineState.PAUSED
+    engine._state_events[EngineState.PAUSED].set()
+    engine._pending_signals = deque([b"pending-control"])
+    engine.resume_request_ids = []
+
+    loop = engine._loop
+    condition = engine._cond
+    state_events = engine._state_events
+    pending_signals = engine._pending_signals
+    with (
+        mock.patch(
+            "megatron.core.inference.engines.dynamic_engine.torch.distributed.get_rank",
+            return_value=0,
+        ),
+        mock.patch(
+            "megatron.core.inference.engines.dynamic_engine.torch.cuda.Event",
+            return_value=mock.Mock(),
+        ),
+    ):
+        engine.reset()
+
+    assert engine.use_coordinator is True
+    assert engine._loop is loop
+    assert engine._cond is condition
+    assert engine._state_events is state_events
+    assert engine.state == EngineState.PAUSED
+    assert engine._state_events[EngineState.PAUSED].is_set()
+    assert engine._pending_signals is pending_signals
+    assert list(engine._pending_signals) == [b"pending-control"]
+    assert engine.resume_request_ids is None
+    engine.context.reset.assert_called_once_with()
+    engine.controller._async_sched_logits.clear.assert_called_once_with()
 
 
 def test_streaming_partials_are_sent():
