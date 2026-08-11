@@ -4209,7 +4209,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             if active_requests_requiring_new_block_count > 0:
                 newly_paused_request_ids = self.request_ids[
-                    torch.nonzero(active_requests_requiring_new_block) + self.paused_request_count
+                    torch.nonzero(active_requests_requiring_new_block, as_tuple=True)[0]
+                    + self.paused_request_count
                 ]
 
             # Swap unfinished active requests on the left side with paused requests on the right side
