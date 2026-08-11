@@ -473,7 +473,8 @@ class DynamicInferenceRequest(InferenceRequest):
                 # the last generated token does not undergo a forward pass
                 # hence we expect routing indices for total_tokens - 1
                 assert self.routing_indices.shape[0] == total_tokens - 1, (
-                    f"routing_indices first dimension {self.routing_indices.shape[0]} does not match "
+                    "routing_indices first dimension "
+                    f"{self.routing_indices.shape[0]} does not match "
                     f"total tokens {total_tokens-1}."
                 )
 
