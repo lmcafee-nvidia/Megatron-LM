@@ -756,7 +756,10 @@ class DynamicInferenceRequestRecord:
             if not values:
                 return None
             original_value_count = max(0, prompt_length - 1)
-            value = max(values, key=len)
+            # Prefer the latest recomputation when equally complete candidates
+            # exist, so returned scores agree with the segment that continued
+            # generation under the newest model/policy state.
+            _, value = max(enumerate(values), key=lambda item: (len(item[1]), item[0]))
             return value[:original_value_count]
 
         prompt_tokens = self.requests[0].prompt_tokens
