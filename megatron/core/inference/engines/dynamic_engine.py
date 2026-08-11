@@ -343,8 +343,17 @@ class DynamicInferenceEngine(AbstractEngine):
     def reset(self) -> None:
         """Reset per-run state after all requests have drained."""
 
-        use_coordinator = getattr(self, "use_coordinator", False)
         initialize_runtime_state = not hasattr(self, "_state_events")
+        if not initialize_runtime_state and self.state not in (
+            EngineState.RUNNING,
+            EngineState.PAUSED,
+        ):
+            raise RuntimeError(
+                "A drained engine can only be reset while RUNNING or PAUSED; "
+                f"got {self.state.name}."
+            )
+
+        use_coordinator = getattr(self, "use_coordinator", False)
         self.context.reset()
         self.controller._async_sched_logits.clear()
 

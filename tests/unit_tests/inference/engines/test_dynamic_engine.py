@@ -967,6 +967,23 @@ def test_drained_reset_preserves_coordinator_runtime_state():
     engine.controller._async_sched_logits.clear.assert_called_once_with()
 
 
+def test_drained_reset_rejects_suspended_state_before_context_mutation():
+    """Reset rejects states whose inference storage may be deallocated."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine._state_events = {}
+    engine.state = EngineState.SUSPENDED
+    engine.context = types.SimpleNamespace(reset=mock.Mock())
+    engine.controller = types.SimpleNamespace(
+        _async_sched_logits=types.SimpleNamespace(clear=mock.Mock())
+    )
+
+    with pytest.raises(RuntimeError, match="only be reset while RUNNING or PAUSED"):
+        engine.reset()
+
+    engine.context.reset.assert_not_called()
+    engine.controller._async_sched_logits.clear.assert_not_called()
+
+
 def test_streaming_partials_are_sent():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine._partial_emit_lengths = {}
