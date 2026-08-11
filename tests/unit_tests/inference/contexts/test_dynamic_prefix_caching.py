@@ -2914,7 +2914,9 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             assert list(engine.waiting_request_ids) == [1]
 
             block_ids = context.request_to_kv_block_ids[: context.total_request_count]
-            block_ids = torch.unique(block_ids[block_ids >= 0]).to(torch.long)
+            block_ids = torch.unique(block_ids[block_ids >= 0]).to(
+                device=context.memory_buffer.device, dtype=torch.long
+            )
             assert block_ids.numel() > 0
             kv_pointer = context.memory_buffer.data_ptr()
             kv_data = context.memory_buffer.index_select(2, block_ids).clone()
