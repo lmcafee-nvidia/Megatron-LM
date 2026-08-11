@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import gc
 from collections import deque
 from types import SimpleNamespace
 
@@ -22,9 +23,14 @@ from megatron.core.inference.inference_request import (
     compute_block_hashes_batched,
 )
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.inference.engines.test_dynamic_engine import (
+    DynamicEngineTestConfig,
+    DynamicInferenceEngineTestBase,
+)
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -111,11 +117,15 @@ class PrefixCachingTestBase:
         )
 
     @staticmethod
-    def _req(ctx, prompt_tokens, request_id=1, *, enable_prefix_caching=True):
+    def _req(ctx, prompt_tokens, request_id=1, *, enable_prefix_caching=True, sampling_params=None):
         return DynamicInferenceRequest(
             request_id=request_id,
             prompt_tokens=prompt_tokens,
-            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            sampling_params=(
+                sampling_params
+                if sampling_params is not None
+                else SamplingParams(num_tokens_to_generate=10)
+            ),
             block_size_tokens=ctx.block_size_tokens,
             enable_prefix_caching=enable_prefix_caching,
         )
@@ -814,7 +824,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
 
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         # no prefill skipping
-        (matched, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(req2, len(prompt))
+        matched, _, _, _, prefix_skip, eff_chunk = ctx._compute_prefix_match(req2, len(prompt))
         assert len(matched) == 3 and prefix_skip == 0 and eff_chunk == len(prompt)
 
         ctx.add_request(req2)
@@ -970,7 +980,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         self._mamba_allocate_and_register(ctx, self._block_ids(ctx, 0, 3)[:1])
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         req2._mamba_num_matched_blocks = 1
-        (matched, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(req2, len(prompt))
+        matched, _, _, _, prefix_skip, eff_chunk = ctx._compute_prefix_match(req2, len(prompt))
         assert len(matched) == 3 and prefix_skip == bs and eff_chunk == len(prompt) - bs
 
         # no mamba match means no skip
@@ -979,7 +989,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         ctx2.add_request(self._req(ctx2, p2.clone()))
         req2b = self._req(ctx2, p2.clone(), request_id=2)
         req2b._mamba_num_matched_blocks = 0
-        (m2, _, _, _, ps2, ec2) = ctx2._compute_prefix_match(req2b, len(p2))
+        m2, _, _, _, ps2, ec2 = ctx2._compute_prefix_match(req2b, len(p2))
         assert len(m2) == 3 and ps2 == 0 and ec2 == len(p2)
 
         # zero prefill for hybrid (mamba-cached, block-aligned)
@@ -989,7 +999,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         self._mamba_allocate_and_register(ctx3, self._block_ids(ctx3, 0, 3))
         req3 = self._req(ctx3, p3.clone(), request_id=2)
         req3._mamba_num_matched_blocks = 3
-        (m3, _, _, _, ps3, ec3) = ctx3._compute_prefix_match(req3, len(p3))
+        m3, _, _, _, ps3, ec3 = ctx3._compute_prefix_match(req3, len(p3))
         assert len(m3) == 3 and ps3 == 2 * bs and ec3 == bs
 
         # KV-only prefix skip with non-block-aligned prompt: all 3 full blocks
@@ -1001,7 +1011,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         req4a = self._req(ctx4, p4.clone())
         ctx4.add_request(req4a)
         req4b = self._req(ctx4, p4.clone(), request_id=2)
-        (m4, _, _, _, ps4, ec4) = ctx4._compute_prefix_match(req4b, len(p4))
+        m4, _, _, _, ps4, ec4 = ctx4._compute_prefix_match(req4b, len(p4))
         assert len(m4) == 3 and ps4 == 3 * bs4 and ec4 == tail
         ctx4.add_request(req4b)
 
@@ -1070,7 +1080,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         self._mamba_allocate_and_register(ctx, self._block_ids(ctx, 0, 4)[:2])
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         req2._mamba_num_matched_blocks = 2
-        (matched, _, _, overall, prefix_skip, _) = ctx._compute_prefix_match(req2, len(prompt))
+        matched, _, _, overall, prefix_skip, _ = ctx._compute_prefix_match(req2, len(prompt))
         # Copy block IDs to slot 1 so compute_and_store_offsets can resolve EOS block
         ctx.request_to_kv_block_ids[1] = ctx.request_to_kv_block_ids[0]
         msa.compute_and_store_offsets(
@@ -1647,6 +1657,78 @@ class TestPerBlockRouting(PrefixCachingTestBase):
     """Tests for per-block routing storage and reconstruction."""
 
     @pytest.mark.internal
+    def test_finished_checkpointed_request_reconstructs_full_routing(self):
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        generated = [bs + 1, bs + 2, bs + 3, bs + 4]
+        prompt = self._prompt(2 * bs)
+        producer = self._req(ctx, prompt.clone(), request_id=99)
+        ctx.add_request(producer)
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+        request = self._req(
+            ctx,
+            prompt,
+            request_id=0,
+            sampling_params=SamplingParams(
+                num_tokens_to_generate=4,
+                termination_id=-1,
+                return_log_probs=True,
+                skip_prompt_log_probs=True,
+            ),
+        )
+        ctx.add_request(request)
+        assert request.num_cached_tokens == 2 * bs
+        engine = _StubEngine(ctx)
+        future = engine._add_request(request)
+        engine.waiting_request_ids.clear()
+        record = engine.requests[request.request_id].record
+        record.checkpoint()
+        current = record[-1]
+        current.generated_tokens = generated[:3]
+        current.generated_log_probs = [-0.1, -0.2, -0.3]
+        assert len(record.requests) == 2
+        assert all(part.routing_indices is None for part in record.requests)
+
+        block_ids = self._block_ids(ctx, 1, 2)
+        block_ids += ctx.kv_block_allocator.allocate_memory_blocks(1).tolist()
+        routing = np.arange(3 * bs * 4, dtype=np.int16).reshape(3 * bs, 2, 2)
+        for block_idx, block_id in enumerate(block_ids):
+            start = block_idx * bs
+            ctx.kv_block_allocator.store_block_routing(
+                block_id, np.arange(bs), routing[start : start + bs]
+            )
+
+        engine.finished_request_count = 0
+        engine.evicted_request_count = 0
+        engine.track_generated_token_events = False
+        engine.num_speculative_tokens = 0
+        engine.stop_word_being_finished_ids = set()
+        active_ids, finished_records = engine.post_process_requests(
+            request_ids=torch.tensor([request.request_id]),
+            finished_request_ids=torch.tensor([request.request_id]),
+            evict_request_ids=torch.empty(0, dtype=torch.int64),
+            step_time=0.0,
+            sample=torch.tensor(generated[3:]),
+            accepted_tokens=None,
+            log_probs=[[-0.4]],
+            consumed_chunked_prefill_request_id=-1,
+            finished_routing_block_ids={request.request_id: block_ids},
+        )
+
+        expected = routing[: 2 * bs + 3]
+        merged = record.merge()
+        assert active_ids == []
+        assert finished_records == [record]
+        assert future.result() is record
+        assert merged.generated_tokens == generated
+        assert merged.generated_log_probs == [-0.1, -0.2, -0.3, -0.4]
+        np.testing.assert_array_equal(current.routing_indices, expected)
+        np.testing.assert_array_equal(merged.routing_indices, expected)
+        assert merged.routing_indices.shape[0] == (
+            len(merged.prompt_tokens) + len(merged.generated_tokens) - 1
+        )
+
+    @pytest.mark.internal
     def test_store_and_get_block_routing(self):
         """Verify store_block_routing / get_block_routing round-trip."""
         ctx = self._ctx()
@@ -1923,7 +2005,7 @@ class TestPrefixCacheReuse(PrefixCachingTestBase):
 
         # request 2 shares the first 4 blocks, adds 2 new blocks
         req2 = self._req(ctx, self._prompt(bs * 6), request_id=2)
-        (matched, _, _, _, prefix_skip, _) = ctx._compute_prefix_match(req2, bs * 6)
+        matched, _, _, _, prefix_skip, _ = ctx._compute_prefix_match(req2, bs * 6)
         assert len(matched) == 4 and prefix_skip == bs * 4
         ctx.add_request(req2)
 
@@ -1978,3 +2060,699 @@ class TestPrefixCacheReuse(PrefixCachingTestBase):
             msa._intermediate_block_ids_cpu[0, idx].item()
             == ctx.request_to_kv_block_ids[0][last_aligned_abs // bs - 1].item()
         )
+
+
+PREFIX_CACHE_CONTEXT_CASES = [
+    pytest.param(feature, policy, id=f"{feature}-{policy.name.lower()}")
+    for feature in (
+        "exact-prefix",
+        "partial-prefix",
+        "missing-prefix",
+        "concurrent-sharing",
+        "mixed-cached-fresh",
+    )
+    for policy in (PrefixCachingEvictionPolicy.LRU, PrefixCachingEvictionPolicy.REF_ZERO)
+]
+
+
+class TestPrefixCachePolicyStressMatrix(PrefixCachingTestBase):
+    """Exercise five context behaviors under both eviction policies and forced pressure."""
+
+    def _apply_local_churn(self, ctx, producer, producer_blocks):
+        """Exhaust the pool and make a new request recycle or evict producer blocks."""
+        alloc = ctx.kv_block_allocator
+        policy = alloc.prefix_caching_eviction_policy
+        ctx.release_memory_blocks_from_request_indexes(torch.arange(ctx.total_request_count))
+
+        if policy == PrefixCachingEvictionPolicy.LRU:
+            cached_before = dict(alloc.kv_hash_to_block_id)
+            assert cached_before
+            filler = alloc.allocate_memory_blocks(alloc.pool_avail)
+            assert filler is not None and alloc.pool_avail == 0
+        else:
+            assert not alloc.kv_hash_to_block_id
+            assert all(alloc.block_hashes[block_id].item() == -1 for block_id in producer_blocks)
+            filler = alloc.allocate_memory_blocks(alloc.pool_avail)
+            assert filler is not None and alloc.pool_avail == 0
+            producer_tensor = torch.tensor(producer_blocks, dtype=torch.int32)
+            assert set(producer_blocks) <= set(filler.tolist())
+            alloc.release_memory_blocks(producer_tensor)
+            assert alloc.pool_avail == len(producer_blocks)
+
+        pressure = self._req(
+            ctx, self._prompt(3 * ctx.block_size_tokens, offset=200_000), request_id=100
+        )
+        pressure_idx = ctx.total_request_count
+        ctx.add_request(pressure)
+        pressure_blocks = set(self._block_ids(ctx, pressure_idx, 3))
+
+        if policy == PrefixCachingEvictionPolicy.LRU:
+            evicted_ids = {
+                block_id
+                for block_hash, block_id in cached_before.items()
+                if block_hash not in alloc.kv_hash_to_block_id
+            }
+            assert pressure_blocks == evicted_ids
+        else:
+            assert pressure_blocks == set(producer_blocks)
+            assert not any(
+                block_hash in alloc.kv_hash_to_block_id
+                for block_hash in producer.precomputed_block_hashes
+            )
+
+    def _run_feature_probe(self, feature, policy):
+        """Execute one sharing behavior, then force policy-specific allocator churn."""
+        ctx = self._ctx(
+            buffer_size_gb=0.001,
+            rounder=1,
+            max_requests=12,
+            max_tokens=512,
+            prefix_caching_eviction_policy=policy,
+        )
+        alloc = ctx.kv_block_allocator
+        block_size = ctx.block_size_tokens
+        prompt = self._prompt(3 * block_size)
+        producer = self._req(ctx, prompt.clone())
+        ctx.add_request(producer)
+        producer_blocks = self._block_ids(ctx, 0, 3)
+        if policy == PrefixCachingEvictionPolicy.LRU:
+            ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+
+        if feature == "exact-prefix":
+            probe = self._req(ctx, prompt.clone(), request_id=2)
+            matched, _, _, _, skipped, effective = ctx._compute_prefix_match(probe, len(prompt))
+            assert matched == producer_blocks
+            assert skipped == 2 * block_size and effective == block_size
+            ctx.add_request(probe)
+            assert probe.num_cached_tokens == 3 * block_size
+
+        elif feature == "partial-prefix":
+            partial = torch.cat((prompt[: 2 * block_size], self._prompt(block_size, offset=50_000)))
+            probe = self._req(ctx, partial, request_id=2)
+            matched, *_ = ctx._compute_prefix_match(probe, len(partial))
+            assert matched == producer_blocks[:2]
+            ctx.add_request(probe)
+            assert probe.num_cached_tokens == 2 * block_size
+
+        elif feature == "missing-prefix":
+            probe = self._req(ctx, self._prompt(3 * block_size, offset=50_000), request_id=2)
+            matched, *_ = ctx._compute_prefix_match(probe, 3 * block_size)
+            assert not matched
+            ctx.add_request(probe)
+            assert probe.num_cached_tokens == 0
+
+        elif feature == "concurrent-sharing":
+            for request_id in range(2, 5):
+                ctx.add_request(self._req(ctx, prompt.clone(), request_id=request_id))
+            expected_refs = 3 + int(policy == PrefixCachingEvictionPolicy.REF_ZERO)
+            assert all(
+                alloc.block_ref_counts[block_id].item() == expected_refs
+                for block_id in producer_blocks
+            )
+            ctx.release_memory_blocks_from_request_indexes(torch.tensor([1, 2, 3]))
+            remaining_refs = int(policy == PrefixCachingEvictionPolicy.REF_ZERO)
+            assert all(
+                alloc.block_ref_counts[block_id].item() == remaining_refs
+                for block_id in producer_blocks
+            )
+
+        else:
+            assert feature == "mixed-cached-fresh"
+            cached = self._req(ctx, prompt.clone(), request_id=2)
+            fresh = self._req(ctx, self._prompt(3 * block_size, offset=50_000), request_id=3)
+            ctx.add_request(cached)
+            ctx.add_request(fresh)
+            assert ctx.request_query_lengths[1].item() == block_size
+            assert ctx.request_query_lengths[2].item() == 3 * block_size
+            assert cached.num_cached_tokens == 3 * block_size
+            assert fresh.num_cached_tokens == 0
+
+        self._apply_local_churn(ctx, producer, producer_blocks)
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("feature,policy", PREFIX_CACHE_CONTEXT_CASES)
+    def test_context_policy_matrix(self, feature, policy):
+        self._run_feature_probe(feature, policy)
+
+
+PREFIX_CACHE_ENGINE_CASES = [
+    pytest.param(
+        dict(name="tp4-ref-zero", feature="tp", tp=4, policy=PrefixCachingEvictionPolicy.REF_ZERO),
+        id="tp4-ref-zero",
+    ),
+    pytest.param(
+        dict(name="pp4-lru", feature="pp", pp=4, policy=PrefixCachingEvictionPolicy.LRU),
+        id="pp4-lru",
+    ),
+    pytest.param(
+        dict(name="ep4-moe-lru", feature="moe", ep=4, policy=PrefixCachingEvictionPolicy.LRU),
+        id="ep4-moe-lru",
+    ),
+    pytest.param(
+        dict(name="gpt-chunked-lru", feature="chunked", policy=PrefixCachingEvictionPolicy.LRU),
+        id="gpt-chunked-lru",
+    ),
+    pytest.param(
+        dict(
+            name="gpt-fused-rope-ref-zero",
+            feature="fused-rope",
+            policy=PrefixCachingEvictionPolicy.REF_ZERO,
+        ),
+        id="gpt-fused-rope-ref-zero",
+    ),
+    pytest.param(
+        dict(name="mtp2-ref-zero", feature="mtp", policy=PrefixCachingEvictionPolicy.REF_ZERO),
+        id="mtp2-ref-zero",
+    ),
+    pytest.param(
+        dict(
+            name="hybrid-mamba-ref-zero",
+            feature="mamba",
+            model_provider="hybrid",
+            policy=PrefixCachingEvictionPolicy.REF_ZERO,
+        ),
+        id="hybrid-mamba-ref-zero",
+    ),
+]
+
+
+class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
+    """Run real model rows through cache hits, runtime feature paths, and KV pressure."""
+
+    @classmethod
+    def _build_inference_context(
+        cls, test_config, transformer_config, requests, mamba_inference_state_config=None
+    ):
+        """Build the shared harness context with the row's cache eviction policy."""
+        assert not requests
+        return DynamicInferenceContext(
+            model_config=transformer_config,
+            inference_config=InferenceConfig(
+                max_sequence_length=test_config.max_sequence_length,
+                buffer_size_gb=test_config.context_buffer_size_gb,
+                paused_buffer_size_gb=test_config.context_paused_buffer_size_gb,
+                block_size_tokens=test_config.context_block_size_tokens,
+                max_requests=test_config.context_max_requests,
+                max_tokens=test_config.context_max_tokens,
+                mamba_inference_state_config=mamba_inference_state_config,
+                materialize_only_last_token_logits=(test_config.materialize_only_last_token_logits),
+                enable_chunked_prefill=test_config.enable_chunked_prefill,
+                enable_prefix_caching=test_config.enable_prefix_caching,
+                prefix_caching_eviction_policy=test_config.prefix_caching_eviction_policy,
+                prefix_caching_mamba_gb=(
+                    0.2
+                    if test_config.enable_prefix_caching
+                    and mamba_inference_state_config is not None
+                    else None
+                ),
+                use_flashinfer_fused_rope=test_config.use_flashinfer_fused_rope,
+                num_speculative_tokens=test_config.num_speculative_tokens,
+                sampling_backend="torch",
+            ),
+        )
+
+    @staticmethod
+    def _case_config(case, *, enable_prefix_caching):
+        """Build a small real-engine configuration for one capability row."""
+        block_size = 256  # FlashAttention paged KV blocks must be divisible by 256.
+        prompt_length = 2 * block_size + 5
+        feature = case["feature"]
+        config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=prompt_length,
+            max_prompt_length=prompt_length,
+            num_tokens_to_generate=4,
+            max_sequence_length=(
+                prompt_length + block_size + 16 if feature == "chunked" else prompt_length + 8
+            ),
+            context_buffer_size_gb=0.02,
+            context_block_size_tokens=block_size,
+            context_max_requests=32,
+            context_max_tokens=block_size + 8 if feature == "chunked" else 4096,
+            tensor_model_parallel_size=case.get("tp", 1),
+            pipeline_model_parallel_size=case.get("pp", 1),
+            expert_model_parallel_size=case.get("ep", 1),
+            model_provider=case.get("model_provider", "gpt"),
+            enable_prefix_caching=enable_prefix_caching,
+            enable_chunked_prefill=feature == "chunked",
+            num_speculative_tokens=2 if feature == "mtp" else 0,
+            materialize_only_last_token_logits=feature != "mtp",
+            position_embedding_type="rope" if feature == "fused-rope" else "learned_absolute",
+            hidden_size=64 if feature == "fused-rope" else None,
+            top_k=1,
+        )
+        config.prefix_caching_eviction_policy = case["policy"]
+        config.use_flashinfer_fused_rope = feature == "fused-rope"
+        return config
+
+    @staticmethod
+    def _make_request(context, request_id, prompt, enable_prefix_caching):
+        """Build a deterministic request whose hashes are ready before scheduling."""
+        return DynamicInferenceRequest(
+            request_id=request_id,
+            prompt_tokens=prompt,
+            sampling_params=SamplingParams(
+                num_tokens_to_generate=4,
+                termination_id=-1,
+                return_log_probs=True,
+                # Chunked prefill currently emits one extra generated-top-N
+                # entry for an intermediate chunk. This foundation owns
+                # generated-logprob parity there; top-N remains covered by all
+                # non-chunked rows.
+                top_n_logprobs=0 if context.enable_chunked_prefill else 5,
+                skip_prompt_log_probs=True,
+                top_k=1,
+            ),
+            block_size_tokens=context.block_size_tokens,
+            enable_prefix_caching=enable_prefix_caching,
+        )
+
+    @staticmethod
+    def _install_runtime_witnesses(engine, feature):
+        """Count calls on the feature path during the stressed engine run."""
+        evidence = {
+            "tp_reducing_forwards": 0,
+            "pipeline_forwards": 0,
+            "moe_dispatches": 0,
+            "moe_request_ids": set(),
+            "fused_rope_calls": 0,
+            "mamba_restores": 0,
+        }
+        model = engine.controller.inference_wrapped_model.model
+
+        if feature == "tp":
+
+            def trace_tp_reduce(module, *_):
+                assert torch.distributed.get_world_size(module.tp_group) > 1
+                evidence["tp_reducing_forwards"] += 1
+
+            for module in model.modules():
+                if module.__class__.__name__ == "RowParallelLinear":
+                    module.register_forward_pre_hook(trace_tp_reduce)
+
+        if feature == "pp":
+            wrapper = engine.controller.inference_wrapped_model
+            original = wrapper.forward_pass_with_pipeline_parallel
+
+            def traced_pipeline_forward(*args, **kwargs):
+                assert wrapper.model_is_pipeline_parallel
+                evidence["pipeline_forwards"] += 1
+                return original(*args, **kwargs)
+
+            wrapper.forward_pass_with_pipeline_parallel = traced_pipeline_forward
+
+        if feature == "moe":
+            instrumented_layers = 0
+            for module in model.modules():
+                if module.__class__.__name__ != "MoELayer":
+                    continue
+                original = module.dispatch
+
+                def traced_moe_dispatch(*args, _module=module, _original=original, **kwargs):
+                    dispatcher = _module.token_dispatcher
+                    assert torch.distributed.get_world_size(dispatcher.ep_group) > 1
+                    evidence["moe_dispatches"] += 1
+                    active_request_ids = engine.context.request_ids[
+                        engine.context.paused_request_count : engine.context.total_request_count
+                    ]
+                    evidence["moe_request_ids"].update(
+                        request_id for request_id in active_request_ids.tolist() if request_id >= 0
+                    )
+                    return _original(*args, **kwargs)
+
+                module.dispatch = traced_moe_dispatch
+                instrumented_layers += 1
+            assert instrumented_layers > 0
+
+        if feature == "fused-rope":
+            context = engine.context
+            original = context.apply_fused_qk_rotary_emb
+
+            def traced_fused_rope(*args, **kwargs):
+                assert context.use_flashinfer_fused_rope
+                cos_sin_cache = args[2] if len(args) > 2 else kwargs["cos_sin_emb"]
+                assert cos_sin_cache.is_cuda
+                evidence["fused_rope_calls"] += 1
+                return original(*args, **kwargs)
+
+            context.apply_fused_qk_rotary_emb = traced_fused_rope
+
+        if feature == "mamba" and engine.context.mamba_slot_allocator is not None:
+            allocator = engine.context.mamba_slot_allocator
+            original = allocator.restore_to_live
+
+            def traced_mamba_restore(*args, **kwargs):
+                restored = original(*args, **kwargs)
+                evidence["mamba_restores"] += int(restored)
+                return restored
+
+            allocator.restore_to_live = traced_mamba_restore
+
+        return evidence
+
+    @torch.inference_mode()
+    def _run_engine_session(self, case, *, enable_prefix_caching):
+        """Run three donor/follower/pressure waves through one real engine."""
+        config = self._case_config(case, enable_prefix_caching=enable_prefix_caching)
+        env = self._build_test_env(config)
+        engine = env.engine
+        context = engine.context
+        allocator = context.kv_block_allocator
+        engine.controller.tokenizer.detokenize = lambda tokens, **_: f"tok_{tokens[0]}"
+        if case["feature"] == "fused-rope":
+            # The shared test model is CPU-initialized, while FlashInfer requires
+            # its cos/sin cache on CUDA. Establish that kernel precondition here;
+            # lazy cache migration is owned by the separate fused-RoPE fix.
+            model = engine.controller.inference_wrapped_model.model
+            model.rotary_pos_emb.inv_freq = model.rotary_pos_emb.inv_freq.cuda()
+            model.rotary_pos_emb_cache.clear()
+            assert model.config.hidden_size // model.config.num_attention_heads == 16
+        evidence = self._install_runtime_witnesses(engine, case["feature"])
+        pool_size = allocator.pool_size
+        storage_size = context.memory_buffer.untyped_storage().nbytes()
+        finished = {}
+        wave_block_ids = []
+        all_hashes = set()
+        min_pool_avail = allocator.pool_avail
+        saw_chunk = False
+        max_mamba_matched_blocks = 0
+        step_count = 0
+        cached_request_ids = set()
+        feature_seen_for_cached_request = False
+        mtp_seen_for_cached_decode = False
+
+        for cycle in range(3):
+            block_size = context.block_size_tokens
+            base = (
+                torch.arange(
+                    2 * block_size + 5, dtype=torch.int64, device=torch.cuda.current_device()
+                )
+                + cycle * 17
+            ) % (config.vocab_size - 1)
+            pressure = (base + 37) % (config.vocab_size - 1)
+
+            # Cached execution normally needs three producer blocks, one
+            # follower tail, and three divergent blocks. The chunked row gives
+            # the follower a second tail block so the hit-bearing request must
+            # itself continue prefill. Cache-off needs nine blocks normally and
+            # ten for the extended chunked follower, though those requests run
+            # serially under the chunk budget.
+            target_allocatable = (
+                8
+                if enable_prefix_caching and config.enable_chunked_prefill
+                else 7 if enable_prefix_caching or config.enable_chunked_prefill else 9
+            )
+            allocatable = allocator.get_allocatable_count()
+            if allocatable > target_allocatable:
+                filler = allocator.allocate_memory_blocks(allocatable - target_allocatable)
+                assert filler is not None
+            assert allocator.get_allocatable_count() == target_allocatable
+
+            follower_prompt = base.clone()
+            if case["feature"] == "chunked":
+                follower_prompt = torch.cat((base, base[: block_size + 8]))
+            requests = [
+                self._make_request(
+                    context, 3 * cycle, base, enable_prefix_caching=enable_prefix_caching
+                ),
+                self._make_request(context, 3 * cycle + 1, follower_prompt, enable_prefix_caching),
+                self._make_request(context, 3 * cycle + 2, pressure, enable_prefix_caching),
+            ]
+            wave_ids = {request.request_id for request in requests}
+            if enable_prefix_caching:
+                for request in requests:
+                    engine._add_request(request)
+                    all_hashes.update(request.precomputed_block_hashes)
+            else:
+                engine._add_request(requests[0])
+                if not config.enable_chunked_prefill:
+                    engine._add_request(requests[2])
+
+            baseline_follower_pending = not enable_prefix_caching
+            hits_before = engine._prefix_cache_hits
+            blocks_this_wave = set()
+            while wave_ids - finished.keys():
+                step_hits_before = engine._prefix_cache_hits
+                cached_tokens_before = {
+                    request.request_id: request.num_cached_tokens for request in requests
+                }
+                generated_before = {
+                    request.request_id: len(request.generated_tokens) for request in requests
+                }
+                feature_key = {
+                    "tp": "tp_reducing_forwards",
+                    "pp": "pipeline_forwards",
+                    "fused-rope": "fused_rope_calls",
+                    "mamba": "mamba_restores",
+                }.get(case["feature"])
+                feature_before = evidence[feature_key] if feature_key is not None else None
+                mtp_before = int(engine._spec_tokens_proposed_per_pos.sum())
+                result = engine.step_modern()
+                step_count += 1
+                newly_cached_ids = {
+                    request.request_id
+                    for request in requests
+                    if request.num_cached_tokens > cached_tokens_before[request.request_id]
+                }
+                if engine._prefix_cache_hits > step_hits_before:
+                    assert newly_cached_ids
+                    cached_request_ids.update(newly_cached_ids)
+                    if feature_key is not None:
+                        assert evidence[feature_key] > feature_before
+                        feature_seen_for_cached_request = True
+                    elif case["feature"] == "chunked":
+                        assert any(
+                            request.request_id in newly_cached_ids
+                            and (
+                                request.finished_chunk_token_count > 0
+                                or context.chunked_prefill_request_id == request.request_id
+                            )
+                            for request in requests
+                        )
+                        feature_seen_for_cached_request = True
+
+                # MTP intentionally starts after prefill, so its request-specific
+                # witness belongs to a later decode step rather than the hit step.
+                # A cached request whose generated length grows in a step that
+                # records proposals necessarily contributed to the MTP counter.
+                mtp_after = int(engine._spec_tokens_proposed_per_pos.sum())
+                if case["feature"] == "mtp" and mtp_after > mtp_before:
+                    mtp_seen_for_cached_decode |= any(
+                        request.request_id in cached_request_ids
+                        and len(request.generated_tokens) > generated_before[request.request_id]
+                        for request in requests
+                    )
+                if baseline_follower_pending and (
+                    not config.enable_chunked_prefill or context.chunked_prefill_request_id == -1
+                ):
+                    engine._add_request(requests[1])
+                    if config.enable_chunked_prefill:
+                        engine._add_request(requests[2])
+                    baseline_follower_pending = False
+
+                min_pool_avail = min(min_pool_avail, allocator.pool_avail)
+                active_blocks = context.request_to_kv_block_ids[: context.total_request_count]
+                blocks_this_wave.update(active_blocks[active_blocks >= 0].tolist())
+                saw_chunk |= context.chunked_prefill_request_id != -1
+                max_mamba_matched_blocks = max(
+                    max_mamba_matched_blocks,
+                    *(getattr(request, "_mamba_num_matched_blocks", 0) for request in requests),
+                )
+                for record in result["finished_request_records"]:
+                    merged = record.merge()
+                    finished[merged.request_id] = merged
+                assert step_count < 256, f"{case['name']} did not converge"
+
+            torch.cuda.synchronize()
+            assert allocator.pool_size == pool_size
+            assert context.memory_buffer.untyped_storage().nbytes() == storage_size
+            assert context.total_request_count == 0
+            assert allocator.get_active_used() == 0
+            assert allocator.get_allocatable_count() == target_allocatable
+            wave_block_ids.append(blocks_this_wave)
+            if enable_prefix_caching:
+                assert engine._prefix_cache_hits > hits_before
+                if case["policy"] == PrefixCachingEvictionPolicy.REF_ZERO:
+                    assert not allocator.kv_hash_to_block_id
+                    assert all(
+                        allocator.block_ref_counts[block_id].item() == 0
+                        for block_id in blocks_this_wave
+                    )
+
+        assert len(finished) == 9
+        if enable_prefix_caching:
+            assert min_pool_avail == 0
+            assert engine._prefix_cache_hits >= 3
+            assert engine._prefix_cache_blocks_matched >= 6
+            assert engine._prefix_coordination_waits >= 3
+            if case["policy"] == PrefixCachingEvictionPolicy.LRU:
+                assert all_hashes - allocator.kv_hash_to_block_id.keys()
+            else:
+                assert all(
+                    len(previous & current) >= 2
+                    for previous, current in zip(wave_block_ids, wave_block_ids[1:])
+                )
+        else:
+            assert engine._prefix_cache_hits == 0
+
+        if enable_prefix_caching and case["feature"] == "moe":
+            # EP routing evidence is recorded with the live request IDs inside
+            # token_dispatch. The engine drains hit accounting after the forward,
+            # so correlating the dispatcher batch to the cached follower is more
+            # precise than comparing counters on adjacent host steps.
+            assert cached_request_ids & evidence["moe_request_ids"]
+            feature_seen_for_cached_request = True
+
+        return finished, {
+            "saw_chunk": saw_chunk,
+            "mtp_tokens_proposed": int(engine._spec_tokens_proposed_per_pos.sum()),
+            "min_pool_avail": min_pool_avail,
+            "max_mamba_matched_blocks": max_mamba_matched_blocks,
+            "feature_seen_for_cached_request": feature_seen_for_cached_request,
+            "mtp_seen_for_cached_decode": mtp_seen_for_cached_decode,
+            **evidence,
+        }
+
+    @staticmethod
+    def _assert_scalar_logprob_close(value, expected, *, rel=2e-2, abs=5e-2):
+        """Compare one logprob while preserving matching non-finite results."""
+        if np.isnan(value) or np.isnan(expected):
+            assert np.isnan(value) and np.isnan(expected)
+        else:
+            assert value == pytest.approx(expected, rel=rel, abs=abs)
+
+    @staticmethod
+    def _assert_logprob_parity(cached_request, baseline_request):
+        """Check generated and top-N logprobs against the cache-off run."""
+        cached_logprobs = cached_request.generated_log_probs
+        baseline_logprobs = baseline_request.generated_log_probs
+        assert cached_logprobs is not None and baseline_logprobs is not None
+        assert len(cached_logprobs) == len(cached_request.generated_tokens)
+        np.testing.assert_allclose(cached_logprobs, baseline_logprobs, rtol=2e-2, atol=5e-2)
+
+        cached_top_n = cached_request.generated_top_n_logprobs
+        baseline_top_n = baseline_request.generated_top_n_logprobs
+        if cached_request.sampling_params.top_n_logprobs == 0:
+            assert not cached_top_n
+            assert not baseline_top_n
+            assert not cached_request.prompt_log_probs
+            assert not cached_request.prompt_top_n_logprobs
+            return
+        assert cached_top_n is not None and baseline_top_n is not None
+        assert len(cached_top_n) == len(cached_request.generated_tokens)
+        for token, logprob, baseline_logprob, cached_values, baseline_values in zip(
+            cached_request.generated_tokens,
+            cached_logprobs,
+            baseline_logprobs,
+            cached_top_n,
+            baseline_top_n,
+        ):
+            assert 0 < len(cached_values) <= 5
+            assert len(cached_values) == len(baseline_values)
+            cached_keys = set(cached_values)
+            baseline_keys = set(baseline_values)
+            for key in cached_keys & baseline_keys:
+                TestPrefixCacheRealEngineMatrix._assert_scalar_logprob_close(
+                    cached_values[key], baseline_values[key]
+                )
+            token_key = f"tok_{token}"
+            assert token_key in cached_values
+            assert token_key in baseline_values
+            TestPrefixCacheRealEngineMatrix._assert_scalar_logprob_close(
+                cached_values[token_key], logprob, abs=0.1
+            )
+            TestPrefixCacheRealEngineMatrix._assert_scalar_logprob_close(
+                baseline_values[token_key], baseline_logprob, abs=0.1
+            )
+
+            cached_ranked = sorted(cached_values.values(), reverse=True)
+            baseline_ranked = sorted(baseline_values.values(), reverse=True)
+            np.testing.assert_allclose(cached_ranked, baseline_ranked, rtol=2e-2, atol=5e-2)
+            if cached_keys != baseline_keys:
+                cached_cutoff = cached_ranked[-1]
+                baseline_cutoff = baseline_ranked[-1]
+                for key in cached_keys - baseline_keys:
+                    TestPrefixCacheRealEngineMatrix._assert_scalar_logprob_close(
+                        cached_values[key], baseline_cutoff
+                    )
+                for key in baseline_keys - cached_keys:
+                    TestPrefixCacheRealEngineMatrix._assert_scalar_logprob_close(
+                        baseline_values[key], cached_cutoff
+                    )
+
+        assert not cached_request.prompt_log_probs
+        assert not cached_request.prompt_top_n_logprobs
+
+    @staticmethod
+    def _clear_engine_runtime():
+        """Release per-row model and inference allocations before rebuilding."""
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    @torch.inference_mode()
+    def _run_engine_case(self, case):
+        """Compare cache-on and cache-off output while asserting row activation."""
+        self._clear_engine_runtime()
+        try:
+            cached, stats = self._run_engine_session(case, enable_prefix_caching=True)
+            self._clear_engine_runtime()
+            baseline, baseline_stats = self._run_engine_session(case, enable_prefix_caching=False)
+
+            for request_id in range(9):
+                cached_request = cached[request_id]
+                baseline_request = baseline[request_id]
+                assert cached_request.generated_tokens == baseline_request.generated_tokens
+                assert cached_request.generated_text == baseline_request.generated_text
+                assert len(cached_request.generated_tokens) == 4
+                self._assert_logprob_parity(cached_request, baseline_request)
+
+            assert stats["min_pool_avail"] == 0
+            assert baseline_stats["min_pool_avail"] <= 1
+            feature = case["feature"]
+            if feature == "mtp":
+                assert stats["mtp_seen_for_cached_decode"]
+            else:
+                assert stats["feature_seen_for_cached_request"]
+            if feature == "tp":
+                assert stats["tp_reducing_forwards"] > 0
+            elif feature == "pp":
+                assert stats["pipeline_forwards"] > 0
+            elif feature == "moe":
+                assert stats["moe_dispatches"] > 0
+            elif feature == "chunked":
+                assert stats["saw_chunk"]
+            elif feature == "fused-rope":
+                assert stats["fused_rope_calls"] > 0
+            elif feature == "mamba":
+                assert stats["max_mamba_matched_blocks"] > 0
+                assert stats["mamba_restores"] > 0
+            else:
+                assert feature == "mtp"
+                assert stats["mtp_tokens_proposed"] > 0
+        finally:
+            self._clear_engine_runtime()
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("case", PREFIX_CACHE_ENGINE_CASES)
+    def test_real_engine_stress_row(self, case):
+        if case["feature"] == "mamba":
+            available, reason = _check_mamba_sequence_packing_support()
+            if not available:
+                pytest.skip(reason)
+        if case["feature"] == "fused-rope":
+            pytest.importorskip("flashinfer")
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=case.get("tp", 1),
+            pipeline_model_parallel_size=case.get("pp", 1),
+            expert_model_parallel_size=case.get("ep", 1),
+            expert_tensor_parallel_size=1,
+        )
+        try:
+            self._run_engine_case(case)
+        finally:
+            DynamicInferenceContext.ROUNDER = 64
+            DynamicInferenceContext.TOKEN_ROUNDER = 64
+            DynamicInferenceContext.REQUEST_ROUNDER = 64
+            Utils.destroy_model_parallel()
