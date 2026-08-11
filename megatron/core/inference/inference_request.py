@@ -4,7 +4,7 @@ import copy
 import hashlib
 import time
 import warnings
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -452,36 +452,37 @@ class DynamicInferenceRequest(InferenceRequest):
         # prompt tensor off the engine->coordinator->API path. Null it around
         # super() so the tensor is never serialized, then restore local state.
         prompt_len = len(self.prompt_tokens) if self.prompt_tokens is not None else None
-        drop_prompt = (
-            self.prompt_tokens is not None
-            and self.sampling_params is not None
-            and not getattr(self.sampling_params, "return_prompt_tokens", False)
+        drop_prompt = self.prompt_tokens is not None and not getattr(
+            self.sampling_params, "return_prompt_tokens", False
         )
-        saved_prompt_tokens = None
-        if drop_prompt:
-            saved_prompt_tokens = self.prompt_tokens
-            self.prompt_tokens = None
+        saved_prompt_tokens = self.prompt_tokens
+        saved_remaining_prompt_tokens = self.remaining_prompt_tokens
+        try:
+            if drop_prompt:
+                self.prompt_tokens = None
+                self.remaining_prompt_tokens = None
 
-        obj = super().serialize()
-        obj["events"] = [e.serialize() for e in self.events]
-        obj.pop("event_add_engine", None)
-        obj["prompt_length"] = prompt_len
+            obj = super().serialize()
+            obj["events"] = [e.serialize() for e in self.events]
+            obj.pop("event_add_engine", None)
+            obj["prompt_length"] = prompt_len
 
-        # Sanity check routing_indices: ndarray [total_tokens - 1, num_layers, topk]
-        if self.routing_indices is not None:
-            total_tokens = prompt_len + len(self.generated_tokens)
-            # the last generated token does not undergo a forward pass
-            # hence we expect routing indices for total_tokens - 1
-            assert self.routing_indices.shape[0] == total_tokens - 1, (
-                f"routing_indices first dimension {self.routing_indices.shape[0]} does not match "
-                f"total tokens {total_tokens-1}."
-            )
+            # Sanity check routing_indices: ndarray [total_tokens - 1, num_layers, topk]
+            if self.routing_indices is not None:
+                total_tokens = prompt_len + len(self.generated_tokens)
+                # the last generated token does not undergo a forward pass
+                # hence we expect routing indices for total_tokens - 1
+                assert self.routing_indices.shape[0] == total_tokens - 1, (
+                    f"routing_indices first dimension {self.routing_indices.shape[0]} does not match "
+                    f"total tokens {total_tokens-1}."
+                )
 
-        if drop_prompt:
-            self.prompt_tokens = saved_prompt_tokens
-
-        nvtx_range_pop("DynamicInferenceRequest.serialize")
-        return obj
+            return obj
+        finally:
+            if drop_prompt:
+                self.prompt_tokens = saved_prompt_tokens
+                self.remaining_prompt_tokens = saved_remaining_prompt_tokens
+            nvtx_range_pop("DynamicInferenceRequest.serialize")
 
     def _post_deserialize(self, obj):
         super()._post_deserialize(obj)
@@ -664,8 +665,10 @@ class DynamicInferenceRequestRecord:
 
         old_request = self[-1]
 
-        # Carry forward policy_epoch as-is.
-        policy_epoch = old_request.policy_epoch
+        # Policy history remains logically attached to the request, but each
+        # checkpoint owns its list so later epoch stamping cannot mutate an
+        # earlier segment in the record.
+        policy_epoch = copy.deepcopy(old_request.policy_epoch)
 
         # Reset kv_cache_epoch to None: the KV cache is recomputed fresh after checkpoint;
         # the engine's stamping logic will initialize a new stamp record with the recompute epoch.
@@ -684,16 +687,16 @@ class DynamicInferenceRequestRecord:
             dim=0,
         )
 
-        # New sampling params.
-        new_sampling_params = SamplingParams(
-            **{
-                **asdict(old_request.sampling_params),
-                "num_tokens_to_generate": (
-                    old_request.sampling_params.num_tokens_to_generate
-                    - len(old_request.generated_tokens)
-                ),
-            }
-        )
+        # Preserve both dataclass and dynamically-added sampling fields.
+        new_sampling_params = copy.deepcopy(old_request.sampling_params)
+        if old_request.sampling_params.num_tokens_to_generate is not None:
+            new_sampling_params.num_tokens_to_generate = (
+                old_request.sampling_params.num_tokens_to_generate
+                - len(old_request.generated_tokens)
+            )
+        # num_tokens_total is converted to a generation budget on first
+        # admission and must not be applied again to the expanded prompt.
+        new_sampling_params.num_tokens_total = None
 
         # Preserve prefix-cache configuration and let __post_init__ recompute hashes for the
         # expanded prompt. The previous hash list may not include newly completed blocks.
@@ -701,8 +704,10 @@ class DynamicInferenceRequestRecord:
             request_id=old_request.request_id,
             prompt_tokens=new_prompt_tokens,
             sampling_params=new_sampling_params,
+            status=old_request.status,
             policy_epoch=policy_epoch,
             kv_cache_epoch=kv_cache_epoch,
+            stop_word_ids=copy.deepcopy(old_request.stop_word_ids),
             block_size_tokens=old_request.block_size_tokens,
             enable_prefix_caching=old_request.enable_prefix_caching,
         )
@@ -712,6 +717,19 @@ class DynamicInferenceRequestRecord:
             new_request.event_add_engine = old_request.event_add_engine
         else:
             new_request.add_event_add_engine()
+
+        # The first segment supplies the original prompt to merge(), and the
+        # newest segment must remain on the active device for re-admission. A
+        # superseded intermediate segment only serves as history, so keeping
+        # its cumulative prompt on CUDA causes repeated checkpoints to retain
+        # overlapping, steadily growing GPU allocations.
+        if len(self.requests) > 1:
+            old_prompt_tokens = old_request.prompt_tokens
+            old_request.prompt_tokens = old_prompt_tokens.cpu()
+            if old_request.remaining_prompt_tokens is old_prompt_tokens:
+                old_request.remaining_prompt_tokens = old_request.prompt_tokens
+            elif old_request.remaining_prompt_tokens is not None:
+                old_request.remaining_prompt_tokens = old_request.remaining_prompt_tokens.cpu()
         self.requests.append(new_request)
 
     def merge(self, tokenizer: MegatronTokenizer | None = None) -> DynamicInferenceRequest:
@@ -730,6 +748,16 @@ class DynamicInferenceRequestRecord:
                 return None
             return [item for value in values if value is not None for item in value]
 
+        def merge_original_prompt_values(key, prompt_length):
+            """Select the most complete scores for the original prompt only."""
+            values = [getattr(request, key) for request in self.requests]
+            values = [value for value in values if value is not None]
+            if not values:
+                return None
+            original_value_count = max(0, prompt_length - 1)
+            value = max(values, key=len)
+            return value[:original_value_count]
+
         prompt_tokens = self.requests[0].prompt_tokens
         prompt_text = self.requests[0].prompt
         routing_indices = None
@@ -742,16 +770,19 @@ class DynamicInferenceRequestRecord:
         except TypeError as e:  # generally means r.generated_text is None
             generated_text = None
 
-        policy_epoch = self.requests[-1].policy_epoch
-        kv_cache_epoch = self.requests[-1].kv_cache_epoch
+        policy_epoch = copy.deepcopy(self.requests[-1].policy_epoch)
+        kv_cache_epoch = copy.deepcopy(self.requests[-1].kv_cache_epoch)
+        ttft = next((request.ttft for request in self.requests if request.ttft is not None), None)
 
         # Merged request.
         request = DynamicInferenceRequest(
             request_id=self.requests[0].request_id,
             prompt=prompt_text,
             prompt_tokens=prompt_tokens,
-            prompt_log_probs=self.requests[0].prompt_log_probs,
-            prompt_top_n_logprobs=self.requests[0].prompt_top_n_logprobs,
+            prompt_log_probs=merge_original_prompt_values("prompt_log_probs", len(prompt_tokens)),
+            prompt_top_n_logprobs=merge_original_prompt_values(
+                "prompt_top_n_logprobs", len(prompt_tokens)
+            ),
             generated_text=generated_text,
             generated_tokens=generated_tokens,
             generated_length=len(generated_tokens),
@@ -760,7 +791,7 @@ class DynamicInferenceRequestRecord:
             sampling_params=self.requests[0].sampling_params,
             policy_epoch=policy_epoch,
             kv_cache_epoch=kv_cache_epoch,
-            ttft=self.requests[0].ttft,
+            ttft=ttft,
             tpot=merge_lists("tpot"),
             status=self.requests[-1].status,
             latency=self.latency,

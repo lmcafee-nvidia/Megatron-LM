@@ -12,6 +12,7 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
     InferenceRequest,
+    Status,
     compute_block_hashes_batched,
     deserialize_ndarray,
     deserialize_tensor,
@@ -270,6 +271,111 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     assert DynamicInferenceRequestRecord(requests=[c, d]).merge().generated_text is None
 
 
+def test_checkpoint_preserves_runtime_state_without_aliasing():
+    """Checkpointing preserves state that controls re-admission and generation."""
+    sampling_params = SamplingParams(num_tokens_to_generate=5, termination_id=0)
+    sampling_params.add_attributes({"min_length": 3, "custom_sampler_state": {"seed": 17}})
+    request = _make_dynamic_request(
+        sampling_params=sampling_params,
+        generated_tokens=[8, 9],
+        status=Status.ACTIVE_BUT_NOT_GENERATING_TOKENS,
+        stop_word_ids=[[8, 9]],
+        policy_epoch=[(0, 4)],
+        kv_cache_epoch=[(0, 4)],
+    )
+    record = DynamicInferenceRequestRecord.from_request(request)
+
+    record.checkpoint()
+    checkpoint = record[-1]
+
+    assert checkpoint.sampling_params.num_tokens_to_generate == 3
+    assert checkpoint.sampling_params.num_tokens_total is None
+    assert checkpoint.sampling_params.min_length == 3
+    assert checkpoint.sampling_params.custom_sampler_state == {"seed": 17}
+    assert checkpoint.sampling_params is not request.sampling_params
+    assert checkpoint.status == Status.ACTIVE_BUT_NOT_GENERATING_TOKENS
+    assert checkpoint.stop_word_ids == [[8, 9]]
+    assert checkpoint.stop_word_ids is not request.stop_word_ids
+    assert checkpoint.policy_epoch == [(0, 4)]
+    assert checkpoint.policy_epoch is not request.policy_epoch
+    # KV state is recomputed, so unlike policy history it deliberately starts unstamped.
+    assert checkpoint.kv_cache_epoch is None
+
+    request.policy_epoch.append((1, 5))
+    request.stop_word_ids[0].append(10)
+    request.sampling_params.custom_sampler_state["seed"] = 99
+    assert checkpoint.policy_epoch == [(0, 4)]
+    assert checkpoint.stop_word_ids == [[8, 9]]
+    assert checkpoint.sampling_params.custom_sampler_state == {"seed": 17}
+
+
+def test_merge_uses_complete_original_prompt_scores_and_first_ttft():
+    """A later recomputed segment can complete prompt scores and own the first-token timing."""
+    sampling_params = SamplingParams(num_tokens_to_generate=4, termination_id=0)
+    first = _make_dynamic_request(
+        prompt_tokens=torch.tensor([1, 2, 3, 4]),
+        sampling_params=sampling_params,
+        generated_tokens=[],
+        prompt_log_probs=[-0.1],
+        prompt_top_n_logprobs=[{"one": -0.1}],
+        ttft=None,
+    )
+    second = _make_dynamic_request(
+        prompt_tokens=torch.tensor([1, 2, 3, 4, 5]),
+        sampling_params=sampling_params,
+        generated_tokens=[6],
+        prompt_log_probs=[-0.1, -0.2, -0.3, -0.4],
+        prompt_top_n_logprobs=[{"one": -0.1}, {"two": -0.2}, {"three": -0.3}, {"generated": -0.4}],
+        ttft=0.25,
+    )
+    third = _make_dynamic_request(
+        prompt_tokens=torch.tensor([1, 2, 3, 4, 5, 6]),
+        sampling_params=sampling_params,
+        generated_tokens=[7],
+        prompt_log_probs=[-0.1, -0.2],
+        prompt_top_n_logprobs=[{"one": -0.1}, {"two": -0.2}],
+        ttft=0.5,
+    )
+
+    merged = DynamicInferenceRequestRecord(requests=[first, second, third]).merge()
+
+    assert merged.prompt_log_probs == [-0.1, -0.2, -0.3]
+    assert merged.prompt_top_n_logprobs == [{"one": -0.1}, {"two": -0.2}, {"three": -0.3}]
+    assert merged.ttft == 0.25
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA prompt storage")
+def test_repeated_checkpoints_bound_reachable_cuda_prompt_storage():
+    """Only the original and active cumulative prompts remain reachable on CUDA."""
+    request = _make_dynamic_request(
+        prompt_tokens=torch.tensor([1, 2, 3, 4], device=torch.cuda.current_device()),
+        generated_tokens=[5],
+    )
+    record = DynamicInferenceRequestRecord.from_request(request)
+    for next_token in (6, 7, 8):
+        record.checkpoint()
+        record[-1].generated_tokens = [next_token]
+
+    assert record[0].prompt_tokens.is_cuda
+    assert record[-1].prompt_tokens.is_cuda
+    assert all(segment.prompt_tokens.device.type == "cpu" for segment in record.requests[1:-1])
+    assert all(
+        segment.remaining_prompt_tokens.device.type == "cpu" for segment in record.requests[1:-1]
+    )
+
+    cuda_prompt_storages = {
+        tensor.untyped_storage().data_ptr(): tensor.untyped_storage().nbytes()
+        for segment in record.requests
+        for tensor in (segment.prompt_tokens, segment.remaining_prompt_tokens)
+        if tensor is not None and tensor.is_cuda
+    }
+    assert len(cuda_prompt_storages) == 2
+    assert sum(cuda_prompt_storages.values()) == (
+        record[0].prompt_tokens.untyped_storage().nbytes()
+        + record[-1].prompt_tokens.untyped_storage().nbytes()
+    )
+
+
 def test_dynamic_inference_request_serialize_strips_event_add_engine():
     """DynamicInferenceRequest.serialize() omits `event_add_engine` (it's a
     pointer into `events`, not independent state); on deserialize we get the
@@ -293,14 +399,14 @@ def test_dynamic_inference_request_serialize_strips_event_add_engine():
 
 
 @pytest.mark.parametrize(
-    ("return_prompt_tokens", "expected_prompt_field"),
+    ("return_prompt_tokens", "expected_prompt_field", "expected_remaining_prompt_field"),
     [
-        (False, None),  # default: prompt_tokens dropped from payload
-        (True, ("tensor", [1, 2, 3, 4])),  # opt-in: prompt_tokens preserved
+        (False, None, None),  # default: prompt state dropped from payload
+        (True, ("tensor", [1, 2, 3, 4]), ("tensor", [1, 2, 3, 4])),
     ],
 )
 def test_dynamic_inference_request_serialize_return_prompt_tokens(
-    return_prompt_tokens, expected_prompt_field
+    return_prompt_tokens, expected_prompt_field, expected_remaining_prompt_field
 ):
     """DynamicInferenceRequest.serialize() reports prompt_length unconditionally
     (the API uses it for `usage.prompt_tokens` on the response) and drops the
@@ -327,11 +433,31 @@ def test_dynamic_inference_request_serialize_return_prompt_tokens(
     assert obj["prompt_length"] == 4
     # Payload either preserves the tensor wrapper or drops it (present but None).
     assert obj["prompt_tokens"] == expected_prompt_field
+    assert obj["remaining_prompt_tokens"] == expected_remaining_prompt_field
     # Local instance is unaffected — the drop is wire-only.
     assert torch.equal(req.prompt_tokens, prompt)
     # routing_indices survives the drop path (shape check would have crashed on
     # the temporarily-None self.prompt_tokens if the fix used self.prompt_tokens).
     assert isinstance(obj["routing_indices"], tuple) and obj["routing_indices"][0] == "ndarray"
+
+
+def test_dynamic_inference_request_serialize_restores_prompt_state_after_error(monkeypatch):
+    """A serialization failure must not clear prompt state on the live request."""
+    request = _make_dynamic_request()
+    prompt_tokens = request.prompt_tokens
+    request.remaining_prompt_tokens = request.prompt_tokens[2:]
+    remaining_prompt_tokens = request.remaining_prompt_tokens
+
+    def raise_serialization_error(_request):
+        raise RuntimeError("injected serialization failure")
+
+    monkeypatch.setattr(InferenceRequest, "serialize", raise_serialization_error)
+
+    with pytest.raises(RuntimeError, match="injected serialization failure"):
+        request.serialize()
+
+    assert request.prompt_tokens is prompt_tokens
+    assert request.remaining_prompt_tokens is remaining_prompt_tokens
 
 
 def test_dynamic_inference_request_serialize_prompt_length_absent():
