@@ -1775,84 +1775,87 @@ class DynamicInferenceEngine(AbstractEngine):
             if segment.generated_length is not None:
                 segment.generated_length = len(segment.generated_tokens)
 
+        matched_stop = None
         for stop_word_ids in request.stop_word_ids:
             stop_len = len(stop_word_ids)
-            if len(generated_tokens) >= stop_len:
-                # Check only endpoints produced in this step. Speculative decoding
-                # can append several tokens, so the stop word may end before the
-                # final appended token.
-                for i in range(endpoint_count):
-                    end_idx = -i if i > 0 else None
-                    if list(generated_tokens[-stop_len - i : end_idx]) == stop_word_ids:
-                        total_trim = (
-                            i if request.sampling_params.detokenize_stop_sequence else i + stop_len
-                        )
-                        pending_trim = min(total_trim, pending_token_count)
-                        if pending_trim > 0:
-                            trim_segment_tail(request, pending_trim, trim_stored_scores=False)
+            if len(generated_tokens) < stop_len:
+                continue
+            # Search every endpoint produced in this step before mutating state.
+            # A larger trailing-token count means this stop completed earlier;
+            # at the same endpoint, prefer the longer stop sequence.
+            for trailing_token_count in range(endpoint_count):
+                end_idx = -trailing_token_count if trailing_token_count > 0 else None
+                if (
+                    list(generated_tokens[-stop_len - trailing_token_count : end_idx])
+                    == stop_word_ids
+                ):
+                    candidate = (trailing_token_count, stop_len)
+                    if matched_stop is None or candidate > matched_stop:
+                        matched_stop = candidate
 
-                        # Any remainder belongs to tokens generated before this
-                        # step. Remove their already-stored result metadata from
-                        # newest to oldest so merged tokens, logprobs, and top-N
-                        # values stay aligned.
-                        stored_trim = total_trim - pending_trim
-                        older_segment_trim = 0
-                        for segment in reversed(segments):
-                            if stored_trim == 0:
-                                break
-                            segment_trim = min(stored_trim, len(segment.generated_tokens))
-                            if segment_trim == 0:
-                                continue
-                            trim_segment_tail(segment, segment_trim, trim_stored_scores=True)
-                            if segment is not request:
-                                older_segment_trim += segment_trim
-                            stored_trim -= segment_trim
-                        assert stored_trim == 0, "Stop-word trim exceeds generated history."
+        if matched_stop is None:
+            return False, 0, 0
 
-                        # Tokens from older checkpoint segments are duplicated at
-                        # the end of the active segment's cumulative prompt. Drop
-                        # the same suffix so terminal routing/serialization lengths
-                        # describe the visible merged result.
-                        if older_segment_trim > 0:
-                            old_prompt_tokens = request.prompt_tokens
-                            old_remaining_prompt_tokens = request.remaining_prompt_tokens
-                            request.prompt_tokens = old_prompt_tokens[:-older_segment_trim]
-                            if old_remaining_prompt_tokens is not None:
-                                remaining_length = max(
-                                    0, len(old_remaining_prompt_tokens) - older_segment_trim
-                                )
-                                request.remaining_prompt_tokens = (
-                                    request.prompt_tokens[-remaining_length:]
-                                    if remaining_length > 0
-                                    else request.prompt_tokens[:0]
-                                )
+        trailing_token_count, stop_len = matched_stop
+        total_trim = (
+            trailing_token_count
+            if request.sampling_params.detokenize_stop_sequence
+            else trailing_token_count + stop_len
+        )
+        pending_trim = min(total_trim, pending_token_count)
+        if pending_trim > 0:
+            trim_segment_tail(request, pending_trim, trim_stored_scores=False)
 
-                        prompt_score_trim = 0
-                        if (
-                            older_segment_trim > 0
-                            and not request.sampling_params.skip_prompt_log_probs
-                        ):
-                            # Chunked prefill may already have stored some prompt
-                            # scores. Remove any suffix now outside the shortened
-                            # prompt and ask the caller to trim only the remainder
-                            # from this step's pending score tensors.
-                            target_prompt_score_count = max(0, len(request.prompt_tokens) - 1)
-                            existing_prompt_score_count = len(request.prompt_log_probs or [])
-                            stored_prompt_score_trim = min(
-                                older_segment_trim,
-                                max(0, existing_prompt_score_count - target_prompt_score_count),
-                            )
-                            if stored_prompt_score_trim > 0:
-                                request.prompt_log_probs = request.prompt_log_probs[
-                                    :-stored_prompt_score_trim
-                                ]
-                                if request.prompt_top_n_logprobs is not None:
-                                    request.prompt_top_n_logprobs = request.prompt_top_n_logprobs[
-                                        :-stored_prompt_score_trim
-                                    ]
-                            prompt_score_trim = older_segment_trim - stored_prompt_score_trim
-                        return True, pending_trim, prompt_score_trim
-        return False, 0, 0
+        # Any remainder belongs to tokens generated before this step. Remove
+        # their already-stored result metadata from newest to oldest so merged
+        # tokens, logprobs, and top-N values stay aligned.
+        stored_trim = total_trim - pending_trim
+        older_segment_trim = 0
+        for segment in reversed(segments):
+            if stored_trim == 0:
+                break
+            segment_trim = min(stored_trim, len(segment.generated_tokens))
+            if segment_trim == 0:
+                continue
+            trim_segment_tail(segment, segment_trim, trim_stored_scores=True)
+            if segment is not request:
+                older_segment_trim += segment_trim
+            stored_trim -= segment_trim
+        assert stored_trim == 0, "Stop-word trim exceeds generated history."
+
+        # Tokens from older checkpoint segments are duplicated at the end of
+        # the active segment's cumulative prompt. Drop the same suffix so
+        # terminal routing/serialization lengths describe the visible result.
+        if older_segment_trim > 0:
+            old_prompt_tokens = request.prompt_tokens
+            old_remaining_prompt_tokens = request.remaining_prompt_tokens
+            request.prompt_tokens = old_prompt_tokens[:-older_segment_trim]
+            if old_remaining_prompt_tokens is not None:
+                remaining_length = max(0, len(old_remaining_prompt_tokens) - older_segment_trim)
+                request.remaining_prompt_tokens = (
+                    request.prompt_tokens[-remaining_length:]
+                    if remaining_length > 0
+                    else request.prompt_tokens[:0]
+                )
+
+        prompt_score_trim = 0
+        if older_segment_trim > 0 and not request.sampling_params.skip_prompt_log_probs:
+            # Chunked prefill may already have stored some prompt scores. Remove
+            # any suffix now outside the shortened prompt and ask the caller to
+            # trim only the remainder from this step's pending score tensors.
+            target_prompt_score_count = max(0, len(request.prompt_tokens) - 1)
+            existing_prompt_score_count = len(request.prompt_log_probs or [])
+            stored_prompt_score_trim = min(
+                older_segment_trim, max(0, existing_prompt_score_count - target_prompt_score_count)
+            )
+            if stored_prompt_score_trim > 0:
+                request.prompt_log_probs = request.prompt_log_probs[:-stored_prompt_score_trim]
+                if request.prompt_top_n_logprobs is not None:
+                    request.prompt_top_n_logprobs = request.prompt_top_n_logprobs[
+                        :-stored_prompt_score_trim
+                    ]
+            prompt_score_trim = older_segment_trim - stored_prompt_score_trim
+        return True, pending_trim, prompt_score_trim
 
     def get_prefix_coordination_metrics(self) -> dict:
         """Return prefix caching coordination metrics.

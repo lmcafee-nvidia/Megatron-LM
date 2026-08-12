@@ -4245,9 +4245,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
     @pytest.mark.parametrize("detokenize_stop_sequence", [True, False])
     def test_detokenize_stop_sequence_flag(self, detokenize_stop_sequence):
-        """Test that _check_stop_words_for_request_post_append strips or keeps
-        the stop word tokens based on detokenize_stop_sequence."""
-        engine = types.SimpleNamespace(num_speculative_tokens=0)
+        """The earliest speculative stop wins and is either retained or stripped."""
+        engine = types.SimpleNamespace(num_speculative_tokens=1)
         check = DynamicInferenceEngine._check_stop_words_for_request_post_append
 
         request = types.SimpleNamespace(
@@ -4257,7 +4256,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             generated_top_n_logprobs=None,
             events=[],
             tpot=[],
-            stop_word_ids=[[4, 5]],
+            stop_word_ids=[[5], [4]],
             sampling_params=SamplingParams(detokenize_stop_sequence=detokenize_stop_sequence),
         )
         hit, trimmed, prompt_score_trim = check(engine, request)
@@ -4265,8 +4264,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert prompt_score_trim == 0
         if detokenize_stop_sequence:
             # Stop word kept
-            assert request.generated_tokens == [1, 2, 3, 4, 5]
-            assert trimmed == 0
+            assert request.generated_tokens == [1, 2, 3, 4]
+            assert trimmed == 1
         else:
             # Stop word stripped
             assert request.generated_tokens == [1, 2, 3]
