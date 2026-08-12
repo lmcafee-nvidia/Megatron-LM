@@ -490,7 +490,7 @@ def _allocate_leaving(allocator, remaining):
         return None
     blocks = allocator.allocate_memory_blocks(count)
     assert blocks is not None and allocator.get_allocatable_count() == remaining
-    return blocks
+    return blocks.clone()
 
 
 def _release_filler(allocator, blocks):
