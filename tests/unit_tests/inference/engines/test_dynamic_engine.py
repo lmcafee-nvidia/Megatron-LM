@@ -3222,6 +3222,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 prompt_tokens=req_tokens,
                 sampling_params=SamplingParams(
                     num_tokens_to_generate=num_tokens_to_generate,
+                    top_k=1,
                     return_log_probs=True,
                     skip_prompt_log_probs=False,
                     termination_id=-1,
