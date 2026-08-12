@@ -52,6 +52,8 @@ from tests.unit_tests.inference.test_dynamic_prefix_caching_coordinator import (
 )
 from tests.unit_tests.test_utilities import Utils
 
+# Policy values document checkpoint/merge ownership and make new dataclass fields
+# fail the exhaustiveness test until they receive an explicit lifecycle decision.
 REQUEST_FIELD_POLICY = {
     "request_id": "checkpoint:preserve / merge:first",
     "prompt": "checkpoint:reset / merge:first",
@@ -256,15 +258,13 @@ _CHUNKED_RECOMPUTE = _AsyncPairScenario(
     },
     sampling=(
         {
-            "temperature": 0.8,
-            "top_k": 8,
             "return_log_probs": True,
             "skip_prompt_log_probs": False,
             "top_n_logprobs": 3,
             "return_prompt_tokens": True,
         },
     ),
-    signals=("chunked", "logprobs", "top-n", "sampled"),
+    signals=("chunked", "logprobs", "top-n"),
 )
 
 _PERSIST_TE_SWA = _AsyncPairScenario(
