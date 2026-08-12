@@ -1291,6 +1291,8 @@ class TextGenerationController:
             return
 
         context_idx = context.get_index_of_chunked_prefill_request(safe=True)
+        if context_idx == -1:
+            return
         active_idx = context_idx - context.paused_request_count
         active_request_count = context.total_request_count - context.paused_request_count
         assert 0 <= active_idx < active_request_count
