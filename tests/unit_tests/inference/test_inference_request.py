@@ -252,6 +252,8 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     merged = rec.merge()
     assert merged.generated_tokens == [10, 11, 12]
     assert merged.generated_text == "foobar"
+    rec.generated_text = "combined"
+    assert rec.merge().generated_text == "combined"
     assert merged.generated_length == 3 and merged.latency == 4.2
     assert merged.routing_indices.tolist() == [[1, 2], [3, 4]]
 

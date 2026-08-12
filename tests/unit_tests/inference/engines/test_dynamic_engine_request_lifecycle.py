@@ -65,7 +65,7 @@ REQUEST_FIELD_POLICY = {
     "arrival_time": "checkpoint:reset / merge:reset",
     "status": "checkpoint:preserve / merge:last",
     "encoder_prompt": "checkpoint:drop / merge:drop",
-    "generated_text": "checkpoint:reset / merge:concatenate",
+    "generated_text": "checkpoint:reset / merge:decode-concatenated-tokens",
     "segments": "checkpoint:drop / merge:drop-unsupported",
     "generated_segments": "checkpoint:drop / merge:drop-unsupported",
     "generated_sequence_lengths": "checkpoint:drop / merge:drop-unsupported",
@@ -334,7 +334,7 @@ class _RunResult:
 
 
 def _configure_test_tokenizer(engine):
-    detokenize = lambda tokens, **_kwargs: "".join(f"<{token}>" for token in tokens)
+    detokenize = lambda tokens, **_kwargs: f"<{','.join(str(token) for token in tokens)}>"
     engine.controller.tokenizer.bos = None
     engine.controller.tokenizer.tokenize = lambda text: [int(token) for token in text.split()]
     engine.controller.tokenizer.detokenize = detokenize
@@ -876,7 +876,7 @@ class TestRequestLifecyclePairwise(_DynamicInferenceEngineTestBase):
                 "the designated UVM owner must use managed allocation; "
                 "a fallback run receives no pairwise credit"
             )
-        detokenize = lambda tokens, **_kwargs: "".join(f"<{token}>" for token in tokens)
+        detokenize = lambda tokens, **_kwargs: f"<{','.join(str(token) for token in tokens)}>"
         engine.controller.tokenizer.detokenize = detokenize
         engine.controller.detokenize = lambda _tokenizer, tokens, **kwargs: detokenize(
             tokens, **kwargs
