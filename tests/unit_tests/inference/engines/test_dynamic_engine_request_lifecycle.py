@@ -1187,7 +1187,7 @@ class TestRequestLifecyclePairwise(_DynamicInferenceEngineTestBase):
             prompt,
             300,
             full_logprobs=True,
-            stop_words=["269 270"],
+            stop_words=["267 268"],
             keep_stop=False,
         )
         first_filler = _allocate_leaving(allocator, 1) if treatment else None
@@ -1232,7 +1232,7 @@ class TestRequestLifecyclePairwise(_DynamicInferenceEngineTestBase):
         _release_filler(allocator, second_filler)
         _assert_engine_drained(engine, [future], completed, (request_id,))
         merged = completed[request_id]
-        assert merged.generated_tokens == list(range(11, 269))
+        assert merged.generated_tokens == list(range(11, 267))
         score_count = len(merged.generated_tokens)
         assert (
             len(merged.generated_log_probs) == len(merged.generated_top_n_logprobs) == score_count
@@ -1242,7 +1242,7 @@ class TestRequestLifecyclePairwise(_DynamicInferenceEngineTestBase):
         )
         witness = None
         if treatment:
-            assert second_boundary == (259, 269)
+            assert second_boundary == (257, 267)
             assert engine.evicted_request_count == 2
             assert record_lengths[request_id] == 3
             assert _event_count(merged, DynamicInferenceEventType.PAUSE) == 2
