@@ -52,9 +52,6 @@ from tests.unit_tests.inference.test_dynamic_prefix_caching_coordinator import (
 )
 from tests.unit_tests.test_utilities import Utils
 
-# Policy values describe checkpoint/merge ownership.  The exhaustiveness test
-# intentionally fails whenever either public dataclass gains a field without an
-# explicit lifecycle decision.
 REQUEST_FIELD_POLICY = {
     "request_id": "checkpoint:preserve / merge:first",
     "prompt": "checkpoint:reset / merge:first",
@@ -798,7 +795,7 @@ class TestRequestLifecyclePairwise(_DynamicInferenceEngineTestBase):
                 "remaining_prompt_length": len(request.remaining_prompt_tokens),
             }
             engine.suspend()
-            assert engine.resume_request_ids[:3] == [3, 1, 0]
+            assert engine.resume_request_ids == [3, 1, 0]
             assert len(engine.requests[target_id].record.requests) == 1
             engine.resume()
             resumed = engine.get_request(target_id)
