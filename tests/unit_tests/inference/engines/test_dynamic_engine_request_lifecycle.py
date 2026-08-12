@@ -1089,6 +1089,9 @@ class TestRequestLifecyclePairwise(_DynamicInferenceEngineTestBase):
         requests = [completed[request_id] for request_id in (companion_id, chunk_id)]
         if treatment:
             assert record_lengths == {companion_id: 2, chunk_id: 1}
+            assert all(
+                segment.generated_text is not None for segment in futures[0].result().requests
+            )
         return _RunResult(requests, record_lengths, runtime, witness)
 
     @classmethod
