@@ -924,6 +924,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 if req.finished_chunk_token_count > 0:
                     req.remaining_prompt_tokens = req.prompt_tokens
                     req.finished_chunk_token_count = 0
+                    # The restarted prefill recomputes these positions, so its
+                    # scores must replace rather than follow the partial scores.
+                    req.prompt_log_probs = None
+                    req.prompt_top_n_logprobs = None
 
             # Reset the chunked prefill request id
             self.chunked_prefill_request_id = -1
