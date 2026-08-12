@@ -341,7 +341,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.create_cuda_graphs()
 
     def reset(self) -> None:
-        """Reset per-run state after all requests have drained."""
+        """Reset per-run state; the caller must first drain all requests."""
 
         initialize_runtime_state = not hasattr(self, "_state_events")
         if not initialize_runtime_state and self.state not in (
