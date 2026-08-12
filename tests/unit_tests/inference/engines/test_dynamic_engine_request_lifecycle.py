@@ -52,8 +52,7 @@ from tests.unit_tests.inference.test_dynamic_prefix_caching_coordinator import (
 )
 from tests.unit_tests.test_utilities import Utils
 
-# Policy values document checkpoint/merge ownership and make new dataclass fields
-# fail the exhaustiveness test until they receive an explicit lifecycle decision.
+# New request fields require an explicit checkpoint/merge lifecycle decision.
 REQUEST_FIELD_POLICY = {
     "request_id": "checkpoint:preserve / merge:first",
     "prompt": "checkpoint:reset / merge:first",
