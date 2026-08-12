@@ -3184,17 +3184,13 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         prompt_length = 512
         num_tokens_to_generate = 4
 
-        # Create a deterministic mock forward pass that returns logits
-        # dependent ONLY on position_ids. This guarantees the same logits
-        # whether processed in one giant chunk or split across multiple chunks.
         def deterministic_mock_forward(input_ids, position_ids, attention_mask, *args, **kwargs):
             vocab_size = kwargs["vocab_size"]
-            # Use torch.linspace to generate varying but 100% deterministic logits per position
-            static_logits = torch.linspace(
-                -50, 50, 4096 * vocab_size, device=input_ids.device, dtype=torch.bfloat16
-            ).view(4096, vocab_size)
-
-            return static_logits[position_ids]
+            # Make selected logprobs strongly token-sensitive while remaining
+            # independent of chunk shape. The old bf16 linspace collapsed most
+            # within-row differences and could hide a wrong boundary token.
+            token_logits = torch.arange(vocab_size, device=input_ids.device, dtype=torch.float32)
+            return token_logits.expand(*position_ids.shape, vocab_size)
 
         def get_log_probs(chunked: bool, max_tokens: int):
             test_config = DynamicEngineTestConfig(
@@ -3219,9 +3215,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 deterministic_mock_forward, vocab_size=test_config.vocab_size
             )
 
-            # Ensure identical prompt tokens for both runs
-            torch.manual_seed(42)
-            req_tokens = torch.randint(0, test_config.vocab_size, (prompt_length,), device='cuda')
+            # Keep every known prompt target distinct from the argmax token.
+            req_tokens = torch.arange(prompt_length, device='cuda') % (test_config.vocab_size - 1)
             req = DynamicInferenceRequest(
                 request_id=1,
                 prompt_tokens=req_tokens,
