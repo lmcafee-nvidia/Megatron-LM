@@ -1087,6 +1087,12 @@ class TestRequestLifecyclePairwise(_DynamicInferenceEngineTestBase):
             pytest.fail("chunked companion eviction did not drain")
         _assert_engine_drained(engine, futures, completed, (companion_id, chunk_id))
         requests = [completed[request_id] for request_id in (companion_id, chunk_id)]
+        assert not requests[0].prompt_log_probs and not requests[0].prompt_top_n_logprobs
+        assert (
+            len(requests[0].generated_tokens)
+            == len(requests[0].generated_log_probs)
+            == len(requests[0].generated_top_n_logprobs)
+        )
         if treatment:
             assert record_lengths == {companion_id: 2, chunk_id: 1}
             assert all(
