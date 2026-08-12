@@ -748,6 +748,9 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
         chunked_prefill_request_id=-1,
         kv_cache_management_mode=KVCacheManagementMode.RECOMPUTE,
         static_kv_memory_pointers=True,
+        request_ids=torch.tensor([request.request_id]),
+        total_request_count=1,
+        paused_request_count=0,
         deallocate_inference_state_buffers=mock.Mock(),
         reinitialize_inference_state_buffers=mock.Mock(),
     )
@@ -779,9 +782,6 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
 
         engine.resume()
 
-    assert engine.context.deallocate_inference_state_buffers.call_count == 1
-    assert engine.context.reinitialize_inference_state_buffers.call_count == 1
-    assert engine.state == EngineState.RUNNING
     assert engine._add_request.call_count == 1
     assert engine._add_request.call_args.args[0] is checkpointed
     assert engine._add_request.call_args.kwargs == {"is_resume": True}

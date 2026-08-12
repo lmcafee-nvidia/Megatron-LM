@@ -251,7 +251,7 @@ _CHUNKED_RECOMPUTE = _AsyncPairScenario(
     pairs=("prefill:chunked", "kv:recompute", "api:coordinator"),
     config={
         "enable_chunked_prefill": True,
-        "context_max_tokens": 8,
+        "context_max_tokens": 16,
         "kv_cache_management_mode": "recompute",
         "static_kv_memory_pointers": False,
         "materialize_only_last_token_logits": False,
@@ -259,13 +259,15 @@ _CHUNKED_RECOMPUTE = _AsyncPairScenario(
     },
     sampling=(
         {
+            "temperature": 0.8,
+            "top_k": 8,
             "return_log_probs": True,
             "skip_prompt_log_probs": False,
             "top_n_logprobs": 3,
             "return_prompt_tokens": True,
         },
     ),
-    signals=("chunked", "logprobs", "top-n"),
+    signals=("chunked", "logprobs", "top-n", "sampled"),
 )
 
 _PERSIST_TE_SWA = _AsyncPairScenario(
@@ -796,7 +798,7 @@ class TestRequestLifecyclePairwise(_DynamicInferenceEngineTestBase):
                 "remaining_prompt_length": len(request.remaining_prompt_tokens),
             }
             engine.suspend()
-            assert engine.context.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE
+            assert engine.resume_request_ids[:3] == [3, 1, 0]
             assert len(engine.requests[target_id].record.requests) == 1
             engine.resume()
             resumed = engine.get_request(target_id)
@@ -881,9 +883,11 @@ class TestRequestLifecyclePairwise(_DynamicInferenceEngineTestBase):
         engine.controller.detokenize = lambda _tokenizer, tokens, **kwargs: detokenize(
             tokens, **kwargs
         )
-        requests = _make_scenario_requests(env, scenario)[:3]
+        requests = _make_scenario_requests(env, scenario)
+        request_idxs = (3, 1, 0) if scenario is _CHUNKED_RECOMPUTE else range(3)
+        requests = [requests[i] for i in request_idxs]
         env.requests = requests
-        target_id = requests[0].request_id
+        target_id = requests[-1 if scenario is _CHUNKED_RECOMPUTE else 0].request_id
         futures = [engine._add_request(request) for request in requests]
         runtime = Counter()
         _instrument_request_correlated_runtime(env, scenario, runtime)
