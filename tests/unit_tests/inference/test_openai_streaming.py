@@ -78,6 +78,7 @@ async def test_chat_completions_uses_generated_logprobs_only_when_requested():
             self.return_log_probs.append(sampling_params.return_log_probs)
             generated_log_probs = [-0.25, -0.5] if sampling_params.return_log_probs else None
             return {
+                "uid": "request-1",
                 "status": "COMPLETED",
                 "generated_text": "ab",
                 "prompt_length": 2,
