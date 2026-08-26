@@ -346,3 +346,42 @@ def test_dynamic_inference_request_serialize_prompt_length_absent():
 
     assert obj["prompt_length"] is None
     assert obj["prompt_tokens"] is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA prompt storage")
+def test_repeated_checkpoints_bound_reachable_cuda_prompt_storage():
+    """Only the original and active cumulative prompts remain reachable on CUDA."""
+    request = _make_dynamic_request(
+        prompt_tokens=torch.tensor([1, 2, 3, 4], device=torch.cuda.current_device()),
+        sampling_params=SamplingParams(
+            num_tokens_to_generate=8, termination_id=0, return_prompt_tokens=True
+        ),
+        generated_tokens=[5],
+    )
+    record = DynamicInferenceRequestRecord.from_request(request)
+    for next_token in (6, 7, 8):
+        record.checkpoint()
+        record[-1].generated_tokens = [next_token]
+
+    assert record[0].prompt_tokens.is_cuda
+    assert record[-1].prompt_tokens.is_cuda
+    assert all(segment.prompt_tokens.device.type == "cpu" for segment in record.requests[1:-1])
+    assert all(
+        segment.remaining_prompt_tokens.device.type == "cpu" for segment in record.requests[1:-1]
+    )
+
+    cuda_prompt_storages = {
+        tensor.untyped_storage().data_ptr(): tensor.untyped_storage().nbytes()
+        for segment in record.requests
+        for tensor in (segment.prompt_tokens, segment.remaining_prompt_tokens)
+        if tensor is not None and tensor.is_cuda
+    }
+    assert len(cuda_prompt_storages) == 2
+    assert sum(cuda_prompt_storages.values()) == (
+        record[0].prompt_tokens.untyped_storage().nbytes()
+        + record[-1].prompt_tokens.untyped_storage().nbytes()
+    )
+    serialized = msgpack.unpackb(msgpack.packb(record.merge().serialize()), raw=False)
+    round_trip = DynamicInferenceRequest.deserialize(serialized)
+    assert round_trip.prompt_tokens.tolist() == [1, 2, 3, 4]
+    assert round_trip.generated_tokens == [5, 6, 7, 8]
