@@ -2343,11 +2343,21 @@ class DynamicInferenceEngine(AbstractEngine):
                             request.prompt_tokens.tolist(),
                             remove_EOD=False,
                         )
-                    request.generated_text = self.controller.detokenize(
-                        self.controller.tokenizer,
-                        request.generated_tokens,
-                        remove_EOD=not request.sampling_params.detokenize_stop_sequence,
-                    )
+                merged_request = record.merge()
+                record.generated_text = self.controller.detokenize(
+                    self.controller.tokenizer,
+                    merged_request.generated_tokens,
+                    remove_EOD=not record.requests[-1].sampling_params.detokenize_stop_sequence,
+                )
+                if len(record.requests) == 1:
+                    record.requests[0].generated_text = record.generated_text
+                else:
+                    for request in record.requests:
+                        request.generated_text = self.controller.detokenize(
+                            self.controller.tokenizer,
+                            request.generated_tokens,
+                            remove_EOD=not request.sampling_params.detokenize_stop_sequence,
+                        )
             nvtx_range_pop("detokenization")
 
         # Handle necessary ZMQ DP coordinator communication.

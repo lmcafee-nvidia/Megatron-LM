@@ -619,6 +619,7 @@ class DynamicInferenceRequestRecord:
 
     requests: list[DynamicInferenceRequest] = field(default_factory=list)
     latency: Optional[float] = None
+    generated_text: Optional[str] = None
 
     @classmethod
     def from_request(cls, request: DynamicInferenceRequest) -> "DynamicInferenceRequestRecord":
@@ -737,10 +738,12 @@ class DynamicInferenceRequestRecord:
         if routing_parts:
             routing_indices = np.concatenate(routing_parts)
         generated_tokens = merge_lists("generated_tokens")
-        try:
-            generated_text = "".join(r.generated_text for r in self.requests)
-        except TypeError as e:  # generally means r.generated_text is None
-            generated_text = None
+        generated_text = self.generated_text
+        if generated_text is None:
+            try:
+                generated_text = "".join(r.generated_text for r in self.requests)
+            except TypeError:  # generally means r.generated_text is None
+                generated_text = None
 
         policy_epoch = self.requests[-1].policy_epoch
         kv_cache_epoch = self.requests[-1].kv_cache_epoch

@@ -738,6 +738,64 @@ def test_post_process_eviction_requeues_prefix_cached_request_with_fresh_hashes(
     _assert_prefix_cache_checkpoint(request, engine.get_request(request.request_id))
 
 
+def test_finished_checkpoint_text_is_decoded_from_the_complete_token_stream():
+    """Checkpoint boundaries must not change tokenizer-visible generated text."""
+    sampling_params = SamplingParams(num_tokens_to_generate=3, termination_id=-1)
+    first = DynamicInferenceRequest(
+        request_id=31,
+        prompt="first prompt",
+        prompt_tokens=torch.tensor([1, 2]),
+        sampling_params=sampling_params,
+        generated_tokens=[10, 11],
+    )
+    second = DynamicInferenceRequest(
+        request_id=31,
+        prompt="checkpoint prompt",
+        prompt_tokens=torch.tensor([1, 2, 10, 11]),
+        sampling_params=sampling_params,
+        generated_tokens=[12],
+    )
+    checkpointed = DynamicInferenceRequestRecord(requests=[first, second])
+    single_request = DynamicInferenceRequest(
+        request_id=32,
+        prompt="single prompt",
+        prompt_tokens=torch.tensor([3, 4]),
+        sampling_params=sampling_params,
+        generated_tokens=[20, 21],
+    )
+    single = DynamicInferenceRequestRecord.from_request(single_request)
+
+    def detokenize(_tokenizer, tokens, **_kwargs):
+        return f"<{','.join(str(token) for token in tokens)}>"
+
+    engine = types.SimpleNamespace(
+        use_coordinator=False,
+        failed_request_ids=[31, 32],
+        requests={
+            31: types.SimpleNamespace(
+                record=checkpointed, future=types.SimpleNamespace(done=lambda: True)
+            ),
+            32: types.SimpleNamespace(
+                record=single, future=types.SimpleNamespace(done=lambda: True)
+            ),
+        },
+        controller=types.SimpleNamespace(tokenizer=object(), detokenize=detokenize),
+        context=types.SimpleNamespace(enable_prefix_caching=False, step_count=0),
+        logging_step_interval=0,
+    )
+
+    result = asyncio.run(
+        DynamicInferenceEngine.async_bookkeep(engine, None, {"kv_stats": None}, 0.0)
+    )
+
+    assert result["finished_request_records"] == [checkpointed, single]
+    assert checkpointed.generated_text == "<10,11,12>"
+    assert checkpointed.merge().generated_text == "<10,11,12>"
+    assert [segment.generated_text for segment in checkpointed.requests] == ["<10,11>", "<12>"]
+    assert single.generated_text == "<20,21>"
+    assert single_request.generated_text == "<20,21>"
+
+
 def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes():
     """RECOMPUTE suspend/resume must re-add the prefix-enabled checkpoint tail."""
     request = _make_prefix_cached_request_for_checkpoint(request_id=23)
