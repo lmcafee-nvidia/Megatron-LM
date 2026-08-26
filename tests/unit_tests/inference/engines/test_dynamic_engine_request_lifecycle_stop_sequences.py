@@ -7,10 +7,13 @@ from collections import Counter
 import pytest
 import torch
 
+from megatron.core.inference.inference_request import DynamicInferenceEventType
 from megatron.core.utils import is_fa_min_version
 from tests.unit_tests.inference.engines.request_lifecycle_test_utils import (
     RequestLifecyclePairwiseBase,
+    _active_request_row,
     _allocate_leaving,
+    _assert_engine_drained,
     _collect_finished,
     _event_count,
     _install_incrementing_logits,
