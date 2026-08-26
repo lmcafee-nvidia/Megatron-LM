@@ -74,10 +74,13 @@ Planned new features:
 
 - **`MegatronAsyncLLM` requires `use_coordinator=True`** -- constructing with `use_coordinator=False` raises `ValueError` at `__init__`. The underlying `DynamicInferenceEngine` caches its loop reference at construction time and binds internal asyncio primitives (`_cond`, `_state_events`) to it. Coordinator mode rebinds those to a dedicated daemon-thread loop via `start_listening_to_data_parallel_coordinator`; direct mode has no such rebinding, so the synchronous `engine.generate()` path collides with the caller's running asyncio loop and raises `RuntimeError: This event loop is already running`. Use `MegatronLLM` for sync direct/coordinator workflows. Tracked for an upstream `engine.async_generate(...)` (or engine loop-rebinding) fix that would let `MegatronAsyncLLM` support direct mode.
 
-- **`llm.engine.reset()` is unsafe in coordinator mode.** Two failure modes, both upstream in `dynamic_engine.py`:
-  - *Deadlock*: `reset()` *rebinds* (does not mutate in-place) `_cond` / `_state_events`. Any coroutine on the engine-loop task that is `await`ing one of those primitives holds a reference to the OLD object in its suspended frame. Subsequent `notify_all()` / `set()` calls hit the NEW objects, leaving the suspended waiter stranded; the next `generate()` hangs.
-  - *Silent corruption*: `reset()` also sets `self.use_coordinator = False`, which silently re-routes failed-request handling, scheduling notification, and `suspend()`'s state machine to direct-mode branches. Outcome: not-a-hang but wrong behavior, harder to diagnose.
-  - The example `offline_inference.py` blocks `--inference-repeat-n > 1` with `--use-coordinator` for these reasons. Direct-mode reset is safe.
+- **High-level coordinator reset is not synchronized.** `engine.reset()` preserves the
+  coordinator's long-lived loop objects and mode when the engine is drained and
+  internally quiescent. The high-level coordinator API does not yet provide a handoff
+  proving its background engine loop has finished bookkeeping after the final reply,
+  however, so an immediate reset can still race that loop. `offline_inference.py`
+  therefore blocks `--inference-repeat-n > 1` with `--use-coordinator`. Direct-mode
+  reset is safe.
 
 - **HTTP frontend is fixed to global rank 0.** There is no per-rank `role` override on `ServeConfig` to host the HTTP server on a non-rank-0 rank or to opt a rank out of HTTP. Control placement via the launcher (e.g., torchrun rank-0 placement), mirroring how vLLM's `--headless` is invoked today.
 
