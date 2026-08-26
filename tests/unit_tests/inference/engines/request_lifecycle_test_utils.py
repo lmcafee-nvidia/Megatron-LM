@@ -558,7 +558,7 @@ class RequestLifecyclePairwiseBase(_DynamicInferenceEngineTestBase):
             assert (
                 engine.context.unified_memory_level == 1
             ), "the designated UVM owner must use managed allocation"
-        detokenize = lambda tokens, **_kwargs: f"<{','.join(str(token) for token in tokens)}>"
+        detokenize = lambda tokens, **_kwargs: "".join(f"<{token}>" for token in tokens)
         engine.controller.tokenizer.detokenize = detokenize
         engine.controller.detokenize = lambda _tokenizer, tokens, **kwargs: detokenize(
             tokens, **kwargs
