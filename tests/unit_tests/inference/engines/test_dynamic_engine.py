@@ -782,6 +782,94 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
     assert engine._add_request.call_args.args[0] is checkpointed
 
 
+def _make_resolved_record_future(loop, request_id: int, status: Status):
+    request = DynamicInferenceRequest(
+        request_id=request_id,
+        prompt_tokens=torch.tensor([1, 2]),
+        sampling_params=SamplingParams(num_tokens_to_generate=1),
+        status=status,
+    )
+    record = DynamicInferenceRequestRecord.from_request(request)
+    future = loop.create_future()
+    future.set_result(record)
+    return record, future
+
+
+def test_generate_collects_own_invalid_batch_without_model_step():
+    """A synchronous all-invalid call returns its failures without taking unrelated ones."""
+    loop = asyncio.new_event_loop()
+    try:
+        engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+        engine.request_counter = iter(range(10))
+        engine.requests = {}
+        engine.failed_request_ids = []
+        engine.step_modern = mock.Mock()
+
+        unrelated_record, unrelated_future = _make_resolved_record_future(loop, 9, Status.FAILED)
+        engine.requests[9] = types.SimpleNamespace(record=unrelated_record, future=unrelated_future)
+        engine.failed_request_ids.append(9)
+
+        def reject_request(request_id, _prompt, _sampling_params):
+            record, future = _make_resolved_record_future(loop, request_id, Status.FAILED)
+            engine.requests[request_id] = types.SimpleNamespace(record=record, future=future)
+            engine.failed_request_ids.append(request_id)
+            return future
+
+        engine.add_request = mock.Mock(side_effect=reject_request)
+
+        results = engine.generate(["bad-a", "bad-b"], SamplingParams())
+
+        assert [record.request_id for record in results] == [0, 1]
+        assert all(record[-1].status == Status.FAILED for record in results)
+        engine.step_modern.assert_not_called()
+        assert engine.failed_request_ids == [9]
+        assert set(engine.requests) == {9}
+    finally:
+        loop.close()
+
+
+def test_generate_mixed_batch_waits_only_for_its_pending_future():
+    """Mixed admission returns failed and completed records without an extra empty step."""
+    loop = asyncio.new_event_loop()
+    try:
+        engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+        engine.request_counter = iter(range(10))
+        engine.requests = {}
+        engine.failed_request_ids = []
+        pending_future = None
+
+        def add_request(request_id, _prompt, _sampling_params):
+            nonlocal pending_future
+            status = Status.FAILED if request_id == 0 else Status.ACTIVE_AND_GENERATING_TOKENS
+            record, future = _make_resolved_record_future(loop, request_id, status)
+            if request_id == 1:
+                pending_future = loop.create_future()
+                future = pending_future
+            engine.requests[request_id] = types.SimpleNamespace(record=record, future=future)
+            if request_id == 0:
+                engine.failed_request_ids.append(request_id)
+            return future
+
+        def finish_pending_request():
+            entry = engine.requests.pop(1)
+            entry.record[-1].status = Status.COMPLETED
+            pending_future.set_result(entry.record)
+            return {"finished_request_records": [entry.record]}
+
+        engine.add_request = mock.Mock(side_effect=add_request)
+        engine.step_modern = mock.Mock(side_effect=finish_pending_request)
+
+        results = engine.generate(["bad", "good"], SamplingParams())
+
+        assert [record.request_id for record in results] == [0, 1]
+        assert [record[-1].status for record in results] == [Status.FAILED, Status.COMPLETED]
+        engine.step_modern.assert_called_once_with()
+        assert engine.failed_request_ids == []
+        assert engine.requests == {}
+    finally:
+        loop.close()
+
+
 def test_streaming_partials_are_sent():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine._partial_emit_lengths = {}

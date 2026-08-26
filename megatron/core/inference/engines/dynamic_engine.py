@@ -1051,6 +1051,31 @@ class DynamicInferenceEngine(AbstractEngine):
                 request.generated_text = ""
         request_entry.future.set_result(request_entry.record)
 
+    def _collect_failed_request_records(
+        self, request_ids: Optional[set[int]] = None
+    ) -> List[DynamicInferenceRequestRecord]:
+        """Remove and return a snapshot of synchronously failed requests.
+
+        Args:
+            request_ids: Optional ownership filter. Failed requests outside this
+                set remain queued for their caller.
+
+        Returns:
+            Failed request records selected from the current queue snapshot.
+        """
+        failed_request_ids, self.failed_request_ids = self.failed_request_ids, []
+        failed_request_records = []
+        for failed_request_id in failed_request_ids:
+            if request_ids is not None and failed_request_id not in request_ids:
+                self.failed_request_ids.append(failed_request_id)
+                continue
+            failed_entry = self.requests.pop(failed_request_id)
+            failed_request_records.append(failed_entry.record)
+            assert (
+                failed_entry.future.done()
+            ), f"Failed request {failed_request_id} future has not been properly resolved."
+        return failed_request_records
+
     def has_unfinished_requests(self) -> bool:
         """Test if context contains unfinished requests."""
         return self.context.has_unfinished_requests() or len(self.waiting_request_ids) > 0
@@ -2318,15 +2343,9 @@ class DynamicInferenceEngine(AbstractEngine):
             active_request_ids: list[int] = []
             finished_request_records: list[DynamicInferenceRequestRecord] = []
 
-        # Failed requests. Status and events were already set in _handle_failed_request;
-        # here we just clean up the entry and include it in finished_request_records.
-        for failed_request_id in self.failed_request_ids:
-            failed_entry = self.requests.pop(failed_request_id)
-            finished_request_records.append(failed_entry.record)
-            assert (
-                failed_entry.future.done()
-            ), f"Failed request {failed_request_id} future has not been properly resolved."
-        self.failed_request_ids.clear()
+        # Failed requests. Take the current queue snapshot so a later admission
+        # cannot be erased by this bookkeeping pass.
+        finished_request_records.extend(self._collect_failed_request_records())
 
         nvtx_range_pop("bookkeeping")
 
@@ -2625,14 +2644,21 @@ class DynamicInferenceEngine(AbstractEngine):
     ) -> List[DynamicInferenceRequest]:
         """Generates completions for a static list of prompts."""
 
+        request_futures = []
+        submitted_request_ids = set()
         for prompt in prompts:
             request_id = int(next(self.request_counter))
-            _ = self.add_request(request_id, prompt, sampling_params)
+            submitted_request_ids.add(request_id)
+            request_futures.append(self.add_request(request_id, prompt, sampling_params))
 
-        finished_request_records_list = []
-        while self.has_unfinished_requests():
-            result = self.step_modern()
-            finished_request_records_list.extend(result["finished_request_records"])
+        # Admission failures resolve their futures synchronously. Remove only
+        # this call's failed entries, and do not run an empty model step solely
+        # to make bookkeeping observe them.
+        self._collect_failed_request_records(submitted_request_ids)
+        while any(not future.done() for future in request_futures):
+            self.step_modern()
+
+        finished_request_records_list = [future.result() for future in request_futures]
 
         # Ensure requests are returned in the same order they were passed in.
         finished_request_records_list.sort(key=lambda r: r.request_id)
