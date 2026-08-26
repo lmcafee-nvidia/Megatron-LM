@@ -2623,7 +2623,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.context.kv_block_allocator.invalidate_prefix_cache()
         if self.context.mamba_slot_allocator is not None:
-            self.context.mamba_slot_allocator.invalidate_cache()
+            self.context.mamba_slot_allocator.invalidate_prefix_cache()
         self.context.dynamo_helper.notify_kv_cache_cleared()
         self._generation_epoch = generation_epoch
 

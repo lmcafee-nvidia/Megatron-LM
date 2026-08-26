@@ -699,7 +699,7 @@ class MambaSlotAllocator:
     # Reset
     # =========================================================================
 
-    def invalidate_cache(self) -> None:
+    def invalidate_prefix_cache(self) -> None:
         """Discard durable and pending prefix state without touching GPU storage."""
         self.block_to_slot.fill_(-1)
         self.slot_to_block.fill_(-1)
@@ -714,6 +714,6 @@ class MambaSlotAllocator:
 
     def reset(self) -> None:
         """Reset all state (mappings, free pool, cache, intermediate tracking)."""
-        self.invalidate_cache()
+        self.invalidate_prefix_cache()
         self.intermediate_ssm_out.zero_()
         self.intermediate_conv_out.zero_()
