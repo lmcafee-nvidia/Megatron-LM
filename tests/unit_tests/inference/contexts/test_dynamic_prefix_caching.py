@@ -2621,15 +2621,16 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         )
 
     @classmethod
-    def _run_prompt_logprob_request(cls, engine, request_id, prompt, top_n, pre_schedule=False):
+    def _run_prompt_logprob_request(cls, engine, request_id, prompt, top_n, expect_uncached=False):
         request = cls._make_prompt_logprob_request(engine, request_id, prompt, top_n)
         computed_before = engine.context.lifetime_prefill_token_count
         engine._add_request(request)
-        if pre_schedule:
-            engine.schedule_chunked_prefill()
-            assert request._prompt_logprobs_force_uncached
+        check_uncached = expect_uncached
         for _ in range(32):
             result = engine.step_modern()
+            if check_uncached:
+                assert request._prompt_logprobs_force_uncached
+                check_uncached = False
             for record in result["finished_request_records"]:
                 output = record.merge()
                 if output.request_id == request_id:
@@ -2748,7 +2749,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             filler_count = allocator.get_allocatable_count() - 3
             filler = allocator.allocate_memory_blocks(filler_count).clone()
             assert filler is not None and allocator.get_allocatable_count() == 3
-            pressure, pressure_cost, _ = run(engine, 13, prompt, 4, pre_schedule=True)
+            pressure, pressure_cost, _ = run(engine, 13, prompt, 4, expect_uncached=True)
             self._assert_prompt_logprob_parity(pressure, oracle_top4)
             assert (pressure.num_cached_tokens, pressure_cost) == (0, prompt_length)
             allocator.release_memory_blocks(filler)
