@@ -2757,7 +2757,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             # Leave exactly three allocatable blocks: enough for a private
             # full prefill, but not enough to pin two matches plus shadows.
             filler_count = allocator.get_allocatable_count() - 3
-            filler = allocator.allocate_memory_blocks(filler_count)
+            filler = allocator.allocate_memory_blocks(filler_count).clone()
             assert filler is not None and allocator.get_allocatable_count() == 3
             engine.context.max_tokens = prompt_length
             pressure, pressure_cost = self._run_prompt_logprob_request(
