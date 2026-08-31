@@ -2696,11 +2696,13 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             cache_config = self._case_config(case, enable_prefix_caching=True)
             cache_config.materialize_only_last_token_logits = False
             cache_config.enable_chunked_prefill = True
+            cache_config.context_max_tokens = cache_config.context_block_size_tokens + 8
             cache_env = self._build_test_env(cache_config)
             engine = cache_env.engine
             engine.controller.tokenizer.detokenize = lambda tokens, **_: f"tok_{tokens[0]}"
             donor, donor_cost = self._run_prompt_logprob_request(engine, 10, prompt, 5)
             assert donor_cost == prompt_length
+            assert sum(event.type.name == "ADD_CONTEXT" for event in donor.events) > 1
             self._assert_prompt_logprob_parity(donor, oracle_top5)
             allocator = engine.context.kv_block_allocator
             sidecars = sorted(
