@@ -2545,6 +2545,21 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         else:
             assert value == pytest.approx(expected, rel=rel, abs=abs)
 
+    @classmethod
+    def _assert_top_n_logprobs_close(cls, actual, expected):
+        """Compare ranked values while permitting equal-score cutoff substitutions."""
+        assert len(actual) == len(expected)
+        actual_ranked = sorted(actual.values(), reverse=True)
+        expected_ranked = sorted(expected.values(), reverse=True)
+        np.testing.assert_allclose(actual_ranked, expected_ranked, rtol=2e-2, atol=5e-2)
+        actual_keys, expected_keys = set(actual), set(expected)
+        for key in actual_keys & expected_keys:
+            cls._assert_scalar_logprob_close(actual[key], expected[key])
+        for key in actual_keys - expected_keys:
+            cls._assert_scalar_logprob_close(actual[key], expected_ranked[-1])
+        for key in expected_keys - actual_keys:
+            cls._assert_scalar_logprob_close(expected[key], actual_ranked[-1])
+
     @staticmethod
     def _assert_logprob_parity(cached_request, baseline_request):
         """Check generated and top-N logprobs against the cache-off run."""
@@ -2572,13 +2587,9 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             baseline_top_n,
         ):
             assert 0 < len(cached_values) <= 5
-            assert len(cached_values) == len(baseline_values)
-            cached_keys = set(cached_values)
-            baseline_keys = set(baseline_values)
-            for key in cached_keys & baseline_keys:
-                TestPrefixCacheRealEngineMatrix._assert_scalar_logprob_close(
-                    cached_values[key], baseline_values[key]
-                )
+            TestPrefixCacheRealEngineMatrix._assert_top_n_logprobs_close(
+                cached_values, baseline_values
+            )
             token_key = f"tok_{token}"
             assert token_key in cached_values
             assert token_key in baseline_values
@@ -2588,21 +2599,6 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             TestPrefixCacheRealEngineMatrix._assert_scalar_logprob_close(
                 baseline_values[token_key], baseline_logprob, abs=0.1
             )
-
-            cached_ranked = sorted(cached_values.values(), reverse=True)
-            baseline_ranked = sorted(baseline_values.values(), reverse=True)
-            np.testing.assert_allclose(cached_ranked, baseline_ranked, rtol=2e-2, atol=5e-2)
-            if cached_keys != baseline_keys:
-                cached_cutoff = cached_ranked[-1]
-                baseline_cutoff = baseline_ranked[-1]
-                for key in cached_keys - baseline_keys:
-                    TestPrefixCacheRealEngineMatrix._assert_scalar_logprob_close(
-                        cached_values[key], baseline_cutoff
-                    )
-                for key in baseline_keys - cached_keys:
-                    TestPrefixCacheRealEngineMatrix._assert_scalar_logprob_close(
-                        baseline_values[key], cached_cutoff
-                    )
 
         assert not cached_request.prompt_log_probs
         assert not cached_request.prompt_top_n_logprobs
@@ -2655,9 +2651,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             assert actual_rows is not None and expected_rows is not None
             assert len(actual_rows) == len(expected_rows)
             for actual_row, expected_row in zip(actual_rows, expected_rows):
-                assert set(actual_row) == set(expected_row)
-                for token in actual_row:
-                    cls._assert_scalar_logprob_close(actual_row[token], expected_row[token])
+                cls._assert_top_n_logprobs_close(actual_row, expected_row)
 
     @pytest.mark.internal
     @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
