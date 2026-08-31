@@ -2608,6 +2608,173 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         assert not cached_request.prompt_top_n_logprobs
 
     @staticmethod
+    def _make_prompt_logprob_request(engine, request_id, prompt, top_n):
+        return DynamicInferenceRequest(
+            request_id=request_id,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(
+                num_tokens_to_generate=4,
+                termination_id=-1,
+                return_log_probs=True,
+                skip_prompt_log_probs=False,
+                top_n_logprobs=top_n,
+                top_k=1,
+            ),
+            block_size_tokens=engine.context.block_size_tokens,
+            enable_prefix_caching=engine.context.enable_prefix_caching,
+        )
+
+    @classmethod
+    def _run_prompt_logprob_request(cls, engine, request_id, prompt, top_n, pre_schedule=False):
+        """Run one prompt-score request and return its prefill-token cost."""
+        request = cls._make_prompt_logprob_request(engine, request_id, prompt, top_n)
+        computed_before = engine.context.lifetime_prefill_token_count
+        engine._add_request(request)
+        if pre_schedule:
+            engine.schedule_chunked_prefill()
+            assert request._prompt_logprobs_force_uncached
+        for _ in range(32):
+            result = engine.step_modern()
+            for record in result["finished_request_records"]:
+                output = record.merge()
+                if output.request_id == request_id:
+                    return output, engine.context.lifetime_prefill_token_count - computed_before
+        pytest.fail(f"prompt-logprob request {request_id} did not finish")
+
+    @classmethod
+    def _assert_prompt_logprob_parity(cls, actual, expected):
+        """Compare the complete selected and top-N prompt/decode result."""
+        assert actual.generated_tokens == expected.generated_tokens
+        assert actual.generated_text == expected.generated_text
+        for field in ("prompt_log_probs", "generated_log_probs"):
+            actual_values, expected_values = getattr(actual, field), getattr(expected, field)
+            assert actual_values is not None and expected_values is not None
+            np.testing.assert_allclose(actual_values, expected_values, rtol=2e-2, atol=5e-2)
+        for field in ("prompt_top_n_logprobs", "generated_top_n_logprobs"):
+            actual_rows, expected_rows = getattr(actual, field), getattr(expected, field)
+            assert actual_rows is not None and expected_rows is not None
+            assert len(actual_rows) == len(expected_rows)
+            for actual_row, expected_row in zip(actual_rows, expected_rows):
+                assert set(actual_row) == set(expected_row)
+                for token in actual_row:
+                    cls._assert_scalar_logprob_close(actual_row[token], expected_row[token])
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
+    @torch.inference_mode()
+    def test_prompt_logprob_sidecar_reuse(self, model_provider):
+        """Reuse only an exact prompt-score sidecar and recompute a key mismatch."""
+        if model_provider == "hybrid":
+            available, reason = _check_mamba_sequence_packing_support()
+            if not available:
+                pytest.skip(reason)
+        Utils.initialize_model_parallel()
+        self._clear_engine_runtime()
+        try:
+            case = {
+                "name": f"{model_provider}-prompt-logprob-sidecar",
+                "feature": "mamba" if model_provider == "hybrid" else "base",
+                "model_provider": model_provider,
+                "policy": PrefixCachingEvictionPolicy.LRU,
+            }
+            prompt_length = 2 * 256 + 1
+            prompt = torch.arange(prompt_length, device=torch.cuda.current_device()) % 99
+
+            oracle_config = self._case_config(case, enable_prefix_caching=False)
+            oracle_config.materialize_only_last_token_logits = False
+            oracle_env = self._build_test_env(oracle_config)
+            oracle_env.engine.controller.tokenizer.detokenize = (
+                lambda tokens, **_: f"tok_{tokens[0]}"
+            )
+            oracle_top5, oracle_cost = self._run_prompt_logprob_request(
+                oracle_env.engine, 0, prompt, 5
+            )
+            oracle_top4, oracle_top4_cost = self._run_prompt_logprob_request(
+                oracle_env.engine, 1, prompt, 4
+            )
+            assert oracle_cost == oracle_top4_cost == prompt_length
+            del oracle_env
+            self._clear_engine_runtime()
+
+            cache_config = self._case_config(case, enable_prefix_caching=True)
+            cache_config.materialize_only_last_token_logits = False
+            cache_config.enable_chunked_prefill = True
+            cache_env = self._build_test_env(cache_config)
+            engine = cache_env.engine
+            engine.controller.tokenizer.detokenize = lambda tokens, **_: f"tok_{tokens[0]}"
+            donor, donor_cost = self._run_prompt_logprob_request(engine, 10, prompt, 5)
+            assert donor_cost == prompt_length
+            self._assert_prompt_logprob_parity(donor, oracle_top5)
+
+            allocator = engine.context.kv_block_allocator
+            sidecars = sorted(
+                allocator.block_prompt_logprobs.values(),
+                key=lambda sidecar: sidecar.logical_block_index,
+            )
+            assert len(sidecars) == 2 and all(sidecar.reusable for sidecar in sidecars)
+            np.testing.assert_array_equal(sidecars[0].target_positions, np.arange(1, 256))
+            np.testing.assert_array_equal(sidecars[1].target_positions, np.arange(256))
+            assert [sidecar.top_n_logprobs.shape for sidecar in sidecars] == [(255, 5), (256, 5)]
+            assert all(
+                not array.flags.writeable
+                for sidecar in sidecars
+                for array in (
+                    sidecar.target_positions,
+                    sidecar.selected_logprobs,
+                    sidecar.top_n_logprobs,
+                    sidecar.top_n_token_ids,
+                )
+            )
+
+            exact, exact_cost = self._run_prompt_logprob_request(engine, 11, prompt, 5)
+            self._assert_prompt_logprob_parity(exact, oracle_top5)
+            assert exact.num_cached_tokens == 512
+            assert exact_cost == (2 if model_provider == "gpt" else 257)
+
+            mismatch, mismatch_cost = self._run_prompt_logprob_request(engine, 12, prompt, 4)
+            self._assert_prompt_logprob_parity(mismatch, oracle_top4)
+            assert mismatch.num_cached_tokens == 0
+            assert mismatch_cost == prompt_length
+
+            # The mismatch is admitted first, then overwrites the allocator
+            # mapping before the exact request captures its retained top-4 refs.
+            concurrent = [
+                self._make_prompt_logprob_request(engine, 20, prompt, 5),
+                self._make_prompt_logprob_request(engine, 21, prompt, 4),
+            ]
+            for request in concurrent:
+                engine._add_request(request)
+            outputs = {}
+            for _ in range(32):
+                for record in engine.step_modern()["finished_request_records"]:
+                    output = record.merge()
+                    outputs[output.request_id] = output
+                if outputs.keys() >= {20, 21}:
+                    break
+            self._assert_prompt_logprob_parity(outputs[20], oracle_top5)
+            self._assert_prompt_logprob_parity(outputs[21], oracle_top4)
+
+            # Leave exactly three allocatable blocks: enough for a private
+            # full prefill, but not enough to pin two matches plus shadows.
+            filler_count = allocator.get_allocatable_count() - 3
+            filler = allocator.allocate_memory_blocks(filler_count)
+            assert filler is not None and allocator.get_allocatable_count() == 3
+            engine.context.max_tokens = prompt_length
+            pressure, pressure_cost = self._run_prompt_logprob_request(
+                engine, 13, prompt, 4, pre_schedule=True
+            )
+            self._assert_prompt_logprob_parity(pressure, oracle_top4)
+            assert pressure.num_cached_tokens == 0
+            assert pressure_cost == prompt_length
+            allocator.release_memory_blocks(filler)
+        finally:
+            DynamicInferenceContext.ROUNDER = 64
+            DynamicInferenceContext.TOKEN_ROUNDER = 64
+            DynamicInferenceContext.REQUEST_ROUNDER = 64
+            Utils.destroy_model_parallel()
+            self._clear_engine_runtime()
+
+    @staticmethod
     def _clear_engine_runtime():
         """Release per-row model and inference allocations before rebuilding."""
         torch.cuda.synchronize()

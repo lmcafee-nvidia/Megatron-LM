@@ -859,6 +859,26 @@ class TextGenerationController:
         else:
             self._all_logits_cuda = logits
 
+        # Prompt-logprob cache misses are recomputed in private shadow blocks.
+        # Publish the canonical block table again before any Mamba state, routing,
+        # or prompt-logprob sidecar is committed from this forward.
+        context.finalize_prompt_logprob_shadows()
+
+    def _replace_partial_prefill_sample_with_prompt_token(self) -> None:
+        """Use the known next prompt token for a partial chunk's selected logprob."""
+        context = self.inference_wrapped_model.inference_context
+        if context.chunked_prefill_request_id == -1:
+            return
+
+        context_idx = context.get_index_of_chunked_prefill_request(safe=True)
+        if context_idx == -1:
+            return
+        active_idx = context_idx - context.paused_request_count
+        active_request_count = context.total_request_count - context.paused_request_count
+        assert 0 <= active_idx < active_request_count
+        assert active_idx == active_request_count - 1
+        self._sampled_tokens_cuda[active_idx].copy_(context.chunked_prefill_next_prompt_token)
+
     def _rewind_kv_cache(self, accepted_counts_cpu: Optional[Tensor] = None) -> tuple:
         """Update the KV cache bookkeeping for speculative decoding.
 
@@ -1705,6 +1725,150 @@ class TextGenerationController:
 
         return top_n_results if top_n_results else None
 
+    def _store_prompt_logprob_sidecars(
+        self,
+        log_probs: Optional[List[List[float]]],
+        top_n_logprobs: Optional[Dict[int, List[Tuple[Tensor, Tensor]]]],
+    ) -> Dict[int, Dict[str, Any]]:
+        """Store prefill scores beside their target KV blocks before bookkeeping.
+
+        The returned mapping carries only strong references and explicit prompt
+        row counts. The engine uses it after context bookkeeping to keep those
+        sidecars alive and to append only generated-token rows to request fields.
+        """
+        if not log_probs:
+            return {}
+
+        context = self.inference_wrapped_model.inference_context
+        allocator = context.kv_block_allocator
+        active_slice = slice(context.paused_request_count, context.total_request_count)
+        query_lengths = context.request_query_lengths[active_slice].tolist()
+        source_positions = context.token_to_position_in_request[: context.active_token_count].split(
+            query_lengths
+        )
+        request_ids = context.request_ids[active_slice].tolist()
+        prefill_status = context.request_in_prefill_status_tensor[active_slice].tolist()
+        updates: Dict[int, Dict[str, Any]] = {}
+        block_size = context.block_size_tokens
+
+        for active_idx, (request_id, is_prefill, positions, request_log_probs) in enumerate(
+            zip(request_ids, prefill_status, source_positions, log_probs)
+        ):
+            key = context.prompt_logprobs_cache_keys.get(request_id)
+            if not is_prefill or key is None:
+                continue
+
+            prompt_row_count = (
+                len(request_log_probs)
+                if request_id == context.chunked_prefill_request_id
+                else max(len(request_log_probs) - 1, 0)
+            )
+            prompt_positions = positions[:prompt_row_count].cpu().numpy().astype(np.int64) + 1
+            selected = np.asarray(request_log_probs[:prompt_row_count], dtype=np.float32)
+
+            if key.top_n > 0 and prompt_row_count > 0:
+                if top_n_logprobs is None or active_idx not in top_n_logprobs:
+                    raise RuntimeError(
+                        f"missing top-{key.top_n} prompt logprobs for request {request_id}"
+                    )
+                prompt_top_n = top_n_logprobs[active_idx][:prompt_row_count]
+                top_values = np.stack([values.cpu().numpy() for values, _ in prompt_top_n]).astype(
+                    np.float32, copy=False
+                )
+                top_ids = np.stack(
+                    [token_ids.cpu().numpy() for _, token_ids in prompt_top_n]
+                ).astype(np.int32, copy=False)
+            else:
+                top_values = None
+                top_ids = None
+
+            request_block_ids = context.request_to_kv_block_ids[
+                context.paused_request_count + active_idx
+            ]
+            valid_block_ids = request_block_ids[request_block_ids >= 0].tolist()
+            block_hashes = context.prompt_logprobs_block_hashes.get(request_id, ())
+            block_refs = dict(context.prompt_logprobs_matched_refs.get(request_id, {}))
+
+            for logical_block_index in np.unique(prompt_positions // block_size):
+                logical_block_index = int(logical_block_index)
+                if logical_block_index in block_refs:
+                    # This exact immutable sidecar was retained at admission.
+                    # A Mamba backoff may recompute its rows, but replacing it
+                    # would make concurrent semantic variants order-dependent.
+                    continue
+                row_mask = prompt_positions // block_size == logical_block_index
+                local_positions = (prompt_positions[row_mask] % block_size).astype(np.int32)
+                block_id = (
+                    valid_block_ids[logical_block_index]
+                    if logical_block_index < len(valid_block_ids)
+                    else None
+                )
+                expected_hash = (
+                    block_hashes[logical_block_index]
+                    if logical_block_index < len(block_hashes)
+                    else None
+                )
+                block_ref = allocator.store_prompt_logprobs(
+                    request_id=request_id,
+                    logical_block_index=logical_block_index,
+                    block_id=block_id,
+                    key=key,
+                    target_positions=local_positions,
+                    selected_logprobs=selected[row_mask],
+                    top_n_logprobs=top_values[row_mask] if top_values is not None else None,
+                    top_n_token_ids=top_ids[row_mask] if top_ids is not None else None,
+                    expected_block_hash=expected_hash,
+                )
+
+                # A row ending at the block boundary completes this compact
+                # sidecar. Publish it immediately when the KV hash is durable.
+                if (
+                    block_id is not None
+                    and expected_hash is not None
+                    and int(allocator.block_hashes[block_id]) == int(expected_hash)
+                    and local_positions.size
+                    and int(local_positions.max()) == block_size - 1
+                ):
+                    required = np.arange(
+                        1 if logical_block_index == 0 else 0, block_size, dtype=np.int32
+                    )
+                    block_ref = allocator.seal_prompt_logprobs_block(
+                        block_id, key, expected_hash, required, reusable=True
+                    )
+                block_refs[logical_block_index] = block_ref
+
+            final_prefill = request_id != context.chunked_prefill_request_id
+            if final_prefill:
+                prompt_token_count = int(positions[-1]) + 1
+                if prompt_token_count > 1:
+                    expected_hashes = [
+                        block_hashes[index] if index < len(block_hashes) else None
+                        for index in range((prompt_token_count + block_size - 1) // block_size)
+                    ]
+                    captured = allocator.capture_prompt_logprobs_for_request(
+                        request_id,
+                        valid_block_ids,
+                        key,
+                        prompt_token_count,
+                        expected_hashes,
+                        retained_refs=context.prompt_logprobs_matched_refs.get(request_id),
+                    )
+                    block_refs = {index: ref for index, ref in enumerate(captured)}
+
+            updates[request_id] = {
+                "blocks": block_refs,
+                "prompt_row_count": prompt_row_count,
+                "complete": final_prefill,
+            }
+            if final_prefill:
+                # Decode and later checkpoint segments must not keep collecting
+                # rows under this request ID. The engine owns the captured refs.
+                context.prompt_logprobs_cache_keys.pop(request_id, None)
+                context.prompt_logprobs_block_hashes.pop(request_id, None)
+                context.prompt_logprobs_matched_refs.pop(request_id, None)
+
+        return updates
+
     def _run_dummy_base_forward(self, input_ids: Tensor, position_ids: Tensor) -> None:
         """Run the base-model portion of an expert-parallel dummy step.
 
@@ -2202,6 +2366,7 @@ class TextGenerationController:
 
         range_push("sampling")
         self._dynamic_step_sample_logits()
+        self._replace_partial_prefill_sample_with_prompt_token()
         sampled_tokens_gpu = self._sampled_tokens_cuda[:active_request_count]
         if sampled_tokens_gpu.is_cuda:
             self._async_sched_sample_gpu_ready_event.record(
@@ -2254,6 +2419,7 @@ class TextGenerationController:
             torch.int64
         )
         self._compute_serial_mtp_and_sample(base_position=base_position)
+        self._replace_partial_prefill_sample_with_prompt_token()
         sampled_tokens_gpu = self._sampled_tokens_cuda[:active_request_count]
         sampled_mtp_tokens_gpu = self._sampled_mtp_tokens_cuda[:, :active_request_count]
         accepted_tokens_gpu = (
@@ -2752,6 +2918,7 @@ class TextGenerationController:
         decode_only: DecodeOnly,
         log_probs: Optional[List[List[float]]],
         top_n_logprobs: Optional[Dict[int, List[Tuple[Tensor, Tensor]]]],
+        prompt_logprob_updates: Optional[Dict[int, Dict[str, Any]]] = None,
         *,
         count_compaction: bool,
     ) -> DynamicBatchControllerStepResult:
@@ -2767,6 +2934,8 @@ class TextGenerationController:
                 grouped by active request.
             top_n_logprobs (Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]): Top-n
                 log probabilities and token IDs grouped by active request.
+            prompt_logprob_updates: Prompt sidecar references captured before
+                request lifecycle bookkeeping.
             count_compaction (bool): Whether finished requests discarded successor rows.
 
         Returns:
@@ -2789,6 +2958,7 @@ class TextGenerationController:
                 "accepted_tokens": request_result.accepted_tokens_cpu,
                 "log_probs": log_probs,
                 "top_n_logprobs": top_n_logprobs,
+                "prompt_logprob_updates": prompt_logprob_updates or {},
                 "cuda_graph_request_count": cuda_graph_request_count,
             },
         )
@@ -2815,6 +2985,9 @@ class TextGenerationController:
         request_result = None
         cuda_graph_request_count = None
         log_probs_transfer = None
+        log_probs = None
+        top_n_logprobs = None
+        prompt_logprob_updates = {}
 
         with torch.inference_mode():
             if had_pending_forward:
@@ -2833,6 +3006,23 @@ class TextGenerationController:
                 log_probs_transfer = self._copy_async_sched_log_probs_to_cpu(log_probs_gpu_result)
 
                 self._synchronize_async_sched_event(sample_result.sample_cpu_ready_event)
+
+                # Prefill sidecars must be sealed while the consumed request
+                # block table still owns its physical blocks. No-overlap is the
+                # only async path that can consume prefill work.
+                if log_probs_transfer is not None:
+                    self._synchronize_async_sched_event(log_probs_transfer.cpu_ready_event)
+                log_probs, top_n_logprobs = self._materialize_async_sched_log_probs(
+                    log_probs_transfer,
+                    (
+                        sample_result.accepted_counts_cpu_view
+                        if self.num_speculative_tokens > 0
+                        else None
+                    ),
+                )
+                prompt_logprob_updates = self._store_prompt_logprob_sidecars(
+                    log_probs, top_n_logprobs
+                )
 
                 # -------------------------------------------------------------------------
                 # Update
@@ -2873,18 +3063,13 @@ class TextGenerationController:
             assert active_request_count > 0, "Async no-overlap admission did not add a request."
             return DynamicBatchControllerStepResult(decode_only=decode_only, primer_only=True)
 
-        if log_probs_transfer is not None:
-            self._synchronize_async_sched_event(log_probs_transfer.cpu_ready_event)
-        log_probs, top_n_logprobs = self._materialize_async_sched_log_probs(
-            log_probs_transfer,
-            sample_result.accepted_counts_cpu_view if self.num_speculative_tokens > 0 else None,
-        )
         result = self._build_async_sched_step_result(
             request_result,
             cuda_graph_request_count,
             decode_only,
             log_probs,
             top_n_logprobs,
+            prompt_logprob_updates,
             count_compaction=False,
         )
         await asyncio.sleep(0)
@@ -3172,6 +3357,8 @@ class TextGenerationController:
             else:
                 self._dynamic_step_sample_logits()
 
+            self._replace_partial_prefill_sample_with_prompt_token()
+
             log_probs = None
             top_n_logprobs = None
             if return_log_probs or return_top_n_logprobs:
@@ -3190,6 +3377,8 @@ class TextGenerationController:
                             log_probs_tensor
                         )
             range_pop()
+
+            prompt_logprob_updates = self._store_prompt_logprob_sidecars(log_probs, top_n_logprobs)
 
             # Capture before update_requests (called by _dynamic_step_context_bookkeeping)
             # resets num_prefill_requests to 0, which would make num_decode_requests
@@ -3220,6 +3409,7 @@ class TextGenerationController:
                 ),
                 "log_probs": log_probs,
                 "top_n_logprobs": top_n_logprobs,
+                "prompt_logprob_updates": prompt_logprob_updates,
                 "cuda_graph_request_count": cuda_graph_request_count,
             }
             if self.num_speculative_tokens > 0:
@@ -3639,7 +3829,7 @@ class TextGenerationController:
                 if sampling_params.num_tokens_to_generate > 0:
                     # Check end of generation status for each tensor
                     # and update generated sequence lengths
-                    (is_generation_done_tensor, generated_sequence_lengths) = (
+                    is_generation_done_tensor, generated_sequence_lengths = (
                         self.update_generation_status(
                             updated_prompts_tokens=batch_prompt_tokens,
                             generation_started=generation_started,
