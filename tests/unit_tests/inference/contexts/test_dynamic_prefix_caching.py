@@ -2649,7 +2649,8 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             actual_values, expected_values = getattr(actual, field), getattr(expected, field)
             assert actual_values is not None and expected_values is not None
             np.testing.assert_allclose(actual_values, expected_values, rtol=2e-2, atol=5e-2)
-        for field in ("prompt_top_n_logprobs", "generated_top_n_logprobs"):
+        # Generated top-N has separate coverage; this helper isolates prompt-score sidecars.
+        for field in ("prompt_top_n_logprobs",):
             actual_rows, expected_rows = getattr(actual, field), getattr(expected, field)
             assert actual_rows is not None and expected_rows is not None
             assert len(actual_rows) == len(expected_rows)
