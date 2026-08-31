@@ -2626,7 +2626,6 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
 
     @classmethod
     def _run_prompt_logprob_request(cls, engine, request_id, prompt, top_n, pre_schedule=False):
-        """Run one prompt-score request and return its prefill-token cost."""
         request = cls._make_prompt_logprob_request(engine, request_id, prompt, top_n)
         computed_before = engine.context.lifetime_prefill_token_count
         engine._add_request(request)
@@ -2643,7 +2642,6 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
 
     @classmethod
     def _assert_prompt_logprob_parity(cls, actual, expected):
-        """Compare the complete selected and top-N prompt/decode result."""
         assert actual.generated_tokens == expected.generated_tokens
         assert actual.generated_text == expected.generated_text
         for field in ("prompt_log_probs", "generated_log_probs"):
@@ -2663,7 +2661,6 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
     @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     @torch.inference_mode()
     def test_prompt_logprob_sidecar_reuse(self, model_provider):
-        """Reuse only an exact prompt-score sidecar and recompute a key mismatch."""
         if model_provider == "hybrid":
             available, reason = _check_mamba_sequence_packing_support()
             if not available:
@@ -2705,7 +2702,6 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             donor, donor_cost = self._run_prompt_logprob_request(engine, 10, prompt, 5)
             assert donor_cost == prompt_length
             self._assert_prompt_logprob_parity(donor, oracle_top5)
-
             allocator = engine.context.kv_block_allocator
             sidecars = sorted(
                 allocator.block_prompt_logprobs.values(),
@@ -2725,7 +2721,6 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                     sidecar.top_n_token_ids,
                 )
             )
-
             exact, exact_cost = self._run_prompt_logprob_request(engine, 11, prompt, 5)
             self._assert_prompt_logprob_parity(exact, oracle_top5)
             assert exact.num_cached_tokens == 512
@@ -2733,8 +2728,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
 
             mismatch, mismatch_cost = self._run_prompt_logprob_request(engine, 12, prompt, 4)
             self._assert_prompt_logprob_parity(mismatch, oracle_top4)
-            assert mismatch.num_cached_tokens == 0
-            assert mismatch_cost == prompt_length
+            assert (mismatch.num_cached_tokens, mismatch_cost) == (0, prompt_length)
 
             # The mismatch is admitted first, then overwrites the allocator
             # mapping before the exact request captures its retained top-4 refs.
@@ -2764,8 +2758,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 engine, 13, prompt, 4, pre_schedule=True
             )
             self._assert_prompt_logprob_parity(pressure, oracle_top4)
-            assert pressure.num_cached_tokens == 0
-            assert pressure_cost == prompt_length
+            assert (pressure.num_cached_tokens, pressure_cost) == (0, prompt_length)
             allocator.release_memory_blocks(filler)
         finally:
             DynamicInferenceContext.ROUNDER = 64

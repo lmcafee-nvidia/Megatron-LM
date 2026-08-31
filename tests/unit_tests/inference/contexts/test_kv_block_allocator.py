@@ -741,16 +741,12 @@ def test_evict_lru_preserves_invariant_under_random_chains():
 
 
 def test_prompt_logprob_keys_are_exact_and_normalized():
-    raw = PromptLogprobsKey.create(
-        "raw_logprobs", 2, sampling_backend="ignored", temperature=0.2, top_k=7, top_p=0.8
-    )
+    raw = PromptLogprobsKey.create("raw_logprobs", 2, "ignored", 0.2, 7, 0.8)
     assert raw == PromptLogprobsKey("raw_logprobs", 2, None, None, None, None)
     assert raw != PromptLogprobsKey.create("raw_logprobs", 3)
-
     processed = PromptLogprobsKey.create("processed_logprobs", 2, "torch")
     assert processed == PromptLogprobsKey("processed_logprobs", 2, "torch", 1.0, 0, 0.0)
     assert processed != PromptLogprobsKey.create("processed_logprobs", 2, "torch", temperature=0.0)
-    assert processed != raw
     with pytest.raises(ValueError, match="must not exceed 20"):
         PromptLogprobsKey.create("raw_logprobs", 21)
 

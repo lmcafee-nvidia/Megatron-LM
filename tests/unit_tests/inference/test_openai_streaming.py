@@ -59,8 +59,7 @@ async def test_chat_completions_uses_generated_logprobs_only_when_requested():
     )
 
     class FakeTokenizer:
-        bos = None
-        chat_template = None
+        bos, chat_template = None, None
 
         @staticmethod
         def tokenize(_text):
@@ -71,8 +70,7 @@ async def test_chat_completions_uses_generated_logprobs_only_when_requested():
             return "".join(chr(ord("a") + token - 1) for token in tokens)
 
     class FakeInferenceClient:
-        def __init__(self):
-            self.return_log_probs = []
+        return_log_probs = []
 
         async def add_request(self, _prompt_tokens, sampling_params, multi_modal_data=None):
             self.return_log_probs.append(sampling_params.return_log_probs)
@@ -85,7 +83,6 @@ async def test_chat_completions_uses_generated_logprobs_only_when_requested():
                 "num_cached_tokens": 1,
                 "generated_tokens": [1, 2],
                 "generated_log_probs": generated_log_probs,
-                # This legacy-shaped field catches a regression back to the old lookup.
                 "log_probs": [-9.0, -9.0],
                 "generated_top_n_logprobs": [{"a": -0.25}, {"b": -0.5}],
                 "policy_epoch": [],
