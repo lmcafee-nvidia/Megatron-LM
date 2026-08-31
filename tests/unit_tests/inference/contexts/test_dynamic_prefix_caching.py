@@ -2637,7 +2637,8 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             for record in result["finished_request_records"]:
                 output = record.merge()
                 if output.request_id == request_id:
-                    return output, engine.context.lifetime_prefill_token_count - computed_before
+                    cost = engine.context.lifetime_prefill_token_count - computed_before
+                    return output, cost, request.finished_chunk_token_count > 0
         pytest.fail(f"prompt-logprob request {request_id} did not finish")
 
     @classmethod
@@ -2683,12 +2684,9 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             oracle_env.engine.controller.tokenizer.detokenize = (
                 lambda tokens, **_: f"tok_{tokens[0]}"
             )
-            oracle_top5, oracle_cost = self._run_prompt_logprob_request(
-                oracle_env.engine, 0, prompt, 5
-            )
-            oracle_top4, oracle_top4_cost = self._run_prompt_logprob_request(
-                oracle_env.engine, 1, prompt, 4
-            )
+            run = self._run_prompt_logprob_request
+            oracle_top5, oracle_cost, _ = run(oracle_env.engine, 0, prompt, 5)
+            oracle_top4, oracle_top4_cost, _ = run(oracle_env.engine, 1, prompt, 4)
             assert oracle_cost == oracle_top4_cost == prompt_length
             del oracle_env
             self._clear_engine_runtime()
@@ -2700,9 +2698,9 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             cache_env = self._build_test_env(cache_config)
             engine = cache_env.engine
             engine.controller.tokenizer.detokenize = lambda tokens, **_: f"tok_{tokens[0]}"
-            donor, donor_cost = self._run_prompt_logprob_request(engine, 10, prompt, 5)
+            donor, donor_cost, donor_chunked = run(engine, 10, prompt, 5)
             assert donor_cost == prompt_length
-            assert sum(event.type.name == "ADD_CONTEXT" for event in donor.events) > 1
+            assert donor_chunked
             self._assert_prompt_logprob_parity(donor, oracle_top5)
             allocator = engine.context.kv_block_allocator
             sidecars = sorted(
@@ -2723,12 +2721,12 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                     sidecar.top_n_token_ids,
                 )
             )
-            exact, exact_cost = self._run_prompt_logprob_request(engine, 11, prompt, 5)
+            exact, exact_cost, _ = run(engine, 11, prompt, 5)
             self._assert_prompt_logprob_parity(exact, oracle_top5)
             assert exact.num_cached_tokens == 512
             assert exact_cost == (2 if model_provider == "gpt" else 257)
 
-            mismatch, mismatch_cost = self._run_prompt_logprob_request(engine, 12, prompt, 4)
+            mismatch, mismatch_cost, _ = run(engine, 12, prompt, 4)
             self._assert_prompt_logprob_parity(mismatch, oracle_top4)
             assert (mismatch.num_cached_tokens, mismatch_cost) == (0, prompt_length)
 
@@ -2755,10 +2753,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             filler_count = allocator.get_allocatable_count() - 3
             filler = allocator.allocate_memory_blocks(filler_count).clone()
             assert filler is not None and allocator.get_allocatable_count() == 3
-            engine.context.max_tokens = prompt_length
-            pressure, pressure_cost = self._run_prompt_logprob_request(
-                engine, 13, prompt, 4, pre_schedule=True
-            )
+            pressure, pressure_cost, _ = run(engine, 13, prompt, 4, pre_schedule=True)
             self._assert_prompt_logprob_parity(pressure, oracle_top4)
             assert (pressure.num_cached_tokens, pressure_cost) == (0, prompt_length)
             allocator.release_memory_blocks(filler)

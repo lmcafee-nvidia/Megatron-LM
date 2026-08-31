@@ -2109,12 +2109,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 # How many tokens we can admit this step.
                 token_budget = self.context.max_tokens - self.context.active_token_count
 
-                # If canonical matches plus private shadows cannot fit, make the
-                # feasible chunk fully private before calculating its span. This
-                # prevents a long cached prefix from inflating the span beyond
-                # the compute budget and then deadlocking at admission.
+                # If the complete shadow plan cannot fit but a bounded private
+                # chunk can, make the request fully private before calculating
+                # its span. This prevents a long cached prefix from inflating
+                # the span beyond the compute budget and deadlocking admission.
                 capacity_chunk = min(remaining_len, token_budget)
-                match_plan = self.context._compute_prefix_match(req, capacity_chunk)
+                match_plan = self.context._compute_prefix_match(req, remaining_len)
                 if self.context._prompt_logprob_uncached_fallback_available(
                     req, match_plan[0], match_plan[1], match_plan[2], match_plan[3], capacity_chunk
                 ):
