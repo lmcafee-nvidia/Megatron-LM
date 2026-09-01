@@ -747,8 +747,9 @@ def test_prompt_logprob_keys_are_exact_and_normalized():
     processed = PromptLogprobsKey.create("processed_logprobs", 2, "torch")
     assert processed == PromptLogprobsKey("processed_logprobs", 2, "torch", 1.0, 0, 0.0)
     assert processed != PromptLogprobsKey.create("processed_logprobs", 2, "torch", temperature=0.0)
-    with pytest.raises(ValueError, match="must not exceed 20"):
-        PromptLogprobsKey.create("raw_logprobs", 21)
+    assert PromptLogprobsKey.create("raw_logprobs", 100).top_n == 100
+    with pytest.raises(ValueError, match="must not exceed 100"):
+        PromptLogprobsKey.create("raw_logprobs", 101)
 
 
 def test_prompt_logprob_reuse_requires_exact_key_and_latest_variant_replaces():
@@ -759,8 +760,7 @@ def test_prompt_logprob_reuse_requires_exact_key_and_latest_variant_replaces():
     allocator.register_kv_block_hashes([block_id], [101])
     key_2 = PromptLogprobsKey.create("raw_logprobs", 2)
     positions = np.arange(1, 4, dtype=np.int32)
-    allocator.store_prompt_logprobs(
-        1,
+    original = allocator.store_prompt_logprobs(
         0,
         block_id,
         key_2,
@@ -770,7 +770,6 @@ def test_prompt_logprob_reuse_requires_exact_key_and_latest_variant_replaces():
         np.arange(6).reshape(3, 2),
         101,
     )
-    original = allocator.seal_prompt_logprobs_block(block_id, key_2, 101, positions, True)
     assert allocator.get_prompt_logprobs_block(block_id, key_2, 101) is original
     assert allocator.get_prompt_logprobs_block(block_id, key_2, 102) is None
     assert (
@@ -782,8 +781,7 @@ def test_prompt_logprob_reuse_requires_exact_key_and_latest_variant_replaces():
 
     key_3 = PromptLogprobsKey.create("raw_logprobs", 3)
     assert allocator.get_prompt_logprobs_block(block_id, key_3, 101) is None
-    allocator.store_prompt_logprobs(
-        2,
+    replacement = allocator.store_prompt_logprobs(
         0,
         block_id,
         key_3,
@@ -793,20 +791,19 @@ def test_prompt_logprob_reuse_requires_exact_key_and_latest_variant_replaces():
         np.arange(9).reshape(3, 3),
         101,
     )
-    replacement = allocator.seal_prompt_logprobs_block(block_id, key_3, 101, positions, True)
     assert allocator.get_prompt_logprobs_block(block_id, key_2, 101) is None
     assert allocator.get_prompt_logprobs_block(block_id, key_3, 101) is replacement
+    np.testing.assert_array_equal(original.selected_logprobs[positions], [-1, -2, -3])
 
 
-def test_prompt_logprob_pending_boundary_materializes_after_block_cleanup():
+def test_prompt_logprob_partial_block_materializes_after_block_cleanup():
     allocator = KVBlockAllocator(
         _make_context(), pool_size=6, paused_limit=1, enable_prefix_caching=True
     )
     block_0, block_1 = map(int, allocator.allocate_memory_blocks(2).tolist())
     allocator.register_kv_block_hashes([block_0, block_1], [101, 202])
     key = PromptLogprobsKey.create("raw_logprobs", 2)
-    allocator.store_prompt_logprobs(
-        7,
+    block_0_ref = allocator.store_prompt_logprobs(
         0,
         block_0,
         key,
@@ -816,10 +813,9 @@ def test_prompt_logprob_pending_boundary_materializes_after_block_cleanup():
         np.array([[11, 12], [21, 22], [31, 32]]),
         101,
     )
-    allocator.store_prompt_logprobs(
-        7,
+    block_1_ref = allocator.store_prompt_logprobs(
         1,
-        None,
+        block_1,
         key,
         np.array([0]),
         np.array([-4]),
@@ -827,16 +823,12 @@ def test_prompt_logprob_pending_boundary_materializes_after_block_cleanup():
         np.array([[41, 42]]),
         202,
     )
-    allocator.attach_pending_prompt_logprobs(7, 1, block_1, key, 202)
-    refs = allocator.capture_prompt_logprobs_for_request(7, [block_0, block_1], key, 5, [101, 202])
-    assert refs[0].target_positions.tolist() == [1, 2, 3]
-    assert refs[1].target_positions.tolist() == [0]
-    assert refs[0].reusable and not refs[1].reusable
-    with pytest.raises(ValueError):
-        refs[0].selected_logprobs[0] = 0
+    refs = (block_0_ref, block_1_ref)
+    assert allocator.get_prompt_logprobs_block(block_0, key, 101) is block_0_ref
+    assert allocator.get_prompt_logprobs_block(block_1, key, 202) is None
 
     allocator.release_memory_blocks(torch.tensor([block_0, block_1]))
     assert allocator.block_prompt_logprobs == {}
-    materialized = allocator.materialize_prompt_logprobs(refs, key, 5)
-    np.testing.assert_allclose(materialized.selected_logprobs, [-1, -2, -3, -4])
-    assert materialized.top_n_token_ids.tolist() == [[11, 12], [21, 22], [31, 32], [41, 42]]
+    selected, _, top_ids = allocator.materialize_prompt_logprobs(refs, key, 5)
+    np.testing.assert_allclose(selected, [-1, -2, -3, -4])
+    assert top_ids.tolist() == [[11, 12], [21, 22], [31, 32], [41, 42]]

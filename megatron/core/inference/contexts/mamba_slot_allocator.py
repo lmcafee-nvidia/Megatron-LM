@@ -504,22 +504,6 @@ class MambaSlotAllocator:
         else:
             self._eos_cache_block_id_cpu[current_id] = -1
 
-    def remap_pending_block_ids(self, shadow_to_canonical: Dict[int, int]) -> None:
-        """Redirect pending intermediate-state commits from shadows to canonical blocks.
-
-        Prompt-logprob recompute forwards may use temporary KV blocks for a
-        cache-matched suffix. Their Mamba states describe the same logical block
-        boundaries and must therefore be committed under the canonical IDs.
-
-        Args:
-            shadow_to_canonical: Temporary block ID to canonical block ID mapping.
-        """
-        for shadow_block_id, canonical_block_id in shadow_to_canonical.items():
-            intermediate_mask = self._intermediate_block_ids_cpu == shadow_block_id
-            self._intermediate_block_ids_cpu[intermediate_mask] = canonical_block_id
-            eos_mask = self._eos_cache_block_id_cpu == shadow_block_id
-            self._eos_cache_block_id_cpu[eos_mask] = canonical_block_id
-
     def get_intermediate_cpu_data(self):
         """Get intermediate offsets and counts as CPU tensor slices for current prefill batch.
 

@@ -859,11 +859,6 @@ class TextGenerationController:
         else:
             self._all_logits_cuda = logits
 
-        # Prompt-logprob cache misses are recomputed in private shadow blocks.
-        # Publish the canonical block table again before any Mamba state, routing,
-        # or prompt-logprob sidecar is committed from this forward.
-        context.finalize_prompt_logprob_shadows()
-
     def _replace_partial_prefill_sample_with_prompt_token(self) -> None:
         """Use the known next prompt token for a partial chunk's selected logprob."""
         context = self.inference_wrapped_model.inference_context
@@ -1730,16 +1725,13 @@ class TextGenerationController:
         log_probs: Optional[List[List[float]]],
         top_n_logprobs: Optional[Dict[int, List[Tuple[Tensor, Tensor]]]],
     ) -> Dict[int, Dict[str, Any]]:
-        """Store prefill scores beside their target KV blocks before bookkeeping.
-
-        The returned mapping carries only strong references and explicit prompt
-        row counts. The engine uses it after context bookkeeping to keep those
-        sidecars alive and to append only generated-token rows to request fields.
-        """
+        """Store prompt rows in physical sidecars and return continuation carries."""
         if not log_probs:
             return {}
 
         context = self.inference_wrapped_model.inference_context
+        if not context.enable_prefix_caching:
+            return {}
         allocator = context.kv_block_allocator
         active_slice = slice(context.paused_request_count, context.total_request_count)
         query_lengths = context.request_query_lengths[active_slice].tolist()
@@ -1758,12 +1750,13 @@ class TextGenerationController:
             if not is_prefill or key is None:
                 continue
 
+            is_partial_prefill = request_id == context.chunked_prefill_request_id
             prompt_row_count = (
-                len(request_log_probs)
-                if request_id == context.chunked_prefill_request_id
-                else max(len(request_log_probs) - 1, 0)
+                len(request_log_probs) if is_partial_prefill else max(len(request_log_probs) - 1, 0)
             )
-            prompt_positions = positions[:prompt_row_count].cpu().numpy().astype(np.int64) + 1
+            stored_row_count = prompt_row_count - 1 if is_partial_prefill else prompt_row_count
+            assert stored_row_count >= 0
+            prompt_positions = positions[:stored_row_count].cpu().numpy().astype(np.int64) + 1
             selected = np.asarray(request_log_probs[:prompt_row_count], dtype=np.float32)
 
             if key.top_n > 0 and prompt_row_count > 0:
@@ -1782,6 +1775,19 @@ class TextGenerationController:
                 top_values = None
                 top_ids = None
 
+            stored_selected = selected[:stored_row_count]
+            stored_top_values = top_values[:stored_row_count] if top_values is not None else None
+            stored_top_ids = top_ids[:stored_row_count] if top_ids is not None else None
+
+            pending_row = None
+            if is_partial_prefill:
+                assert prompt_row_count > 0
+                pending_row = (
+                    selected[-1:],
+                    top_values[-1:] if top_values is not None else None,
+                    top_ids[-1:] if top_ids is not None else None,
+                )
+
             request_block_ids = context.request_to_kv_block_ids[
                 context.paused_request_count + active_idx
             ]
@@ -1791,74 +1797,45 @@ class TextGenerationController:
 
             for logical_block_index in np.unique(prompt_positions // block_size):
                 logical_block_index = int(logical_block_index)
-                if logical_block_index in block_refs:
-                    # This exact immutable sidecar was retained at admission.
-                    # A Mamba backoff may recompute its rows, but replacing it
-                    # would make concurrent semantic variants order-dependent.
-                    continue
                 row_mask = prompt_positions // block_size == logical_block_index
                 local_positions = (prompt_positions[row_mask] % block_size).astype(np.int32)
-                block_id = (
-                    valid_block_ids[logical_block_index]
-                    if logical_block_index < len(valid_block_ids)
-                    else None
-                )
+                assert logical_block_index < len(valid_block_ids)
+                block_id = valid_block_ids[logical_block_index]
                 expected_hash = (
                     block_hashes[logical_block_index]
                     if logical_block_index < len(block_hashes)
                     else None
                 )
+                block_ref = block_refs.get(logical_block_index)
                 block_ref = allocator.store_prompt_logprobs(
-                    request_id=request_id,
                     logical_block_index=logical_block_index,
                     block_id=block_id,
                     key=key,
                     target_positions=local_positions,
-                    selected_logprobs=selected[row_mask],
-                    top_n_logprobs=top_values[row_mask] if top_values is not None else None,
-                    top_n_token_ids=top_ids[row_mask] if top_ids is not None else None,
+                    selected_logprobs=stored_selected[row_mask],
+                    top_n_logprobs=(
+                        stored_top_values[row_mask] if stored_top_values is not None else None
+                    ),
+                    top_n_token_ids=(
+                        stored_top_ids[row_mask] if stored_top_ids is not None else None
+                    ),
                     expected_block_hash=expected_hash,
+                    block=block_ref,
                 )
-
-                # A row ending at the block boundary completes this compact
-                # sidecar. Publish it immediately when the KV hash is durable.
-                if (
-                    block_id is not None
-                    and expected_hash is not None
-                    and int(allocator.block_hashes[block_id]) == int(expected_hash)
-                    and local_positions.size
-                    and int(local_positions.max()) == block_size - 1
-                ):
-                    required = np.arange(
-                        1 if logical_block_index == 0 else 0, block_size, dtype=np.int32
-                    )
-                    block_ref = allocator.seal_prompt_logprobs_block(
-                        block_id, key, expected_hash, required, reusable=True
-                    )
                 block_refs[logical_block_index] = block_ref
 
-            final_prefill = request_id != context.chunked_prefill_request_id
+            final_prefill = not is_partial_prefill
             if final_prefill:
                 prompt_token_count = int(positions[-1]) + 1
                 if prompt_token_count > 1:
-                    expected_hashes = [
-                        block_hashes[index] if index < len(block_hashes) else None
-                        for index in range((prompt_token_count + block_size - 1) // block_size)
-                    ]
-                    captured = allocator.capture_prompt_logprobs_for_request(
-                        request_id,
-                        valid_block_ids,
-                        key,
-                        prompt_token_count,
-                        expected_hashes,
-                        retained_refs=context.prompt_logprobs_matched_refs.get(request_id),
-                    )
-                    block_refs = {index: ref for index, ref in enumerate(captured)}
+                    expected_block_count = (prompt_token_count + block_size - 1) // block_size
+                    assert set(range(expected_block_count)).issubset(block_refs)
 
             updates[request_id] = {
                 "blocks": block_refs,
                 "prompt_row_count": prompt_row_count,
                 "complete": final_prefill,
+                "pending_row": pending_row,
             }
             if final_prefill:
                 # Decode and later checkpoint segments must not keep collecting
@@ -2964,7 +2941,7 @@ class TextGenerationController:
         )
 
     async def _run_async_sched_step_no_overlap(
-        self, *, schedule_waiting_requests: Optional[Callable[[], None]]
+        self, *, schedule_waiting_requests: Optional[Callable[[Dict[int, Dict[str, Any]]], None]]
     ) -> DynamicBatchControllerStepResult:
         """Run ``sample/MTP -> update -> admit -> forward``.
 
@@ -2972,8 +2949,8 @@ class TextGenerationController:
         first two phases, admits requests, and launches a primer-only forward.
 
         Args:
-            schedule_waiting_requests (Optional[Callable[[], None]]): Engine callback
-                that admits eligible non-chunked prefill requests.
+            schedule_waiting_requests: Engine callback that stages consumed prompt
+                scores and admits eligible prefill requests.
 
         Returns:
             DynamicBatchControllerStepResult: Primer-only state or sampled output.
@@ -3039,7 +3016,7 @@ class TextGenerationController:
             # -------------------------------------------------------------------------
             # This is the only async-scheduling admission mutation point.
             if schedule_waiting_requests is not None:
-                schedule_waiting_requests()
+                schedule_waiting_requests(prompt_logprob_updates)
 
             # -------------------------------------------------------------------------
             # Forward
@@ -3425,7 +3402,7 @@ class TextGenerationController:
         skip_bookkeeping: Optional[bool] = False,
         *,
         run_async_overlap: bool = True,
-        schedule_waiting_requests: Optional[Callable[[], None]] = None,
+        schedule_waiting_requests: Optional[Callable[[Dict[int, Dict[str, Any]]], None]] = None,
     ) -> DynamicBatchControllerStepResult:
         """Forward step the model and update the inference context.
 
@@ -3433,8 +3410,8 @@ class TextGenerationController:
             skip_bookkeeping (Optional[bool]): If true, skip context bookkeeping
                 on the legacy path.
             run_async_overlap (bool): Whether to run the overlap ordering.
-            schedule_waiting_requests (Optional[Callable[[], None]]): Engine callback
-                used by the no-overlap path to admit eligible prefill requests.
+            schedule_waiting_requests: Engine callback used by the no-overlap path
+                to stage consumed prompt scores and admit eligible prefill requests.
 
         Returns:
             DynamicBatchControllerStepResult: One controller-step result.

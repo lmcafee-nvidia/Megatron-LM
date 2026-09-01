@@ -2,7 +2,7 @@
 
 import heapq
 from collections import deque
-from typing import Callable, Dict, NamedTuple, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -14,9 +14,9 @@ from megatron.core.inference.config import PrefixCachingEvictionPolicy
 BlocksDeregisteredObserver = Callable[[list[int], set[int]], None]
 
 # Selected prompt scores plus top-N float32 values and int32 token IDs consume
-# roughly ``(1 + 2 * N) * 4`` bytes per token. Keeping N at or below 20 limits a
-# 256-token sidecar to about 41 KiB while covering the practical API range.
-MAX_CACHED_PROMPT_TOP_N_LOGPROBS = 20
+# roughly ``(1 + 2 * N) * 4`` bytes per token. A limit of 100 keeps a 256-token
+# sidecar below 1 MiB while covering practical API requests.
+MAX_CACHED_PROMPT_TOP_N_LOGPROBS = 100
 
 
 class PromptLogprobsKey(NamedTuple):
@@ -77,39 +77,17 @@ class PromptLogprobsKey(NamedTuple):
         )
 
 
-class PromptLogprobsBlockRef(NamedTuple):
-    """Immutable reference to one block's compact prompt-logprob sidecar.
+class PromptLogprobsBlock:
+    """Mutable prompt-logprob sidecar bound to one physical KV block.
 
-    The numpy buffers are read-only. Holding this object keeps the buffers alive
-    even after the physical block's allocator mapping is removed or reused.
+    Allocator mappings retain only the latest settings variant. A request may
+    keep a strong reference to an older object until its result is materialized.
     """
-
-    block_id: int
-    logical_block_index: int
-    key: PromptLogprobsKey
-    expected_block_hash: Optional[int]
-    target_positions: np.ndarray
-    selected_logprobs: np.ndarray
-    top_n_logprobs: np.ndarray
-    top_n_token_ids: np.ndarray
-    reusable: bool
-
-
-class MaterializedPromptLogprobs(NamedTuple):
-    """Prompt log probabilities reconstructed in prompt-target order."""
-
-    selected_logprobs: np.ndarray
-    top_n_logprobs: np.ndarray
-    top_n_token_ids: np.ndarray
-
-
-class _PromptLogprobsBlockBuilder:
-    """Mutable dense builder used until a block sidecar is published."""
 
     __slots__ = (
         "logical_block_index",
         "key",
-        "expected_block_hash",
+        "block_id",
         "selected_logprobs",
         "top_n_logprobs",
         "top_n_token_ids",
@@ -117,23 +95,19 @@ class _PromptLogprobsBlockBuilder:
     )
 
     def __init__(
-        self,
-        block_size: int,
-        logical_block_index: int,
-        key: PromptLogprobsKey,
-        expected_block_hash: Optional[int],
+        self, block_size: int, logical_block_index: int, key: PromptLogprobsKey, block_id: int
     ) -> None:
+        self.block_id = block_id
         self.logical_block_index = logical_block_index
         self.key = key
-        self.expected_block_hash = expected_block_hash
         self.selected_logprobs = np.empty((block_size,), dtype=np.float32)
         self.top_n_logprobs = np.empty((block_size, key.top_n), dtype=np.float32)
         self.top_n_token_ids = np.empty((block_size, key.top_n), dtype=np.int32)
         self.valid = np.zeros((block_size,), dtype=np.bool_)
 
-    def matches(self, key: PromptLogprobsKey, expected_block_hash: Optional[int]) -> bool:
+    def matches(self, logical_block_index: int, key: PromptLogprobsKey) -> bool:
         """Whether newly stored rows belong to this same semantic sidecar."""
-        return self.key == key and self.expected_block_hash == expected_block_hash
+        return self.logical_block_index == logical_block_index and self.key == key
 
     def store(
         self,
@@ -195,10 +169,8 @@ class _PromptLogprobsBlockBuilder:
         self.top_n_token_ids[positions] = top_ids
         self.valid[positions] = True
 
-    def freeze(
-        self, block_id: int, required_positions: np.ndarray, reusable: bool
-    ) -> PromptLogprobsBlockRef:
-        """Atomically publish a compact, read-only view of required rows."""
+    def has_rows(self, required_positions: np.ndarray) -> bool:
+        """Whether every requested target-token position has been stored."""
         required = np.asarray(required_positions)
         if required.ndim != 1 or not np.issubdtype(required.dtype, np.integer):
             raise ValueError("required_positions must be a one-dimensional integer array")
@@ -209,33 +181,21 @@ class _PromptLogprobsBlockBuilder:
             raise ValueError("required target position is outside the KV block")
         if np.unique(required).size != required.size:
             raise ValueError("required_positions must not contain duplicates")
-        missing = required[~self.valid[required]]
-        if missing.size:
+        return bool(self.valid[required].all())
+
+    def extract(self, required_positions: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Copy requested rows in caller-provided target-token order."""
+        required = np.asarray(required_positions, dtype=np.int32)
+        if not self.has_rows(required):
+            missing = required[~self.valid[required]]
             raise ValueError(
                 f"prompt-logprob sidecar is missing target positions {missing.tolist()}"
             )
-
-        positions = np.array(required, dtype=np.int32, copy=True)
-        selected = np.array(self.selected_logprobs[required], dtype=np.float32, copy=True)
-        top_values = np.array(self.top_n_logprobs[required], dtype=np.float32, copy=True)
-        top_ids = np.array(self.top_n_token_ids[required], dtype=np.int32, copy=True)
-        for array in (positions, selected, top_values, top_ids):
-            array.flags.writeable = False
-
-        return PromptLogprobsBlockRef(
-            block_id=block_id,
-            logical_block_index=self.logical_block_index,
-            key=self.key,
-            expected_block_hash=self.expected_block_hash,
-            target_positions=positions,
-            selected_logprobs=selected,
-            top_n_logprobs=top_values,
-            top_n_token_ids=top_ids,
-            reusable=reusable,
+        return (
+            np.array(self.selected_logprobs[required], dtype=np.float32, copy=True),
+            np.array(self.top_n_logprobs[required], dtype=np.float32, copy=True),
+            np.array(self.top_n_token_ids[required], dtype=np.int32, copy=True),
         )
-
-
-PromptLogprobsBlock = Union[_PromptLogprobsBlockBuilder, PromptLogprobsBlockRef]
 
 
 class KVBlockAllocator:
@@ -321,11 +281,9 @@ class KVBlockAllocator:
         self.block_routing: Dict[int, np.ndarray] = {}
 
         # Prompt-logprob sidecars share the lifetime and identity of physical KV
-        # blocks. Pending builders cover the one-token look-ahead at an exact
-        # chunk boundary, where the target's logical block exists but its
-        # physical block has not been allocated yet.
+        # blocks. Request-owned state carries scores until their target block is
+        # allocated, so this mapping contains only physically bound sidecars.
         self.block_prompt_logprobs: Dict[int, PromptLogprobsBlock] = {}
-        self._pending_prompt_logprobs: Dict[Tuple[int, int], _PromptLogprobsBlockBuilder] = {}
 
     def __str__(self):
         return (
@@ -523,7 +481,6 @@ class KVBlockAllocator:
         # Clear per-block routing storage
         self.block_routing.clear()
         self.block_prompt_logprobs.clear()
-        self._pending_prompt_logprobs.clear()
 
     # =========================================================================
     # Prefix caching methods
@@ -654,8 +611,8 @@ class KVBlockAllocator:
         block_ids_list = block_ids.tolist()
         hashes = self.block_hashes[block_ids_i64].tolist()
 
-        # Captured immutable PromptLogprobsBlockRef objects remain valid after
-        # these allocator-owned mappings are removed.
+        # Request-held PromptLogprobsBlock objects remain valid after these
+        # allocator-owned mappings are removed.
         for bid in block_ids_list:
             self.block_prompt_logprobs.pop(bid, None)
 
@@ -865,124 +822,40 @@ class KVBlockAllocator:
                 f"KV block {block_id} has hash {actual_hash}, expected {expected_block_hash}"
             )
 
-    @staticmethod
-    def _prompt_logprobs_entry_matches(
-        entry: PromptLogprobsBlock, key: PromptLogprobsKey, expected_block_hash: Optional[int]
-    ) -> bool:
-        """Whether an allocator entry is an exact semantic/content match."""
-        if isinstance(entry, _PromptLogprobsBlockBuilder):
-            return entry.matches(key, expected_block_hash)
-        return entry.key == key and entry.expected_block_hash == expected_block_hash
-
-    def attach_pending_prompt_logprobs(
-        self,
-        request_id: int,
-        logical_block_index: int,
-        block_id: int,
-        key: PromptLogprobsKey,
-        expected_block_hash: Optional[int],
-    ) -> PromptLogprobsBlock:
-        """Attach an exact-boundary pending builder to a physical KV block.
-
-        The pending builder object itself is installed in the per-block mapping;
-        it is not copied. If an immutable reusable sidecar already exists for the
-        exact key and block hash, it remains canonical and the redundant pending
-        computation is discarded.
-        """
-        request_id = int(request_id)
-        logical_block_index = int(logical_block_index)
-        block_id = self._validate_prompt_logprobs_block_id(block_id)
-        self._validate_prompt_logprobs_hash(block_id, expected_block_hash)
-        pending_key = (request_id, logical_block_index)
-        pending = self._pending_prompt_logprobs.get(pending_key)
-        if pending is None:
-            raise KeyError(f"no pending prompt-logprob block for request/block {pending_key}")
-        if not pending.matches(key, expected_block_hash):
-            raise ValueError("pending prompt-logprob block has a different key or block hash")
-
-        current = self.block_prompt_logprobs.get(block_id)
-        if isinstance(current, PromptLogprobsBlockRef) and self._prompt_logprobs_entry_matches(
-            current, key, expected_block_hash
-        ):
-            self._pending_prompt_logprobs.pop(pending_key)
-            return current
-
-        # Installing the pending builder is the latest variant for this physical
-        # block. Any previous mismatched variant is intentionally replaced.
-        self._pending_prompt_logprobs.pop(pending_key)
-        self.block_prompt_logprobs[block_id] = pending
-        return pending
-
     def store_prompt_logprobs(
         self,
-        request_id: int,
         logical_block_index: int,
-        block_id: Optional[int],
+        block_id: int,
         key: PromptLogprobsKey,
         target_positions: np.ndarray,
         selected_logprobs: np.ndarray,
         top_n_logprobs: Optional[np.ndarray] = None,
         top_n_token_ids: Optional[np.ndarray] = None,
         expected_block_hash: Optional[int] = None,
+        block: Optional[PromptLogprobsBlock] = None,
     ) -> PromptLogprobsBlock:
-        """Store prompt scores by target-token position.
+        """Store prompt scores in a mutable sidecar on a physical KV block.
 
-        ``block_id`` may be ``None`` when a score crosses an exact chunk
-        boundary and the target's block has not been allocated. Such rows stay
-        request-private under ``(request_id, logical_block_index)`` until
-        :meth:`attach_pending_prompt_logprobs` installs that same builder object
-        on its eventual physical block.
-
-        Only one semantic variant is retained per physical block. Storing a new
-        key replaces the old mapping. Writes that repeat rows already present in
-        an immutable matching sidecar are ignored, which keeps a cached result
-        canonical when Mamba state restoration recomputes a matched block.
+        Only the latest settings variant is discoverable. Existing strong
+        references remain valid when a new variant replaces the mapping.
         """
-        request_id = int(request_id)
         logical_block_index = int(logical_block_index)
         if logical_block_index < 0:
             raise ValueError("logical_block_index must be non-negative")
-        if expected_block_hash is not None:
-            expected_block_hash = int(expected_block_hash)
-
-        pending_key = (request_id, logical_block_index)
-        if block_id is None:
-            entry = self._pending_prompt_logprobs.get(pending_key)
-            if entry is None or not entry.matches(key, expected_block_hash):
-                entry = _PromptLogprobsBlockBuilder(
-                    self.context.block_size_tokens, logical_block_index, key, expected_block_hash
-                )
-                self._pending_prompt_logprobs[pending_key] = entry
+        block_id = self._validate_prompt_logprobs_block_id(block_id)
+        self._validate_prompt_logprobs_hash(block_id, expected_block_hash)
+        if block is not None:
+            if block.block_id != block_id or not block.matches(logical_block_index, key):
+                raise ValueError("prompt-logprob block reference does not match the store target")
+            entry = block
         else:
-            block_id = self._validate_prompt_logprobs_block_id(block_id)
-            self._validate_prompt_logprobs_hash(block_id, expected_block_hash)
-            pending = self._pending_prompt_logprobs.get(pending_key)
-            if pending is not None and pending.matches(key, expected_block_hash):
-                entry = self.attach_pending_prompt_logprobs(
-                    request_id, logical_block_index, block_id, key, expected_block_hash
-                )
-            else:
-                # A later key for this request/logical block supersedes stale
-                # pending work as well as a stale physical-block variant.
-                self._pending_prompt_logprobs.pop(pending_key, None)
-                entry = self.block_prompt_logprobs.get(block_id)
-                if entry is None or not self._prompt_logprobs_entry_matches(
-                    entry, key, expected_block_hash
-                ):
-                    entry = _PromptLogprobsBlockBuilder(
-                        self.context.block_size_tokens,
-                        logical_block_index,
-                        key,
-                        expected_block_hash,
-                    )
-                    self.block_prompt_logprobs[block_id] = entry
+            entry = self.block_prompt_logprobs.get(block_id)
+        if entry is None or not entry.matches(logical_block_index, key):
+            entry = PromptLogprobsBlock(
+                self.context.block_size_tokens, logical_block_index, key, block_id
+            )
 
-        if isinstance(entry, PromptLogprobsBlockRef):
-            positions = np.asarray(target_positions, dtype=np.int32)
-            if positions.ndim != 1 or not np.isin(positions, entry.target_positions).all():
-                raise ValueError("immutable prompt-logprob sidecar does not contain stored rows")
-            return entry
-
+        self.block_prompt_logprobs[block_id] = entry
         entry.store(target_positions, selected_logprobs, top_n_logprobs, top_n_token_ids)
         return entry
 
@@ -991,167 +864,35 @@ class KVBlockAllocator:
         block_id: int,
         key: PromptLogprobsKey,
         expected_block_hash: Optional[int],
-        reusable_only: bool = True,
-    ) -> Optional[PromptLogprobsBlockRef]:
-        """Return an exact immutable sidecar match, if one is published."""
+        required_positions: Optional[np.ndarray] = None,
+    ) -> Optional[PromptLogprobsBlock]:
+        """Return a complete sidecar for the exact key and live KV hash."""
         block_id = self._validate_prompt_logprobs_block_id(block_id)
+        if (
+            not self.enable_prefix_caching
+            or expected_block_hash is None
+            or int(self.block_hashes[block_id]) != int(expected_block_hash)
+        ):
+            return None
         entry = self.block_prompt_logprobs.get(block_id)
-        if not isinstance(entry, PromptLogprobsBlockRef):
+        if entry is None or entry.key != key:
             return None
-        if not self._prompt_logprobs_entry_matches(entry, key, expected_block_hash):
-            return None
-        if reusable_only and not entry.reusable:
+        if required_positions is None:
+            required_positions = np.arange(
+                1 if entry.logical_block_index == 0 else 0,
+                self.context.block_size_tokens,
+                dtype=np.int32,
+            )
+        if not entry.has_rows(required_positions):
             return None
         return entry
 
-    def seal_prompt_logprobs_block(
-        self,
-        block_id: int,
-        key: PromptLogprobsKey,
-        expected_block_hash: Optional[int],
-        required_positions: np.ndarray,
-        reusable: bool,
-    ) -> PromptLogprobsBlockRef:
-        """Publish a mutable block builder as one immutable compact sidecar."""
-        block_id = self._validate_prompt_logprobs_block_id(block_id)
-        self._validate_prompt_logprobs_hash(block_id, expected_block_hash)
-        entry = self.block_prompt_logprobs.get(block_id)
-        if entry is None or not self._prompt_logprobs_entry_matches(
-            entry, key, expected_block_hash
-        ):
-            raise KeyError(f"no matching prompt-logprob sidecar for KV block {block_id}")
-
-        required = np.sort(np.asarray(required_positions, dtype=np.int32))
-        if isinstance(entry, PromptLogprobsBlockRef):
-            if not np.isin(required, entry.target_positions).all():
-                raise ValueError("immutable prompt-logprob sidecar is missing required rows")
-            if not reusable or entry.reusable:
-                return entry
-            # Promotion shares the already-read-only numeric buffers.
-            frozen = PromptLogprobsBlockRef(
-                block_id=entry.block_id,
-                logical_block_index=entry.logical_block_index,
-                key=entry.key,
-                expected_block_hash=entry.expected_block_hash,
-                target_positions=entry.target_positions,
-                selected_logprobs=entry.selected_logprobs,
-                top_n_logprobs=entry.top_n_logprobs,
-                top_n_token_ids=entry.top_n_token_ids,
-                reusable=True,
-            )
-        else:
-            frozen = entry.freeze(block_id, required, reusable)
-
-        if reusable:
-            if not self.enable_prefix_caching:
-                raise ValueError("a reusable prompt-logprob sidecar requires prefix caching")
-            actual_hash = int(self.block_hashes[block_id])
-            if expected_block_hash is None or actual_hash != int(expected_block_hash):
-                raise ValueError(
-                    "a reusable prompt-logprob sidecar requires its exact registered KV hash"
-                )
-
-        # One atomic mapping replacement exposes only the complete immutable
-        # object to future prefix lookups.
-        self.block_prompt_logprobs[block_id] = frozen
-        return frozen
-
-    def capture_prompt_logprobs_for_request(
-        self,
-        request_id: int,
-        block_ids: Sequence[int],
-        key: PromptLogprobsKey,
-        prompt_token_count: int,
-        expected_block_hashes: Optional[Sequence[Optional[int]]] = None,
-        retained_refs: Optional[Dict[int, PromptLogprobsBlockRef]] = None,
-    ) -> Tuple[PromptLogprobsBlockRef, ...]:
-        """Seal and retain a request's ordered complete and partial sidecars.
-
-        Complete registered blocks become prefix-reusable. The last incomplete
-        block remains private, but its returned strong reference survives block
-        release and later allocator reuse.
-        """
-        prompt_token_count = int(prompt_token_count)
-        if prompt_token_count < 0:
-            raise ValueError("prompt_token_count must be non-negative")
-        block_size = self.context.block_size_tokens
-        num_blocks = (prompt_token_count + block_size - 1) // block_size
-        if len(block_ids) < num_blocks:
-            raise ValueError(f"request needs {num_blocks} KV blocks, got {len(block_ids)}")
-        if expected_block_hashes is not None and len(expected_block_hashes) < num_blocks:
-            raise ValueError("expected_block_hashes does not cover every prompt block")
-
-        captured = []
-        retained_refs = retained_refs or {}
-        for logical_block_index in range(num_blocks):
-            block_id = self._validate_prompt_logprobs_block_id(block_ids[logical_block_index])
-            expected_hash = (
-                expected_block_hashes[logical_block_index]
-                if expected_block_hashes is not None
-                else None
-            )
-            if expected_hash is not None:
-                expected_hash = int(expected_hash)
-
-            retained = retained_refs.get(logical_block_index)
-            if retained is not None:
-                if (
-                    retained.block_id != block_id
-                    or retained.key != key
-                    or retained.logical_block_index != logical_block_index
-                    or retained.expected_block_hash != expected_hash
-                    or not retained.reusable
-                ):
-                    raise ValueError("retained prompt-logprob sidecar has the wrong identity")
-                captured.append(retained)
-                continue
-
-            pending_key = (int(request_id), logical_block_index)
-            pending = self._pending_prompt_logprobs.get(pending_key)
-            current = self.block_prompt_logprobs.get(block_id)
-            if pending is not None and pending.matches(key, expected_hash):
-                if not (
-                    isinstance(current, PromptLogprobsBlockRef)
-                    and self._prompt_logprobs_entry_matches(current, key, expected_hash)
-                ):
-                    current = self.attach_pending_prompt_logprobs(
-                        request_id, logical_block_index, block_id, key, expected_hash
-                    )
-                else:
-                    self._pending_prompt_logprobs.pop(pending_key)
-
-            if current is None or not self._prompt_logprobs_entry_matches(
-                current, key, expected_hash
-            ):
-                raise KeyError(
-                    "missing exact prompt-logprob sidecar for "
-                    f"request {request_id}, logical block {logical_block_index}"
-                )
-
-            global_start = logical_block_index * block_size
-            local_start = 1 if logical_block_index == 0 else 0
-            local_stop = min(block_size, prompt_token_count - global_start)
-            required = np.arange(local_start, max(local_start, local_stop), dtype=np.int32)
-            complete_block = prompt_token_count - global_start >= block_size
-            registered_hash = int(self.block_hashes[block_id]) if self.enable_prefix_caching else -1
-            reusable = (
-                complete_block
-                and expected_hash is not None
-                and registered_hash == int(expected_hash)
-            )
-            captured.append(
-                self.seal_prompt_logprobs_block(block_id, key, expected_hash, required, reusable)
-            )
-
-        self._pending_prompt_logprobs.pop((int(request_id), num_blocks), None)
-        return tuple(captured)
-
     def materialize_prompt_logprobs(
         self,
-        block_refs: Sequence[PromptLogprobsBlockRef],
+        block_refs: Sequence[PromptLogprobsBlock],
         key: PromptLogprobsKey,
         prompt_token_count: int,
-    ) -> MaterializedPromptLogprobs:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Reconstruct numeric prompt results in target-token order.
 
         A prompt of ``P`` tokens has ``P - 1`` prompt scores. Logical block zero
@@ -1163,7 +904,7 @@ class KVBlockAllocator:
             raise ValueError("prompt_token_count must be non-negative")
         expected_count = max(prompt_token_count - 1, 0)
         if expected_count == 0:
-            return MaterializedPromptLogprobs(
+            return (
                 np.empty((0,), dtype=np.float32),
                 np.empty((0, key.top_n), dtype=np.float32),
                 np.empty((0, key.top_n), dtype=np.int32),
@@ -1188,18 +929,10 @@ class KVBlockAllocator:
             if not required.size:
                 continue
 
-            lookup = {int(position): index for index, position in enumerate(ref.target_positions)}
-            try:
-                indices = np.asarray(
-                    [lookup[int(position)] for position in required], dtype=np.intp
-                )
-            except KeyError as exc:
-                raise ValueError(
-                    f"prompt-logprob block {logical_block_index} is missing target position {exc.args[0]}"
-                ) from exc
-            selected_parts.append(ref.selected_logprobs[indices])
-            top_values_parts.append(ref.top_n_logprobs[indices])
-            top_ids_parts.append(ref.top_n_token_ids[indices])
+            selected, top_values, top_ids = ref.extract(required)
+            selected_parts.append(selected)
+            top_values_parts.append(top_values)
+            top_ids_parts.append(top_ids)
 
         selected = np.concatenate(selected_parts).astype(np.float32, copy=False)
         top_values = np.concatenate(top_values_parts).astype(np.float32, copy=False)
@@ -1208,14 +941,7 @@ class KVBlockAllocator:
             raise ValueError(
                 f"materialized {selected.size} prompt scores, expected {expected_count}"
             )
-        return MaterializedPromptLogprobs(selected, top_values, top_ids)
-
-    def discard_pending_prompt_logprobs(self, request_id: int) -> None:
-        """Drop request-private builders after completion or cancellation."""
-        request_id = int(request_id)
-        stale = [key for key in self._pending_prompt_logprobs if key[0] == request_id]
-        for key in stale:
-            self._pending_prompt_logprobs.pop(key)
+        return selected, top_values, top_ids
 
     # =========================================================================
     # Per-block routing storage methods (for MoE routing replay)

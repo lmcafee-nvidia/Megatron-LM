@@ -9,7 +9,11 @@ import numpy as np
 import pytest
 import torch
 
-from megatron.core.inference.config import InferenceConfig, PrefixCachingEvictionPolicy
+from megatron.core.inference.config import (
+    AsyncScheduleMode,
+    InferenceConfig,
+    PrefixCachingEvictionPolicy,
+)
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.contexts.mamba_slot_allocator import (
     MambaSlotAllocator,
@@ -2621,19 +2625,16 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         )
 
     @classmethod
-    def _run_prompt_logprob_request(cls, engine, request_id, prompt, top_n, expect_uncached=False):
+    def _run_prompt_logprob_request(cls, engine, request_id, prompt, top_n):
         request = cls._make_prompt_logprob_request(engine, request_id, prompt, top_n)
         computed_before = engine.context.lifetime_prefill_token_count
         engine._add_request(request)
-        check_uncached = expect_uncached
         for _ in range(32):
             result = engine.step_modern()
-            if check_uncached:
-                assert request._prompt_logprobs_force_uncached
-                check_uncached = False
             for record in result["finished_request_records"]:
                 output = record.merge()
                 if output.request_id == request_id:
+                    assert getattr(request, "_pending_prompt_logprob_row", None) is None
                     cost = engine.context.lifetime_prefill_token_count - computed_before
                     return output, cost, request.finished_chunk_token_count > 0
         pytest.fail(f"prompt-logprob request {request_id} did not finish")
@@ -2656,8 +2657,9 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
 
     @pytest.mark.internal
     @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
+    @pytest.mark.parametrize("async_sched_mode", list(AsyncScheduleMode))
     @torch.inference_mode()
-    def test_prompt_logprob_sidecar_reuse(self, model_provider):
+    def test_prompt_logprob_sidecar_reuse(self, model_provider, async_sched_mode):
         if model_provider == "hybrid":
             available, reason = _check_mamba_sequence_packing_support()
             if not available:
@@ -2690,6 +2692,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             cache_config = self._case_config(case, enable_prefix_caching=True)
             cache_config.materialize_only_last_token_logits = False
             cache_config.enable_chunked_prefill = True
+            cache_config.async_sched_mode = async_sched_mode
             cache_config.context_max_tokens = cache_config.context_block_size_tokens + 8
             cache_env = self._build_test_env(cache_config)
             engine = cache_env.engine
@@ -2703,20 +2706,10 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 allocator.block_prompt_logprobs.values(),
                 key=lambda sidecar: sidecar.logical_block_index,
             )
-            assert len(sidecars) == 2 and all(sidecar.reusable for sidecar in sidecars)
-            np.testing.assert_array_equal(sidecars[0].target_positions, np.arange(1, 256))
-            np.testing.assert_array_equal(sidecars[1].target_positions, np.arange(256))
-            assert [sidecar.top_n_logprobs.shape for sidecar in sidecars] == [(255, 5), (256, 5)]
-            assert all(
-                not array.flags.writeable
-                for sidecar in sidecars
-                for array in (
-                    sidecar.target_positions,
-                    sidecar.selected_logprobs,
-                    sidecar.top_n_logprobs,
-                    sidecar.top_n_token_ids,
-                )
-            )
+            assert len(sidecars) == 2
+            np.testing.assert_array_equal(np.flatnonzero(sidecars[0].valid), np.arange(1, 256))
+            np.testing.assert_array_equal(np.flatnonzero(sidecars[1].valid), np.arange(256))
+            assert [sidecar.top_n_logprobs.shape for sidecar in sidecars] == [(256, 5), (256, 5)]
             exact, exact_cost, _ = run(engine, 11, prompt, 5)
             self._assert_prompt_logprob_parity(exact, oracle_top5)
             assert exact.num_cached_tokens == 512
@@ -2726,8 +2719,33 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             self._assert_prompt_logprob_parity(mismatch, oracle_top4)
             assert (mismatch.num_cached_tokens, mismatch_cost) == (0, prompt_length)
 
-            # The mismatch is admitted first, then overwrites the allocator
-            # mapping before the exact request captures its retained top-4 refs.
+            # Keep the two canonical prefix blocks pinned and leave only one
+            # allocatable block. Reuse still succeeds because no private shadow
+            # copy of either matched KV block is needed.
+            top4_sidecars = sorted(
+                allocator.block_prompt_logprobs.values(),
+                key=lambda sidecar: sidecar.logical_block_index,
+            )
+            matched_ids = torch.tensor(
+                [sidecar.block_id for sidecar in top4_sidecars], dtype=torch.int32
+            )
+            allocator.block_ref_counts[matched_ids] += 1
+            filler = None
+            try:
+                filler_count = allocator.get_allocatable_count() - 1
+                filler = allocator.allocate_memory_blocks(filler_count).clone()
+                assert filler is not None and allocator.get_allocatable_count() == 1
+                pressure, pressure_cost, _ = run(engine, 13, prompt, 4)
+                self._assert_prompt_logprob_parity(pressure, oracle_top4)
+                assert pressure.num_cached_tokens == 512
+                assert pressure_cost == (2 if model_provider == "gpt" else 257)
+            finally:
+                if filler is not None:
+                    allocator.release_memory_blocks(filler)
+                allocator.release_memory_blocks(matched_ids)
+
+            # Each request keeps its own sidecar references while a different
+            # settings variant replaces the allocator's discoverable mapping.
             concurrent = [
                 self._make_prompt_logprob_request(engine, 20, prompt, 5),
                 self._make_prompt_logprob_request(engine, 21, prompt, 4),
@@ -2743,16 +2761,9 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                     break
             self._assert_prompt_logprob_parity(outputs[20], oracle_top5)
             self._assert_prompt_logprob_parity(outputs[21], oracle_top4)
-
-            # Leave exactly three allocatable blocks: enough for a private
-            # full prefill, but not enough to pin two matches plus shadows.
-            filler_count = allocator.get_allocatable_count() - 3
-            filler = allocator.allocate_memory_blocks(filler_count).clone()
-            assert filler is not None and allocator.get_allocatable_count() == 3
-            pressure, pressure_cost, _ = run(engine, 13, prompt, 4, expect_uncached=True)
-            self._assert_prompt_logprob_parity(pressure, oracle_top4)
-            assert (pressure.num_cached_tokens, pressure_cost) == (0, prompt_length)
-            allocator.release_memory_blocks(filler)
+            assert {sidecar.key.top_n for sidecar in allocator.block_prompt_logprobs.values()} == {
+                4
+            }
         finally:
             DynamicInferenceContext.ROUNDER = 64
             DynamicInferenceContext.TOKEN_ROUNDER = 64
