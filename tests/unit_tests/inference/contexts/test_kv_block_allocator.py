@@ -779,6 +779,9 @@ def test_prompt_logprob_reuse_requires_exact_key_and_latest_variant_replaces():
         is None
     )
 
+    replacement_values = np.full((3, 2), -9)
+    original.valid[3] = False
+    original.store(positions, np.full(3, -9), replacement_values, -replacement_values)
     key_3 = PromptLogprobsKey.create("raw_logprobs", 3)
     assert allocator.get_prompt_logprobs_block(block_id, key_3, 101) is None
     replacement = allocator.store_prompt_logprobs(
@@ -793,44 +796,10 @@ def test_prompt_logprob_reuse_requires_exact_key_and_latest_variant_replaces():
     )
     assert allocator.get_prompt_logprobs_block(block_id, key_2, 101) is None
     assert allocator.get_prompt_logprobs_block(block_id, key_3, 101) is replacement
-    np.testing.assert_array_equal(original.selected_logprobs[positions], [-1, -2, -3])
-
-
-def test_prompt_logprob_replay_fills_missing_rows_without_replacing_cached_scores():
-    allocator = KVBlockAllocator(
-        _make_context(), pool_size=6, paused_limit=1, enable_prefix_caching=True
-    )
-    block_id = int(allocator.allocate_memory_blocks(1).item())
-    allocator.register_kv_block_hashes([block_id], [101])
-    key = PromptLogprobsKey.create("raw_logprobs", 2)
-    sidecar = allocator.store_prompt_logprobs(
-        0,
-        block_id,
-        key,
-        np.array([1, 2]),
-        np.array([-1.0, -2.0]),
-        np.array([[-1.1, -1.2], [-2.1, -2.2]]),
-        np.array([[11, 12], [21, 22]]),
-        101,
-    )
-
-    replayed = allocator.store_prompt_logprobs(
-        0,
-        block_id,
-        key,
-        np.array([1, 2, 3]),
-        np.array([-10.0, -20.0, -3.0]),
-        np.array([[-10.1, -10.2], [-20.1, -20.2], [-3.1, -3.2]]),
-        np.array([[101, 102], [201, 202], [31, 32]]),
-        101,
-        block=sidecar,
-    )
-
-    assert replayed is sidecar
-    selected, top_values, top_ids = sidecar.extract(np.array([1, 2, 3]))
-    np.testing.assert_allclose(selected, [-1.0, -2.0, -3.0])
-    np.testing.assert_allclose(top_values, [[-1.1, -1.2], [-2.1, -2.2], [-3.1, -3.2]])
-    assert top_ids.tolist() == [[11, 12], [21, 22], [31, 32]]
+    selected, top_values, top_ids = original.extract(positions)
+    assert selected.tolist() == [-1, -2, -9]
+    assert top_values.tolist() == [[0, 0], [0, 0], [-9, -9]]
+    assert top_ids.tolist() == [[0, 1], [2, 3], [9, 9]]
 
 
 def test_prompt_logprob_partial_block_materializes_after_block_cleanup():
