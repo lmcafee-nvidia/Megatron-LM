@@ -116,7 +116,7 @@ class PromptLogprobsBlock:
         top_n_logprobs: Optional[np.ndarray],
         top_n_token_ids: Optional[np.ndarray],
     ) -> None:
-        """Store or replace rows indexed by target-token position."""
+        """Fill rows indexed by target-token position without replacing cached scores."""
         positions = np.asarray(target_positions)
         if positions.ndim != 1:
             raise ValueError("target_positions must be one-dimensional")
@@ -164,10 +164,16 @@ class PromptLogprobsBlock:
             top_values = top_values_array.astype(np.float32, copy=False)
             top_ids = top_ids_array.astype(np.int32, copy=False)
 
-        self.selected_logprobs[positions] = selected
-        self.top_n_logprobs[positions] = top_values
-        self.top_n_token_ids[positions] = top_ids
-        self.valid[positions] = True
+        # A hybrid model can replay the final matched block after restoring the
+        # preceding Mamba state so it can compute the first uncached score. Keep
+        # the original scores for replayed positions: small numeric differences do
+        # not make cached scores stale. Newly missing rows remain mutable.
+        missing = ~self.valid[positions]
+        missing_positions = positions[missing]
+        self.selected_logprobs[missing_positions] = selected[missing]
+        self.top_n_logprobs[missing_positions] = top_values[missing]
+        self.top_n_token_ids[missing_positions] = top_ids[missing]
+        self.valid[missing_positions] = True
 
     def has_rows(self, required_positions: np.ndarray) -> bool:
         """Whether every requested target-token position has been stored."""
