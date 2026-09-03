@@ -335,6 +335,53 @@ def test_dynamic_inference_request_serialize_strips_event_add_engine():
     assert rec_out.requests[0].request_id == 7
 
 
+def test_merge_uses_complete_and_latest_original_prompt_scores():
+    """A later recomputation can replace incomplete original-prompt scores."""
+    sampling_params = SamplingParams(num_tokens_to_generate=4, termination_id=0)
+    first = _make_dynamic_request(
+        prompt_tokens=torch.tensor([1, 2, 3, 4]),
+        sampling_params=sampling_params,
+        generated_tokens=[],
+        prompt_log_probs=[-0.1],
+        prompt_top_n_logprobs=[{"one": -0.1}],
+    )
+    second = _make_dynamic_request(
+        prompt_tokens=torch.tensor([1, 2, 3, 4, 5]),
+        sampling_params=sampling_params,
+        generated_tokens=[6],
+        prompt_log_probs=[-0.1, -0.2, -0.3, -0.4],
+        prompt_top_n_logprobs=[{"one": -0.1}, {"two": -0.2}, {"three": -0.3}, {"extra": -0.4}],
+    )
+    third = _make_dynamic_request(
+        prompt_tokens=torch.tensor([1, 2, 3, 4, 5, 6]),
+        sampling_params=sampling_params,
+        generated_tokens=[7],
+        prompt_log_probs=[-0.1, -0.2],
+        prompt_top_n_logprobs=[{"one": -0.1}, {"two": -0.2}],
+    )
+    fourth = _make_dynamic_request(
+        prompt_tokens=torch.tensor([1, 2, 3, 4, 5, 6, 7]),
+        sampling_params=sampling_params,
+        generated_tokens=[8],
+        prompt_log_probs=[-1.1, -1.2, -1.3, -1.4],
+        prompt_top_n_logprobs=[
+            {"new-one": -1.1},
+            {"new-two": -1.2},
+            {"new-three": -1.3},
+            {"new-extra": -1.4},
+        ],
+    )
+
+    merged = DynamicInferenceRequestRecord(requests=[first, second, third, fourth]).merge()
+
+    assert merged.prompt_log_probs == [-1.1, -1.2, -1.3]
+    assert merged.prompt_top_n_logprobs == [
+        {"new-one": -1.1},
+        {"new-two": -1.2},
+        {"new-three": -1.3},
+    ]
+
+
 @pytest.mark.parametrize(
     ("return_prompt_tokens", "expected_prompt_field", "expected_remaining_prompt_field"),
     [
