@@ -45,7 +45,7 @@ from tests.unit_tests.test_utilities import Utils
 @dataclass
 class _RunResult:
     requests: list[DynamicInferenceRequest]
-    record_lengths: dict[int, int]
+    checkpoint_counts: Counter
     runtime: Counter
     witness: dict[str, object] | None
 
@@ -150,21 +150,27 @@ def _event_count(request, event_type):
     return sum(event.type == event_type for event in request.events)
 
 
-def _collect_finished(result, completed, record_lengths):
-    for record in result["finished_request_records"]:
-        merged = record.merge()
-        completed[merged.request_id] = merged
-        record_lengths[merged.request_id] = len(record.requests)
+def _track_checkpoint_calls(engine, checkpoint_counts, *request_ids):
+    for request_id in request_ids:
+        record = engine.requests[request_id].record
+        record.checkpoint = mock.Mock(
+            wraps=record.checkpoint,
+            side_effect=lambda _request_id=request_id: checkpoint_counts.update([_request_id])
+            or mock.DEFAULT,
+        )
+
+
+def _collect_finished(result, completed, tokenizer):
+    for request in result["finished_requests"]:
+        request.finalize_text(tokenizer)
+        completed[request.request_id] = request
 
 
 def _assert_engine_drained(engine, futures, completed, request_ids):
     assert set(completed) == set(request_ids)
     assert all(future.done() for future in futures)
-    assert not engine.requests
-    assert not engine.waiting_request_ids
-    assert not engine.failed_request_ids
-    assert engine.context.total_request_count == 0
-    assert engine.context.paused_request_count == 0
+    assert not (engine.requests or engine.waiting_request_ids or engine.failed_request_ids)
+    assert (engine.context.total_request_count, engine.context.paused_request_count) == (0, 0)
 
 
 def _snapshot_run(result):
@@ -457,7 +463,7 @@ class RequestLifecyclePairwiseBase(_DynamicInferenceEngineTestBase):
         torch.cuda.empty_cache()
 
     @classmethod
-    def _intervene(cls, scenario, engine, target_id, runtime):
+    def _intervene(cls, scenario, engine, target_id, runtime, checkpoint_counts):
         context = engine.context
         request = engine.get_request(target_id)
         feature_keys = _feature_keys(scenario)
@@ -474,16 +480,15 @@ class RequestLifecyclePairwiseBase(_DynamicInferenceEngineTestBase):
                 "finished_chunk_token_count": request.finished_chunk_token_count,
                 "remaining_prompt_length": len(request.remaining_prompt_tokens),
             }
+            assert checkpoint_counts[target_id] == 0
             engine.suspend()
             assert engine.resume_request_ids == [3, 1, 0]
-            assert len(engine.requests[target_id].record.requests) == 1
+            assert checkpoint_counts[target_id] == 1
             engine.resume()
             resumed = engine.get_request(target_id)
             assert resumed.finished_chunk_token_count == 0
             assert torch.equal(resumed.remaining_prompt_tokens, resumed.prompt_tokens)
-            witness["record_segments_after_resume"] = len(
-                engine.requests[target_id].record.requests
-            )
+            witness["checkpoint_calls_after_resume"] = checkpoint_counts[target_id]
         else:
             row, block_ids, kv_before = _request_kv_snapshot(context, target_id)
             pointer_before = context.memory_buffer.data_ptr()
@@ -567,20 +572,19 @@ class RequestLifecyclePairwiseBase(_DynamicInferenceEngineTestBase):
         requests = [all_requests[i] for i in (3, 1, 0)] if is_chunked else all_requests[:3]
         target_id = requests[-1 if is_chunked else 0].request_id
         futures = [engine._add_request(request) for request in requests]
-        runtime = Counter()
+        checkpoint_counts, runtime = Counter(), Counter()
+        _track_checkpoint_calls(
+            engine, checkpoint_counts, *(request.request_id for request in requests)
+        )
         _instrument_request_correlated_runtime(env, scenario, runtime)
         feature_keys = _feature_keys(scenario)
         intervention = None
         completed = {}
-        record_lengths = {}
 
         for _ in range(128):
             result = engine.step_modern()
             runtime["steps"] += 1
-            for record in result["finished_request_records"]:
-                merged = record.merge()
-                completed[merged.request_id] = merged
-                record_lengths[merged.request_id] = len(record.requests)
+            _collect_finished(result, completed, engine.controller.tokenizer)
 
             if treatment and intervention is None and target_id in engine.requests:
                 target = engine.get_request(target_id)
@@ -595,20 +599,18 @@ class RequestLifecyclePairwiseBase(_DynamicInferenceEngineTestBase):
                         2 if scenario.name == "persist-te-swa-stochastic" else 1
                     )
                 if ready:
-                    intervention = cls._intervene(scenario, engine, target_id, runtime)
+                    intervention = cls._intervene(
+                        scenario, engine, target_id, runtime, checkpoint_counts
+                    )
 
             if not engine.has_unfinished_requests():
                 break
         else:
             pytest.fail(f"{scenario.name} did not drain within 128 steps")
 
-        assert set(completed) == {request.request_id for request in requests}
-        assert all(future.done() for future in futures)
-        assert not engine.requests
-        assert not engine.waiting_request_ids
-        assert not engine.failed_request_ids
-        assert engine.context.total_request_count == 0
-        assert engine.context.paused_request_count == 0
+        _assert_engine_drained(
+            engine, futures, completed, (request.request_id for request in requests)
+        )
         if treatment:
             assert intervention is not None
             for key in feature_keys:
@@ -625,7 +627,7 @@ class RequestLifecyclePairwiseBase(_DynamicInferenceEngineTestBase):
             assert all(request.generated_log_probs is not None for request in finished)
             assert all(request.prompt_top_n_logprobs for request in finished)
             assert all(request.generated_top_n_logprobs for request in finished)
-        return _RunResult(finished, record_lengths, runtime, intervention)
+        return _RunResult(finished, checkpoint_counts, runtime, intervention)
 
     @classmethod
     def _assert_pair(cls, scenario, *, coordinator=False):

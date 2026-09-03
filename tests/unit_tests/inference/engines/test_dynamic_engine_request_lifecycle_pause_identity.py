@@ -23,6 +23,7 @@ from tests.unit_tests.inference.engines.request_lifecycle_test_utils import (
     _release_filler,
     _run_treatment_pair,
     _RunResult,
+    _track_checkpoint_calls,
 )
 from tests.unit_tests.inference.engines.test_dynamic_engine import set_rounder as _set_rounder
 from tests.unit_tests.inference.engines.test_dynamic_engine_async_sched import (
@@ -64,8 +65,9 @@ class TestRequestLifecyclePairwise(RequestLifecyclePairwiseBase):
             request.sampling_params.add_attributes({"top_n_logprobs": 0})
         head_filler = _allocate_leaving(allocator, 4) if treatment else None
         futures = [engine._add_request(companion)]
-        completed, record_lengths = {}, {}
-        _collect_finished(engine.step_modern(), completed, record_lengths)
+        checkpoint_counts, completed = Counter(), {}
+        _track_checkpoint_calls(engine, checkpoint_counts, companion_id)
+        _collect_finished(engine.step_modern(), completed, engine.controller.tokenizer)
         assert (
             companion.generated_tokens
             and context.request_last_kv_block_offset[
@@ -76,21 +78,18 @@ class TestRequestLifecyclePairwise(RequestLifecyclePairwiseBase):
         target_forwards_before = runtime[("model-forward", 0, companion_id)]
 
         futures.append(engine._add_request(chunk))
+        _track_checkpoint_calls(engine, checkpoint_counts, chunk_id)
         engine.schedule_waiting_requests()
         assert context.chunked_prefill_request_id == chunk_id
         assert chunk.finished_chunk_token_count == 255
         assert len(chunk.remaining_prompt_tokens) == 258
         tail_filler = _allocate_leaving(allocator, 0) if treatment else None
         evictions_before = engine.evicted_request_count
-        _collect_finished(engine.step_modern(), completed, record_lengths)
+        _collect_finished(engine.step_modern(), completed, engine.controller.tokenizer)
         witness = None
         if treatment:
-            record = engine.requests[companion_id].record
-            merged = record.merge()
             assert engine.evicted_request_count == evictions_before + 1
-            assert len(record.requests) == 2
-            assert _event_count(merged, DynamicInferenceEventType.PAUSE) == 1
-            assert _event_count(merged, DynamicInferenceEventType.EVICT) == 1
+            assert checkpoint_counts[companion_id] == 1
             assert context.chunked_prefill_request_id == chunk_id
             assert chunk.finished_chunk_token_count == 255
             assert _event_count(chunk, DynamicInferenceEventType.EVICT) == 0
@@ -107,7 +106,7 @@ class TestRequestLifecyclePairwise(RequestLifecyclePairwiseBase):
         for _ in range(128):
             if not engine.has_unfinished_requests():
                 break
-            _collect_finished(engine.step_modern(), completed, record_lengths)
+            _collect_finished(engine.step_modern(), completed, engine.controller.tokenizer)
         else:
             pytest.fail("chunked companion eviction did not drain")
         _assert_engine_drained(engine, futures, completed, (companion_id, chunk_id))
@@ -117,11 +116,10 @@ class TestRequestLifecyclePairwise(RequestLifecyclePairwiseBase):
         assert not requests[0].prompt_top_n_logprobs
         assert not requests[0].generated_top_n_logprobs
         if treatment:
-            assert record_lengths == {companion_id: 2, chunk_id: 1}
-            assert all(
-                segment.generated_text is not None for segment in futures[0].result().requests
-            )
-        return _RunResult(requests, record_lengths, runtime, witness)
+            assert checkpoint_counts[companion_id] == 1 and not checkpoint_counts[chunk_id]
+            assert _event_count(requests[0], DynamicInferenceEventType.PAUSE) == 1
+            assert _event_count(requests[0], DynamicInferenceEventType.EVICT) == 1
+        return _RunResult(requests, checkpoint_counts, runtime, witness)
 
     @torch.inference_mode()
     def test_chunked_companion_zero_budget_evict(self):
@@ -173,9 +171,10 @@ class TestRequestLifecyclePairwiseEP2(RequestLifecyclePairwiseBase):
         )
         filler = _allocate_leaving(allocator, 2) if treatment else None
         futures = [engine._add_request(target), engine._add_request(companion)]
-        completed, record_lengths = {}, {}
-        _collect_finished(engine.step_modern(), completed, record_lengths)
-        _collect_finished(engine.step_modern(), completed, record_lengths)
+        checkpoint_counts, completed = Counter(), {}
+        _track_checkpoint_calls(engine, checkpoint_counts, target_id, companion_id)
+        _collect_finished(engine.step_modern(), completed, engine.controller.tokenizer)
+        _collect_finished(engine.step_modern(), completed, engine.controller.tokenizer)
         witness = None
         dispatch_at_pause = None
         if treatment:
@@ -183,8 +182,8 @@ class TestRequestLifecyclePairwiseEP2(RequestLifecyclePairwiseBase):
             assert context.request_ids[0].item() == target_id
             assert allocator.get_paused_used() == 1
             assert engine.evicted_request_count == 0
-            assert len(engine.requests[target_id].record.requests) == 1
-            paused = engine.requests[target_id].record.merge()
+            assert checkpoint_counts[target_id] == 0
+            paused = engine.get_request(target_id)
             assert _event_count(paused, DynamicInferenceEventType.PAUSE) == 1
             assert _event_count(paused, DynamicInferenceEventType.EVICT) == 0
             dispatch_at_pause = runtime[("nccl-dispatch", target_id)]
@@ -195,25 +194,24 @@ class TestRequestLifecyclePairwiseEP2(RequestLifecyclePairwiseBase):
         for _ in range(32):
             if not engine.has_unfinished_requests():
                 break
-            _collect_finished(engine.step_modern(), completed, record_lengths)
+            _collect_finished(engine.step_modern(), completed, engine.controller.tokenizer)
         else:
             pytest.fail("EP2 retained-pause requests did not drain")
         _release_filler(allocator, filler)
         _assert_engine_drained(engine, futures, completed, (target_id, companion_id))
         assert runtime["nccl-token-dispatches"] == runtime["nccl-token-combines"] > 0
-        assert runtime["nccl-combine-before-dispatch"] == 0
-        assert runtime["nccl-dispatch-inflight"] == 0
+        assert runtime["nccl-combine-before-dispatch"] == runtime["nccl-dispatch-inflight"] == 0
         if treatment:
             assert runtime[("nccl-dispatch", target_id)] > dispatch_at_pause
             assert engine.evicted_request_count == 0
-            assert record_lengths[target_id] == 1
+            assert not checkpoint_counts
             witness = {
                 "request_id": target_id,
                 "dispatches_at_pause": dispatch_at_pause,
                 "dispatches_total": runtime[("nccl-dispatch", target_id)],
             }
         requests = [completed[request_id] for request_id in (target_id, companion_id)]
-        return _RunResult(requests, record_lengths, runtime, witness)
+        return _RunResult(requests, checkpoint_counts, runtime, witness)
 
     @torch.inference_mode()
     def test_retained_pause_ep2(self):
