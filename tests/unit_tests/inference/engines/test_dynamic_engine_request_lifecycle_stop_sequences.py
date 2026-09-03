@@ -23,6 +23,7 @@ from tests.unit_tests.inference.engines.request_lifecycle_test_utils import (
     _release_filler,
     _run_treatment_pair,
     _RunResult,
+    _track_checkpoint_calls,
 )
 from tests.unit_tests.inference.engines.test_dynamic_engine_async_sched import (
     _AsyncPairScenario,
@@ -66,18 +67,18 @@ class TestRequestLifecycleStopSequences(RequestLifecyclePairwiseBase):
         )
         filler = _allocate_leaving(allocator, 1) if treatment else None
         future = engine._add_request(request)
-        completed, record_lengths = {}, {}
-        _collect_finished(engine.step_modern(), completed, record_lengths)
+        checkpoint_counts, completed = Counter(), {}
+        _track_checkpoint_calls(engine, checkpoint_counts, request_id)
+        _collect_finished(engine.step_modern(), completed, engine.controller.tokenizer)
         assert request.generated_tokens == [11]
         row = _active_request_row(context, request_id)
         slot_before = int(context.mamba_metadata.request_to_mamba_state_idx[row].item())
-        _collect_finished(engine.step_modern(), completed, record_lengths)
+        _collect_finished(engine.step_modern(), completed, engine.controller.tokenizer)
         witness = None
         if treatment:
-            record = engine.requests[request_id].record
-            assert engine.evicted_request_count == 1
-            assert len(record.requests) == 2
-            assert record.merge().generated_tokens == [11, 12]
+            assert (engine.evicted_request_count, checkpoint_counts[request_id]) == (1, 1)
+            checkpointed_tokens = engine.get_request(request_id).prompt_tokens[len(prompt) :]
+            assert checkpointed_tokens.tolist() == [11, 12]
             assert context.total_request_count == 0
             assert context.mamba_metadata.request_to_mamba_state_idx[0].item() == -1
             assert context.mamba_metadata.mamba_state_free_slot_count == context.max_requests
@@ -98,7 +99,7 @@ class TestRequestLifecycleStopSequences(RequestLifecyclePairwiseBase):
         for _ in range(16):
             if not engine.has_unfinished_requests():
                 break
-            _collect_finished(engine.step_modern(), completed, record_lengths)
+            _collect_finished(engine.step_modern(), completed, engine.controller.tokenizer)
         else:
             pytest.fail("hybrid Mamba stop-keep request did not drain")
         _release_filler(allocator, filler)
@@ -110,11 +111,9 @@ class TestRequestLifecycleStopSequences(RequestLifecyclePairwiseBase):
             len(merged.generated_log_probs) == len(merged.generated_top_n_logprobs) == score_count
         )
         if treatment:
-            assert record_lengths[request_id] == 2
             assert _event_count(merged, DynamicInferenceEventType.EVICT) == 1
-            assert runtime[("mamba-forward", 0, request_id)] > 0
-            assert runtime[("mamba-forward", 1, request_id)] > 0
-        return _RunResult([merged], record_lengths, runtime, witness)
+            assert all(runtime[("mamba-forward", phase, request_id)] > 0 for phase in range(2))
+        return _RunResult([merged], checkpoint_counts, runtime, witness)
 
     @classmethod
     def _run_repeated_mtp_stop_strip(cls, *, treatment):
@@ -144,12 +143,12 @@ class TestRequestLifecycleStopSequences(RequestLifecyclePairwiseBase):
         )
         first_filler = _allocate_leaving(allocator, 1) if treatment else None
         future = engine._add_request(request)
-        completed, record_lengths = {}, {}
-        _collect_finished(engine.step_modern(), completed, record_lengths)
+        checkpoint_counts, completed = Counter(), {}
+        _track_checkpoint_calls(engine, checkpoint_counts, request_id)
+        _collect_finished(engine.step_modern(), completed, engine.controller.tokenizer)
         if treatment:
-            assert engine.evicted_request_count == 1
-            assert len(engine.requests[request_id].record.requests) == 2
-            assert engine.requests[request_id].record.merge().generated_tokens == [11]
+            assert (engine.evicted_request_count, checkpoint_counts[request_id]) == (1, 1)
+            assert engine.get_request(request_id).prompt_tokens[len(prompt) :].tolist() == [11]
             _release_filler(allocator, first_filler)
             first_filler = None
 
@@ -164,7 +163,7 @@ class TestRequestLifecycleStopSequences(RequestLifecyclePairwiseBase):
                 and engine.evicted_request_count == 1
                 and second_filler is None
                 and request_id in live_ids
-                and len(engine.requests[request_id].record.requests) == 2
+                and checkpoint_counts[request_id] == 1
             ):
                 row = _active_request_row(context, request_id)
                 block_count = int(context.request_kv_block_counts[row].item())
@@ -172,10 +171,10 @@ class TestRequestLifecycleStopSequences(RequestLifecyclePairwiseBase):
                 if block_count == 2 and offset >= 253:
                     second_filler = _allocate_leaving(allocator, 0)
                     assert second_filler is not None
-            _collect_finished(engine.step_modern(), completed, record_lengths)
+            _collect_finished(engine.step_modern(), completed, engine.controller.tokenizer)
             if treatment and engine.evicted_request_count == 2 and second_boundary is None:
-                partial = engine.requests[request_id].record.merge()
-                second_boundary = (len(partial.generated_tokens), partial.generated_tokens[-1])
+                checkpointed_tokens = engine.get_request(request_id).prompt_tokens[len(prompt) :]
+                second_boundary = (len(checkpointed_tokens), int(checkpointed_tokens[-1]))
                 _release_filler(allocator, second_filler)
                 second_filler = None
         else:
@@ -196,7 +195,7 @@ class TestRequestLifecycleStopSequences(RequestLifecyclePairwiseBase):
         if treatment:
             assert second_boundary == (257, 267)
             assert engine.evicted_request_count == 2
-            assert record_lengths[request_id] == 3
+            assert checkpoint_counts[request_id] == 2
             assert _event_count(merged, DynamicInferenceEventType.PAUSE) == 2
             assert _event_count(merged, DynamicInferenceEventType.EVICT) == 2
             for phase in range(3):
@@ -208,7 +207,7 @@ class TestRequestLifecycleStopSequences(RequestLifecyclePairwiseBase):
                 "evictions": engine.evicted_request_count,
                 "second_boundary": second_boundary,
             }
-        return _RunResult([merged], record_lengths, runtime, witness)
+        return _RunResult([merged], checkpoint_counts, runtime, witness)
 
     @torch.inference_mode()
     def test_single_evict_hybrid_mamba_stop_keep(self):
