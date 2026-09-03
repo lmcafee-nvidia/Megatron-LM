@@ -940,7 +940,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # Reset any partially prefilled requests so they recompute from the start
             for req_id in [*waiting_request_ids, *recompute_resident_ids]:
                 req = self.get_request(req_id)
-                if req.finished_chunk_token_count > 0:
+                if req.finished_chunk_token_count > 0 and not req.generated_tokens:
                     req.remaining_prompt_tokens = req.prompt_tokens
                     req.finished_chunk_token_count = 0
                     # The restarted prefill recomputes these positions, so its
