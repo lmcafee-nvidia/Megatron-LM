@@ -837,9 +837,11 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
     engine.requests = {request.request_id: types.SimpleNamespace(record=record)}
     engine.waiting_request_ids = deque()
     engine.state = EngineState.RUNNING
+    engine.controller = types.SimpleNamespace(
+        _async_sched_logits=types.SimpleNamespace(clear=mock.Mock())
+    )
     engine.unified_memory_level = 0
     engine.use_coordinator = False
-    engine.controller = types.SimpleNamespace(_async_sched_logits={})
     engine._add_request = mock.Mock()
     engine._notify_cond_for_new_request = mock.Mock(return_value=None)
     engine._loop = types.SimpleNamespace(call_soon_threadsafe=mock.Mock())
