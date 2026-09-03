@@ -25,7 +25,7 @@ REQUEST_FIELD_POLICY = {
     "arrival_time": "checkpoint:reset / merge:reset",
     "status": "checkpoint:preserve / merge:last",
     "encoder_prompt": "checkpoint:drop / merge:drop",
-    "generated_text": "checkpoint:reset / merge:decode-concatenated-tokens",
+    "generated_text": "checkpoint:reset / merge:reset / finalize:decode-concatenated-tokens",
     "segments": "checkpoint:drop / merge:drop-unsupported",
     "generated_segments": "checkpoint:drop / merge:drop-unsupported",
     "generated_sequence_lengths": "checkpoint:drop / merge:drop-unsupported",
