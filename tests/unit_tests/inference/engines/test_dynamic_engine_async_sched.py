@@ -270,6 +270,7 @@ def test_async_forward_routes_one_controller_iteration(
     engine.state = EngineState.RUNNING
     engine.logging_step_interval = 0
     engine.metrics_writer = None
+    engine._cuda_graph_rebuild_pending = False
     engine.schedule_waiting_requests = mock.Mock()
     engine._should_run_async_sched_overlap = mock.Mock(return_value=run_async_overlap)
     engine.context = SimpleNamespace(
@@ -1922,7 +1923,7 @@ def _controller_with_pending_logits():
 def test_async_reset_clears_pending_logits():
     """Engine reset cannot expose logits produced for the previous request batch."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
-    engine.context = SimpleNamespace(reset=mock.Mock())
+    engine.context = SimpleNamespace(reset=mock.Mock(), cuda_graphs_available=True)
     engine.controller = _controller_with_pending_logits()
     engine.num_speculative_tokens = 1
     engine._loop = None
