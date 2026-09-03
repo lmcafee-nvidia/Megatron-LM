@@ -69,11 +69,11 @@ class TestRequestLifecycleStopSequences(RequestLifecyclePairwiseBase):
         future = engine._add_request(request)
         checkpoint_counts, completed = Counter(), {}
         _track_checkpoint_calls(engine, checkpoint_counts, request_id)
-        _collect_finished(engine.step_modern(), completed, engine.controller.tokenizer)
+        _collect_finished(engine, engine.step_modern(), completed)
         assert request.generated_tokens == [11]
         row = _active_request_row(context, request_id)
         slot_before = int(context.mamba_metadata.request_to_mamba_state_idx[row].item())
-        _collect_finished(engine.step_modern(), completed, engine.controller.tokenizer)
+        _collect_finished(engine, engine.step_modern(), completed)
         witness = None
         if treatment:
             assert (engine.evicted_request_count, checkpoint_counts[request_id]) == (1, 1)
@@ -99,7 +99,7 @@ class TestRequestLifecycleStopSequences(RequestLifecyclePairwiseBase):
         for _ in range(16):
             if not engine.has_unfinished_requests():
                 break
-            _collect_finished(engine.step_modern(), completed, engine.controller.tokenizer)
+            _collect_finished(engine, engine.step_modern(), completed)
         else:
             pytest.fail("hybrid Mamba stop-keep request did not drain")
         _release_filler(allocator, filler)
@@ -145,7 +145,7 @@ class TestRequestLifecycleStopSequences(RequestLifecyclePairwiseBase):
         future = engine._add_request(request)
         checkpoint_counts, completed = Counter(), {}
         _track_checkpoint_calls(engine, checkpoint_counts, request_id)
-        _collect_finished(engine.step_modern(), completed, engine.controller.tokenizer)
+        _collect_finished(engine, engine.step_modern(), completed)
         if treatment:
             assert (engine.evicted_request_count, checkpoint_counts[request_id]) == (1, 1)
             assert engine.get_request(request_id).prompt_tokens[len(prompt) :].tolist() == [11]
@@ -171,7 +171,7 @@ class TestRequestLifecycleStopSequences(RequestLifecyclePairwiseBase):
                 if block_count == 2 and offset >= 253:
                     second_filler = _allocate_leaving(allocator, 0)
                     assert second_filler is not None
-            _collect_finished(engine.step_modern(), completed, engine.controller.tokenizer)
+            _collect_finished(engine, engine.step_modern(), completed)
             if treatment and engine.evicted_request_count == 2 and second_boundary is None:
                 checkpointed_tokens = engine.get_request(request_id).prompt_tokens[len(prompt) :]
                 second_boundary = (len(checkpointed_tokens), int(checkpointed_tokens[-1]))
