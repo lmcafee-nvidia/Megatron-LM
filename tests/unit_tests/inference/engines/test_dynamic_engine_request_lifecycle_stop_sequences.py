@@ -137,7 +137,7 @@ class TestRequestLifecycleStopSequences(RequestLifecyclePairwiseBase):
             request_id,
             prompt,
             300,
-            full_logprobs=True,
+            full_logprobs=False,
             stop_words=["267 268"],
             keep_stop=False,
         )
