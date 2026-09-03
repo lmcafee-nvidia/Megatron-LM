@@ -150,6 +150,16 @@ def _event_count(request, event_type):
     return sum(event.type == event_type for event in request.events)
 
 
+def _track_checkpoint_calls(engine, checkpoint_counts, *request_ids):
+    for request_id in request_ids:
+        record = engine.requests[request_id].record
+        record.checkpoint = mock.Mock(
+            wraps=record.checkpoint,
+            side_effect=lambda _request_id=request_id: checkpoint_counts.update([_request_id])
+            or mock.DEFAULT,
+        )
+
+
 def _collect_finished(engine, result, completed):
     for request in result["finished_requests"]:
         assert request.generated_text is None
@@ -357,6 +367,7 @@ def _request_kv_snapshot(context, request_id):
 
 def _coordinator_projection(request):
     coordinator = make_coordinator_direct(data_parallel_size=1, enable_prefix_caching=False)
+    coordinator.tokenizer.detokenize = mock.Mock(wraps=coordinator.tokenizer.detokenize)
     rank = coordinator.identities_of_data_parallel_ranks[0]
     request_id = request.request_id
     client = b"request-lifecycle-client"
@@ -369,10 +380,11 @@ def _coordinator_projection(request):
     coordinator._pending_counts[coordinator.identity_to_rank_index[rank]] = 1
 
     engine_payload = msgpack.packb(
-        [Headers.ENGINE_REPLY.value, [request.serialize()]], use_bin_type=True
+        [Headers.ENGINE_REPLY.value, [{**request.serialize(), "generated_text": None}]],
+        use_bin_type=True,
     )
     handle_engine_reply(coordinator, rank, msgpack.unpackb(engine_payload, raw=False))
-
+    coordinator.tokenizer.detokenize.assert_called_once()
     frames = coordinator.router_socket.send_multipart.call_args.args[0]
     assert frames[0] == client
     header, returned_id, returned = msgpack.unpackb(frames[1], raw=False)
