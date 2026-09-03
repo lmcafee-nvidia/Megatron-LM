@@ -3203,6 +3203,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             num_tokens_to_generate=num_tokens_to_generate,
             materialize_only_last_token_logits=materialize_only_last_token_logits,
             return_log_probs=True,
+            top_n_logprobs=3,
             skip_prompt_log_probs=skip_prompt_log_probs,
             model_provider="gpt",
             context_block_size_tokens=256,
@@ -3223,6 +3224,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 f"Request {request.request_id}: Expected {len(request.generated_tokens)} "
                 f"generated log probs, got {len(request.generated_log_probs)}"
             )
+            assert len(request.generated_top_n_logprobs) == len(request.generated_tokens)
 
             if skip_prompt_log_probs:
                 assert request.prompt_log_probs is None or len(request.prompt_log_probs) == 0, (
@@ -3230,11 +3232,13 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     f"skip_prompt_log_probs=True, but got "
                     f"{len(request.prompt_log_probs) if request.prompt_log_probs else 0} items"
                 )
+                assert not request.prompt_top_n_logprobs
             else:
                 assert len(request.prompt_log_probs) == prompt_length - 1, (
                     f"Request {request.request_id}: Expected {prompt_length - 1} "
                     f"prompt log probs, got {len(request.prompt_log_probs)}"
                 )
+                assert len(request.prompt_top_n_logprobs) == prompt_length - 1
 
             # Validate each generated log prob
             for i, log_prob in enumerate(request.generated_log_probs):
@@ -3261,17 +3265,13 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         prompt_length = 512
         num_tokens_to_generate = 4
 
-        # Create a deterministic mock forward pass that returns logits
-        # dependent ONLY on position_ids. This guarantees the same logits
-        # whether processed in one giant chunk or split across multiple chunks.
         def deterministic_mock_forward(input_ids, position_ids, attention_mask, *args, **kwargs):
             vocab_size = kwargs["vocab_size"]
-            # Use torch.linspace to generate varying but 100% deterministic logits per position
-            static_logits = torch.linspace(
-                -50, 50, 4096 * vocab_size, device=input_ids.device, dtype=torch.bfloat16
-            ).view(4096, vocab_size)
-
-            return static_logits[position_ids]
+            # Make selected logprobs strongly token-sensitive while remaining
+            # independent of chunk shape. The old bf16 linspace collapsed most
+            # within-row differences and could hide a wrong boundary token.
+            token_logits = torch.arange(vocab_size, device=input_ids.device, dtype=torch.float32)
+            return token_logits.expand(*position_ids.shape, vocab_size)
 
         def get_log_probs(chunked: bool, max_tokens: int):
             test_config = DynamicEngineTestConfig(
@@ -3296,16 +3296,17 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 deterministic_mock_forward, vocab_size=test_config.vocab_size
             )
 
-            # Ensure identical prompt tokens for both runs
-            torch.manual_seed(42)
-            req_tokens = torch.randint(0, test_config.vocab_size, (prompt_length,), device='cuda')
+            # Keep every known prompt target distinct from the argmax token.
+            req_tokens = torch.arange(prompt_length, device='cuda') % (test_config.vocab_size - 1)
             req = DynamicInferenceRequest(
                 request_id=1,
                 prompt_tokens=req_tokens,
                 sampling_params=SamplingParams(
                     num_tokens_to_generate=num_tokens_to_generate,
+                    top_k=1,
                     return_log_probs=True,
                     skip_prompt_log_probs=False,
+                    top_n_logprobs=3,
                     termination_id=-1,
                 ),
             )
@@ -3317,19 +3318,21 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 env.engine.schedule_waiting_requests()
                 env.engine.step_modern()
 
-            return req.prompt_log_probs
+            return req.prompt_log_probs, req.prompt_top_n_logprobs
 
         # Run non-chunked baseline (all 512 tokens in one pass)
-        baseline_log_probs = get_log_probs(chunked=False, max_tokens=1000)
+        baseline_log_probs, baseline_top_n = get_log_probs(chunked=False, max_tokens=1000)
 
         # Run chunked (512 tokens split across 256-token boundaries)
-        chunked_log_probs = get_log_probs(chunked=True, max_tokens=256)
+        chunked_log_probs, chunked_top_n = get_log_probs(chunked=True, max_tokens=256)
 
         assert baseline_log_probs is not None, "Baseline prompt_log_probs is missing"
         assert chunked_log_probs is not None, "Chunked prompt_log_probs is missing"
 
         assert len(baseline_log_probs) == prompt_length - 1
         assert len(chunked_log_probs) == prompt_length - 1
+        assert len(baseline_top_n) == prompt_length - 1
+        assert len(chunked_top_n) == prompt_length - 1
 
         # Compare element-wise using math.isclose to handle minor floating point rounding
         for i, (base_lp, chunk_lp) in enumerate(zip(baseline_log_probs, chunked_log_probs)):
@@ -3338,6 +3341,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 f"Baseline={base_lp:.4f}, Chunked={chunk_lp:.4f}. "
                 "This indicates log prob corruption at chunk boundaries!"
             )
+        for baseline_row, chunked_row in zip(baseline_top_n, chunked_top_n):
+            assert baseline_row.keys() == chunked_row.keys()
+            assert list(baseline_row.values()) == pytest.approx(list(chunked_row.values()))
 
     @pytest.mark.internal
     @pytest.mark.skipif(
