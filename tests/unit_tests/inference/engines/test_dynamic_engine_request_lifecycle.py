@@ -154,7 +154,6 @@ _UVM_OFFLOAD = _AsyncPairScenario(
     not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
 )
 class TestRequestLifecycleCorePairwise(RequestLifecyclePairwiseBase):
-
     @torch.inference_mode()
     def test_persist_te_swa_stochastic(self):
         result = self._assert_pair(_PERSIST_TE_SWA)
