@@ -4227,7 +4227,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         for request in finished_requests:
             assert request.status == Status.COMPLETED, f"Request {request.request_id} failed."
             assert (
-                len(request.generated_tokens) == 511
+                len(request.generated_tokens) == request.sampling_params.num_tokens_to_generate
             ), f"Request {request.request_id} didn't generate expected tokens."
 
     @pytest.mark.internal
