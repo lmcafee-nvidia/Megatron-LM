@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, auto
 from itertools import repeat
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, TypedDict, Union
 
 import torch
 from torch import Tensor
@@ -215,7 +215,16 @@ class RequestEntry:
     """Entry in the engine's `self.requests` dict."""
 
     record: DynamicInferenceRequestRecord
-    future: asyncio.Future
+    future: asyncio.Future[DynamicInferenceRequest]
+
+
+class DynamicInferenceEngineStepResult(TypedDict):
+    """Result returned by modern dynamic-engine step APIs."""
+
+    active_request_ids: list[int]
+    finished_requests: list[DynamicInferenceRequest]
+    step_time: float
+    cuda_graph_request_count: int | None
 
 
 # pylint: disable=line-too-long
@@ -233,7 +242,7 @@ class DynamicInferenceEngine(AbstractEngine):
     Args:
         text_generation_controller (TextGenerationController): A text generation
             controller that will be used to define how to preprocess prompts, generate
-            outputs and detokenizer the output tokens.
+            output tokens, and apply token-level generation policy.
         inference_context (DynamicInferenceContext): Context for managing in-flight
             batching and a dynamic block-level KV cache (similar to paged attention).
     """
@@ -998,6 +1007,14 @@ class DynamicInferenceEngine(AbstractEngine):
         async with self._cond:
             self._cond.notify_all()
 
+    @staticmethod
+    def _complete_request(request_entry: RequestEntry) -> DynamicInferenceRequest:
+        """Merge an engine-owned record once and resolve its completion future."""
+        assert not request_entry.future.done(), "Request future was already resolved."
+        finished_request = request_entry.record.merge()
+        request_entry.future.set_result(finished_request)
+        return finished_request
+
     def _handle_failed_request(self, request_id: int):
         """Handle a failed request by sending the reply immediately.
 
@@ -1030,26 +1047,14 @@ class DynamicInferenceEngine(AbstractEngine):
         request.status = Status.FAILED
         request.add_event_fail()
         self.failed_request_ids.append(request_id)
+        finished_request = self._complete_request(request_entry)
 
         # Send the reply immediately, because it may never get a chance to be sent again.
         if self.use_coordinator and self.is_mp_coordinator:
             payload = msgpack.packb(
-                [Headers.ENGINE_REPLY.value, [request_entry.record.merge().serialize()]],
-                use_bin_type=True,
+                [Headers.ENGINE_REPLY.value, [finished_request.serialize()]], use_bin_type=True
             )
             self.socket_for_receiving_requests.send(payload)
-        elif not self.use_coordinator:
-            if request.prompt is None:
-                request.prompt = self.controller.tokenizer.detokenize(
-                    request.prompt_tokens.tolist()
-                )
-            if request.generated_tokens:
-                request.generated_text = self.controller.tokenizer.detokenize(
-                    request.generated_tokens
-                )
-            else:
-                request.generated_text = ""
-        request_entry.future.set_result(request_entry.record)
 
     def has_unfinished_requests(self) -> bool:
         """Test if context contains unfinished requests."""
@@ -1277,7 +1282,7 @@ class DynamicInferenceEngine(AbstractEngine):
         pre_fwd_active_token_count: Optional[int] = None,
         pre_fwd_step_count: Optional[int] = None,
         finished_routing_block_ids: Optional[Dict[int, list[int]]] = None,
-    ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest]]:
+    ) -> Tuple[List[int], List[DynamicInferenceRequest]]:
         """
         Handles post-processing for requests after a step.
 
@@ -1301,11 +1306,11 @@ class DynamicInferenceEngine(AbstractEngine):
                 Used for per-block routing reconstruction.
 
         Returns:
-            A list of active requests and completed requests as `DynamicInferenceRequest` objects
+            Active request IDs and completed requests.
         """
         active_request_ids: list[int] = []
         finished_request_ids = set(finished_request_ids.tolist())
-        finished_request_records: list[DynamicInferenceRequestRecord] = []
+        finished_requests: list[DynamicInferenceRequest] = []
         self.finished_request_count += len(finished_request_ids)
         if evict_request_ids is not None:
             self.evicted_request_count += evict_request_ids.numel()
@@ -1333,6 +1338,7 @@ class DynamicInferenceEngine(AbstractEngine):
         for req_idx, (request_id, tokens, accepted_tokens_list, request_log_probs) in enumerate(
             zip(request_ids.tolist(), sample.tolist(), accepted_tokens_iter, log_probs_iter)
         ):
+            finished_entry = None
 
             # Ensure tokens is always a list for consistent handling
             if not isinstance(tokens, list):
@@ -1462,11 +1468,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
                     request.add_event_finish()
-                    finished_entry = self.requests.pop(request_id)
-                    finished_request = finished_entry.record[-1]
-                    finished_request.generated_length = len(finished_request.generated_tokens)
-                    finished_request_records.append(finished_entry.record)
-                    finished_entry.future.set_result(finished_entry.record)
+                    finished_entry = self.requests[request_id]
                 elif stop_word_hit:
                     # Stop word detected - mark for removal in next step's bookkeeping
                     # Don't pop yet; let the next step handle it properly via callback
@@ -1567,6 +1569,12 @@ class DynamicInferenceEngine(AbstractEngine):
                     else:
                         request.generated_top_n_logprobs.append(logit_dict)
 
+            # Merge only after the final token's scores and metadata have been applied.
+            if finished_entry is not None:
+                popped_entry = self.requests.pop(request_id)
+                assert popped_entry is finished_entry
+                finished_requests.append(self._complete_request(finished_entry))
+
         # Handle evicted requests.
         if evict_request_ids is not None and evict_request_ids.numel() > 0:
 
@@ -1587,7 +1595,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Clear the stop word being finished set after processing
         self.stop_word_being_finished_ids.clear()
 
-        return active_request_ids, finished_request_records
+        return active_request_ids, finished_requests
 
     def _get_and_clear_stop_word_finished_ids(self, active_request_ids: list[int]) -> set[int]:
         """Get and clear the set of request IDs that should be finished due to stop words.
@@ -2261,7 +2269,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
     async def async_bookkeep(
         self, step_result: Optional[Dict], context_state: Dict, step_time: float
-    ):
+    ) -> DynamicInferenceEngineStepResult:
         """Uses `asyncio` for continuous bookkeeping.
 
         Args:
@@ -2272,8 +2280,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         Returns:
             A dictionary containing:
-                active_requests (List): Requests that ran in the last step and are still active.
-                finished_requests (List): Requests that ran in the last step and have now finished.
+                active_request_ids (List): IDs that ran in the last step and remain active.
+                finished_requests (List): Flat, text-unfinalized requests that finished.
                 step_time (float): The step time in seconds.
                 cuda_graph_request_count (int): The CUDA graph batch size matching this step.
         """
@@ -2298,8 +2306,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 newly_paused_request_ids = newly_paused_request_ids.tolist()
                 [self.get_request(i).add_event_pause() for i in newly_paused_request_ids]
 
-            # Process finished requests (adds FINISH events and returns records).
-            active_request_ids, finished_request_records = self.post_process_requests(
+            # Process finished requests after applying all final-step metadata.
+            active_request_ids, finished_requests = self.post_process_requests(
                 active_request_ids,
                 finished_request_ids,
                 evict_request_ids,
@@ -2316,61 +2324,33 @@ class DynamicInferenceEngine(AbstractEngine):
 
         else:
             active_request_ids: list[int] = []
-            finished_request_records: list[DynamicInferenceRequestRecord] = []
+            finished_requests: list[DynamicInferenceRequest] = []
 
         # Failed requests. Status and events were already set in _handle_failed_request;
-        # here we just clean up the entry and include it in finished_request_records.
+        # here we just clean up the entry and reuse its already-merged future result.
         for failed_request_id in self.failed_request_ids:
             failed_entry = self.requests.pop(failed_request_id)
-            finished_request_records.append(failed_entry.record)
             assert (
                 failed_entry.future.done()
             ), f"Failed request {failed_request_id} future has not been properly resolved."
+            finished_requests.append(failed_entry.future.result())
         self.failed_request_ids.clear()
 
         nvtx_range_pop("bookkeeping")
 
-        # Detokenize all finished requests if not using
-        # the coordinator. Otherwise, the coordinator will
-        # overlap detokenization with the engine.
-        if not self.use_coordinator:
-            nvtx_range_push("detokenization")
-            for record in finished_request_records:
-                for request in record.requests:
-                    if request.prompt is None:
-                        request.prompt = self.controller.detokenize(
-                            self.controller.tokenizer,
-                            request.prompt_tokens.tolist(),
-                            remove_EOD=False,
-                        )
-                merged_request = record.merge()
-                record.generated_text = self.controller.detokenize(
-                    self.controller.tokenizer,
-                    merged_request.generated_tokens,
-                    remove_EOD=not record.requests[-1].sampling_params.detokenize_stop_sequence,
-                )
-                if len(record.requests) == 1:
-                    record.requests[0].generated_text = record.generated_text
-                else:
-                    for request in record.requests:
-                        request.generated_text = self.controller.detokenize(
-                            self.controller.tokenizer,
-                            request.generated_tokens,
-                            remove_EOD=not request.sampling_params.detokenize_stop_sequence,
-                        )
-            nvtx_range_pop("detokenization")
-
         # Handle necessary ZMQ DP coordinator communication.
-        # Failed request replies were already sent in _handle_failed_request,
-        # so only send completed records here.
+        # Failed request replies were already sent in _handle_failed_request.
         if self.use_coordinator and self.is_mp_coordinator:
-            records_to_send = [
-                r for r in finished_request_records if r.requests[-1].status != Status.FAILED
+            requests_to_send = [
+                request for request in finished_requests if request.status != Status.FAILED
             ]
-            if records_to_send:
+            if requests_to_send:
                 nvtx_range_push("coordinator_communication")
                 payload = msgpack.packb(
-                    [Headers.ENGINE_REPLY.value, [r.merge().serialize() for r in records_to_send]],
+                    [
+                        Headers.ENGINE_REPLY.value,
+                        [request.serialize() for request in requests_to_send],
+                    ],
                     use_bin_type=True,
                 )
                 self.socket_for_receiving_requests.send(payload)
@@ -2379,8 +2359,8 @@ class DynamicInferenceEngine(AbstractEngine):
             # Stream newly generated tokens for active requests. Finished
             # requests were already popped from self.requests above, so their
             # emit lengths are dropped here rather than in the loop.
-            for record in finished_request_records:
-                self._partial_emit_lengths.pop(record.requests[-1].request_id, None)
+            for request in finished_requests:
+                self._partial_emit_lengths.pop(request.request_id, None)
             self._try_send_streaming_partials()
 
         # Drain prefix cache hit counters from context into engine accumulators.
@@ -2564,24 +2544,19 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return {
             "active_request_ids": active_request_ids,
-            "finished_request_records": finished_request_records,
+            "finished_requests": finished_requests,
             "step_time": step_time,
             "cuda_graph_request_count": cuda_graph_request_count,
         }
 
-    async def async_step(
-        self,
-    ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
+    async def async_step(self) -> DynamicInferenceEngineStepResult:
         """
         Wrapper for controller.generate_output_tokens_dynamic_batch(), to
         match vLLM API. Uses `asyncio` for continuous generation which allows this
         method to sleep and wake up when new requests are available.
 
         Returns:
-            A tuple comprised of:
-                1. Requests that ran in the last step and are still active.
-                2. Requests that ran in the last step and have now finished.
-                3. The step time in seconds.
+            Active request IDs, finished requests, and step metadata.
         """
         last_step_data = await self.async_forward()
         ret = await self.async_bookkeep(*last_step_data)
@@ -2606,9 +2581,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # No running loop - safe to use run_until_complete
             return self._loop.run_until_complete(coro)
 
-    def step_modern(
-        self,
-    ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
+    def step_modern(self) -> DynamicInferenceEngineStepResult:
         """Synchronous wrapper for `self.async_step`."""
         return self._run_coroutine_sync(self.async_step())
 
@@ -2623,8 +2596,7 @@ class DynamicInferenceEngine(AbstractEngine):
         )
         result = self._run_coroutine_sync(self.async_step())
         active_requests = [self.get_request(i) for i in result["active_request_ids"]]
-        finished_requests = [r.merge() for r in result["finished_request_records"]]
-        return active_requests, finished_requests, result["step_time"]
+        return active_requests, result["finished_requests"], result["step_time"]
 
     # For backwards compatibility, point `step()` to `step_legacy()`. Starting in
     # `megatron-core` 0.16, `step_modern()` will be renamed to `step()`.
@@ -2633,21 +2605,21 @@ class DynamicInferenceEngine(AbstractEngine):
     def generate(
         self, prompts: List[str], sampling_params: Optional[SamplingParams] = SamplingParams()
     ) -> List[DynamicInferenceRequest]:
-        """Generates completions for a static list of prompts."""
+        """Generate token-complete, text-unfinalized requests for a prompt batch."""
 
         for prompt in prompts:
             request_id = int(next(self.request_counter))
             _ = self.add_request(request_id, prompt, sampling_params)
 
-        finished_request_records_list = []
+        finished_requests = []
         while self.has_unfinished_requests():
             result = self.step_modern()
-            finished_request_records_list.extend(result["finished_request_records"])
+            finished_requests.extend(result["finished_requests"])
 
         # Ensure requests are returned in the same order they were passed in.
-        finished_request_records_list.sort(key=lambda r: r.request_id)
+        finished_requests.sort(key=lambda request: request.request_id)
 
-        return finished_request_records_list
+        return finished_requests
 
     def schedule_requests(self) -> int:
         """Drains the ZMQ socket for a batch of requests and adds them to the engine.
