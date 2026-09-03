@@ -357,6 +357,7 @@ def _request_kv_snapshot(context, request_id):
 
 def _coordinator_projection(request):
     coordinator = make_coordinator_direct(data_parallel_size=1, enable_prefix_caching=False)
+    coordinator.tokenizer.detokenize = mock.Mock(wraps=coordinator.tokenizer.detokenize)
     rank = coordinator.identities_of_data_parallel_ranks[0]
     request_id = request.request_id
     client = b"request-lifecycle-client"
@@ -369,10 +370,11 @@ def _coordinator_projection(request):
     coordinator._pending_counts[coordinator.identity_to_rank_index[rank]] = 1
 
     engine_payload = msgpack.packb(
-        [Headers.ENGINE_REPLY.value, [request.serialize()]], use_bin_type=True
+        [Headers.ENGINE_REPLY.value, [{**request.serialize(), "generated_text": None}]],
+        use_bin_type=True,
     )
     handle_engine_reply(coordinator, rank, msgpack.unpackb(engine_payload, raw=False))
-
+    coordinator.tokenizer.detokenize.assert_called_once()
     frames = coordinator.router_socket.send_multipart.call_args.args[0]
     assert frames[0] == client
     header, returned_id, returned = msgpack.unpackb(frames[1], raw=False)
@@ -554,12 +556,10 @@ class RequestLifecyclePairwiseBase(_DynamicInferenceEngineTestBase):
             assert (
                 engine.context.unified_memory_level == 1
             ), "the designated UVM owner must use managed allocation"
-        detokenize = lambda tokens, **_kwargs: "".join(f"<{token}>" for token in tokens)
-        engine.controller.tokenizer.detokenize = detokenize
-        engine.controller.detokenize = lambda _tokenizer, tokens, **kwargs: detokenize(
-            tokens, **kwargs
-        )
         all_requests = _make_scenario_requests(env, scenario)
+        engine.controller.tokenizer.detokenize = lambda tokens, **_kwargs: "".join(
+            f"<{token}>" for token in tokens
+        )
         requests = [all_requests[i] for i in (3, 1, 0)] if is_chunked else all_requests[:3]
         target_id = requests[-1 if is_chunked else 0].request_id
         futures = [engine._add_request(request) for request in requests]
