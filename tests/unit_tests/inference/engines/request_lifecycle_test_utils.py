@@ -45,7 +45,7 @@ from tests.unit_tests.test_utilities import Utils
 @dataclass
 class _RunResult:
     requests: list[DynamicInferenceRequest]
-    record_lengths: dict[int, int]
+    checkpoint_counts: dict[int, int]
     runtime: Counter
     witness: dict[str, object] | None
 
@@ -150,11 +150,11 @@ def _event_count(request, event_type):
     return sum(event.type == event_type for event in request.events)
 
 
-def _collect_finished(result, completed, record_lengths):
-    for record in result["finished_request_records"]:
-        merged = record.merge()
-        completed[merged.request_id] = merged
-        record_lengths[merged.request_id] = len(record.requests)
+def _collect_finished(engine, result, completed):
+    for request in result["finished_requests"]:
+        assert request.generated_text is None
+        request.finalize_text(engine.controller.tokenizer)
+        completed[request.request_id] = request
 
 
 def _assert_engine_drained(engine, futures, completed, request_ids):
@@ -476,14 +476,10 @@ class RequestLifecyclePairwiseBase(_DynamicInferenceEngineTestBase):
             }
             engine.suspend()
             assert engine.resume_request_ids == [3, 1, 0]
-            assert len(engine.requests[target_id].record.requests) == 1
             engine.resume()
             resumed = engine.get_request(target_id)
             assert resumed.finished_chunk_token_count == 0
             assert torch.equal(resumed.remaining_prompt_tokens, resumed.prompt_tokens)
-            witness["record_segments_after_resume"] = len(
-                engine.requests[target_id].record.requests
-            )
         else:
             row, block_ids, kv_before = _request_kv_snapshot(context, target_id)
             pointer_before = context.memory_buffer.data_ptr()
@@ -567,20 +563,19 @@ class RequestLifecyclePairwiseBase(_DynamicInferenceEngineTestBase):
         requests = [all_requests[i] for i in (3, 1, 0)] if is_chunked else all_requests[:3]
         target_id = requests[-1 if is_chunked else 0].request_id
         futures = [engine._add_request(request) for request in requests]
+        records = {request_id: entry.record for request_id, entry in engine.requests.items()}
+        for record in records.values():
+            record.checkpoint = mock.Mock(wraps=record.checkpoint)
         runtime = Counter()
         _instrument_request_correlated_runtime(env, scenario, runtime)
         feature_keys = _feature_keys(scenario)
         intervention = None
         completed = {}
-        record_lengths = {}
 
         for _ in range(128):
             result = engine.step_modern()
             runtime["steps"] += 1
-            for record in result["finished_request_records"]:
-                merged = record.merge()
-                completed[merged.request_id] = merged
-                record_lengths[merged.request_id] = len(record.requests)
+            _collect_finished(engine, result, completed)
 
             if treatment and intervention is None and target_id in engine.requests:
                 target = engine.get_request(target_id)
@@ -625,7 +620,10 @@ class RequestLifecyclePairwiseBase(_DynamicInferenceEngineTestBase):
             assert all(request.generated_log_probs is not None for request in finished)
             assert all(request.prompt_top_n_logprobs for request in finished)
             assert all(request.generated_top_n_logprobs for request in finished)
-        return _RunResult(finished, record_lengths, runtime, intervention)
+        checkpoint_counts = {
+            request_id: record.checkpoint.call_count for request_id, record in records.items()
+        }
+        return _RunResult(finished, checkpoint_counts, runtime, intervention)
 
     @classmethod
     def _assert_pair(cls, scenario, *, coordinator=False):

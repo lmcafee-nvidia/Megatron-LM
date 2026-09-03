@@ -53,5 +53,4 @@ class TestRequestLifecycleRecomputeContinuity(RequestLifecyclePairwiseBase):
     def test_chunked_partial_recompute_api_coordinator(self):
         result = self._assert_pair(_CHUNKED_RECOMPUTE, coordinator=True)
         assert result.witness["finished_chunk_token_count"] > 0
-        assert result.witness["record_segments_after_resume"] == 1
-        assert result.record_lengths[0] == 1
+        assert result.checkpoint_counts == {3: 1, 1: 1, 0: 0}
