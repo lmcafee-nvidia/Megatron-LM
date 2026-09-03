@@ -293,14 +293,14 @@ def test_dynamic_inference_request_serialize_strips_event_add_engine():
 
 
 @pytest.mark.parametrize(
-    ("return_prompt_tokens", "expected_prompt_field"),
+    ("return_prompt_tokens", "expected_prompt_field", "expected_remaining_prompt_field"),
     [
-        (False, None),  # default: prompt_tokens dropped from payload
-        (True, ("tensor", [1, 2, 3, 4])),  # opt-in: prompt_tokens preserved
+        (False, None, None),  # default: prompt state dropped from payload
+        (True, ("tensor", [1, 2, 3, 4]), ("tensor", [1, 2, 3, 4])),
     ],
 )
 def test_dynamic_inference_request_serialize_return_prompt_tokens(
-    return_prompt_tokens, expected_prompt_field
+    return_prompt_tokens, expected_prompt_field, expected_remaining_prompt_field
 ):
     """DynamicInferenceRequest.serialize() reports prompt_length unconditionally
     (the API uses it for `usage.prompt_tokens` on the response) and drops the
@@ -327,11 +327,31 @@ def test_dynamic_inference_request_serialize_return_prompt_tokens(
     assert obj["prompt_length"] == 4
     # Payload either preserves the tensor wrapper or drops it (present but None).
     assert obj["prompt_tokens"] == expected_prompt_field
+    assert obj["remaining_prompt_tokens"] == expected_remaining_prompt_field
     # Local instance is unaffected — the drop is wire-only.
     assert torch.equal(req.prompt_tokens, prompt)
     # routing_indices survives the drop path (shape check would have crashed on
     # the temporarily-None self.prompt_tokens if the fix used self.prompt_tokens).
     assert isinstance(obj["routing_indices"], tuple) and obj["routing_indices"][0] == "ndarray"
+
+
+def test_dynamic_inference_request_serialize_restores_prompt_state_after_error(monkeypatch):
+    """A serialization failure must not clear prompt state on the live request."""
+    request = _make_dynamic_request()
+    prompt_tokens = request.prompt_tokens
+    request.remaining_prompt_tokens = request.prompt_tokens[2:]
+    remaining_prompt_tokens = request.remaining_prompt_tokens
+
+    def raise_serialization_error(_request):
+        raise RuntimeError("injected serialization failure")
+
+    monkeypatch.setattr(InferenceRequest, "serialize", raise_serialization_error)
+
+    with pytest.raises(RuntimeError, match="injected serialization failure"):
+        request.serialize()
+
+    assert request.prompt_tokens is prompt_tokens
+    assert request.remaining_prompt_tokens is remaining_prompt_tokens
 
 
 def test_dynamic_inference_request_serialize_prompt_length_absent():
