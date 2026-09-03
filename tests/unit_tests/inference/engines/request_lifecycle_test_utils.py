@@ -45,7 +45,7 @@ from tests.unit_tests.test_utilities import Utils
 @dataclass
 class _RunResult:
     requests: list[DynamicInferenceRequest]
-    checkpoint_counts: Counter
+    checkpoint_counts: dict[int, int]
     runtime: Counter
     witness: dict[str, object] | None
 
@@ -160,17 +160,21 @@ def _track_checkpoint_calls(engine, checkpoint_counts, *request_ids):
         )
 
 
-def _collect_finished(result, completed, tokenizer):
+def _collect_finished(engine, result, completed):
     for request in result["finished_requests"]:
-        request.finalize_text(tokenizer)
+        assert request.generated_text is None
+        request.finalize_text(engine.controller.tokenizer)
         completed[request.request_id] = request
 
 
 def _assert_engine_drained(engine, futures, completed, request_ids):
     assert set(completed) == set(request_ids)
     assert all(future.done() for future in futures)
-    assert not (engine.requests or engine.waiting_request_ids or engine.failed_request_ids)
-    assert (engine.context.total_request_count, engine.context.paused_request_count) == (0, 0)
+    assert not engine.requests
+    assert not engine.waiting_request_ids
+    assert not engine.failed_request_ids
+    assert engine.context.total_request_count == 0
+    assert engine.context.paused_request_count == 0
 
 
 def _snapshot_run(result):
@@ -363,6 +367,7 @@ def _request_kv_snapshot(context, request_id):
 
 def _coordinator_projection(request):
     coordinator = make_coordinator_direct(data_parallel_size=1, enable_prefix_caching=False)
+    coordinator.tokenizer.detokenize = mock.Mock(wraps=coordinator.tokenizer.detokenize)
     rank = coordinator.identities_of_data_parallel_ranks[0]
     request_id = request.request_id
     client = b"request-lifecycle-client"
@@ -374,11 +379,12 @@ def _coordinator_projection(request):
     coordinator.request_id_to_rank = {request_id: rank}
     coordinator._pending_counts[coordinator.identity_to_rank_index[rank]] = 1
 
-    raw = request.serialize()
-    raw["generated_text"] = None
-    engine_payload = msgpack.packb([Headers.ENGINE_REPLY.value, [raw]], use_bin_type=True)
+    engine_payload = msgpack.packb(
+        [Headers.ENGINE_REPLY.value, [{**request.serialize(), "generated_text": None}]],
+        use_bin_type=True,
+    )
     handle_engine_reply(coordinator, rank, msgpack.unpackb(engine_payload, raw=False))
-
+    coordinator.tokenizer.detokenize.assert_called_once()
     frames = coordinator.router_socket.send_multipart.call_args.args[0]
     assert frames[0] == client
     header, returned_id, returned = msgpack.unpackb(frames[1], raw=False)
@@ -463,7 +469,7 @@ class RequestLifecyclePairwiseBase(_DynamicInferenceEngineTestBase):
         torch.cuda.empty_cache()
 
     @classmethod
-    def _intervene(cls, scenario, engine, target_id, runtime, checkpoint_counts):
+    def _intervene(cls, scenario, engine, target_id, runtime):
         context = engine.context
         request = engine.get_request(target_id)
         feature_keys = _feature_keys(scenario)
@@ -480,15 +486,12 @@ class RequestLifecyclePairwiseBase(_DynamicInferenceEngineTestBase):
                 "finished_chunk_token_count": request.finished_chunk_token_count,
                 "remaining_prompt_length": len(request.remaining_prompt_tokens),
             }
-            assert checkpoint_counts[target_id] == 0
             engine.suspend()
             assert engine.resume_request_ids == [3, 1, 0]
-            assert checkpoint_counts[target_id] == 1
             engine.resume()
             resumed = engine.get_request(target_id)
             assert resumed.finished_chunk_token_count == 0
             assert torch.equal(resumed.remaining_prompt_tokens, resumed.prompt_tokens)
-            witness["checkpoint_calls_after_resume"] = checkpoint_counts[target_id]
         else:
             row, block_ids, kv_before = _request_kv_snapshot(context, target_id)
             pointer_before = context.memory_buffer.data_ptr()
@@ -564,18 +567,16 @@ class RequestLifecyclePairwiseBase(_DynamicInferenceEngineTestBase):
                 engine.context.unified_memory_level == 1
             ), "the designated UVM owner must use managed allocation"
         all_requests = _make_scenario_requests(env, scenario)
-        detokenize = lambda tokens, **_kwargs: "".join(f"<{token}>" for token in tokens)
-        engine.controller.tokenizer.detokenize = detokenize
-        engine.controller.detokenize = lambda _tokenizer, tokens, **kwargs: detokenize(
-            tokens, **kwargs
+        engine.controller.tokenizer.detokenize = lambda tokens, **_kwargs: "".join(
+            f"<{token}>" for token in tokens
         )
         requests = [all_requests[i] for i in (3, 1, 0)] if is_chunked else all_requests[:3]
         target_id = requests[-1 if is_chunked else 0].request_id
         futures = [engine._add_request(request) for request in requests]
-        checkpoint_counts, runtime = Counter(), Counter()
-        _track_checkpoint_calls(
-            engine, checkpoint_counts, *(request.request_id for request in requests)
-        )
+        records = {request_id: entry.record for request_id, entry in engine.requests.items()}
+        for record in records.values():
+            record.checkpoint = mock.Mock(wraps=record.checkpoint)
+        runtime = Counter()
         _instrument_request_correlated_runtime(env, scenario, runtime)
         feature_keys = _feature_keys(scenario)
         intervention = None
@@ -584,7 +585,7 @@ class RequestLifecyclePairwiseBase(_DynamicInferenceEngineTestBase):
         for _ in range(128):
             result = engine.step_modern()
             runtime["steps"] += 1
-            _collect_finished(result, completed, engine.controller.tokenizer)
+            _collect_finished(engine, result, completed)
 
             if treatment and intervention is None and target_id in engine.requests:
                 target = engine.get_request(target_id)
@@ -599,18 +600,20 @@ class RequestLifecyclePairwiseBase(_DynamicInferenceEngineTestBase):
                         2 if scenario.name == "persist-te-swa-stochastic" else 1
                     )
                 if ready:
-                    intervention = cls._intervene(
-                        scenario, engine, target_id, runtime, checkpoint_counts
-                    )
+                    intervention = cls._intervene(scenario, engine, target_id, runtime)
 
             if not engine.has_unfinished_requests():
                 break
         else:
             pytest.fail(f"{scenario.name} did not drain within 128 steps")
 
-        _assert_engine_drained(
-            engine, futures, completed, (request.request_id for request in requests)
-        )
+        assert set(completed) == {request.request_id for request in requests}
+        assert all(future.done() for future in futures)
+        assert not engine.requests
+        assert not engine.waiting_request_ids
+        assert not engine.failed_request_ids
+        assert engine.context.total_request_count == 0
+        assert engine.context.paused_request_count == 0
         if treatment:
             assert intervention is not None
             for key in feature_keys:
@@ -627,6 +630,9 @@ class RequestLifecyclePairwiseBase(_DynamicInferenceEngineTestBase):
             assert all(request.generated_log_probs is not None for request in finished)
             assert all(request.prompt_top_n_logprobs for request in finished)
             assert all(request.generated_top_n_logprobs for request in finished)
+        checkpoint_counts = {
+            request_id: record.checkpoint.call_count for request_id, record in records.items()
+        }
         return _RunResult(finished, checkpoint_counts, runtime, intervention)
 
     @classmethod

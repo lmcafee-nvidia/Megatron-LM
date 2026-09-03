@@ -67,7 +67,7 @@ class TestRequestLifecyclePairwise(RequestLifecyclePairwiseBase):
         futures = [engine._add_request(companion)]
         checkpoint_counts, completed = Counter(), {}
         _track_checkpoint_calls(engine, checkpoint_counts, companion_id)
-        _collect_finished(engine.step_modern(), completed, engine.controller.tokenizer)
+        _collect_finished(engine, engine.step_modern(), completed)
         assert (
             companion.generated_tokens
             and context.request_last_kv_block_offset[
@@ -85,7 +85,7 @@ class TestRequestLifecyclePairwise(RequestLifecyclePairwiseBase):
         assert len(chunk.remaining_prompt_tokens) == 258
         tail_filler = _allocate_leaving(allocator, 0) if treatment else None
         evictions_before = engine.evicted_request_count
-        _collect_finished(engine.step_modern(), completed, engine.controller.tokenizer)
+        _collect_finished(engine, engine.step_modern(), completed)
         witness = None
         if treatment:
             assert engine.evicted_request_count == evictions_before + 1
@@ -106,7 +106,7 @@ class TestRequestLifecyclePairwise(RequestLifecyclePairwiseBase):
         for _ in range(128):
             if not engine.has_unfinished_requests():
                 break
-            _collect_finished(engine.step_modern(), completed, engine.controller.tokenizer)
+            _collect_finished(engine, engine.step_modern(), completed)
         else:
             pytest.fail("chunked companion eviction did not drain")
         _assert_engine_drained(engine, futures, completed, (companion_id, chunk_id))
@@ -173,8 +173,8 @@ class TestRequestLifecyclePairwiseEP2(RequestLifecyclePairwiseBase):
         futures = [engine._add_request(target), engine._add_request(companion)]
         checkpoint_counts, completed = Counter(), {}
         _track_checkpoint_calls(engine, checkpoint_counts, target_id, companion_id)
-        _collect_finished(engine.step_modern(), completed, engine.controller.tokenizer)
-        _collect_finished(engine.step_modern(), completed, engine.controller.tokenizer)
+        _collect_finished(engine, engine.step_modern(), completed)
+        _collect_finished(engine, engine.step_modern(), completed)
         witness = None
         dispatch_at_pause = None
         if treatment:
@@ -194,7 +194,7 @@ class TestRequestLifecyclePairwiseEP2(RequestLifecyclePairwiseBase):
         for _ in range(32):
             if not engine.has_unfinished_requests():
                 break
-            _collect_finished(engine.step_modern(), completed, engine.controller.tokenizer)
+            _collect_finished(engine, engine.step_modern(), completed)
         else:
             pytest.fail("EP2 retained-pause requests did not drain")
         _release_filler(allocator, filler)
