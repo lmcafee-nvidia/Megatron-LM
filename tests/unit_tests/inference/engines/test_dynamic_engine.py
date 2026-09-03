@@ -839,6 +839,7 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
     engine.state = EngineState.RUNNING
     engine.unified_memory_level = 0
     engine.use_coordinator = False
+    engine.controller = types.SimpleNamespace(_async_sched_logits={})
     engine._add_request = mock.Mock()
     engine._notify_cond_for_new_request = mock.Mock(return_value=None)
     engine._loop = types.SimpleNamespace(call_soon_threadsafe=mock.Mock())
@@ -4221,7 +4222,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         for request in finished_requests:
             assert request.status == Status.COMPLETED, f"Request {request.request_id} failed."
             assert (
-                len(request.generated_tokens) == 511
+                len(request.generated_tokens) == request.sampling_params.num_tokens_to_generate
             ), f"Request {request.request_id} didn't generate expected tokens."
 
     @pytest.mark.internal
