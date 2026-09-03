@@ -268,9 +268,9 @@ def test_async_forward_routes_one_controller_iteration(
     """Primer-only work crosses the engine boundary without an internal controller loop."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.state = EngineState.RUNNING
+    engine._cuda_graph_rebuild_pending = False
     engine.logging_step_interval = 0
     engine.metrics_writer = None
-    engine._cuda_graph_rebuild_pending = False
     engine.schedule_waiting_requests = mock.Mock()
     engine._should_run_async_sched_overlap = mock.Mock(return_value=run_async_overlap)
     engine.context = SimpleNamespace(
