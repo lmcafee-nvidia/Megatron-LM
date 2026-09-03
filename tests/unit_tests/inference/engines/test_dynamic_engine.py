@@ -597,13 +597,12 @@ class DynamicInferenceEngineTestBase:
             env.mem_usage["suspend_resume"][env.engine.context.step_count] = suspend_resume_mems
 
         # Nothing done?
-        finished_request_records = result["finished_request_records"]
-        if len(finished_request_records) == 0:
+        finished_requests = result["finished_requests"]
+        if len(finished_requests) == 0:
             return
 
         # Append output tokens.
-        for finished_request_record in finished_request_records:
-            finished_request = finished_request_record.merge()
+        for finished_request in finished_requests:
             request = env.requests[finished_request.request_id]
             request.output = finished_request.generated_tokens
             request.status = finished_request.status
@@ -720,7 +719,7 @@ def test_post_process_eviction_requeues_prefix_cached_request_with_fresh_hashes(
     engine.num_speculative_tokens = 0
     engine.stop_word_being_finished_ids = set()
 
-    active_request_ids, finished_records = engine.post_process_requests(
+    active_request_ids, finished_requests = engine.post_process_requests(
         request_ids=torch.empty(0, dtype=torch.int64),
         finished_request_ids=torch.empty(0, dtype=torch.int64),
         evict_request_ids=torch.tensor([request.request_id], dtype=torch.int64),
@@ -732,10 +731,95 @@ def test_post_process_eviction_requeues_prefix_cached_request_with_fresh_hashes(
     )
 
     assert active_request_ids == []
-    assert finished_records == []
+    assert finished_requests == []
     assert list(engine.waiting_request_ids) == [request.request_id]
     assert len(record.requests) == 2
     _assert_prefix_cache_checkpoint(request, engine.get_request(request.request_id))
+
+
+@pytest.mark.asyncio
+async def test_completion_merges_after_final_scores_and_reuses_failed_result():
+    """Normal and failed completion each expose their one future-owned flat request."""
+    request = DynamicInferenceRequest(
+        request_id=41,
+        prompt_tokens=torch.tensor([1, 2]),
+        sampling_params=SamplingParams(
+            num_tokens_to_generate=3,
+            termination_id=-1,
+            return_log_probs=True,
+            skip_prompt_log_probs=True,
+            top_n_logprobs=2,
+        ),
+        generated_tokens=[10, 11],
+    )
+    request.add_event_add_engine()
+    record = DynamicInferenceRequestRecord.from_request(request)
+    record.checkpoint()
+    request = record[-1]
+    future = asyncio.get_running_loop().create_future()
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.requests = {41: types.SimpleNamespace(record=record, future=future)}
+    engine.context = types.SimpleNamespace(kv_block_allocator=types.SimpleNamespace())
+    engine.controller = types.SimpleNamespace(
+        tokenizer=types.SimpleNamespace(
+            detokenize=lambda tokens: f"<{','.join(str(token) for token in tokens)}>"
+        )
+    )
+    engine.finished_request_count = 0
+    engine.evicted_request_count = 0
+    engine.track_generated_token_events = False
+    engine.num_speculative_tokens = 0
+    engine.stop_word_being_finished_ids = set()
+    engine.stop_word_finished_request_ids = set()
+
+    with mock.patch.object(record, "merge", wraps=record.merge) as merge:
+        active_ids, finished_requests = engine.post_process_requests(
+            request_ids=torch.tensor([41]),
+            finished_request_ids=torch.tensor([41]),
+            evict_request_ids=torch.empty(0, dtype=torch.int64),
+            step_time=0.25,
+            sample=torch.tensor([12]),
+            accepted_tokens=None,
+            log_probs=[[-0.25]],
+            consumed_chunked_prefill_request_id=-1,
+            top_n_logprobs={0: [(torch.tensor([-0.25, -1.0]), torch.tensor([12, 13]))]},
+        )
+
+    finished = finished_requests[0]
+    assert active_ids == []
+    assert merge.call_count == 1
+    assert future.result() is finished
+    assert finished.generated_log_probs == [-0.25]
+    assert finished.generated_top_n_logprobs == [{"<12>": -0.25, "<13>": -1.0}]
+    assert finished.tpot == [0.25]
+    assert (finished.generated_tokens, finished.generated_text) == ([10, 11, 12], None)
+    assert finished.finalize_text(engine.controller.tokenizer).generated_text == "<10,11,12>"
+
+    failed = DynamicInferenceRequest(
+        request_id=42,
+        prompt_tokens=torch.tensor([3, 4]),
+        sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
+    )
+    failed_record = DynamicInferenceRequestRecord.from_request(failed)
+    failed_future = asyncio.get_running_loop().create_future()
+    engine.requests = {42: types.SimpleNamespace(record=failed_record, future=failed_future)}
+    engine.failed_request_ids = []
+    engine.rank = 1
+    engine.use_coordinator = engine.is_mp_coordinator = True
+    engine.socket_for_receiving_requests = engine._try_send_streaming_partials = mock.Mock()
+    engine._partial_emit_lengths = {}
+    engine.context = types.SimpleNamespace(enable_prefix_caching=False, step_count=0)
+    engine.logging_step_interval = 0
+
+    with mock.patch.object(failed_record, "merge", wraps=failed_record.merge) as merge:
+        engine._handle_failed_request(42)
+        result = await engine.async_bookkeep(None, {"kv_stats": None}, 0.0)
+
+    assert merge.call_count == 1
+    assert result["finished_requests"] == [failed_future.result()]
+    assert result["finished_requests"][0].status == Status.FAILED
+    assert result["finished_requests"][0].generated_text is None
+    assert engine.socket_for_receiving_requests.send.call_count == 1
 
 
 def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes():
@@ -753,8 +837,10 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
     engine.requests = {request.request_id: types.SimpleNamespace(record=record)}
     engine.waiting_request_ids = deque()
     engine.state = EngineState.RUNNING
-    engine.unified_memory_level = 0
-    engine.use_coordinator = False
+    engine.controller = types.SimpleNamespace(
+        _async_sched_logits=types.SimpleNamespace(clear=mock.Mock())
+    )
+    engine.unified_memory_level, engine.use_coordinator = 0, False
     engine._add_request = mock.Mock()
     engine._notify_cond_for_new_request = mock.Mock(return_value=None)
     engine._loop = types.SimpleNamespace(call_soon_threadsafe=mock.Mock())
@@ -1328,8 +1414,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         # Call the generate function.
         # It's safe to use request 0's sampling params here because all sampling
         # params are identical as long as use_fixed_output_lengths == False.
-        finished_request_records = env.engine.generate(prompts, env.requests[0].sampling_params)
-        finished_requests = [r.merge() for r in finished_request_records]
+        finished_requests = env.engine.generate(prompts, env.requests[0].sampling_params)
 
         # Verify results
         assert len(finished_requests) == len(
@@ -1379,8 +1464,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 num_tokens_to_generate = env.requests[
                     request_id
                 ].sampling_params.num_tokens_to_generate
-                request_record = fut.result()
-                request = request_record.merge()
+                request = fut.result()
                 assert request.generated_length == num_tokens_to_generate, (
                     f"Request {request_id} expected to generate {num_tokens_to_generate} "
                     f"tokens but generated {request.generated_length}"
@@ -1474,8 +1558,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             add_request(1)
             while env.engine.has_unfinished_requests():
                 result = env.engine.step_modern()
-                for record in result["finished_request_records"]:
-                    request = record.merge()
+                for request in result["finished_requests"]:
                     outputs[request.request_id] = list(request.generated_tokens)
             return env.engine, outputs
 
@@ -3292,26 +3375,32 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         # Generation epoch 2: stamp then generate remaining tokens.
         set_epoch(2)
 
-        finished_records = []
+        finished_requests = []
         while engine.has_unfinished_requests():
             result = engine.step_modern()
-            finished_records.extend(result["finished_request_records"])
+            finished_requests.extend(result["finished_requests"])
 
-        for record in finished_records:
-            merged = record.merge()
-
-            assert merged.policy_epoch == [(0, 0), (PROMPT_LEN + 2, 1), (PROMPT_LEN + 5, 2)]
+        for finished_request in finished_requests:
+            assert finished_request.policy_epoch == [
+                (0, 0),
+                (PROMPT_LEN + 2, 1),
+                (PROMPT_LEN + 5, 2),
+            ]
 
             if use_checkpoint:
                 # KV cache was cleared by checkpoint; stamping logic recreated it at epoch 2.
-                assert merged.kv_cache_epoch == [(0, 2)]
+                assert finished_request.kv_cache_epoch == [(0, 2)]
             else:
-                assert merged.kv_cache_epoch == [(0, 0), (PROMPT_LEN + 2, 1), (PROMPT_LEN + 5, 2)]
+                assert finished_request.kv_cache_epoch == [
+                    (0, 0),
+                    (PROMPT_LEN + 2, 1),
+                    (PROMPT_LEN + 5, 2),
+                ]
 
         # Verify checkpoint clears kv_cache_epoch and preserves policy.
-        record = finished_records[0]
+        record = DynamicInferenceRequestRecord.from_request(finished_requests[0])
         record.checkpoint()
-        assert record[-1].policy_epoch == merged.policy_epoch
+        assert record[-1].policy_epoch == finished_requests[0].policy_epoch
         assert record[-1].kv_cache_epoch is None
 
     @pytest.mark.internal
@@ -3535,13 +3624,13 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         tracked_req = env.engine.get_request(0)
         tracked_req.stop_word_ids = [[8, 9]]  # The sequence will generate 5, 6, 7, 8, 9, ...
 
-        finished_records = []
+        finished_requests = []
         while env.engine.has_unfinished_requests():
             res = env.engine.step_modern()
-            finished_records.extend(res["finished_request_records"])
+            finished_requests.extend(res["finished_requests"])
 
         # Retrieve the finalized request from the engine's output
-        finished_req = finished_records[0].merge()
+        finished_req = finished_requests[0]
 
         assert finished_req.status == Status.COMPLETED
         # Since num_tokens_to_generate=10, output should stop early at ~7 tokens
@@ -3629,12 +3718,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         tracked_req = env.engine.get_request(0)
         tracked_req.stop_word_ids = [[7, 8, 9]]
 
-        finished_records = []
+        finished_requests = []
         while env.engine.has_unfinished_requests():
             res = env.engine.step_modern()
-            finished_records.extend(res["finished_request_records"])
+            finished_requests.extend(res["finished_requests"])
 
-        finished_req = finished_records[0].merge()
+        finished_req = finished_requests[0]
 
         assert finished_req.status == Status.COMPLETED
         assert len(finished_req.generated_tokens) < 10
@@ -3726,12 +3815,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         tracked_req = env.engine.get_request(0)
         tracked_req.stop_word_ids = [[6]]
 
-        finished_records = []
+        finished_requests = []
         while env.engine.has_unfinished_requests():
             res = env.engine.step_modern()
-            finished_records.extend(res["finished_request_records"])
+            finished_requests.extend(res["finished_requests"])
 
-        finished_req = finished_records[0].merge()
+        finished_req = finished_requests[0]
 
         assert finished_req.status == Status.COMPLETED
         # The output should end exactly at the stop word, with no trailing tokens.
@@ -3856,16 +3945,16 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             ),
         )
 
-        finished_records = []
+        finished_requests = []
         step_count = 0
         while env.engine.has_unfinished_requests():
             res = env.engine.step_modern()
-            finished_records.extend(res["finished_request_records"])
+            finished_requests.extend(res["finished_requests"])
             step_count += 1
             assert step_count < 100, "Engine did not converge"
 
-        assert len(finished_records) == 1
-        finished_req = finished_records[0].merge()
+        assert len(finished_requests) == 1
+        finished_req = finished_requests[0]
 
         assert (
             finished_req.status == Status.COMPLETED
@@ -4024,12 +4113,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             sampling_params=SamplingParams(num_tokens_to_generate=6, termination_id=99),
         )
 
-        finished_records = []
+        finished_requests = []
         while env.engine.has_unfinished_requests():
             res = env.engine.step_modern()
-            finished_records.extend(res["finished_request_records"])
+            finished_requests.extend(res["finished_requests"])
 
-        finished_req = finished_records[0].merge()
+        finished_req = finished_requests[0]
 
         # If there is double counting, the tracked active length will outpace the actual
         # generated tokens, causing premature termination when it thinks it hit max_sequence_length.
@@ -4117,37 +4206,25 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             env.engine._add_request(request)
 
         eviction_occurred = False
+        finished_requests = []
 
-        # Step the engine manually until all requests finish.
         while env.engine.has_unfinished_requests():
-            # Record the number of evicted requests before the step
             evicted_before = env.engine.evicted_request_count
-
-            # Step the engine
             env.engine.schedule_waiting_requests()
-            env.engine.step_modern()
-
-            # Check if any request was evicted during this step
+            result = env.engine.step_modern()
+            finished_requests.extend(result["finished_requests"])
             if env.engine.evicted_request_count > evicted_before:
                 eviction_occurred = True
 
-        # Assert that our constrained memory actually caused an eviction,
-        # proving we exercised the evict_overflow_paused_requests path with spec tokens.
         assert (
             eviction_occurred
         ), "Test failed to trigger an eviction. The test environment memory wasn't tight enough."
 
-        # Verify all requests successfully went back through the queue and finished cleanly.
-        # We MUST check the merged records from the engine, because eviction checkpoints
-        # the requests, leaving the original instances in env.requests permanently active.
-        for request_id, entry in env.engine.requests.items():
-            merged_req = entry.record.merge()
+        for request in finished_requests:
+            assert request.status == Status.COMPLETED, f"Request {request.request_id} failed."
             assert (
-                merged_req.status == Status.COMPLETED
-            ), f"Request {request_id} failed to complete."
-            assert (
-                len(merged_req.generated_tokens) == 511
-            ), f"Request {request_id} didn't generate expected tokens."
+                len(request.generated_tokens) == request.sampling_params.num_tokens_to_generate
+            ), f"Request {request.request_id} didn't generate expected tokens."
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -4487,15 +4564,14 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             )
 
         # Run to completion.
-        finished_records = []
+        finished_requests = []
         while env.engine.has_unfinished_requests():
             res = env.engine.step_modern()
-            finished_records.extend(res["finished_request_records"])
+            finished_requests.extend(res["finished_requests"])
 
-        assert len(finished_records) == num_requests
+        assert len(finished_requests) == num_requests
 
-        for record in finished_records:
-            req = record.merge()
+        for req in finished_requests:
             assert (
                 req.status == Status.COMPLETED
             ), f"Request {req.request_id} not completed: {req.status}"
@@ -4611,15 +4687,14 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 ),
             )
 
-        finished_records = []
+        finished_requests = []
         while env.engine.has_unfinished_requests():
             res = env.engine.step_modern()
-            finished_records.extend(res["finished_request_records"])
+            finished_requests.extend(res["finished_requests"])
 
-        assert len(finished_records) == num_requests
+        assert len(finished_requests) == num_requests
 
-        for record in finished_records:
-            req = record.merge()
+        for req in finished_requests:
             assert req.status == Status.COMPLETED
 
             # Validate generated top-n logprobs.
@@ -4737,15 +4812,14 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 ),
             )
 
-        finished_records = []
+        finished_requests = []
         while env.engine.has_unfinished_requests():
             res = env.engine.step_modern()
-            finished_records.extend(res["finished_request_records"])
+            finished_requests.extend(res["finished_requests"])
 
-        assert len(finished_records) == 3
+        assert len(finished_requests) == 3
 
-        for record in finished_records:
-            req = record.merge()
+        for req in finished_requests:
             assert req.status == Status.COMPLETED
             req_top_n = top_n_values[req.request_id]
 
@@ -4811,15 +4885,14 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             )
             env.engine.add_request(request_id=i, prompt=prompt, sampling_params=params)
 
-        finished_records = []
+        finished_requests = []
         while env.engine.has_unfinished_requests():
             res = env.engine.step_modern()
-            finished_records.extend(res["finished_request_records"])
+            finished_requests.extend(res["finished_requests"])
 
-        assert len(finished_records) == num_requests
+        assert len(finished_requests) == num_requests
 
-        for record in finished_records:
-            req = record.merge()
+        for req in finished_requests:
             assert (
                 req.status == Status.COMPLETED
             ), f"Request {req.request_id} not completed: {req.status}"
@@ -4888,15 +4961,14 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 ),
             )
 
-        finished_records = []
+        finished_requests = []
         while env.engine.has_unfinished_requests():
             res = env.engine.step_modern()
-            finished_records.extend(res["finished_request_records"])
+            finished_requests.extend(res["finished_requests"])
 
-        assert len(finished_records) == num_requests
+        assert len(finished_requests) == num_requests
 
-        for record in finished_records:
-            req = record.merge()
+        for req in finished_requests:
             assert req.status == Status.COMPLETED
 
             # Top-n logprobs must be present and match token count.
@@ -5000,13 +5072,13 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             ),
         )
 
-        finished_records = []
+        finished_requests = []
         while env.engine.has_unfinished_requests():
             res = env.engine.step_modern()
-            finished_records.extend(res["finished_request_records"])
+            finished_requests.extend(res["finished_requests"])
 
-        assert len(finished_records) == 1
-        req = finished_records[0].merge()
+        assert len(finished_requests) == 1
+        req = finished_requests[0]
         assert req.status == Status.COMPLETED
         assert (
             len(req.generated_tokens) == 6
@@ -5106,12 +5178,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         tracked_req = env.engine.get_request(0)
         tracked_req.stop_word_ids = [[6]]
 
-        finished_records = []
+        finished_requests = []
         while env.engine.has_unfinished_requests():
             res = env.engine.step_modern()
-            finished_records.extend(res["finished_request_records"])
+            finished_requests.extend(res["finished_requests"])
 
-        finished_req = finished_records[0].merge()
+        finished_req = finished_requests[0]
 
         assert finished_req.status == Status.COMPLETED
         assert finished_req.generated_tokens == [5, 6]
@@ -5237,19 +5309,18 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         engine.resume()
 
         # Run to completion.
-        finished_records = []
+        finished_requests = []
         step_count = 0
         while engine.has_unfinished_requests():
             res = engine.step_modern()
-            finished_records.extend(res["finished_request_records"])
+            finished_requests.extend(res["finished_requests"])
             step_count += 1
             assert step_count < 200, "Engine did not converge after resume"
 
         # In recompute mode, requests are re-prefilled from prompt + generated_tokens.
         # In persist mode, requests continue from where they left off.
         # Either way, all requests must complete.
-        for record in finished_records:
-            req = record.merge()
+        for req in finished_requests:
             assert req.status == Status.COMPLETED, f"Request {req.request_id}: status={req.status}"
             assert len(req.generated_tokens) == num_tokens_to_generate, (
                 f"Request {req.request_id}: expected {num_tokens_to_generate} "
@@ -5425,18 +5496,17 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         )
 
         # Run to completion.
-        finished_records = []
+        finished_requests = []
         step_count = 0
         while env.engine.has_unfinished_requests():
             res = env.engine.step_modern()
-            finished_records.extend(res["finished_request_records"])
+            finished_requests.extend(res["finished_requests"])
             step_count += 1
             assert step_count < 200, "Engine did not converge"
 
-        assert len(finished_records) == 3
+        assert len(finished_requests) == 3
 
-        for record in finished_records:
-            req = record.merge()
+        for req in finished_requests:
             assert (
                 req.status == Status.COMPLETED
             ), f"Request {req.request_id} not completed: {req.status}"
@@ -5512,13 +5582,13 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             ),
         )
 
-        finished_records = []
+        finished_requests = []
         while env.engine.has_unfinished_requests():
             res = env.engine.step_modern()
-            finished_records.extend(res["finished_request_records"])
+            finished_requests.extend(res["finished_requests"])
 
-        assert len(finished_records) == 1
-        req = finished_records[0].merge()
+        assert len(finished_requests) == 1
+        req = finished_requests[0]
 
         assert req.status == Status.COMPLETED
         assert len(req.generated_tokens) == 5, f"Expected 5 tokens, got {len(req.generated_tokens)}"
@@ -5633,18 +5703,17 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 ),
             )
 
-        finished_records = []
+        finished_requests = []
         step_count = 0
         while env.engine.has_unfinished_requests():
             res = env.engine.step_modern()
-            finished_records.extend(res["finished_request_records"])
+            finished_requests.extend(res["finished_requests"])
             step_count += 1
             assert step_count < 200, "Engine did not converge"
 
-        assert len(finished_records) == 2
+        assert len(finished_requests) == 2
 
-        for record in finished_records:
-            req = record.merge()
+        for req in finished_requests:
             assert req.status == Status.COMPLETED, f"Request {req.request_id}: status={req.status}"
             assert len(req.generated_tokens) == num_tokens_to_generate, (
                 f"Request {req.request_id}: expected {num_tokens_to_generate} "
@@ -5973,9 +6042,8 @@ class TestChunkedPrefillCudaGraphs:
         while engine.has_unfinished_requests():
             result = engine.step_modern()
             step_count += 1
-            for record in result["finished_request_records"]:
-                merged = record.merge()
-                finished[merged.request_id] = list(merged.generated_tokens)
+            for request in result["finished_requests"]:
+                finished[request.request_id] = list(request.generated_tokens)
 
         return finished, step_count
 
