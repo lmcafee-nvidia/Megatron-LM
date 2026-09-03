@@ -748,6 +748,19 @@ class DynamicInferenceRequestRecord:
                 return None
             return [item for value in values if value is not None for item in value]
 
+        def merge_original_prompt_values(key, prompt_length):
+            """Select the most complete scores for the original prompt only."""
+            values = [getattr(request, key) for request in self.requests]
+            values = [value for value in values if value is not None]
+            if not values:
+                return None
+            original_value_count = max(0, prompt_length - 1)
+            # Prefer the latest recomputation when equally complete candidates
+            # exist, so returned scores agree with the segment that continued
+            # generation under the newest model/policy state.
+            _, value = max(enumerate(values), key=lambda item: (len(item[1]), item[0]))
+            return value[:original_value_count]
+
         prompt_tokens = self.requests[0].prompt_tokens
         prompt_text = self.requests[0].prompt
         routing_indices = None
@@ -769,8 +782,10 @@ class DynamicInferenceRequestRecord:
             request_id=self.requests[0].request_id,
             prompt=prompt_text,
             prompt_tokens=prompt_tokens,
-            prompt_log_probs=self.requests[0].prompt_log_probs,
-            prompt_top_n_logprobs=self.requests[0].prompt_top_n_logprobs,
+            prompt_log_probs=merge_original_prompt_values("prompt_log_probs", len(prompt_tokens)),
+            prompt_top_n_logprobs=merge_original_prompt_values(
+                "prompt_top_n_logprobs", len(prompt_tokens)
+            ),
             generated_text=generated_text,
             generated_tokens=generated_tokens,
             generated_length=len(generated_tokens),
