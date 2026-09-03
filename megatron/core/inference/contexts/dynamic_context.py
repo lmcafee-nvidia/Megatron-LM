@@ -4245,6 +4245,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 )
 
             if active_requests_requiring_new_block_count > 0:
+                # Clone required: request_ids is mutated later in update_requests,
+                # while this snapshot is returned to the caller.
                 newly_paused_request_ids = self.request_ids[
                     self.paused_request_count : self.paused_request_count
                     + active_requests_requiring_new_block_count
