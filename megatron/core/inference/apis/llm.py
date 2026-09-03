@@ -79,9 +79,9 @@ class MegatronLLM(_MegatronLLMBase):
             assert self._loop_manager is not None
             return self._loop_manager.run_sync(self._generate_impl(normalized, sampling_params))
         # Direct mode: bypass _generate_impl (which would use to_thread,
-        # pointless for sync). Call the engine directly and merge.
-        records = self._engine.generate(normalized, sampling_params)
-        return [r.merge() for r in records]
+        # pointless for sync). Finalize the flat engine results here.
+        requests = self._engine.generate(normalized, sampling_params)
+        return [request.finalize_text(self._controller.tokenizer) for request in requests]
 
     def pause(self) -> None:
         """Transition the engine to ``PAUSED``. Coordinator mode only.

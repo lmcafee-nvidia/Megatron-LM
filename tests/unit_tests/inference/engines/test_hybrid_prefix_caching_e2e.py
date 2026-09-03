@@ -274,9 +274,8 @@ class TestMambaPrefixCachingE2E:
         finished = {}
         while engine.has_unfinished_requests():
             result = engine.step_modern()
-            for record in result["finished_request_records"]:
-                merged = record.merge()
-                finished[merged.request_id] = list(merged.generated_tokens)
+            for request in result["finished_requests"]:
+                finished[request.request_id] = list(request.generated_tokens)
         return finished, engine.context.lifetime_prefill_token_count
 
     def _get_ref_count(self, alloc, block_hash):
@@ -360,9 +359,8 @@ class TestMambaPrefixCachingE2E:
             step += 1
             step_prefill = ctx.lifetime_prefill_token_count - prev_prefill
             prev_prefill = ctx.lifetime_prefill_token_count
-            for record in result["finished_request_records"]:
-                merged = record.merge()
-                finished[merged.request_id] = list(merged.generated_tokens)
+            for request in result["finished_requests"]:
+                finished[request.request_id] = list(request.generated_tokens)
 
             if step <= 2 or (step == 3 and not req3_added) or (step == 4 and req3_added):
                 self._assert_step(step, reqs_by_group, alloc, step_prefill, 1, ctx)
@@ -411,9 +409,8 @@ class TestMambaPrefixCachingE2E:
             step += 1
             step_prefill = ctx.lifetime_prefill_token_count - prev_prefill
             prev_prefill = ctx.lifetime_prefill_token_count
-            for record in result["finished_request_records"]:
-                merged = record.merge()
-                finished[merged.request_id] = list(merged.generated_tokens)
+            for request in result["finished_requests"]:
+                finished[request.request_id] = list(request.generated_tokens)
 
             if step <= 2 or (step == 3 and not req3_added) or (step == 4 and req3_added):
                 self._assert_step(step, reqs, alloc, step_prefill, NUM_GROUPS, ctx)
@@ -548,9 +545,8 @@ class TestMambaPrefixCachingE2E:
             step += 1
             step_prefill = ctx.lifetime_prefill_token_count - prev_prefill
             prev_prefill = ctx.lifetime_prefill_token_count
-            for record in result["finished_request_records"]:
-                merged = record.merge()
-                finished[merged.request_id] = list(merged.generated_tokens)
+            for request in result["finished_requests"]:
+                finished[request.request_id] = list(request.generated_tokens)
 
             if step == 1:
                 assert reqs[0]._mamba_num_matched_blocks == 0, f"step 1"
@@ -633,9 +629,8 @@ class TestMambaPrefixCachingE2E:
             engine._add_request(req)
             while engine.has_unfinished_requests():
                 result = engine.step_modern()
-                for record in result["finished_request_records"]:
-                    merged = record.merge()
-                    finished[merged.request_id] = list(merged.generated_tokens)
+                for request in result["finished_requests"]:
+                    finished[request.request_id] = list(request.generated_tokens)
             return req
 
         # E: seed request
