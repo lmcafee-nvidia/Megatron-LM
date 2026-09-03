@@ -107,6 +107,7 @@ def test_suspend_clears_only_recomputed_cache(cache_mode, expect_clear):
     engine = object.__new__(DynamicInferenceEngine)
     engine.state = EngineState.RUNNING
     engine.context = context
+    engine.controller = SimpleNamespace(_async_sched_logits=Mock())
     engine.unified_memory_level = 0
     engine.requests = {}
     engine.waiting_request_ids = deque()
