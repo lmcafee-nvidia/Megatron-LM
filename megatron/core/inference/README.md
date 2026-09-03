@@ -50,7 +50,7 @@ asyncio.run(main())
 | `MegatronLLM` | Sync entry. Methods: `generate`, `pause`/`unpause`/`suspend`/`resume`, `shutdown`/`wait_for_shutdown`. Properties: `engine`, `context`, `controller`, `is_primary_rank`. Context-manager protocol. |
 | `MegatronAsyncLLM` | Async-flavored equivalent. Adds `serve(serve_config, blocking=True)` for HTTP. |
 | `ServeConfig` | Dataclass for the HTTP frontend. Fields: `host` (`"0.0.0.0"`), `port` (`5000`), `parsers` (`[]`), `verbose` (`False`), `frontend_replicas` (`4`). |
-| `SamplingParams`, `DynamicInferenceRequest`, `DynamicInferenceRequestRecord` | Re-exports from `megatron.core.inference`. |
+| `SamplingParams`, `DynamicInferenceRequest` | Request configuration and result types. |
 
 ## Caller responsibilities
 
@@ -62,7 +62,7 @@ asyncio.run(main())
 
 Planned new features:
 
-- **Dynamic streaming.** Offline streaming via `engine.async_step()`; HTTP streaming requires extending the coordinator / `InferenceClient` protocol to carry partial outputs (not just final request records).
+- **Dynamic streaming.** Offline streaming via `engine.async_step()`; HTTP streaming requires extending the coordinator / `InferenceClient` protocol to carry partial outputs alongside final requests.
 
 - **Weight update APIs.** `suspend_for_refit()`, `update_weights_from_collective()`, `resume_after_refit()` wrapping the existing resharding/refit primitives for RL workflows where weights swap between rollout steps.
 
@@ -86,6 +86,11 @@ Planned new features:
 ## Low-level APIs
 
 For step-level control, custom forward-step integration, or migration from existing pipelines, drop down to the building blocks in this directory: `DynamicInferenceEngine` (manual `add_request` / `step_modern` stepping), `DynamicInferenceContext`, `TextGenerationController`, and the model inference wrappers under `model_inference_wrappers/`. Runnable examples live in [`examples/inference/advanced/`](../../examples/inference/advanced/): `gpt_dynamic_inference.py` (manual stepping), `gpt_dynamic_inference_with_coordinator.py` (explicit coordinator + `InferenceClient` lifecycle), `gpt_static_inference.py` (static engine), and `simple_t5_batch_inference.py` (T5).
+
+`DynamicInferenceEngine.step_modern()` and `generate()` return flat, token-complete
+`DynamicInferenceRequest` objects whose `generated_text` is initially `None`. Low-level callers must
+call `request.finalize_text(tokenizer)` at the boundary where decoded text is needed. The high-level
+APIs and coordinator perform this finalization automatically.
 
 ## See also
 
