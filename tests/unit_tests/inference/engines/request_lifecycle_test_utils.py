@@ -374,9 +374,9 @@ def _coordinator_projection(request):
     coordinator.request_id_to_rank = {request_id: rank}
     coordinator._pending_counts[coordinator.identity_to_rank_index[rank]] = 1
 
-    engine_payload = msgpack.packb(
-        [Headers.ENGINE_REPLY.value, [request.serialize()]], use_bin_type=True
-    )
+    raw = request.serialize()
+    raw["generated_text"] = None
+    engine_payload = msgpack.packb([Headers.ENGINE_REPLY.value, [raw]], use_bin_type=True)
     handle_engine_reply(coordinator, rank, msgpack.unpackb(engine_payload, raw=False))
 
     frames = coordinator.router_socket.send_multipart.call_args.args[0]
@@ -563,12 +563,12 @@ class RequestLifecyclePairwiseBase(_DynamicInferenceEngineTestBase):
             assert (
                 engine.context.unified_memory_level == 1
             ), "the designated UVM owner must use managed allocation"
+        all_requests = _make_scenario_requests(env, scenario)
         detokenize = lambda tokens, **_kwargs: "".join(f"<{token}>" for token in tokens)
         engine.controller.tokenizer.detokenize = detokenize
         engine.controller.detokenize = lambda _tokenizer, tokens, **kwargs: detokenize(
             tokens, **kwargs
         )
-        all_requests = _make_scenario_requests(env, scenario)
         requests = [all_requests[i] for i in (3, 1, 0)] if is_chunked else all_requests[:3]
         target_id = requests[-1 if is_chunked else 0].request_id
         futures = [engine._add_request(request) for request in requests]
