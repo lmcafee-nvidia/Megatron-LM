@@ -471,8 +471,8 @@ class _MegatronLLMBase:
             return list(await asyncio.gather(*futures))
         # TODO: replace with an upstream ``engine.async_generate`` so direct-mode
         # async generate doesn't block the caller's event loop.
-        records = self._engine.generate(prompts, sp)
-        return [r.merge() for r in records]
+        requests = self._engine.generate(prompts, sp)
+        return [request.finalize_text(self._controller.tokenizer) for request in requests]
 
     async def _pause_impl(self) -> None:
         if self._is_primary_rank:

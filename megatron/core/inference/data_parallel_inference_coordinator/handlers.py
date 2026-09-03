@@ -195,7 +195,7 @@ def handle_engine_reply(coordinator, sender_identity, payload):
     finished_requests = payload[1]
 
     for finished_request in finished_requests:
-        coordinator.detokenize(finished_request)
+        coordinator.finalize_text(finished_request)
         fid = finished_request["request_id"]
         client_identity = coordinator.request_id_to_client_id[fid]
         client_request_id = coordinator.request_id_to_client_request_id[fid]
