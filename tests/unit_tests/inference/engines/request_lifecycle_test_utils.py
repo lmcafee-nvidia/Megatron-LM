@@ -150,6 +150,16 @@ def _event_count(request, event_type):
     return sum(event.type == event_type for event in request.events)
 
 
+def _track_checkpoint_calls(engine, checkpoint_counts, *request_ids):
+    for request_id in request_ids:
+        record = engine.requests[request_id].record
+        record.checkpoint = mock.Mock(
+            wraps=record.checkpoint,
+            side_effect=lambda _request_id=request_id: checkpoint_counts.update([_request_id])
+            or mock.DEFAULT,
+        )
+
+
 def _collect_finished(engine, result, completed):
     for request in result["finished_requests"]:
         assert request.generated_text is None
