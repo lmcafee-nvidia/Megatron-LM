@@ -16,9 +16,7 @@ import torch
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import compute_block_hashes_batched
-from megatron.core.inference.text_generation_controllers.text_generation_controller import (
-    TextGenerationController,
-)
+from megatron.core.inference.utils import detokenize_tokens
 
 from .handlers import HANDLERS
 from .state import CoordinatorState
@@ -453,12 +451,11 @@ class DataParallelInferenceCoordinator:
             self.identities_of_data_parallel_ranks.append(sender_identity)
             self._register_rank_identity(sender_identity)
 
-    def detokenize(self, finished_request):
-        """
-        Detokenizes the generated tokens in the finished request.
+    def finalize_text(self, finished_request: dict) -> None:
+        """Populate generated text in a serialized finished request.
 
-        This method uses the coordinator's tokenizer to convert the list of
-        generated token IDs back into human-readable text.
+        The coordinator owns terminal text finalization for distributed requests,
+        allowing it to overlap decoding with model execution.
 
         Args:
             finished_request (dict): The serialized merged request containing the
@@ -467,7 +464,7 @@ class DataParallelInferenceCoordinator:
         detokenize_stop_sequence = (finished_request.get("sampling_params", {}) or {}).get(
             "detokenize_stop_sequence", False
         )
-        finished_request["generated_text"] = TextGenerationController.detokenize(
+        finished_request["generated_text"] = detokenize_tokens(
             self.tokenizer,
             finished_request["generated_tokens"],
             remove_EOD=not detokenize_stop_sequence,
