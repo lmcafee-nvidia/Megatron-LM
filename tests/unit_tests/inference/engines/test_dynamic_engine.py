@@ -33,7 +33,7 @@ from megatron.core.inference.contexts.dynamic_context import (
     RequestOverflowError,
     TokenOverflowError,
 )
-from megatron.core.inference.engines import DynamicInferenceEngine
+from megatron.core.inference.engines import DynamicInferenceEngine, dynamic_engine
 from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
@@ -795,31 +795,31 @@ async def test_completion_merges_after_final_scores_and_reuses_failed_result():
     assert (finished.generated_tokens, finished.generated_text) == ([10, 11, 12], None)
     assert finished.finalize_text(engine.controller.tokenizer).generated_text == "<10,11,12>"
 
+    params = SamplingParams(num_tokens_to_generate=-1, termination_id=-1)
     failed = DynamicInferenceRequest(
-        request_id=42,
-        prompt_tokens=torch.tensor([3, 4]),
-        sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
+        request_id=42, prompt_tokens=torch.tensor([3, 4]), sampling_params=params
     )
     failed_record = DynamicInferenceRequestRecord.from_request(failed)
     failed_future = asyncio.get_running_loop().create_future()
     engine.requests = {42: types.SimpleNamespace(record=failed_record, future=failed_future)}
     engine.failed_request_ids = []
-    engine.rank = 1
-    engine.use_coordinator = engine.is_mp_coordinator = True
-    engine.socket_for_receiving_requests = engine._try_send_streaming_partials = mock.Mock()
-    engine._partial_emit_lengths = {}
-    engine.context = types.SimpleNamespace(enable_prefix_caching=False, step_count=0)
-    engine.logging_step_interval = 0
+    engine.rank, engine.use_coordinator, engine.is_mp_coordinator = 1, True, True
+    submit = dynamic_engine.Headers.SUBMIT_REQUEST.value
+    message = dynamic_engine.msgpack.packb([submit, 42, [3, 4], params.serialize()])
+    engine.add_request = lambda *_: engine._handle_failed_request(42)
+    socket = engine.socket_for_receiving_requests = mock.Mock()
+    socket.recv.side_effect = [message, dynamic_engine.zmq.Again]
+    engine.model_parallel_publisher_socket, engine._pending_signals = mock.Mock(), deque()
 
     with mock.patch.object(failed_record, "merge", wraps=failed_record.merge) as merge:
-        engine._handle_failed_request(42)
-        result = await engine.async_bookkeep(None, {"kv_stats": None}, 0.0)
+        assert engine.schedule_requests() == 1
 
+    failed_result = failed_future.result()
+    collect = engine._collect_failed_requests
     assert merge.call_count == 1
-    assert result["finished_requests"] == [failed_future.result()]
-    assert result["finished_requests"][0].status == Status.FAILED
-    assert result["finished_requests"][0].generated_text is None
-    assert engine.socket_for_receiving_requests.send.call_count == 1
+    assert (engine.requests, engine.failed_request_ids, collect()) == ({}, [], [])
+    assert (failed_result.status, failed_result.generated_text) == (Status.FAILED, None)
+    assert socket.send.call_count == 1
 
 
 def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes():

@@ -2796,6 +2796,7 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 raise UnknownHeaderError(header)
 
+        self._collect_failed_requests()
         return len(all_messages)
 
     async def shutdown(self):
