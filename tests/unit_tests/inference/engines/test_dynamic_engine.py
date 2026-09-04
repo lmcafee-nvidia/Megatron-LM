@@ -136,6 +136,7 @@ class DynamicEngineTestConfig:
     hidden_size: Optional[int] = None
     model_provider: str = "gpt"
     return_log_probs: bool = False
+    top_n_logprobs: int = 0
     logprobs_mode: str = "raw_logprobs"
     materialize_only_last_token_logits: bool = True
     skip_prompt_log_probs: bool = False
@@ -242,7 +243,6 @@ class DynamicInferenceEngineTestBase:
                     test_config.min_prompt_length, test_config.max_prompt_length
                 )
 
-            # Num tokens to generate.
             num_tokens_to_generate = test_config.num_tokens_to_generate
             num_tokens_total = test_config.num_tokens_total
 
@@ -256,13 +256,13 @@ class DynamicInferenceEngineTestBase:
                         prompt_length + 1, test_config.max_sequence_length
                     )
 
-            # Sampling params.
             sampling_params = SamplingParams(
                 num_tokens_to_generate=num_tokens_to_generate,
                 termination_id=(
                     -1 if test_config.use_fixed_output_lengths else test_config.vocab_size - 1
                 ),
                 return_log_probs=test_config.return_log_probs,
+                top_n_logprobs=test_config.top_n_logprobs,
                 skip_prompt_log_probs=test_config.skip_prompt_log_probs,
                 temperature=test_config.temperature,
                 top_k=test_config.top_k,
