@@ -4,7 +4,7 @@ import copy
 import hashlib
 import time
 import warnings
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -666,8 +666,10 @@ class DynamicInferenceRequestRecord:
 
         old_request = self[-1]
 
-        # Carry forward policy_epoch as-is.
-        policy_epoch = old_request.policy_epoch
+        # Policy history remains logically attached to the request, but each
+        # checkpoint owns its list so later epoch stamping cannot mutate an
+        # earlier segment in the record.
+        policy_epoch = copy.deepcopy(old_request.policy_epoch)
 
         # Reset kv_cache_epoch to None: the KV cache is recomputed fresh after checkpoint;
         # the engine's stamping logic will initialize a new stamp record with the recompute epoch.
@@ -686,16 +688,16 @@ class DynamicInferenceRequestRecord:
             dim=0,
         )
 
-        # New sampling params.
-        new_sampling_params = SamplingParams(
-            **{
-                **asdict(old_request.sampling_params),
-                "num_tokens_to_generate": (
-                    old_request.sampling_params.num_tokens_to_generate
-                    - len(old_request.generated_tokens)
-                ),
-            }
-        )
+        # Preserve both dataclass and dynamically-added sampling fields.
+        new_sampling_params = copy.deepcopy(old_request.sampling_params)
+        if old_request.sampling_params.num_tokens_to_generate is not None:
+            new_sampling_params.num_tokens_to_generate = (
+                old_request.sampling_params.num_tokens_to_generate
+                - len(old_request.generated_tokens)
+            )
+        # num_tokens_total is converted to a generation budget on first
+        # admission and must not be applied again to the expanded prompt.
+        new_sampling_params.num_tokens_total = None
 
         # Preserve prefix-cache configuration and let __post_init__ recompute hashes for the
         # expanded prompt. The previous hash list may not include newly completed blocks.
@@ -703,6 +705,7 @@ class DynamicInferenceRequestRecord:
             request_id=old_request.request_id,
             prompt_tokens=new_prompt_tokens,
             sampling_params=new_sampling_params,
+            status=old_request.status,
             policy_epoch=policy_epoch,
             kv_cache_epoch=kv_cache_epoch,
             block_size_tokens=old_request.block_size_tokens,
@@ -744,8 +747,9 @@ class DynamicInferenceRequestRecord:
         except TypeError as e:  # generally means r.generated_text is None
             generated_text = None
 
-        policy_epoch = self.requests[-1].policy_epoch
-        kv_cache_epoch = self.requests[-1].kv_cache_epoch
+        policy_epoch = copy.deepcopy(self.requests[-1].policy_epoch)
+        kv_cache_epoch = copy.deepcopy(self.requests[-1].kv_cache_epoch)
+        ttft = next((request.ttft for request in self.requests if request.ttft is not None), None)
 
         # Merged request.
         request = DynamicInferenceRequest(
@@ -762,7 +766,7 @@ class DynamicInferenceRequestRecord:
             sampling_params=self.requests[0].sampling_params,
             policy_epoch=policy_epoch,
             kv_cache_epoch=kv_cache_epoch,
-            ttft=self.requests[0].ttft,
+            ttft=ttft,
             tpot=merge_lists("tpot"),
             status=self.requests[-1].status,
             latency=self.latency,
