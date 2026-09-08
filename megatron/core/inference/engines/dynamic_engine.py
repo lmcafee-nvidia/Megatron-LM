@@ -2915,6 +2915,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     pending_request_ids.append(  # pylint: disable=possibly-used-before-assignment
                         self.waiting_request_ids.popleft()
                     )
+                    can_schedule = True
                     continue
 
             # Use remaining prompt tokens for scheduling decisions
