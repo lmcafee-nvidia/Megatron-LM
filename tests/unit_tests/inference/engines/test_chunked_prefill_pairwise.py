@@ -337,7 +337,7 @@ _CASES = (
             "pipeline-logits-broadcasts",
             "tp-column-partition-forwards",
             "tp-row-partition-forwards",
-            "tp-collective:gather_from_sequence_parallel_region",
+            "tp-collective:sequence-parallel-all-gather",
             "tp-collective:reduce_scatter_to_sequence_parallel_region",
             "tp-sp-gather-dimensions",
             "tp-sp-reduce-scatter-dimensions",
@@ -447,6 +447,48 @@ def _install_chunk_forward_observer(env, partial_forward_ids: list[int]) -> None
         return original(*args, **kwargs)
 
     controller._dynamic_step_forward_logits = observed
+
+
+def _install_consumed_chunk_observer(engine, consumed_chunk_ids: list[int]) -> None:
+    """Record the chunk ID paired with each result at the bookkeeping boundary."""
+    original = engine.post_process_requests
+
+    def observed(*args, **kwargs):
+        consumed_chunk_ids.append(kwargs["consumed_chunked_prefill_request_id"])
+        return original(*args, **kwargs)
+
+    engine.post_process_requests = observed
+
+
+def _install_sequence_parallel_gather_witness(env, runtime: Counter) -> None:
+    """Observe the frozen-weight SP all-gather used by inference linear layers."""
+    from megatron.core.tensor_parallel import layers as tp_layers
+
+    model = env.engine.controller.inference_wrapped_model.model
+    for module in model.modules():
+        if type(module).__name__ != "ColumnParallelLinear" or not module.sequence_parallel:
+            continue
+        tp_size = torch.distributed.get_world_size(module.tp_group)
+        original_forward = module.forward
+
+        def observed(*args, _original=original_forward, _tp_size=tp_size, **kwargs):
+            original_collective = tp_layers.dist_all_gather_func
+
+            def traced_collective(output, input_, *collective_args, **collective_kwargs):
+                result = original_collective(output, input_, *collective_args, **collective_kwargs)
+                runtime["tp-collective:sequence-parallel-all-gather"] += 1
+                runtime["tp-sp-gather-dimensions"] += int(
+                    output.shape[0] == input_.shape[0] * _tp_size
+                )
+                return result
+
+            tp_layers.dist_all_gather_func = traced_collective
+            try:
+                return _original(*args, **kwargs)
+            finally:
+                tp_layers.dist_all_gather_func = original_collective
+
+        module.forward = observed
 
 
 def _install_recurrent_witnesses(env, runtime: Counter) -> None:
@@ -650,6 +692,7 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
         admissions: list[_Admission] = []
         runtime = Counter()
         partial_forward_ids: list[int] = []
+        consumed_chunk_ids: list[int] = []
         finished: dict[int, DynamicInferenceRequest] = {}
         suspended = False
         suspend_before = None
@@ -663,8 +706,11 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
         if chunked:
             _install_admission_observer(engine.context, admissions)
             _instrument_scenario_runtime(env, case.scenario, runtime)
+            if case.name == "tp2-pp2-sp-dp2":
+                _install_sequence_parallel_gather_witness(env, runtime)
             _install_recurrent_witnesses(env, runtime)
             _install_chunk_forward_observer(env, partial_forward_ids)
+            _install_consumed_chunk_observer(engine, consumed_chunk_ids)
 
         def live_request(request_id: int) -> Optional[DynamicInferenceRequest]:
             if request_id not in engine.requests:
@@ -689,10 +735,8 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
             target_before = live_request(_TARGET_ID)
             generated_before = len(target_before.generated_tokens) if target_before else 0
             events_before = _generated_event_count(target_before) if target_before else 0
-            consumed_target_partial = (
-                chunked and engine.context.chunked_prefill_request_id == _TARGET_ID
-            )
             partial_count_before = len(partial_forward_ids)
+            consumed_count_before = len(consumed_chunk_ids)
             counter_before = {key: runtime[key] for key in case.chunk_counters}
             consumed_counter_before = {key: runtime[key] for key in case.consumed_counters}
             proposed_before = int(engine._spec_tokens_proposed_per_pos.sum())
@@ -701,6 +745,9 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
             result = engine.step_modern()
             runtime["steps"] += 1
             new_partial_ids = partial_forward_ids[partial_count_before:]
+            newly_consumed_chunk_ids = consumed_chunk_ids[consumed_count_before:]
+            assert len(newly_consumed_chunk_ids) <= 1
+            consumed_target_partial = _TARGET_ID in newly_consumed_chunk_ids
             if _TARGET_ID in new_partial_ids:
                 target_after = live_request(_TARGET_ID)
                 assert target_after is not None
