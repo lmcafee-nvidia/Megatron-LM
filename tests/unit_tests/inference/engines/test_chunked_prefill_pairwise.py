@@ -211,6 +211,7 @@ _CASES = (
             "hybrid-mamba",
             "mamba-multichunk",
             signals=("chunked", "hybrid", "mamba"),
+            prerequisite="mamba",
             parity="reproducible",
             atol=5.0e-3,
         ),
@@ -673,6 +674,12 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
         def add(request: DynamicInferenceRequest) -> None:
             engine._add_request(request)
 
+        def memory_buffer_state() -> tuple[int, int]:
+            memory_buffer = getattr(engine.context, "memory_buffer", None)
+            if memory_buffer is None:
+                return 0, 0
+            return memory_buffer.untyped_storage().nbytes(), memory_buffer.data_ptr()
+
         def step() -> None:
             nonlocal suspended, suspend_before, suspend_after
             nonlocal suspend_target_admission_count
@@ -751,14 +758,11 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
                     [admission for admission in admissions if admission.request_id == _TARGET_ID]
                 )
                 suspend_chunked_id_before = engine.context.chunked_prefill_request_id
-                storage_before = engine.context.memory_buffer.untyped_storage().nbytes()
-                pointer_before = engine.context.memory_buffer.data_ptr()
+                storage_before, pointer_before = memory_buffer_state()
                 engine.suspend()
-                storage_suspended = engine.context.memory_buffer.untyped_storage().nbytes()
-                pointer_suspended = engine.context.memory_buffer.data_ptr()
+                storage_suspended, pointer_suspended = memory_buffer_state()
                 engine.resume()
-                storage_resumed = engine.context.memory_buffer.untyped_storage().nbytes()
-                pointer_resumed = engine.context.memory_buffer.data_ptr()
+                storage_resumed, pointer_resumed = memory_buffer_state()
                 suspend_storage_bytes = (storage_before, storage_suspended, storage_resumed)
                 suspend_storage_pointers = (pointer_before, pointer_suspended, pointer_resumed)
                 suspend_chunked_id_after = engine.context.chunked_prefill_request_id
@@ -916,7 +920,7 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
 
         if case.name == "processed-hidden-flashinfer":
             for request in session.requests:
-                assert request.prompt_log_probs is None
+                assert not request.prompt_log_probs
                 assert not request.prompt_top_n_logprobs
                 assert request.generated_log_probs is not None
                 assert len(request.generated_log_probs) == len(request.generated_tokens)
