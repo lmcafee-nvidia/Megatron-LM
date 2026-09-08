@@ -1233,6 +1233,11 @@ class DynamicInferenceEngine(AbstractEngine):
                     req.remaining_prompt_tokens = req.prompt_tokens
                     req.finished_chunk_token_count = 0
                     req.num_matched_prefix_blocks = 0
+                    if req_id in waiting_request_ids:
+                        # Waiting requests resume in the same record segment, so
+                        # discard scores produced by the prompt prefix being rewound.
+                        req.prompt_log_probs = None
+                        req.prompt_top_n_logprobs = None
                 if req_id in waiting_request_ids:
                     self._discard_prompt_logprob_state(self.requests[req_id])
 
