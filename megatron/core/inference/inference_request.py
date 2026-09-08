@@ -664,10 +664,14 @@ class DynamicInferenceRequestRecord:
 
         old_request = self[-1]
 
-        # Policy history remains logically attached to the request, but each
-        # checkpoint owns its list so later epoch stamping cannot mutate an
-        # earlier segment in the record.
-        policy_epoch = copy.deepcopy(old_request.policy_epoch)
+        # Engine-created epoch entries are immutable (token index, epoch) tuples, and
+        # the engine only appends to the outer list, so list.copy() provides isolation
+        # without the recursive cost of deepcopy. MessagePack can deserialize tuples
+        # as mutable lists, which would require a deep copy if entries were mutated in
+        # place, but current engine paths never perform such mutations.
+        policy_epoch = (
+            old_request.policy_epoch.copy() if old_request.policy_epoch is not None else None
+        )
 
         # Reset kv_cache_epoch to None: the KV cache is recomputed fresh after checkpoint;
         # the engine's stamping logic will initialize a new stamp record with the recompute epoch.
@@ -744,8 +748,17 @@ class DynamicInferenceRequestRecord:
         except TypeError as e:  # generally means r.generated_text is None
             generated_text = None
 
-        policy_epoch = copy.deepcopy(self.requests[-1].policy_epoch)
-        kv_cache_epoch = copy.deepcopy(self.requests[-1].kv_cache_epoch)
+        # Detach the merged result's outer epoch lists under the engine's append-only
+        # mutation pattern described in checkpoint().
+        latest_request = self.requests[-1]
+        policy_epoch = (
+            latest_request.policy_epoch.copy() if latest_request.policy_epoch is not None else None
+        )
+        kv_cache_epoch = (
+            latest_request.kv_cache_epoch.copy()
+            if latest_request.kv_cache_epoch is not None
+            else None
+        )
         ttft = next((request.ttft for request in self.requests if request.ttft is not None), None)
 
         # Merged request.
