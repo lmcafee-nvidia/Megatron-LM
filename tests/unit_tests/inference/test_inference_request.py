@@ -281,12 +281,13 @@ def test_checkpoint_preserves_runtime_state_without_aliasing():
         status=Status.ACTIVE_BUT_NOT_GENERATING_TOKENS,
         policy_epoch=[(0, 4)],
         kv_cache_epoch=[(0, 4)],
-        ttft=0.25,
+        ttft=None,
     )
     record = DynamicInferenceRequestRecord.from_request(request)
 
     record.checkpoint()
     checkpoint = record[-1]
+    checkpoint.ttft = 0.25
 
     assert checkpoint.sampling_params.num_tokens_to_generate == 3
     assert checkpoint.sampling_params.num_tokens_total is None
@@ -294,6 +295,7 @@ def test_checkpoint_preserves_runtime_state_without_aliasing():
     assert checkpoint.sampling_params.custom_sampler_state == {"seed": 17}
     assert checkpoint.sampling_params is not request.sampling_params
     assert checkpoint.status == Status.ACTIVE_BUT_NOT_GENERATING_TOKENS
+    assert request.ttft is None
     assert checkpoint.policy_epoch == [(0, 4)]
     assert checkpoint.policy_epoch is not request.policy_epoch
     # KV state is recomputed, so unlike policy history it deliberately starts unstamped.
