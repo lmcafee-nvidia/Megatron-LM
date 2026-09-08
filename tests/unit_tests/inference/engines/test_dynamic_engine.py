@@ -846,6 +846,26 @@ def test_drained_reset_rejects_suspended_state_before_context_mutation():
     engine.controller._async_sched_logits.clear.assert_not_called()
 
 
+def test_drained_reset_rejects_outstanding_requests_before_mutation():
+    """Reset rejects a nonempty request table before clearing engine state."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine._state_events = {}
+    engine.state = EngineState.RUNNING
+    requests = {7: object()}
+    engine.requests = requests
+    engine.context = types.SimpleNamespace(reset=mock.Mock())
+    engine.controller = types.SimpleNamespace(
+        _async_sched_logits=types.SimpleNamespace(clear=mock.Mock())
+    )
+
+    with pytest.raises(RuntimeError, match="must drain all requests before reset"):
+        engine.reset()
+
+    assert engine.requests is requests
+    engine.context.reset.assert_not_called()
+    engine.controller._async_sched_logits.clear.assert_not_called()
+
+
 def test_streaming_partials_are_sent():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine._partial_emit_lengths = {}

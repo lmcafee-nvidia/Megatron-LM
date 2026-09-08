@@ -353,6 +353,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 f"got {self.state.name}."
             )
 
+        if not initialize_runtime_state and self.requests:
+            raise RuntimeError(
+                "The engine must drain all requests before reset; "
+                f"got {len(self.requests)} outstanding request(s)."
+            )
+
         use_coordinator = getattr(self, "use_coordinator", False)
         self.context.reset()
         self.controller._async_sched_logits.clear()
