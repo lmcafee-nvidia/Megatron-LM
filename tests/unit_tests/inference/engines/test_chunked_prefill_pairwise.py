@@ -314,6 +314,14 @@ _CASES = (
     ),
     _ChunkCase(
         _owned_scenario(
+            "alternating-swa-learnable-sink",
+            "swa-sink",
+            signals=("chunked", "gpt", "softmax-sink", "swa-alternating"),
+        ),
+        chunk_counters=("swa-kernel-calls", "full-attention-kernel-calls", "sink-correction-calls"),
+    ),
+    _ChunkCase(
+        _owned_scenario(
             "tp2-pp2-sp-dp2",
             "tp2-pp2-sp-dp2",
             config={"offset_sampling_seed_by_dp_rank": False},
