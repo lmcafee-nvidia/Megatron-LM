@@ -206,7 +206,8 @@ class TestChunkedPrefillScheduleCharacterization(PrefixCachingTestBase):
         assert state["cached_tokens"] == 12 and state["cache_hits"] == 1
         assert context.request_to_kv_block_ids[0, :3].tolist() == cached_blocks
 
-    def test_continuation_does_not_reapply_cached_prefix(self):
+    def test_continuation_keeps_prefix_accounting_cumulative(self):
+        """A later chunk adds compute without double-counting the original cache hit."""
         context = self._context(max_tokens=4, prefix=True)
         engine = self._engine(context)
         request = self._request(context, 1, 16)

@@ -43,6 +43,11 @@ class TestChunkedPrefillTransitions(DynamicInferenceEngineTestBase):
         set_rounder(64)
         Utils.destroy_model_parallel()
 
+    def teardown_method(self):
+        gc.collect()
+        delete_cuda_graphs()
+        torch.cuda.empty_cache()
+
     @classmethod
     def _build_chunked_env(
         cls,
