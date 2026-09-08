@@ -359,7 +359,15 @@ def test_repeated_checkpoints_bound_reachable_cuda_prompt_storage():
         generated_tokens=[5],
     )
     record = DynamicInferenceRequestRecord.from_request(request)
-    for next_token in (6, 7, 8):
+
+    record.checkpoint()
+    record[-1].generated_tokens = [6]
+    chunked_prefill_segment = record[-1]
+    chunked_prefill_segment.remaining_prompt_tokens = chunked_prefill_segment.prompt_tokens[-2:]
+    expected_prompt_tokens = chunked_prefill_segment.prompt_tokens.tolist()
+    expected_remaining_tokens = chunked_prefill_segment.remaining_prompt_tokens.tolist()
+
+    for next_token in (7, 8):
         record.checkpoint()
         record[-1].generated_tokens = [next_token]
 
@@ -369,6 +377,13 @@ def test_repeated_checkpoints_bound_reachable_cuda_prompt_storage():
     assert all(
         segment.remaining_prompt_tokens.device.type == "cpu" for segment in record.requests[1:-1]
     )
+    assert chunked_prefill_segment.prompt_tokens.device.type == "cpu"
+    assert chunked_prefill_segment.remaining_prompt_tokens.device.type == "cpu"
+    assert chunked_prefill_segment.prompt_tokens.tolist() == expected_prompt_tokens
+    assert (
+        chunked_prefill_segment.remaining_prompt_tokens is not chunked_prefill_segment.prompt_tokens
+    )
+    assert chunked_prefill_segment.remaining_prompt_tokens.tolist() == expected_remaining_tokens
 
     cuda_prompt_storages = {
         tensor.untyped_storage().data_ptr(): tensor.untyped_storage().nbytes()
