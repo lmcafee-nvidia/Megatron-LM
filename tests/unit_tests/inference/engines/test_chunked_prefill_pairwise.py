@@ -10,6 +10,8 @@ than restating the scheduler's chunk arithmetic in the test.
 
 Prompt-score sidecars and raw visible top-N parity are owned by NVIDIA/Megatron-LM
 #7063, the base of this campaign, and are intentionally not repeated here.
+Gated Delta Net is classified as unsupported rather than counted: its production
+prefill path explicitly rejects chunked execution.
 """
 
 import gc
