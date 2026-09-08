@@ -32,7 +32,6 @@ from megatron.core.inference.inference_request import (
 )
 from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.transformer.attention import HAVE_FA3, HAVE_FA4
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
@@ -124,6 +123,7 @@ class _ChunkCase:
     chunk_budget: int = _CHUNK_BUDGET
     full_budget: int = _FULL_BUDGET
     chunk_counters: tuple[str, ...] = ("model-forward",)
+    consumed_counters: tuple[str, ...] = ()
 
     @property
     def name(self) -> str:
@@ -207,14 +207,13 @@ _CASES = (
     _ChunkCase(
         _owned_scenario(
             "hybrid-mamba",
-            "gdn-multichunk",
-            config={"model_provider": "hybrid", "ssm_mixer": "gdn"},
-            signals=("chunked", "gdn"),
+            "mamba-multichunk",
+            signals=("chunked", "hybrid", "mamba"),
             parity="reproducible",
             atol=5.0e-3,
         ),
         repeated_treatment=True,
-        chunk_counters=("gdn-prefills",),
+        chunk_counters=("mamba-prefills",),
     ),
     _ChunkCase(
         _owned_scenario(
@@ -245,7 +244,13 @@ _CASES = (
             parity="reproducible",
         ),
         repeated_treatment=True,
-        chunk_counters=("log-probs-calculations", "sampling-backend:flashinfer"),
+        chunk_counters=("module-forward:gpt",),
+        consumed_counters=(
+            "log-probs-calculations",
+            "log-probs-mode:processed_logprobs",
+            "log-probs-kernel",
+            "sampling-backend:flashinfer",
+        ),
     ),
     _ChunkCase(
         _owned_scenario(
@@ -301,7 +306,12 @@ _CASES = (
             atol=5.0e-3,
         ),
         repeated_treatment=True,
-        chunk_counters=("fp8-context-forwards", "fused-rope-kernel"),
+        chunk_counters=(
+            "fp8-context-forwards",
+            "fp8-quantized-forwards",
+            "fp8-recipe-forwards",
+            "fused-rope-kernel",
+        ),
     ),
     _ChunkCase(
         _owned_scenario(
@@ -309,7 +319,7 @@ _CASES = (
             "swa-sink",
             signals=("chunked", "gpt", "softmax-sink", "swa-alternating"),
         ),
-        chunk_counters=("swa-kernel-calls", "sink-correction-calls"),
+        chunk_counters=("swa-kernel-calls", "full-attention-kernel-calls", "sink-correction-calls"),
     ),
     _ChunkCase(
         _owned_scenario(
@@ -324,6 +334,10 @@ _CASES = (
             "pipeline-logits-broadcasts",
             "tp-column-partition-forwards",
             "tp-row-partition-forwards",
+            "tp-collective:gather_from_sequence_parallel_region",
+            "tp-collective:reduce_scatter_to_sequence_parallel_region",
+            "tp-sp-gather-dimensions",
+            "tp-sp-reduce-scatter-dimensions",
         ),
     ),
     _ChunkCase(
@@ -334,7 +348,11 @@ _CASES = (
             parity="reproducible",
         ),
         repeated_treatment=True,
-        chunk_counters=("nccl-token-dispatches", "nccl-token-combines"),
+        chunk_counters=(
+            "module-forward:inference-optimized",
+            "nccl-token-dispatches",
+            "nccl-token-combines",
+        ),
     ),
 )
 
@@ -368,6 +386,8 @@ class _Session:
     suspend_target_admission_count: Optional[int] = None
     suspend_chunked_id_before: Optional[int] = None
     suspend_chunked_id_after: Optional[int] = None
+    suspend_storage_bytes: Optional[tuple[int, int, int]] = None
+    suspend_storage_pointers: Optional[tuple[int, int, int]] = None
 
 
 def _generated_event_count(request: DynamicInferenceRequest) -> int:
@@ -533,6 +553,7 @@ def _build_env(case: _ChunkCase, chunked: bool):
         f"tok_{tokens[0]}" if tokens else ""
     )
     env.engine.controller.tokenizer.tokenize = lambda text: [int(token) for token in text.split()]
+    env.engine.controller.tokenizer.bos = None
     if case.name == "te-fp8-fused-rope":
         # The CPU-initialized fixture needs its FlashInfer cos/sin source on CUDA.
         model = env.engine.controller.inference_wrapped_model.model
@@ -555,8 +576,6 @@ def _case_prerequisites(case: _ChunkCase) -> None:
     _check_scenario_prerequisite(case.scenario)
     if case.name == "gdp-prefix-state":
         skip_if_mamba_sequence_packing_not_available("hybrid", "gdp")
-    elif case.name == "gdn-multichunk" and not HAVE_FLA:
-        pytest.skip("GDN requires FLA")
     elif case.name == "mamba-batch-invariant":
         if not te_supports_batch_invariant_attention() or _BATCH_INVARIANT_FA_VERSION is None:
             pytest.skip("batch-invariant Mamba needs TE support and FlashAttention 3 or 4")
@@ -635,6 +654,8 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
         suspend_target_admission_count = None
         suspend_chunked_id_before = None
         suspend_chunked_id_after = None
+        suspend_storage_bytes = None
+        suspend_storage_pointers = None
 
         if chunked:
             _install_admission_observer(engine.context, admissions)
@@ -654,12 +675,17 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
             nonlocal suspended, suspend_before, suspend_after
             nonlocal suspend_target_admission_count
             nonlocal suspend_chunked_id_before, suspend_chunked_id_after
+            nonlocal suspend_storage_bytes, suspend_storage_pointers
             runtime["max-waiting"] = max(runtime["max-waiting"], len(engine.waiting_request_ids))
             target_before = live_request(_TARGET_ID)
             generated_before = len(target_before.generated_tokens) if target_before else 0
             events_before = _generated_event_count(target_before) if target_before else 0
+            consumed_target_partial = (
+                chunked and engine.context.chunked_prefill_request_id == _TARGET_ID
+            )
             partial_count_before = len(partial_forward_ids)
             counter_before = {key: runtime[key] for key in case.chunk_counters}
+            consumed_counter_before = {key: runtime[key] for key in case.consumed_counters}
             proposed_before = int(engine._spec_tokens_proposed_per_pos.sum())
             accepted_before = int(engine._spec_tokens_accepted_per_pos.sum())
 
@@ -672,14 +698,25 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
                 assert len(target_after.generated_tokens) == generated_before
                 assert _generated_event_count(target_after) == events_before
                 runtime["target-partial-no-output"] += 1
-                runtime["target-partial:mtp-proposed"] += (
-                    int(engine._spec_tokens_proposed_per_pos.sum()) - proposed_before
-                )
-                runtime["target-partial:mtp-accepted"] += (
-                    int(engine._spec_tokens_accepted_per_pos.sum()) - accepted_before
-                )
                 for key in case.chunk_counters:
                     runtime[f"target-partial:{key}"] += runtime[key] - counter_before[key]
+
+            if consumed_target_partial:
+                target_after = live_request(_TARGET_ID)
+                assert target_after is not None
+                assert len(target_after.generated_tokens) == generated_before
+                assert _generated_event_count(target_after) == events_before
+                runtime["target-consumed-partial-no-output"] += 1
+                runtime["target-consumed-partial:mtp-proposed"] += (
+                    int(engine._spec_tokens_proposed_per_pos.sum()) - proposed_before
+                )
+                runtime["target-consumed-partial:mtp-accepted"] += (
+                    int(engine._spec_tokens_accepted_per_pos.sum()) - accepted_before
+                )
+                for key in case.consumed_counters:
+                    runtime[f"target-consumed-partial:{key}"] += (
+                        runtime[key] - consumed_counter_before[key]
+                    )
 
             target_after = live_request(_TARGET_ID)
             if target_after is not None and len(target_after.generated_tokens) > generated_before:
@@ -712,8 +749,16 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
                     [admission for admission in admissions if admission.request_id == _TARGET_ID]
                 )
                 suspend_chunked_id_before = engine.context.chunked_prefill_request_id
+                storage_before = engine.context.memory_buffer.untyped_storage().nbytes()
+                pointer_before = engine.context.memory_buffer.data_ptr()
                 engine.suspend()
+                storage_suspended = engine.context.memory_buffer.untyped_storage().nbytes()
+                pointer_suspended = engine.context.memory_buffer.data_ptr()
                 engine.resume()
+                storage_resumed = engine.context.memory_buffer.untyped_storage().nbytes()
+                pointer_resumed = engine.context.memory_buffer.data_ptr()
+                suspend_storage_bytes = (storage_before, storage_suspended, storage_resumed)
+                suspend_storage_pointers = (pointer_before, pointer_suspended, pointer_resumed)
                 suspend_chunked_id_after = engine.context.chunked_prefill_request_id
                 target = live_request(_TARGET_ID)
                 assert target is not None
@@ -765,6 +810,28 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
         assert engine.context.total_request_count == 0
         assert engine.context.active_token_count == 0
         requests = [finished[request_id] for request_id in sorted(finished)]
+        if case.name == "tp2-pp2-sp-dp2":
+            assert not engine.context.config.offset_sampling_seed_by_dp_rank
+            payload = torch.tensor(
+                [
+                    value
+                    for request in requests
+                    for value in (
+                        request.request_id,
+                        len(request.generated_tokens),
+                        *request.generated_tokens,
+                    )
+                ],
+                dtype=torch.int64,
+                device="cuda",
+            )
+            peers = [
+                torch.empty_like(payload)
+                for _ in range(torch.distributed.get_world_size(engine.controller.dp_group))
+            ]
+            torch.distributed.all_gather(peers, payload, group=engine.controller.dp_group)
+            assert all(torch.equal(peer, payload) for peer in peers)
+            runtime["dp-shared-seed-equality"] += 1
         session = _Session(
             requests=requests,
             admissions=admissions,
@@ -778,6 +845,8 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
             suspend_target_admission_count=suspend_target_admission_count,
             suspend_chunked_id_before=suspend_chunked_id_before,
             suspend_chunked_id_after=suspend_chunked_id_after,
+            suspend_storage_bytes=suspend_storage_bytes,
+            suspend_storage_pointers=suspend_storage_pointers,
         )
         del env
         return session
@@ -801,6 +870,12 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
             assert (
                 session.runtime[f"target-partial:{key}"] > 0
             ), f"{case.name} did not execute {key} in a target partial-prefill step"
+        for key in case.consumed_counters:
+            assert (
+                session.runtime[f"target-consumed-partial:{key}"] > 0
+            ), f"{case.name} did not consume {key} from a target partial-prefill step"
+        if case.consumed_counters or case.name == "mtp2-rejection":
+            assert session.runtime["target-consumed-partial-no-output"] >= 2
 
         if case.congestion:
             assert session.runtime["max-waiting"] > 4
@@ -831,11 +906,30 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
         if case.name == "mtp2-rejection":
             assert session.runtime["target-mtp-proposed"] > 0
             assert session.runtime["target-mtp-accepted"] < session.runtime["target-mtp-proposed"]
-            assert session.runtime["target-partial:mtp-proposed"] > 0
+            assert session.runtime["target-consumed-partial:mtp-proposed"] > 0
             assert (
-                session.runtime["target-partial:mtp-accepted"]
-                < session.runtime["target-partial:mtp-proposed"]
+                session.runtime["target-consumed-partial:mtp-accepted"]
+                < session.runtime["target-consumed-partial:mtp-proposed"]
             )
+
+        if case.name == "processed-hidden-flashinfer":
+            for request in session.requests:
+                assert request.prompt_log_probs is None
+                assert not request.prompt_top_n_logprobs
+                assert request.generated_log_probs is not None
+                assert len(request.generated_log_probs) == len(request.generated_tokens)
+                assert request.generated_top_n_logprobs is not None
+                assert len(request.generated_top_n_logprobs) == len(request.generated_tokens)
+
+        if case.name == "tp2-pp2-sp-dp2":
+            assert session.runtime["dp-shared-seed-equality"] == 1
+
+        if case.name == "ep2-moe-optimized":
+            assert (
+                session.runtime["nccl-token-dispatches"] == session.runtime["nccl-token-combines"]
+            )
+            assert session.runtime["nccl-combine-before-dispatch"] == 0
+            assert session.runtime["nccl-dispatch-inflight"] == 0
 
         if case.suspend_mode:
             assert session.suspended
@@ -843,14 +937,29 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
             assert session.suspend_cursor_after is not None
             assert session.suspend_target_admission_count is not None
             assert session.suspend_chunked_id_before == _TARGET_ID
+            assert session.suspend_storage_bytes is not None
+            assert session.suspend_storage_pointers is not None
+            storage_before, storage_suspended, storage_resumed = session.suspend_storage_bytes
+            pointer_before, pointer_suspended, pointer_resumed = session.suspend_storage_pointers
+            assert storage_before > 0 and storage_resumed == storage_before
             if case.suspend_mode == "recompute":
+                assert storage_suspended == 0 and pointer_suspended == 0
                 assert session.suspend_cursor_after == (0, _PROMPT_LENGTH)
                 assert session.suspend_chunked_id_after == -1
                 assert any(
                     admission.finished_before == 0
                     for admission in target_admissions[session.suspend_target_admission_count :]
                 )
+            elif case.suspend_mode == "offload":
+                assert storage_suspended == 0 and pointer_suspended == 0
+                assert pointer_before != 0 and pointer_resumed != 0
             else:
+                assert storage_suspended == storage_before
+                assert (pointer_before, pointer_suspended, pointer_resumed) == (
+                    pointer_before,
+                    pointer_before,
+                    pointer_before,
+                )
                 assert session.suspend_cursor_after == session.suspend_cursor_before
                 assert session.suspend_chunked_id_after == session.suspend_chunked_id_before
 

@@ -240,6 +240,7 @@ class TestChunkedPrefillTransitions(DynamicInferenceEngineTestBase):
         assert transition["after_count"] == 1
         assert transition["after_index"] == 1
         assert transition["after_logits"].shape[0] == 1
+        assert torch.equal(transition["after_logits"], transition["before_logits"][:1])
 
     @pytest.mark.parametrize(
         "kv_mode", [KVCacheManagementMode.PERSIST, KVCacheManagementMode.OFFLOAD]
