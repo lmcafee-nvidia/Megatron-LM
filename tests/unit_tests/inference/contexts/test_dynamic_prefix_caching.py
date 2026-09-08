@@ -3268,16 +3268,16 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             config = self._prompt_logprob_recompute_config(case, enable_prefix_caching=False)
 
             oracle_env = self._build_test_env(config)
-            oracle_env.engine.controller.tokenizer.detokenize = (
-                lambda tokens, **_: f"tok_{tokens[0]}"
+            oracle_env.engine.controller.tokenizer.detokenize = lambda tokens, **_: "".join(
+                f"tok_{token}" for token in tokens
             )
             oracle, _, _ = self._run_prompt_logprob_request(oracle_env.engine, 0, prompt, 5)
             del oracle_env
             self._clear_engine_runtime()
 
             treatment_env = self._build_test_env(config)
-            treatment_env.engine.controller.tokenizer.detokenize = (
-                lambda tokens, **_: f"tok_{tokens[0]}"
+            treatment_env.engine.controller.tokenizer.detokenize = lambda tokens, **_: "".join(
+                f"tok_{token}" for token in tokens
             )
             treatment, checkpoint = self._run_prompt_logprob_request_with_recompute(
                 treatment_env.engine, 1, prompt, 5
@@ -3317,8 +3317,8 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
 
             oracle_config = self._prompt_logprob_recompute_config(case, enable_prefix_caching=False)
             oracle_env = self._build_test_env(oracle_config)
-            oracle_env.engine.controller.tokenizer.detokenize = (
-                lambda tokens, **_: f"tok_{tokens[0]}"
+            oracle_env.engine.controller.tokenizer.detokenize = lambda tokens, **_: "".join(
+                f"tok_{token}" for token in tokens
             )
             oracle, _, _ = self._run_prompt_logprob_request(oracle_env.engine, 0, prompt, 5)
             del oracle_env
@@ -3327,7 +3327,9 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             cache_config = self._prompt_logprob_recompute_config(case, enable_prefix_caching=True)
             cache_env = self._build_test_env(cache_config)
             engine = cache_env.engine
-            engine.controller.tokenizer.detokenize = lambda tokens, **_: f"tok_{tokens[0]}"
+            engine.controller.tokenizer.detokenize = lambda tokens, **_: "".join(
+                f"tok_{token}" for token in tokens
+            )
             donor, donor_cost, _ = self._run_prompt_logprob_request(engine, 10, prompt, 5)
             self._assert_prompt_logprob_parity(donor, oracle)
             assert donor_cost == len(prompt)
