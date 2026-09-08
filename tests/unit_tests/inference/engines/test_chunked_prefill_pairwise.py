@@ -253,6 +253,9 @@ _CASES = (
             "log-probs-mode:processed_logprobs",
             "log-probs-kernel",
             "sampling-backend:flashinfer",
+            "temperature-filter",
+            "top-k-filter",
+            "top-p-filter",
         ),
     ),
     _ChunkCase(
@@ -342,6 +345,7 @@ _CASES = (
             "tp-sp-gather-dimensions",
             "tp-sp-reduce-scatter-dimensions",
         ),
+        consumed_counters=("sampling-backend:torch", "temperature-filter", "top-k-filter"),
     ),
     _ChunkCase(
         _owned_scenario(
@@ -663,6 +667,14 @@ def _cleanup() -> None:
     torch.cuda.empty_cache()
 
 
+def _assert_contiguous_admissions(admissions: list[_Admission], expected_length: int) -> None:
+    cursor = 0
+    for admission in admissions:
+        assert admission.finished_before == cursor
+        cursor += admission.logical_span
+    assert cursor == expected_length
+
+
 @pytest.mark.internal
 @pytest.mark.skipif(
     not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
@@ -763,10 +775,10 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
                 assert len(target_after.generated_tokens) == generated_before
                 assert _generated_event_count(target_after) == events_before
                 runtime["target-consumed-partial-no-output"] += 1
-                runtime["target-consumed-partial:mtp-proposed"] += (
+                runtime["target-consumed-partial-step:decode-mtp-proposed"] += (
                     int(engine._spec_tokens_proposed_per_pos.sum()) - proposed_before
                 )
-                runtime["target-consumed-partial:mtp-accepted"] += (
+                runtime["target-consumed-partial-step:decode-mtp-accepted"] += (
                     int(engine._spec_tokens_accepted_per_pos.sum()) - accepted_before
                 )
                 for key in case.consumed_counters:
@@ -939,12 +951,8 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
             assert session.runtime["_run_async_sched_step_overlap"] > 0
 
         if case.suspend_mode is None:
-            cursor = 0
-            for admission in target_admissions:
-                assert admission.finished_before == cursor
-                cursor += admission.logical_span
             expected_length = _PREFIX_FOLLOWER_LENGTH if case.prefix_flow else _PROMPT_LENGTH
-            assert cursor == expected_length
+            _assert_contiguous_admissions(target_admissions, expected_length)
 
         if case.prefix_flow:
             assert session.prefix_hits > 0
@@ -959,10 +967,10 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
         if case.name == "mtp2-rejection":
             assert session.runtime["target-mtp-proposed"] > 0
             assert session.runtime["target-mtp-accepted"] < session.runtime["target-mtp-proposed"]
-            assert session.runtime["target-consumed-partial:mtp-proposed"] > 0
+            assert session.runtime["target-consumed-partial-step:decode-mtp-proposed"] > 0
             assert (
-                session.runtime["target-consumed-partial:mtp-accepted"]
-                < session.runtime["target-consumed-partial:mtp-proposed"]
+                session.runtime["target-consumed-partial-step:decode-mtp-accepted"]
+                < session.runtime["target-consumed-partial-step:decode-mtp-proposed"]
             )
 
         if case.name == "processed-hidden-flashinfer":
@@ -999,13 +1007,19 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
                 assert storage_suspended == 0 and pointer_suspended == 0
                 assert session.suspend_cursor_after == (0, _PROMPT_LENGTH)
                 assert session.suspend_chunked_id_after == -1
-                assert any(
-                    admission.finished_before == 0
-                    for admission in target_admissions[session.suspend_target_admission_count :]
+                _assert_contiguous_admissions(
+                    target_admissions[: session.suspend_target_admission_count],
+                    session.suspend_cursor_before[0],
+                )
+                _assert_contiguous_admissions(
+                    target_admissions[session.suspend_target_admission_count :], _PROMPT_LENGTH
                 )
             elif case.suspend_mode == "offload":
                 assert storage_suspended == 0 and pointer_suspended == 0
                 assert pointer_before != 0 and pointer_resumed != 0
+                assert session.suspend_cursor_after == session.suspend_cursor_before
+                assert session.suspend_chunked_id_after == session.suspend_chunked_id_before
+                _assert_contiguous_admissions(target_admissions, _PROMPT_LENGTH)
             else:
                 assert storage_suspended == storage_before
                 assert (pointer_before, pointer_suspended, pointer_resumed) == (
@@ -1015,6 +1029,7 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
                 )
                 assert session.suspend_cursor_after == session.suspend_cursor_before
                 assert session.suspend_chunked_id_after == session.suspend_chunked_id_before
+                _assert_contiguous_admissions(target_admissions, _PROMPT_LENGTH)
 
         for request in session.requests:
             assert request.status == Status.COMPLETED
@@ -1045,6 +1060,14 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
             event_types = [event.type for event in actual.events]
             assert event_types.count(DynamicInferenceEventType.GENERATED_TOKEN) == stop_end
             assert event_types.count(DynamicInferenceEventType.FINISH) == 1
+            assert [
+                event_type
+                for event_type in event_types
+                if event_type
+                in (DynamicInferenceEventType.GENERATED_TOKEN, DynamicInferenceEventType.FINISH)
+            ] == [DynamicInferenceEventType.GENERATED_TOKEN] * stop_end + [
+                DynamicInferenceEventType.FINISH
+            ]
 
     @pytest.mark.parametrize("case", _CASES, ids=lambda case: case.name)
     @torch.inference_mode()
