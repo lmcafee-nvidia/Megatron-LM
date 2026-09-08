@@ -1233,11 +1233,16 @@ class DynamicInferenceEngine(AbstractEngine):
                     req.remaining_prompt_tokens = req.prompt_tokens
                     req.finished_chunk_token_count = 0
                     req.num_matched_prefix_blocks = 0
+                    if req_id in waiting_request_ids:
+                        # Waiting requests resume in the same record segment, so
+                        # discard scores produced by the prompt prefix being rewound.
+                        req.prompt_log_probs = None
+                        req.prompt_top_n_logprobs = None
                 if req_id in waiting_request_ids:
                     self._discard_prompt_logprob_state(self.requests[req_id])
 
             # Reset the chunked prefill request id
-            self.chunked_prefill_request_id = -1
+            self.context.chunked_prefill_request_id = -1
         else:
             recompute_active_ids = set()
         self.resume_request_ids = [*recompute_active_ids, *waiting_request_ids]
@@ -2959,6 +2964,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     pending_request_ids.append(  # pylint: disable=possibly-used-before-assignment
                         self.waiting_request_ids.popleft()
                     )
+                    can_schedule = True
                     continue
 
             # Use remaining prompt tokens for scheduling decisions
