@@ -2835,7 +2835,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             # independent of chunk shape. The old bf16 linspace collapsed most
             # within-row differences and could hide a wrong boundary token.
             token_logits = torch.arange(vocab_size, device=input_ids.device, dtype=torch.float32)
-            return token_logits.expand(*position_ids.shape, vocab_size)
+            position_scale = 1 + 0.01 * position_ids.to(torch.float32).unsqueeze(-1)
+            return token_logits * position_scale
 
         def get_log_probs(chunked: bool, max_tokens: int):
             test_config = DynamicEngineTestConfig(
@@ -2853,6 +2854,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 use_cuda_graphs_for_non_decode_steps=False,
             )
             env = self._build_test_env(test_config)
+            # Keep all top-N entries distinct so key-list equality also checks order.
+            env.engine.controller.tokenizer.detokenize = lambda tokens, **kw: f"tok_{tokens[0]}"
 
             # Patch the mock forward to be deterministic
             model_instance = env.engine.controller.inference_wrapped_model.model
@@ -2906,7 +2909,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 "This indicates log prob corruption at chunk boundaries!"
             )
         for baseline_row, chunked_row in zip(baseline_top_n, chunked_top_n):
-            assert baseline_row.keys() == chunked_row.keys()
+            assert len(baseline_row) == len(chunked_row) == 3
+            assert list(baseline_row.keys()) == list(chunked_row.keys())
             assert list(baseline_row.values()) == pytest.approx(list(chunked_row.values()))
 
     @pytest.mark.internal
