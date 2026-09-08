@@ -13,6 +13,7 @@ import torch
 from megatron.core.inference.config import (
     AsyncScheduleMode,
     InferenceConfig,
+    KVCacheManagementMode,
     PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.contexts.dynamic_context import (
@@ -2652,6 +2653,10 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 max_tokens=test_config.context_max_tokens,
                 mamba_inference_state_config=mamba_inference_state_config,
                 materialize_only_last_token_logits=(test_config.materialize_only_last_token_logits),
+                kv_cache_management_mode=KVCacheManagementMode(
+                    test_config.kv_cache_management_mode
+                ),
+                static_kv_memory_pointers=test_config.static_kv_memory_pointers,
                 enable_chunked_prefill=test_config.enable_chunked_prefill,
                 enable_prefix_caching=test_config.enable_prefix_caching,
                 prefix_caching_eviction_policy=test_config.prefix_caching_eviction_policy,
@@ -3168,6 +3173,59 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         pytest.fail(f"prompt-logprob request {request_id} did not finish")
 
     @classmethod
+    def _run_prompt_logprob_request_with_recompute(cls, engine, request_id, prompt, top_n):
+        """Checkpoint once after prefill, then return the merged result and witnesses."""
+        request = cls._make_prompt_logprob_request(engine, request_id, prompt, top_n)
+        computed_before = engine.context.lifetime_prefill_token_count
+        engine._add_request(request)
+        checkpoint = None
+
+        for _ in range(64):
+            result = engine.step_modern()
+            for record in result["finished_request_records"]:
+                output = record.merge()
+                if output.request_id == request_id:
+                    assert checkpoint is not None
+                    checkpoint["record_length_at_completion"] = len(record.requests)
+                    return output, checkpoint
+
+            if checkpoint is None and request_id in engine.requests:
+                current = engine.get_request(request_id)
+                if current.generated_tokens:
+                    entry = engine.requests[request_id]
+                    original = entry.record[0]
+                    generated_before = list(current.generated_tokens)
+                    checkpoint = {
+                        "cached_tokens": current.num_cached_tokens,
+                        "prefill_tokens_before_checkpoint": (
+                            engine.context.lifetime_prefill_token_count - computed_before
+                        ),
+                        "prompt_scores_before_checkpoint": (
+                            None
+                            if original.prompt_log_probs is None
+                            else len(original.prompt_log_probs)
+                        ),
+                        "sidecars_complete_before_checkpoint": entry.prompt_logprobs_complete,
+                    }
+
+                    engine.suspend()
+
+                    assert len(entry.record.requests) == 2
+                    checkpointed = entry.record[-1]
+                    checkpoint.update(
+                        prompt_scores_after_checkpoint=len(original.prompt_log_probs or []),
+                        prompt_top_n_after_checkpoint=len(original.prompt_top_n_logprobs or []),
+                        checkpoint_prompt_length=len(checkpointed.prompt_tokens),
+                        generated_before_checkpoint=generated_before,
+                        checkpoint_skips_prompt_scores=(
+                            checkpointed.sampling_params.skip_prompt_log_probs
+                        ),
+                    )
+                    engine.resume()
+
+        pytest.fail(f"checkpointed prompt-logprob request {request_id} did not finish")
+
+    @classmethod
     def _assert_prompt_logprob_parity(cls, actual, expected):
         assert actual.generated_tokens == expected.generated_tokens
         assert actual.generated_text == expected.generated_text
@@ -3181,6 +3239,121 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             assert len(actual_rows) == len(expected_rows)
             for actual_row, expected_row in zip(actual_rows, expected_rows):
                 cls._assert_top_n_logprobs_close(actual_row, expected_row)
+
+    @staticmethod
+    def _prompt_logprob_recompute_config(case, *, enable_prefix_caching):
+        config = TestPrefixCacheRealEngineMatrix._case_config(
+            case, enable_prefix_caching=enable_prefix_caching
+        )
+        config.materialize_only_last_token_logits = False
+        config.kv_cache_management_mode = "recompute"
+        config.static_kv_memory_pointers = False
+        config.async_sched_mode = AsyncScheduleMode.LEGACY
+        return config
+
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_nonprefix_prompt_logprobs_survive_recompute_checkpoint(self):
+        """A real cache-disabled checkpoint already has complete prompt scores."""
+        Utils.initialize_model_parallel()
+        self._clear_engine_runtime()
+        try:
+            case = {
+                "name": "gpt-nonprefix-prompt-logprob-checkpoint",
+                "feature": "base",
+                "model_provider": "gpt",
+                "policy": PrefixCachingEvictionPolicy.LRU,
+            }
+            prompt = torch.arange(2 * 256 + 1, device=torch.cuda.current_device()) % 99
+            config = self._prompt_logprob_recompute_config(case, enable_prefix_caching=False)
+
+            oracle_env = self._build_test_env(config)
+            oracle_env.engine.controller.tokenizer.detokenize = (
+                lambda tokens, **_: f"tok_{tokens[0]}"
+            )
+            oracle, _, _ = self._run_prompt_logprob_request(oracle_env.engine, 0, prompt, 5)
+            del oracle_env
+            self._clear_engine_runtime()
+
+            treatment_env = self._build_test_env(config)
+            treatment_env.engine.controller.tokenizer.detokenize = (
+                lambda tokens, **_: f"tok_{tokens[0]}"
+            )
+            treatment, checkpoint = self._run_prompt_logprob_request_with_recompute(
+                treatment_env.engine, 1, prompt, 5
+            )
+
+            assert checkpoint["cached_tokens"] == 0
+            assert checkpoint["prompt_scores_before_checkpoint"] == len(prompt) - 1
+            assert checkpoint["prompt_scores_after_checkpoint"] == len(prompt) - 1
+            assert checkpoint["prompt_top_n_after_checkpoint"] == len(prompt) - 1
+            assert checkpoint["checkpoint_prompt_length"] == len(prompt) + len(
+                checkpoint["generated_before_checkpoint"]
+            )
+            assert checkpoint["checkpoint_skips_prompt_scores"] is False
+            assert checkpoint["record_length_at_completion"] == 2
+            self._assert_prompt_logprob_parity(treatment, oracle)
+        finally:
+            DynamicInferenceContext.ROUNDER = 64
+            DynamicInferenceContext.TOKEN_ROUNDER = 64
+            DynamicInferenceContext.REQUEST_ROUNDER = 64
+            Utils.destroy_model_parallel()
+            self._clear_engine_runtime()
+
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_prefix_hit_prompt_logprobs_survive_recompute_checkpoint(self):
+        """Positioned sidecars materialize the original prompt before checkpointing."""
+        Utils.initialize_model_parallel()
+        self._clear_engine_runtime()
+        try:
+            case = {
+                "name": "gpt-prefix-prompt-logprob-checkpoint",
+                "feature": "base",
+                "model_provider": "gpt",
+                "policy": PrefixCachingEvictionPolicy.LRU,
+            }
+            prompt = torch.arange(2 * 256 + 1, device=torch.cuda.current_device()) % 99
+
+            oracle_config = self._prompt_logprob_recompute_config(case, enable_prefix_caching=False)
+            oracle_env = self._build_test_env(oracle_config)
+            oracle_env.engine.controller.tokenizer.detokenize = (
+                lambda tokens, **_: f"tok_{tokens[0]}"
+            )
+            oracle, _, _ = self._run_prompt_logprob_request(oracle_env.engine, 0, prompt, 5)
+            del oracle_env
+            self._clear_engine_runtime()
+
+            cache_config = self._prompt_logprob_recompute_config(case, enable_prefix_caching=True)
+            cache_env = self._build_test_env(cache_config)
+            engine = cache_env.engine
+            engine.controller.tokenizer.detokenize = lambda tokens, **_: f"tok_{tokens[0]}"
+            donor, donor_cost, _ = self._run_prompt_logprob_request(engine, 10, prompt, 5)
+            self._assert_prompt_logprob_parity(donor, oracle)
+            assert donor_cost == len(prompt)
+
+            treatment, checkpoint = self._run_prompt_logprob_request_with_recompute(
+                engine, 11, prompt, 5
+            )
+
+            assert checkpoint["cached_tokens"] == len(prompt) - 2
+            assert checkpoint["prefill_tokens_before_checkpoint"] == 2
+            assert checkpoint["prompt_scores_before_checkpoint"] is None
+            assert checkpoint["sidecars_complete_before_checkpoint"] is True
+            assert checkpoint["prompt_scores_after_checkpoint"] == len(prompt) - 1
+            assert checkpoint["prompt_top_n_after_checkpoint"] == len(prompt) - 1
+            assert checkpoint["checkpoint_prompt_length"] == len(prompt) + len(
+                checkpoint["generated_before_checkpoint"]
+            )
+            assert checkpoint["checkpoint_skips_prompt_scores"] is True
+            assert checkpoint["record_length_at_completion"] == 2
+            self._assert_prompt_logprob_parity(treatment, oracle)
+        finally:
+            DynamicInferenceContext.ROUNDER = 64
+            DynamicInferenceContext.TOKEN_ROUNDER = 64
+            DynamicInferenceContext.REQUEST_ROUNDER = 64
+            Utils.destroy_model_parallel()
+            self._clear_engine_runtime()
 
     @pytest.mark.internal
     @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
