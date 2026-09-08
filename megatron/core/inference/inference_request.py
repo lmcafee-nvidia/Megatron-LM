@@ -447,10 +447,10 @@ class DynamicInferenceRequest(InferenceRequest):
         nvtx_range_push("DynamicInferenceRequest.serialize")
 
         # The prompt length is always reported (needed for usage.prompt_tokens),
-        # but the prompt_tokens tensor is dropped from the wire payload unless the
-        # client asked for it back (return_prompt_tokens). This keeps the large
-        # prompt tensor off the engine->coordinator->API path. Null it around
-        # super() so the tensor is never serialized, then restore local state.
+        # but the prompt_tokens and remaining_prompt_tokens tensors are dropped from
+        # the wire payload unless the client asked for them back (return_prompt_tokens).
+        # This keeps both prompt tensors off the engine->coordinator->API path. Null
+        # them around super() so neither tensor is serialized, then restore local state.
         prompt_len = len(self.prompt_tokens) if self.prompt_tokens is not None else None
         drop_prompt = self.prompt_tokens is not None and not getattr(
             self.sampling_params, "return_prompt_tokens", False
