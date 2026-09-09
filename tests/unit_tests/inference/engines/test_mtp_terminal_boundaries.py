@@ -128,6 +128,10 @@ def test_usable_proposal_count_follows_logical_boundary(boundary, accepted_count
 @pytest.mark.parametrize("keep_stop", [False, True], ids=["strip-stop", "keep-stop"])
 def test_stop_boundary_metrics_do_not_depend_on_output_retention(keep_stop):
     """Only proposals through the first stop endpoint enter the denominator."""
+    assert DynamicInferenceEngine._find_step_stop_match([0] * 100 + [20], [20, 20], [[20, 20]]) == (
+        0,
+        2,
+    )
     request = _make_decode_request(keep_stop=keep_stop)
     request.stop_word_ids = [[20, 20]]
     engine = _make_postprocess_engine(

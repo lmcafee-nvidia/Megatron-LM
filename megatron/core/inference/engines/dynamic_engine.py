@@ -2185,8 +2185,11 @@ class DynamicInferenceEngine(AbstractEngine):
         if not stop_word_ids or not step_tokens:
             return None
 
-        previous_count = len(generated_tokens)
-        candidate_tokens = generated_tokens + step_tokens
+        max_stop_length = max((len(stop_tokens) for stop_tokens in stop_word_ids), default=0)
+        history_length = max(0, max_stop_length - 1)
+        history = generated_tokens[-history_length:] if history_length else []
+        previous_count = len(history)
+        candidate_tokens = history + step_tokens
         for step_position in range(len(step_tokens)):
             end = previous_count + step_position + 1
             for stop_tokens in stop_word_ids:
