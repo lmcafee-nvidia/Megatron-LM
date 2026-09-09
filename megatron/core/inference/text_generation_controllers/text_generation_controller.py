@@ -171,6 +171,7 @@ class _AsyncScheduleRequestResult:
     accepted_tokens_cpu: Optional[Tensor]
     active_request_ids: Tensor
     finished_request_ids: Tensor
+    termination_token_positions: Optional[Tensor] = None
     survivor_idxs: Optional[Tensor] = None
     newly_paused_request_ids: Optional[Tensor] = None
     evict_request_ids: Optional[Tensor] = None
@@ -1709,15 +1710,68 @@ class TextGenerationController(MTPInferenceMixin):
         of the step is 100% CPU.
 
         Returns:
-            tuple: (sampled_tokens_cpu, sampled_mtp_tokens_cpu) where
-                sampled_mtp_tokens_cpu is None when speculative decoding is off.
+            tuple: (sampled_tokens_cpu, sampled_mtp_tokens_cpu, accepted_tokens_cpu)
+                where the MTP tensors are None when speculative decoding is off.
         """
         sampled_tokens_cpu = self._sampled_tokens_cuda[:active_request_count].cpu()
         if self.num_speculative_tokens > 0:
             sampled_mtp_tokens_cpu = self._sampled_mtp_tokens_cuda[:, :active_request_count].cpu()
+            accepted_tokens_cpu = self._accepted_tokens_per_request[:active_request_count].cpu()
         else:
             sampled_mtp_tokens_cpu = None
-        return sampled_tokens_cpu, sampled_mtp_tokens_cpu
+            accepted_tokens_cpu = None
+        return sampled_tokens_cpu, sampled_mtp_tokens_cpu, accepted_tokens_cpu
+
+    @staticmethod
+    def _get_step_termination_token_positions(
+        sampled_tokens_cpu: Tensor, accepted_tokens_cpu: Optional[Tensor], termination_ids: Tensor
+    ) -> Tensor:
+        """Locate the first termination token in each logical output burst.
+
+        Accepted MTP drafts precede the replacement sample in the output. Rejected
+        drafts use ``-1`` padding and must never be interpreted as termination. The
+        returned replacement position is therefore the accepted-draft count rather
+        than the configured speculative depth.
+
+        Args:
+            sampled_tokens_cpu: One replacement token per active request.
+            accepted_tokens_cpu: Accepted draft IDs with ``-1`` rejection padding.
+            termination_ids: Per-request termination token IDs; ``-1`` disables EOS.
+
+        Returns:
+            CPU tensor containing a zero-based logical burst position, or ``-1``
+            when the burst has no enabled termination token.
+        """
+        sampled_tokens_cpu = sampled_tokens_cpu.reshape(-1)
+        termination_ids = termination_ids.reshape(-1)
+        assert sampled_tokens_cpu.numel() == termination_ids.numel()
+
+        request_count = sampled_tokens_cpu.numel()
+        positions = torch.full((request_count,), -1, dtype=torch.long)
+        termination_enabled = termination_ids != -1
+
+        if accepted_tokens_cpu is None:
+            accepted_counts = torch.zeros(request_count, dtype=torch.long)
+            accepted_match = torch.zeros(request_count, dtype=torch.bool)
+            first_accepted_match = torch.zeros(request_count, dtype=torch.long)
+        else:
+            if accepted_tokens_cpu.ndim == 1:
+                accepted_tokens_cpu = accepted_tokens_cpu.reshape(request_count, 1)
+            assert accepted_tokens_cpu.shape[0] == request_count
+            valid_accepted = accepted_tokens_cpu != -1
+            accepted_counts = valid_accepted.sum(dim=1)
+            accepted_matches = (
+                valid_accepted
+                & termination_enabled.unsqueeze(1)
+                & (accepted_tokens_cpu == termination_ids.unsqueeze(1))
+            )
+            accepted_match = accepted_matches.any(dim=1)
+            first_accepted_match = accepted_matches.to(torch.long).argmax(dim=1)
+
+        replacement_match = termination_enabled & (sampled_tokens_cpu == termination_ids)
+        positions[replacement_match] = accepted_counts[replacement_match]
+        positions[accepted_match] = first_accepted_match[accepted_match]
+        return positions
 
     def _apply_stop_word_finished_ids(
         self, active_request_ids: Tensor, active_request_mask: Tensor
@@ -1797,6 +1851,8 @@ class TextGenerationController(MTPInferenceMixin):
                 active_request_ids (Tensor): Current active request IDs.
                 newly_paused_request_ids (Tensor): Newly paused request IDs.
                 finished_request_ids (Tensor): Finished request IDs.
+                termination_token_positions (Tensor): Logical output-burst position
+                    of the first termination token, or ``-1`` when absent.
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
@@ -1804,8 +1860,8 @@ class TextGenerationController(MTPInferenceMixin):
 
         # Batch GPU-to-CPU transfer of all sampled tokens.
         range_push("transfer_samples_to_cpu")
-        sampled_tokens_cpu, sampled_mtp_tokens_cpu = self._transfer_samples_to_cpu(
-            active_request_count
+        sampled_tokens_cpu, sampled_mtp_tokens_cpu, accepted_tokens_cpu = (
+            self._transfer_samples_to_cpu(active_request_count)
         )
         range_pop()
 
@@ -1820,14 +1876,18 @@ class TextGenerationController(MTPInferenceMixin):
         # Only the newly sampled base token is not yet in the KV cache, so add 1.
         active_sequence_lengths += 1
         max_sequence_lengths = context.get_max_sequence_lengths()
+        termination_token_positions = self._get_step_termination_token_positions(
+            sampled_tokens_cpu,
+            accepted_tokens_cpu,
+            context.active_request_metadata["termination_id"][:active_request_count],
+        )
 
         # Request finished if termination_id or length >= max_sequence_length.
-        # Both operands are CPU: sampled_tokens_cpu was D2H'd above, and
-        # active_request_metadata is CPU-pinned.
-        active_request_mask = (
-            sampled_tokens_cpu
-            != context.active_request_metadata["termination_id"][:active_request_count]
-        ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
+        # All operands are CPU: output tokens were D2H'd above, and request
+        # metadata is CPU-pinned.
+        active_request_mask = (termination_token_positions < 0).byte() & torch.less(
+            active_sequence_lengths, max_sequence_lengths
+        ).byte()
 
         # Apply stop words detected during the previous engine bookkeeping step.
         self._apply_stop_word_finished_ids(active_request_ids, active_request_mask)
@@ -1881,6 +1941,8 @@ class TextGenerationController(MTPInferenceMixin):
             # the separate new_sample_copy). Returning the CPU copy avoids a
             # D2H sync when the engine later calls sample.tolist().
             "sample": sampled_tokens_cpu,
+            "termination_token_positions": termination_token_positions,
+            "_accepted_tokens_cpu": accepted_tokens_cpu,
             "finished_routing_block_ids": finished_routing_block_ids,
             "finished_handoff_block_ids": finished_handoff_block_ids,
             "finished_handoff_ssm_slots": finished_handoff_ssm_slots,
@@ -2061,7 +2123,10 @@ class TextGenerationController(MTPInferenceMixin):
         )
 
     def _build_async_sched_request_state(
-        self, sampled_tokens_cpu: Tensor, resolved_sequence_lengths: Tensor
+        self,
+        sampled_tokens_cpu: Tensor,
+        resolved_sequence_lengths: Tensor,
+        termination_token_positions: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """Build request IDs and the active/finished mask for resolution.
 
@@ -2069,6 +2134,9 @@ class TextGenerationController(MTPInferenceMixin):
             sampled_tokens_cpu (Tensor): Sampled CPU token IDs for active requests.
             resolved_sequence_lengths (Tensor): Sequence lengths after accepting
                 current output and before preparing unverified successor tokens.
+            termination_token_positions (Optional[Tensor]): First termination-token
+                position in each logical output burst. When omitted, derive ordinary
+                one-token termination for compatibility with direct callers.
 
         Returns:
             Tuple[Tensor, Tensor, Tensor]: Active request IDs, finished request
@@ -2080,9 +2148,15 @@ class TextGenerationController(MTPInferenceMixin):
         active_request_ids = context.request_ids[active_request_slice].long()
 
         max_sequence_lengths = context.get_max_sequence_lengths()
-        active_request_mask = (
-            sampled_tokens_cpu != context.request_metadata["termination_id"][active_request_slice]
-        ).byte() & torch.less(resolved_sequence_lengths, max_sequence_lengths).byte()
+        if termination_token_positions is None:
+            termination_token_positions = self._get_step_termination_token_positions(
+                sampled_tokens_cpu,
+                None,
+                context.request_metadata["termination_id"][active_request_slice],
+            )
+        active_request_mask = (termination_token_positions < 0).byte() & torch.less(
+            resolved_sequence_lengths, max_sequence_lengths
+        ).byte()
 
         self._apply_stop_word_finished_ids(active_request_ids, active_request_mask)
 
@@ -2591,8 +2665,16 @@ class TextGenerationController(MTPInferenceMixin):
             if sample_result.accepted_tokens_cpu_view is not None
             else None
         )
+        active_request_slice = slice(context.paused_request_count, context.total_request_count)
+        termination_token_positions = self._get_step_termination_token_positions(
+            sampled_tokens_cpu,
+            accepted_tokens_cpu,
+            context.request_metadata["termination_id"][active_request_slice],
+        )
         active_request_ids, finished_request_ids, active_request_mask = (
-            self._build_async_sched_request_state(sampled_tokens_cpu, resolved_sequence_lengths)
+            self._build_async_sched_request_state(
+                sampled_tokens_cpu, resolved_sequence_lengths, termination_token_positions
+            )
         )
         range_pop()
 
@@ -2621,6 +2703,7 @@ class TextGenerationController(MTPInferenceMixin):
             accepted_tokens_cpu=accepted_tokens_cpu,
             active_request_ids=active_request_ids,
             finished_request_ids=finished_request_ids,
+            termination_token_positions=termination_token_positions,
             survivor_idxs=survivor_idxs,
             finished_handoff_block_ids=finished_handoff_block_ids,
             finished_handoff_ssm_slots=finished_handoff_ssm_slots,
@@ -2648,8 +2731,16 @@ class TextGenerationController(MTPInferenceMixin):
             if sample_result.accepted_tokens_cpu_view is not None
             else None
         )
+        active_request_slice = slice(context.paused_request_count, context.total_request_count)
+        termination_token_positions = self._get_step_termination_token_positions(
+            sampled_tokens_cpu,
+            accepted_tokens_cpu,
+            context.request_metadata["termination_id"][active_request_slice],
+        )
         active_request_ids, finished_request_ids, active_request_mask = (
-            self._build_async_sched_request_state(sampled_tokens_cpu, resolved_sequence_lengths)
+            self._build_async_sched_request_state(
+                sampled_tokens_cpu, resolved_sequence_lengths, termination_token_positions
+            )
         )
 
         finished_idxs = (
@@ -2680,6 +2771,7 @@ class TextGenerationController(MTPInferenceMixin):
             accepted_tokens_cpu=accepted_tokens_cpu,
             active_request_ids=active_request_ids,
             finished_request_ids=finished_request_ids,
+            termination_token_positions=termination_token_positions,
             newly_paused_request_ids=update_result.get("newly_paused_request_ids"),
             evict_request_ids=update_result.get("evict_request_ids"),
             finished_handoff_block_ids=finished_handoff_block_ids,
@@ -2735,6 +2827,9 @@ class TextGenerationController(MTPInferenceMixin):
                 "newly_paused_request_ids": request_result.newly_paused_request_ids,
                 "evict_request_ids": request_result.evict_request_ids,
                 "accepted_tokens": request_result.accepted_tokens_cpu,
+                "termination_token_positions": getattr(
+                    request_result, "termination_token_positions", None
+                ),
                 "log_probs": log_probs,
                 "top_n_logprobs": top_n_logprobs,
                 "prompt_logprob_updates": prompt_logprob_updates or {},
@@ -3181,11 +3276,17 @@ class TextGenerationController(MTPInferenceMixin):
                 # request_bookkeeping supplies "sample" as the already-CPU
                 # tensor produced by _transfer_samples_to_cpu.
                 request_bookkeeping = self._dynamic_step_context_bookkeeping()
+            accepted_tokens_cpu = request_bookkeeping.pop("_accepted_tokens_cpu", None)
 
             ret = {
                 "accepted_tokens": (
-                    # Clone needed: .fill_(-1) below would corrupt the returned value.
-                    self._accepted_tokens_per_request.clone()
+                    # Reuse the bookkeeping D2H snapshot when available. The
+                    # fallback clone serves the test-only skip-bookkeeping path.
+                    (
+                        accepted_tokens_cpu
+                        if accepted_tokens_cpu is not None
+                        else self._accepted_tokens_per_request.clone()
+                    )
                     if self.num_speculative_tokens > 0 and num_decode_requests > 0
                     else None
                 ),
