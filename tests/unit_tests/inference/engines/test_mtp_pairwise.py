@@ -575,7 +575,7 @@ def _logical_generated_tokens(engine, request_ids) -> dict[int, tuple[int, ...]]
 
 
 def _build_env(case: _Case, *, mtp_active: bool):
-    env = _DynamicInferenceEngineTestBase._build_test_env(_config(case, mtp_active=mtp_active))
+    env = _DynamicEngineTestBase._build_test_env(_config(case, mtp_active=mtp_active))
     model = env.engine.controller.inference_wrapped_model.model
     if case.config.get("model_provider", "gpt") == "gpt":
         assert model.position_embedding_type == "rope"
@@ -806,7 +806,7 @@ def _cleanup() -> None:
 @pytest.mark.skipif(
     not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
 )
-class TestMTPPairwise(_DynamicInferenceEngineTestBase):
+class TestMTPPairwise(_DynamicEngineTestBase):
     """Single-topology MTP pair owners omitted from inherited campaigns."""
 
     @classmethod
@@ -1165,7 +1165,7 @@ _PARALLEL_CASES = (
 @pytest.mark.skipif(
     not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
 )
-class TestMTPPairwiseParallel(_DynamicInferenceEngineTestBase):
+class TestMTPPairwiseParallel(_DynamicEngineTestBase):
     """MTP pair owners whose production path requires multiple GPUs."""
 
     @pytest.mark.parametrize("case", _PARALLEL_CASES, ids=lambda case: case.name)
