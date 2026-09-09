@@ -293,6 +293,13 @@ _CASES = (
     ),
     _ChunkCase(
         _owned_scenario(
+            "recompute-suspend-resume", "suspend-recompute", signals=("chunked", "gpt", "recompute")
+        ),
+        suspend_mode="recompute",
+        chunk_counters=("module-forward:gpt",),
+    ),
+    _ChunkCase(
+        _owned_scenario(
             "fp8-transformer-engine",
             "te-fp8-fused-rope",
             config={
