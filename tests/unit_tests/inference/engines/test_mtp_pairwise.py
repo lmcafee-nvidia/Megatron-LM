@@ -799,6 +799,7 @@ class TestMTPPairwise(_DynamicEngineTestBase):
 
         original_norm = model_backends.LNImpl
         try:
+            model_backends.LNImpl = WrongNorm
             config = TransformerConfig(
                 num_layers=1,
                 hidden_size=32,
