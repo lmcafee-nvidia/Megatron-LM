@@ -398,6 +398,8 @@ class DynamicEngineTestConfig:
     static_kv_memory_pointers: bool = True
     track_generated_token_events: bool = False
     num_speculative_tokens: int = 0
+    mtp_num_layers: Optional[int] = None
+    mtp_use_repeated_layer: bool = False
     position_embedding_type: str = "learned_absolute"
     use_flashinfer_fused_rope: Optional[bool] = None
     sampling_backend: str = 'torch'
@@ -418,6 +420,11 @@ class DynamicEngineTestConfig:
     softmax_type: str = "vanilla"
 
     def __post_init__(self):
+
+        # Preserve the historical test-harness behavior while allowing tests to
+        # build dormant or repeated MTP layers independently of active speculation.
+        if self.mtp_num_layers is None:
+            self.mtp_num_layers = self.num_speculative_tokens
 
         # Compute max_sequence_length.
         if self.max_sequence_length is None:
@@ -612,7 +619,8 @@ class DynamicInferenceEngineTestBase:
             transformer_config = TransformerConfig(
                 params_dtype=torch.bfloat16,
                 num_layers=4,
-                mtp_num_layers=test_config.num_speculative_tokens,
+                mtp_num_layers=test_config.mtp_num_layers,
+                mtp_use_repeated_layer=test_config.mtp_use_repeated_layer,
                 hidden_size=(
                     test_config.hidden_size
                     if test_config.hidden_size is not None
@@ -691,7 +699,7 @@ class DynamicInferenceEngineTestBase:
 
             # MTP block spec (needed for speculative decoding).
             mtp_block_spec = None
-            if test_config.num_speculative_tokens > 0:
+            if test_config.mtp_num_layers > 0:
                 use_te = test_config.fp8 or test_config.transformer_impl == "transformer_engine"
                 mtp_block_spec = get_gpt_mtp_block_spec(
                     config=transformer_config, spec=layer_spec, use_transformer_engine=use_te
@@ -718,7 +726,8 @@ class DynamicInferenceEngineTestBase:
                 num_layers=(
                     3 if pp_size == 1 else 6
                 ),  # 1 Mamba layer, 1 attention layer, 1 MLP layer
-                mtp_num_layers=test_config.num_speculative_tokens,
+                mtp_num_layers=test_config.mtp_num_layers,
+                mtp_use_repeated_layer=test_config.mtp_use_repeated_layer,
                 hidden_size=256,  # The Mamba layer places several constraints on this
                 **hybrid_mixer_kwargs(test_config.ssm_mixer),
                 num_attention_heads=16,
@@ -774,9 +783,9 @@ class DynamicInferenceEngineTestBase:
             )
 
             # Hybrid model.
-            # When speculative tokens are configured, append MTP depth sections
+            # When MTP layers are configured, append their depth sections
             # to the hybrid layer pattern so the model creates MTP blocks.
-            mtp_suffix = "/M" * test_config.num_speculative_tokens
+            mtp_suffix = "/M" * test_config.mtp_num_layers
             recurrent_symbol = "G" if is_gdn else "M"
             if pp_size == 1:
                 mamba_pattern = recurrent_symbol + "*-" + mtp_suffix
