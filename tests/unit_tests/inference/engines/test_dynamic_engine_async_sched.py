@@ -1113,6 +1113,23 @@ def _instrument_scenario_runtime(env, scenario, runtime):
         model = controller._unwrapped_model
         manager = getattr(model, "_mtp_cudagraph_manager", None)
         assert manager is not None
+        wrapped_runners = set()
+        original_get_runner = manager.get_cudagraph_runner
+
+        def traced_get_runner(*args, **kwargs):
+            runner = original_get_runner(*args, **kwargs)
+            if id(runner) not in wrapped_runners:
+                original_replay = runner.replay_graph_capture
+
+                def traced_replay(*replay_args, _real=original_replay, **replay_kwargs):
+                    runtime["mtp-cuda-graph-replays"] += 1
+                    return _real(*replay_args, **replay_kwargs)
+
+                runner.replay_graph_capture = traced_replay
+                wrapped_runners.add(id(runner))
+            return runner
+
+        manager.get_cudagraph_runner = traced_get_runner
         original_mtp = model.compute_mtp_single_step
 
         def traced_mtp(*args, **kwargs):
@@ -1120,11 +1137,7 @@ def _instrument_scenario_runtime(env, scenario, runtime):
             eager = kwargs.get("eager", False)
             cache_key = kwargs.get("cache_key")
             if context.using_cuda_graph_this_step() and not eager and cache_key is not None:
-                runner = manager.custom_cudagraphs_lookup_table.get(cache_key)
                 runtime["mtp-cuda-graph-invocations"] += 1
-                runtime["mtp-cuda-graph-replays"] += int(
-                    runner is not None and runner.fwd_graph_recorded and runner.cudagraph_created
-                )
             return result
 
         model.compute_mtp_single_step = traced_mtp
