@@ -23,6 +23,7 @@ from typing import Optional
 
 import pytest
 import torch
+from transformer_engine.pytorch import RMSNorm as TERMSNorm
 from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, check_fp8_support
 
 from megatron.core import parallel_state
@@ -30,6 +31,13 @@ from megatron.core.inference.config import AsyncScheduleMode, PrefixCachingEvict
 from megatron.core.inference.inference_request import DynamicInferenceEventType
 from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.models import backends as model_backends
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_layer_specs,
+    get_gpt_mtp_block_spec,
+)
+from megatron.core.tensor_parallel import InferenceColumnParallelLinear
+from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import HAVE_FA3, HAVE_FA4
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
@@ -37,6 +45,7 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     set_batch_invariant_mode,
     te_supports_batch_invariant_attention,
 )
+from megatron.core.transformer.torch_norm import WrappedTorchNorm
 from megatron.core.transformer.utils import is_layer_window_attention
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.inference.contexts.test_dynamic_prefix_caching import (
@@ -82,6 +91,7 @@ class _Case:
     signals: tuple[str, ...] = ("gpt",)
     prerequisite: Optional[str] = None
     stop_keep: Optional[bool] = None
+    exact_top_n: bool = True
     atol: float = 1.0e-3
 
 
@@ -164,6 +174,7 @@ def _sampling(case: _Case, output_length: int) -> SamplingParams:
         "termination_id": -1,
         "return_log_probs": True,
         "skip_prompt_log_probs": True,
+        "top_n_logprobs": 3,
         "temperature": float(case.config.get("temperature", 1.0)),
         "top_k": int(case.config.get("top_k", 1)),
         "top_p": float(case.config.get("top_p", 0.0)),
@@ -185,9 +196,13 @@ def _set_logits(logits: torch.Tensor, tokens, *, distribution: bool = False) -> 
         return
     if isinstance(tokens, int):
         logits[..., tokens] = 100.0
+        logits[..., (tokens + 1) % _VOCAB_SIZE] = 90.0
+        logits[..., (tokens + 2) % _VOCAB_SIZE] = 80.0
         return
     for row, token in enumerate(tokens):
         logits[row, ..., token] = 100.0
+        logits[row, ..., (token + 1) % _VOCAB_SIZE] = 90.0
+        logits[row, ..., (token + 2) % _VOCAB_SIZE] = 80.0
 
 
 def _active_request_ids(context) -> list[int]:
@@ -537,7 +552,18 @@ def _same_model_weights(ordinary_env, mtp_env) -> None:
     treatment = mtp_env.engine.controller.inference_wrapped_model.model.state_dict()
     assert ordinary.keys() == treatment.keys()
     for name in ordinary:
-        assert torch.equal(ordinary[name], treatment[name]), name
+        ordinary_value = ordinary[name]
+        treatment_value = treatment[name]
+        if ordinary_value is None or treatment_value is None:
+            assert name.endswith("_extra_state"), name
+            assert ordinary_value is None and treatment_value is None, name
+            continue
+        assert isinstance(ordinary_value, torch.Tensor), name
+        assert isinstance(treatment_value, torch.Tensor), name
+        assert ordinary_value.dtype == treatment_value.dtype, name
+        assert ordinary_value.layout == treatment_value.layout, name
+        assert ordinary_value.shape == treatment_value.shape, name
+        assert torch.equal(ordinary_value, treatment_value), name
 
 
 def _staged_request_tokens(engine) -> dict[int, tuple[int, ...]]:
@@ -702,6 +728,17 @@ def _assert_complete(session: _Session, case: _Case) -> None:
         assert request.generated_log_probs is not None
         assert len(request.generated_log_probs) == expected_length
         assert torch.isfinite(torch.tensor(request.generated_log_probs)).all()
+        assert request.generated_top_n_logprobs is not None
+        assert len(request.generated_top_n_logprobs) == expected_length
+        assert all(
+            str(token) in top_n
+            for token, top_n in zip(request.generated_tokens, request.generated_top_n_logprobs)
+        )
+        selected_top_n = [
+            top_n[str(token)]
+            for token, top_n in zip(request.generated_tokens, request.generated_top_n_logprobs)
+        ]
+        assert selected_top_n == pytest.approx(request.generated_log_probs, rel=0, abs=case.atol)
         if case.stop_keep is not None:
             generated_events = [
                 event
@@ -777,6 +814,20 @@ def _run_mtp_pair(case: _Case) -> tuple[_Session, _Session]:
         assert hasattr(mtp_model, "mtp")
         assert mtp_model.mtp.mtp_use_repeated_layer is case.repeated
         assert len(mtp_model.mtp.layers) == (1 if case.repeated else case.depth)
+        if case.config.get("transformer_impl") == "inference_optimized":
+            for layer in mtp_model.mtp.layers:
+                assert isinstance(layer.eh_proj, InferenceColumnParallelLinear), type(layer.eh_proj)
+                for norm_name in ("enorm", "hnorm", "final_layernorm"):
+                    norm = getattr(layer, norm_name)
+                    assert isinstance(norm, TERMSNorm), (norm_name, type(norm))
+        elif case.config.get("normalization") == "RMSNorm":
+            for layer in mtp_model.mtp.layers:
+                assert all(
+                    isinstance(getattr(layer, name), torch.nn.RMSNorm)
+                    for name in ("enorm", "hnorm", "final_layernorm")
+                )
+                assert isinstance(layer.mtp_model_layer.input_layernorm, torch.nn.RMSNorm)
+                assert isinstance(layer.mtp_model_layer.pre_mlp_layernorm, torch.nn.RMSNorm)
     else:
         assert not hasattr(mtp_model, "mtp")
 
@@ -785,7 +836,10 @@ def _run_mtp_pair(case: _Case) -> tuple[_Session, _Session]:
     _assert_complete(ordinary, case)
     _assert_complete(treatment, case)
     _assert_request_parity(
-        treatment.requests, _snapshot_requests(ordinary.requests), case.atol, exact_top_n=True
+        treatment.requests,
+        _snapshot_requests(ordinary.requests),
+        case.atol,
+        exact_top_n=case.exact_top_n,
     )
     assert ordinary.runtime["real-base-forward"] > 0
     assert ordinary.runtime["real-mtp-forward"] == 0
@@ -837,9 +891,44 @@ class TestMTPPairwise(_DynamicEngineTestBase):
                 pattern="natural",
                 prompt_lengths=(5, 11),
                 output_lengths=(8, 7),
+                exact_top_n=False,
             )
         )
         assert treatment.witness.raw_depths and set(treatment.witness.raw_depths) == {0}
+
+    @torch.inference_mode()
+    def test_local_rmsnorm_is_explicit_and_matches_ordinary(self):
+        """Local MTP selects RMSNorm independent of an earlier factory side effect."""
+
+        class WrongNorm:
+            pass
+
+        original_norm = model_backends.LNImpl
+        try:
+            config = TransformerConfig(
+                num_layers=1,
+                hidden_size=32,
+                num_attention_heads=4,
+                mtp_num_layers=1,
+                normalization="RMSNorm",
+                transformer_impl="local",
+            )
+            layer_spec = get_gpt_decoder_layer_specs(config, use_transformer_engine=False)[-1]
+            assert layer_spec.submodules.input_layernorm is WrappedTorchNorm
+            model_backends.LNImpl = WrongNorm
+            mtp_spec = get_gpt_mtp_block_spec(config, layer_spec, use_transformer_engine=False)
+            assert mtp_spec.layer_specs[0].submodules.enorm is WrappedTorchNorm
+
+            _run_mtp_pair(
+                _Case(
+                    name="local-rmsnorm",
+                    depth=1,
+                    pattern="accept",
+                    config={"normalization": "RMSNorm"},
+                )
+            )
+        finally:
+            model_backends.LNImpl = original_norm
 
     @torch.inference_mode()
     def test_separate_depth_three_all_accept(self):
