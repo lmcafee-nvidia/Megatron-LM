@@ -2199,6 +2199,35 @@ class DynamicInferenceEngine(AbstractEngine):
                         return step_position, stop_length
         return None
 
+    @staticmethod
+    def _get_usable_speculative_proposal_count(
+        num_speculative_tokens: int,
+        accepted_token_count: int,
+        terminal_token_position: Optional[int],
+    ) -> int:
+        """Count proposal positions usable before a semantic terminal boundary.
+
+        A terminal accepted draft makes only proposals through that draft usable.
+        A replacement-token boundary still required verification of the entire
+        speculative group, as did a step with no terminal boundary.
+
+        Args:
+            num_speculative_tokens: Configured proposals per decode request.
+            accepted_token_count: Accepted draft prefix length for this request.
+            terminal_token_position: Earliest logical output-burst boundary, ``-1``
+                for a boundary before this burst, or ``None`` for no boundary.
+
+        Returns:
+            Number of leading proposal positions to include in acceptance metrics.
+        """
+        if terminal_token_position is None:
+            return num_speculative_tokens
+        if terminal_token_position < 0:
+            return 0
+        if terminal_token_position < accepted_token_count:
+            return min(num_speculative_tokens, terminal_token_position + 1)
+        return num_speculative_tokens
+
     def post_process_requests(
         self,
         request_ids: torch.Tensor,
@@ -2326,9 +2355,11 @@ class DynamicInferenceEngine(AbstractEngine):
 
             request: DynamicInferenceRequest = self.get_request(request_id)
             prompt_logprob_update = prompt_logprob_updates.get(request_id)
+            accepted_token_count = 0
 
             if self.num_speculative_tokens > 0:
                 accepted_tokens = list(filter(lambda tok: tok != -1, accepted_tokens_list))
+                accepted_token_count = len(accepted_tokens)
 
                 # The order `accepted_tokens + tokens` is correct here.
                 # `accepted_tokens` contains the sequence of
@@ -2339,16 +2370,39 @@ class DynamicInferenceEngine(AbstractEngine):
 
             num_stop_word_trim = 0
             is_prefill = len(request.generated_tokens) == 0
+            raw_step_tokens = tokens
             termination_token_position = int(termination_token_position)
+            semantic_terminal_position = None
             stop_match = None
             if (
                 self.num_speculative_tokens > 0
                 and not is_prefill
                 and request_id != consumed_chunked_prefill_request_id
             ):
-                stop_match = self._find_step_stop_match(
-                    request.generated_tokens, tokens, request.stop_word_ids
+                terminal_candidates = []
+                if termination_token_position >= 0:
+                    assert termination_token_position < len(raw_step_tokens)
+                    terminal_candidates.append(termination_token_position)
+
+                remaining_output_tokens = request.sampling_params.num_tokens_to_generate - len(
+                    request.generated_tokens
                 )
+                if remaining_output_tokens <= len(raw_step_tokens):
+                    terminal_candidates.append(max(-1, remaining_output_tokens - 1))
+
+                stop_match = self._find_step_stop_match(
+                    request.generated_tokens, raw_step_tokens, request.stop_word_ids
+                )
+                if stop_match is not None:
+                    terminal_candidates.append(stop_match[0])
+
+                semantic_terminal_position = (
+                    min(terminal_candidates) if terminal_candidates else None
+                )
+                if request_id in self.stop_word_being_finished_ids:
+                    # This step only retires a stop detected after the preceding
+                    # burst, so none of its newly verified proposals are usable.
+                    semantic_terminal_position = -1
 
             if request_id != consumed_chunked_prefill_request_id:
                 # Skip appending token for requests being finished due to stop words
@@ -2461,17 +2515,18 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Skip prefill requests: MTP heads only propose speculative tokens
                 # for decode requests, so counting prefill requests would inflate
                 # the denominator and artificially deflate the acceptance rate.
-                if (
-                    not is_prefill
-                    and len(request.generated_tokens) > 0
-                    and self.num_speculative_tokens > 0
-                ):
-                    actual_proposed = max(0, self.num_speculative_tokens - num_stop_word_trim)
-                    self._spec_tokens_proposed_per_pos[:actual_proposed] += 1
-                    accepted_t = torch.tensor(accepted_tokens_list[:actual_proposed])
-                    self._spec_tokens_accepted_per_pos[:actual_proposed] += (
-                        accepted_t != -1
-                    ).long()
+                if not is_prefill and self.num_speculative_tokens > 0:
+                    actual_proposed = self._get_usable_speculative_proposal_count(
+                        self.num_speculative_tokens,
+                        accepted_token_count,
+                        semantic_terminal_position,
+                    )
+                    if actual_proposed > 0:
+                        self._spec_tokens_proposed_per_pos[:actual_proposed] += 1
+                        accepted_t = torch.tensor(accepted_tokens_list[:actual_proposed])
+                        self._spec_tokens_accepted_per_pos[:actual_proposed] += (
+                            accepted_t != -1
+                        ).long()
 
                 request_finished = request_id in finished_request_ids
                 if request_finished:
