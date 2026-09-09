@@ -46,7 +46,6 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     te_supports_batch_invariant_attention,
 )
 from megatron.core.transformer.torch_norm import WrappedTorchNorm
-from megatron.core.transformer.utils import is_layer_window_attention
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.inference.contexts.test_dynamic_prefix_caching import (
     TestPrefixCacheRealEngineMatrix as _PrefixEngineHarness,
@@ -229,22 +228,18 @@ def _install_mtp_witnesses(env, case: _Case, runtime: Counter) -> _MTPWitness:
             class_name = type(module).__name__
             module_name = type(module).__module__
             if case.config.get("window_size") is not None and class_name == "SelfAttention":
-                real_mtp_attention = module.flash_decode_and_prefill
+                real_mtp_attention = module.core_attention.forward
 
                 def observed_mtp_attention(
                     *args, _module=module, _real=real_mtp_attention, **kwargs
                 ):
-                    if is_layer_window_attention(
-                        _module.config.window_size,
-                        _module.config.window_attn_skip_freq,
-                        _module.layer_number,
-                    ):
-                        runtime["mtp-swa-kernel-calls"] += 1
+                    if _module.core_attention.scale_mask_softmax.window_size is not None:
+                        runtime["mtp-swa-attention-forwards"] += 1
                     else:
-                        runtime["mtp-full-attention-kernel-calls"] += 1
+                        runtime["mtp-full-attention-forwards"] += 1
                     return _real(*args, **kwargs)
 
-                module.flash_decode_and_prefill = observed_mtp_attention
+                module.core_attention.forward = observed_mtp_attention
                 runtime["mtp-attention-modules-installed"] += 1
 
             is_te_module = class_name.startswith("TE") or "transformer_engine" in module_name
@@ -298,23 +293,11 @@ def _install_mtp_witnesses(env, case: _Case, runtime: Counter) -> _MTPWitness:
                 real_parallel_forward = module.forward
 
                 def observed_mtp_column(*args, _real=real_parallel_forward, **kwargs):
-                    from megatron.core.tensor_parallel import layers as tp_layers
-
-                    real_gather = tp_layers.gather_from_sequence_parallel_region
-
-                    def observed_gather(input_, *collective_args, **collective_kwargs):
-                        output = real_gather(input_, *collective_args, **collective_kwargs)
-                        runtime["mtp-tp-sp-gathers"] += 1
-                        runtime["mtp-tp-sp-gather-dimensions"] += int(
-                            output.shape[0] == input_.shape[0] * tp_size
-                        )
-                        return output
-
-                    tp_layers.gather_from_sequence_parallel_region = observed_gather
-                    try:
-                        output = _real(*args, **kwargs)
-                    finally:
-                        tp_layers.gather_from_sequence_parallel_region = real_gather
+                    input_ = args[0] if args else kwargs["input_"]
+                    output = _real(*args, **kwargs)
+                    runtime["mtp-tp-sp-gather-dimensions"] += int(
+                        output[0].shape[0] == input_.shape[0] * tp_size
+                    )
                     runtime["mtp-tp-column-partition-forwards"] += 1
                     return output
 
@@ -329,23 +312,11 @@ def _install_mtp_witnesses(env, case: _Case, runtime: Counter) -> _MTPWitness:
                 real_parallel_forward = module.forward
 
                 def observed_mtp_row(*args, _real=real_parallel_forward, **kwargs):
-                    from megatron.core.tensor_parallel import layers as tp_layers
-
-                    real_reduce = tp_layers.reduce_scatter_to_sequence_parallel_region
-
-                    def observed_reduce(input_, *collective_args, **collective_kwargs):
-                        output = real_reduce(input_, *collective_args, **collective_kwargs)
-                        runtime["mtp-tp-sp-reduce-scatters"] += 1
-                        runtime["mtp-tp-sp-reduce-scatter-dimensions"] += int(
-                            output.shape[0] * tp_size == input_.shape[0]
-                        )
-                        return output
-
-                    tp_layers.reduce_scatter_to_sequence_parallel_region = observed_reduce
-                    try:
-                        output = _real(*args, **kwargs)
-                    finally:
-                        tp_layers.reduce_scatter_to_sequence_parallel_region = real_reduce
+                    input_ = args[0] if args else kwargs["input_"]
+                    output = _real(*args, **kwargs)
+                    runtime["mtp-tp-sp-reduce-scatter-dimensions"] += int(
+                        output[0].shape[0] * tp_size == input_.shape[0]
+                    )
                     runtime["mtp-tp-row-partition-forwards"] += 1
                     return output
 
@@ -1040,13 +1011,20 @@ class TestMTPPairwise(_DynamicEngineTestBase):
         """MTP proposals use the selected sampler and its temperature/k/p filters."""
         if backend == "flashinfer":
             pytest.importorskip("flashinfer")
+        active_filter = "top-k" if backend == "torch" else "top-p"
+        inactive_filter = "top-p" if backend == "torch" else "top-k"
         case = _Case(
             name=f"sampling-{backend}",
             depth=2,
             pattern="distribution",
             prompt_lengths=(5, 7, 9),
             output_lengths=(12, 11, 10),
-            config={"sampling_backend": backend, "temperature": 0.8, "top_k": 3, "top_p": 0.95},
+            config={
+                "sampling_backend": backend,
+                "temperature": 0.8,
+                "top_k": 3 if backend == "torch" else 0,
+                "top_p": 0.95 if backend == "flashinfer" else 0.0,
+            },
         )
         first_env = _build_env(case, mtp_active=True)
         repeat_env = _build_env(case, mtp_active=True)
@@ -1060,13 +1038,13 @@ class TestMTPPairwise(_DynamicEngineTestBase):
             _assert_mtp_active(session, case)
             assert session.runtime[f"sampling-backend:{backend}"] > 0
             assert session.runtime["temperature-filter"] > 0
-            assert session.runtime["top-k-filter"] > 0
-            assert session.runtime["top-p-filter"] > 0
+            assert session.runtime[f"{active_filter}-filter"] > 0
+            assert session.runtime[f"{inactive_filter}-filter"] == 0
             assert session.runtime["mtp-serial-steps"] > 0
             assert session.runtime[f"mtp-local:sampling-backend:{backend}"] > 0
             assert session.runtime["mtp-local:temperature-filter"] > 0
-            assert session.runtime["mtp-local:top-k-filter"] > 0
-            assert session.runtime["mtp-local:top-p-filter"] > 0
+            assert session.runtime[f"mtp-local:{active_filter}-filter"] > 0
+            assert session.runtime[f"mtp-local:{inactive_filter}-filter"] == 0
             assert all(
                 token in {_BASE_TOKEN, _REJECT_TOKEN, _REJECT_TOKEN + 1}
                 for request in session.requests
@@ -1091,17 +1069,21 @@ class TestMTPPairwise(_DynamicEngineTestBase):
     @torch.inference_mode()
     def test_stop_sequence_trims_one_mtp_burst(self, keep):
         """The earliest stop boundary trims tokens and scores consistently."""
-        _run_mtp_pair(
-            _Case(
-                name=f"stop-{'keep' if keep else 'strip'}",
-                depth=3,
-                pattern="stop",
-                prompt_lengths=(5,),
-                output_lengths=(10,),
-                config={"track_generated_token_events": True},
-                stop_keep=keep,
-            )
+        case = _Case(
+            name=f"stop-{'keep' if keep else 'strip'}",
+            depth=3,
+            pattern="stop",
+            prompt_lengths=(5,),
+            output_lengths=(10,),
+            config={"track_generated_token_events": True},
+            stop_keep=keep,
         )
+        if keep:
+            _run_mtp_pair(case)
+        else:
+            treatment = _run_session(_build_env(case, mtp_active=True), case)
+            _assert_complete(treatment, case)
+            _assert_mtp_active(treatment, case)
 
     @torch.inference_mode()
     def test_hybrid_mamba_partial_acceptance_selects_exact_intermediate_state(self):
@@ -1209,8 +1191,8 @@ class TestMTPPairwise(_DynamicEngineTestBase):
         assert treatment.runtime["swa-kernel-calls"] > 0
         assert treatment.runtime["full-attention-kernel-calls"] > 0
         assert treatment.runtime["mtp-attention-modules-installed"] == 2
-        assert treatment.runtime["mtp-swa-kernel-calls"] > 0
-        assert treatment.runtime["mtp-full-attention-kernel-calls"] > 0
+        assert treatment.runtime["mtp-swa-attention-forwards"] > 0
+        assert treatment.runtime["mtp-full-attention-forwards"] > 0
 
 
 _PARALLEL_CASES = (
@@ -1298,6 +1280,12 @@ class TestMTPPairwiseParallel(_DynamicEngineTestBase):
                 assert runtime["mtp-nccl-combine-before-dispatch"] == 0
             else:
                 assert parallel_state.get_data_parallel_world_size() == 2
+                outputs = [request.generated_tokens for request in treatment.requests]
+                acceptance = dict(treatment.witness.accepted_by_request)
+                dp_group = parallel_state.get_data_parallel_group_gloo()
+                gathered = [None] * torch.distributed.get_world_size(group=dp_group)
+                torch.distributed.all_gather_object(gathered, (outputs, acceptance), group=dp_group)
+                assert all(rank_result == (outputs, acceptance) for rank_result in gathered)
                 assert runtime["pipeline-logits-broadcasts"] > 0
                 assert runtime["mtp-pipeline-logits-broadcasts"] > 0
                 if parallel_state.is_pipeline_last_stage():
@@ -1310,11 +1298,6 @@ class TestMTPPairwiseParallel(_DynamicEngineTestBase):
                 else:
                     assert runtime["mtp-tp-column-partitions-installed"] == 0
                     assert runtime["mtp-tp-row-partitions-installed"] == 0
-                outputs = [request.generated_tokens for request in treatment.requests]
-                acceptance = dict(treatment.witness.accepted_by_request)
-                gathered = [None] * world_size
-                torch.distributed.all_gather_object(gathered, (outputs, acceptance))
-                assert all(rank_result == (outputs, acceptance) for rank_result in gathered)
             assert ordinary.requests and treatment.requests
         finally:
             _cleanup()
