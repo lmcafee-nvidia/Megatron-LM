@@ -2164,6 +2164,41 @@ class DynamicInferenceEngine(AbstractEngine):
         entry.prompt_logprob_blocks[logical_block_index] = block_ref
         del request._pending_prompt_logprob_row
 
+    @staticmethod
+    def _find_step_stop_match(
+        generated_tokens: List[int],
+        step_tokens: List[int],
+        stop_word_ids: Optional[List[List[int]]],
+    ) -> Optional[Tuple[int, int]]:
+        """Find the earliest stop-sequence match ending in the current burst.
+
+        Args:
+            generated_tokens: Tokens retained before the current burst.
+            step_tokens: Untrimmed tokens produced by the current step.
+            stop_word_ids: Configured tokenized stop sequences.
+
+        Returns:
+            The zero-based position in ``step_tokens`` of the stop sequence's
+            final token and the matched sequence length, or ``None`` when no
+            stop sequence ends in this burst.
+        """
+        if not stop_word_ids or not step_tokens:
+            return None
+
+        max_stop_length = max((len(stop_tokens) for stop_tokens in stop_word_ids), default=0)
+        history_length = max(0, max_stop_length - 1)
+        history = generated_tokens[-history_length:] if history_length else []
+        previous_count = len(history)
+        candidate_tokens = history + step_tokens
+        for step_position in range(len(step_tokens)):
+            end = previous_count + step_position + 1
+            for stop_tokens in stop_word_ids:
+                stop_length = len(stop_tokens)
+                if stop_length > 0 and end >= stop_length:
+                    if candidate_tokens[end - stop_length : end] == stop_tokens:
+                        return step_position, stop_length
+        return None
+
     def post_process_requests(
         self,
         request_ids: torch.Tensor,
@@ -2305,11 +2340,20 @@ class DynamicInferenceEngine(AbstractEngine):
             num_stop_word_trim = 0
             is_prefill = len(request.generated_tokens) == 0
             termination_token_position = int(termination_token_position)
+            stop_match = None
+            if (
+                self.num_speculative_tokens > 0
+                and not is_prefill
+                and request_id != consumed_chunked_prefill_request_id
+            ):
+                stop_match = self._find_step_stop_match(
+                    request.generated_tokens, tokens, request.stop_word_ids
+                )
 
             if request_id != consumed_chunked_prefill_request_id:
                 # Skip appending token for requests being finished due to stop words
                 # (they already have their final token from the previous step)
-                # Apply output-length and EOS boundaries before
+                # Apply output-length, EOS, and in-burst stop boundaries before
                 # appending so tokens, scores, top-n rows, and events share one suffix.
                 remaining_output_tokens = max(
                     0,
@@ -2319,6 +2363,34 @@ class DynamicInferenceEngine(AbstractEngine):
                 if termination_token_position >= 0:
                     assert termination_token_position < len(tokens)
                     keep = min(keep, termination_token_position + 1)
+
+                # Speculative output can contain more than one occurrence of a stop
+                # sequence. Resolve the earliest visible occurrence before publishing
+                # tokens or per-token metadata. EOS wins a tie so it remains visible.
+                preappend_stop_hit = False
+                suppress_postappend_stop_check = False
+                if stop_match is not None and request_id not in self.stop_word_being_finished_ids:
+                    stop_token_position, stop_length = stop_match
+                    stop_start_position = stop_token_position + 1 - stop_length
+                    eos_precedes_or_ties = (
+                        termination_token_position >= 0
+                        and termination_token_position <= stop_token_position
+                    )
+                    can_trim_before_append = (
+                        request.sampling_params.detokenize_stop_sequence or stop_start_position >= 0
+                    )
+                    if (
+                        stop_token_position < keep
+                        and not eos_precedes_or_ties
+                        and can_trim_before_append
+                    ):
+                        preappend_stop_hit = True
+                        if request.sampling_params.detokenize_stop_sequence:
+                            keep = min(keep, stop_token_position + 1)
+                        else:
+                            keep = min(keep, stop_start_position)
+                    elif eos_precedes_or_ties:
+                        suppress_postappend_stop_check = True
 
                 num_dropped = len(tokens) - keep
                 tokens = tokens[:keep]
@@ -2374,14 +2446,16 @@ class DynamicInferenceEngine(AbstractEngine):
                         per_token_step_time = step_time / len(tokens)
                         request.tpot.extend([per_token_step_time] * len(tokens))
 
-                # Check for stop words (after token is appended).
-                # With speculative decoding, a stop word may end before the last
-                # appended token. The check truncates generated_tokens in-place and
-                # returns how many trailing tokens were removed so we can also trim
-                # the corresponding log probs below.
-                stop_word_hit, num_stop_word_trim = self._check_stop_words_for_request_post_append(
-                    request
-                )
+                if preappend_stop_hit:
+                    stop_word_hit = True
+                elif suppress_postappend_stop_check:
+                    stop_word_hit = False
+                else:
+                    # Ordinary generation and fallback edge cases retain the
+                    # established post-append stop-word behavior.
+                    stop_word_hit, num_stop_word_trim = (
+                        self._check_stop_words_for_request_post_append(request)
+                    )
 
                 # Track per-position acceptance statistics for logging.
                 # Skip prefill requests: MTP heads only propose speculative tokens
