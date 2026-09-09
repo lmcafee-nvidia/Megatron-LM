@@ -20,6 +20,7 @@ from collections import Counter
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import Optional
+from unittest import mock
 
 import pytest
 import torch
@@ -34,6 +35,7 @@ from megatron.core.inference.inference_request import (
 )
 from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.transformer import attention as attention_module
 from megatron.core.transformer.attention import HAVE_FA3, HAVE_FA4
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
@@ -316,6 +318,7 @@ _CASES = (
         _owned_scenario(
             "alternating-swa-learnable-sink",
             "swa-sink",
+            config={"flash_attention_version": 3},
             signals=("chunked", "gpt", "softmax-sink", "swa-alternating"),
         ),
         chunk_counters=("swa-kernel-calls", "full-attention-kernel-calls", "sink-correction-calls"),
@@ -455,6 +458,36 @@ def _install_consumed_chunk_observer(engine, consumed_chunk_ids: list[int]) -> N
         return original(*args, **kwargs)
 
     engine.post_process_requests = observed
+
+
+def _install_fa3_kvcache_witness(env, runtime: Counter) -> None:
+    """Witness FA3's metadata-producing decode without leaking a global patch."""
+    context = env.engine.context
+    original_kvcache = attention_module.flash_attn3_with_kvcache
+
+    def traced_kvcache(*args, **kwargs):
+        active_ids = context.request_ids[context.paused_request_count : context.total_request_count]
+        target_decode = context.is_decode_only() and _TARGET_ID in active_ids.tolist()
+        result = original_kvcache(*args, **kwargs)
+        if target_decode:
+            assert kwargs.get("return_softmax_lse") is True
+            assert isinstance(result, tuple) and len(result) > 2
+            runtime["fa3-target-decode-kvcache-metadata-calls"] += 1
+        return result
+
+    model = env.engine.controller.inference_wrapped_model.model
+    for module in model.modules():
+        if type(module).__name__ != "SelfAttention":
+            continue
+        original_flash = module.flash_decode_and_prefill
+
+        def traced_flash(*args, _original=original_flash, **kwargs):
+            with mock.patch.object(
+                attention_module, "flash_attn3_with_kvcache", new=traced_kvcache
+            ):
+                return _original(*args, **kwargs)
+
+        module.flash_decode_and_prefill = traced_flash
 
 
 def _install_sequence_parallel_gather_witness(env, runtime: Counter) -> None:
@@ -615,6 +648,8 @@ def _build_env(case: _ChunkCase, chunked: bool):
 
 
 def _case_prerequisites(case: _ChunkCase) -> None:
+    if case.name == "swa-sink" and not HAVE_FA3:
+        pytest.skip("swa-sink requires FlashAttention 3")
     _check_scenario_prerequisite(case.scenario)
     if case.name == "gdp-prefix-state":
         skip_if_mamba_sequence_packing_not_available("hybrid", "gdp")
@@ -712,6 +747,8 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
         if chunked:
             _install_admission_observer(engine.context, admissions)
             _instrument_scenario_runtime(env, case.scenario, runtime)
+            if case.name == "swa-sink":
+                _install_fa3_kvcache_witness(env, runtime)
             if case.name == "tp2-pp2-sp-dp2":
                 _install_sequence_parallel_gather_witness(env, runtime)
             _install_recurrent_witnesses(env, runtime)
@@ -1014,6 +1051,8 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
 
         if case.name == "tp2-pp2-sp-dp2":
             assert session.runtime["dp-shared-seed-equality"] == 1
+        if case.name == "swa-sink":
+            assert session.runtime["fa3-target-decode-kvcache-metadata-calls"] > 0
 
         if case.name == "ep2-moe-optimized":
             assert (
