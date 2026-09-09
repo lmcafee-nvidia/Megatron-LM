@@ -4587,6 +4587,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert max_position_seen < env.engine.context.max_sequence_length_for_model
         if num_tokens_to_generate == 2 and num_speculative_tokens == 3:
             assert max_position_seen >= max_sequence_length
+        if num_tokens_to_generate == 5 and num_speculative_tokens == 3:
+            assert max_position_seen == env.engine.context.max_sequence_length_for_model - 1
         assert env.engine.context.active_token_count == 0
         assert env.engine.context.total_request_count == 0
 
