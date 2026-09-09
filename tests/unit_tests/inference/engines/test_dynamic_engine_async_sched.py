@@ -661,7 +661,11 @@ _ASYNC_PAIR_SCENARIOS = (
     _pair_scenario(
         "mtp-depth-one",
         "speculation:mtp-depth-one",
-        config={"num_speculative_tokens": 1},
+        config={
+            "num_speculative_tokens": 1,
+            "position_embedding_type": "rope",
+            "use_flashinfer_fused_rope": False,
+        },
         signals=("mtp",),
     ),
     _pair_scenario(
@@ -673,6 +677,8 @@ _ASYNC_PAIR_SCENARIOS = (
             "num_cuda_graphs": 4,
             "force_build_cuda_graphs": True,
             "materialize_only_last_token_logits": False,
+            "position_embedding_type": "rope",
+            "use_flashinfer_fused_rope": False,
         },
         sampling=(
             {"return_log_probs": True, "skip_prompt_log_probs": False, "top_n_logprobs": 2},
@@ -1102,6 +1108,26 @@ def _instrument_scenario_runtime(env, scenario, runtime):
     controller = env.engine.controller
     context = env.engine.context
     _instrument_async_phases(controller, runtime)
+
+    if "mtp" in scenario.signals and "cuda-graph" in scenario.signals:
+        model = controller._unwrapped_model
+        manager = getattr(model, "_mtp_cudagraph_manager", None)
+        assert manager is not None
+        original_mtp = model.compute_mtp_single_step
+
+        def traced_mtp(*args, **kwargs):
+            result = original_mtp(*args, **kwargs)
+            eager = kwargs.get("eager", False)
+            cache_key = kwargs.get("cache_key")
+            if context.using_cuda_graph_this_step() and not eager and cache_key is not None:
+                runner = manager.custom_cudagraphs_lookup_table.get(cache_key)
+                runtime["mtp-cuda-graph-invocations"] += 1
+                runtime["mtp-cuda-graph-replays"] += int(
+                    runner is not None and runner.fwd_graph_recorded and runner.cudagraph_created
+                )
+            return result
+
+        model.compute_mtp_single_step = traced_mtp
 
     original_forward = controller._dynamic_step_forward_logits
 
@@ -1737,6 +1763,9 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         if "mtp" in signals:
             assert env.engine._spec_steps > 0
             assert int(env.engine._spec_tokens_proposed_per_pos.sum()) > 0
+            if "cuda-graph" in signals:
+                assert runtime["mtp-cuda-graph-invocations"] > 0
+                assert runtime["mtp-cuda-graph-replays"] == runtime["mtp-cuda-graph-invocations"]
         if "metadata-compaction" in signals:
             assert runtime["non-prefix-survivor-compactions"] > 0
         if "hybrid" in signals:
