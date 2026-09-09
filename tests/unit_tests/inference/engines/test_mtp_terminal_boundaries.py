@@ -265,6 +265,7 @@ class TestMtpAcceptedEosLifecycle(DynamicInferenceEngineTestBase):
             min_prompt_length=4,
             max_prompt_length=4,
             num_tokens_to_generate=8,
+            max_sequence_length=12,
             num_speculative_tokens=num_speculative_tokens,
             materialize_only_last_token_logits=False,
             model_provider="gpt",
@@ -284,6 +285,7 @@ class TestMtpAcceptedEosLifecycle(DynamicInferenceEngineTestBase):
 
         witness = {
             "base_calls": 0,
+            "max_base_position": -1,
             "mtp_depths": set(),
             "accepted_eos_rows": 0,
             "accepted_eos_with_suffix_rows": 0,
@@ -291,6 +293,11 @@ class TestMtpAcceptedEosLifecycle(DynamicInferenceEngineTestBase):
         real_forward = model.forward
 
         def deterministic_forward(*args, **kwargs):
+            position_ids = kwargs.get("position_ids", args[1] if len(args) > 1 else None)
+            assert position_ids is not None
+            witness["max_base_position"] = max(
+                witness["max_base_position"], int(position_ids.max().item())
+            )
             logits = real_forward(*args, **kwargs)
             witness["base_calls"] += 1
 
@@ -399,6 +406,8 @@ class TestMtpAcceptedEosLifecycle(DynamicInferenceEngineTestBase):
         assert eos_request.events[-1].type is DynamicInferenceEventType.FINISH
 
         assert witness["base_calls"] > 0
+        assert witness["max_base_position"] >= context.max_sequence_length
+        assert witness["max_base_position"] < context.max_sequence_length_for_model
         assert witness["mtp_depths"] == set(range(num_speculative_tokens))
         assert witness["accepted_eos_rows"] > 0
         assert witness["accepted_eos_with_suffix_rows"] > 0

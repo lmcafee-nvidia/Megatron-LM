@@ -730,7 +730,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_kv_block_count=self.max_kv_block_count,
             max_requests=self.max_requests,
             block_size_tokens=self.block_size_tokens,
-            max_seqlen=self.max_sequence_length,
+            max_seqlen=self.max_sequence_length_for_model,
         )
 
         self.non_graph_attn_metadata["mha_metadata"] = NonGraphedMHAMetadata(
@@ -738,7 +738,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_kv_block_count=self.max_kv_block_count,
             max_requests=self.max_requests,
             block_size_tokens=self.block_size_tokens,
-            max_seqlen=self.max_sequence_length,
+            max_seqlen=self.max_sequence_length_for_model,
         )
 
         self.moe_enable_routing_replay = model_config.moe_enable_routing_replay
@@ -898,6 +898,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             f"  max_requests:            {self.max_requests}",
             f"  max_tokens:              {self.max_tokens}",
             f"  max_sequence_length:     {self.max_sequence_length}",
+            f"  model_forward_seq_length: {self.max_sequence_length_for_model}",
             f"  block_size_tokens:       {self.block_size_tokens}",
             f"  max_kv_blocks_per_req:   {self.max_kv_block_count}",
             f"  KV cache:",
@@ -1700,6 +1701,11 @@ class DynamicInferenceContext(BaseInferenceContext):
     def is_static_batching(self) -> bool:
         """Is static batching? False."""
         return False
+
+    @property
+    def max_sequence_length_for_model(self) -> int:
+        """Include unpublished speculative lookahead in model-forward capacity."""
+        return self.max_sequence_length + self.num_speculative_tokens
 
     def is_decode_only(self) -> bool:
         """
@@ -4123,17 +4129,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Return whether requests can be prepared without lifecycle changes.
 
         Returns:
-            bool: Whether all requests are active decode requests, their next token
-                positions fit the context, and the shared KV-block pool can satisfy
-                the exact next-step allocation demand.
+            bool: Whether all requests are active decode requests, their successor
+                positions fit the model-forward capacity, and the shared KV-block
+                pool can satisfy the exact next-step allocation demand.
         """
         if self.num_prefill_requests != 0 or self.paused_request_count != 0:
             return False
 
-        # The active length is the first successor position. Include all K draft
-        # positions so equality with the context length is rejected as out of bounds.
+        # Overlap launches the successor burst before the pending burst retires terminal
+        # rows. Resolve first if that successor would exceed the physical lookahead bound.
         next_last_token_positions = self.get_active_sequence_lengths() + self.num_speculative_tokens
-        if torch.any(next_last_token_positions >= self.max_sequence_length):
+        if torch.any(next_last_token_positions >= self.max_sequence_length_for_model):
             return False
 
         rows_requiring_new_block = self._get_async_sched_rows_requiring_new_block()
