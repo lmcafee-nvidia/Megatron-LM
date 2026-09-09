@@ -4123,10 +4123,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Return whether requests can be prepared without lifecycle changes.
 
         Returns:
-            bool: Whether all requests are active decode requests and the shared
-                KV-block pool can satisfy the exact next-step allocation demand.
+            bool: Whether all requests are active decode requests, their next token
+                positions fit the context, and the shared KV-block pool can satisfy
+                the exact next-step allocation demand.
         """
         if self.num_prefill_requests != 0 or self.paused_request_count != 0:
+            return False
+
+        # The active length is the first successor position. Include all K draft
+        # positions so equality with the context length is rejected as out of bounds.
+        next_last_token_positions = self.get_active_sequence_lengths() + self.num_speculative_tokens
+        if torch.any(next_last_token_positions >= self.max_sequence_length):
             return False
 
         rows_requiring_new_block = self._get_async_sched_rows_requiring_new_block()
