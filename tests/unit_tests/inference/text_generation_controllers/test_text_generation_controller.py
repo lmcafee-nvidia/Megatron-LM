@@ -1399,15 +1399,16 @@ def test_async_sched_no_overlap_admission_can_finish_without_launching_a_primer(
     controller._run_async_sched_forward_primer.assert_not_called()
 
 
-def test_run_async_sched_update_requests_preserves_pre_update_output():
-    """Legacy bookkeeping may reorder working samples without corrupting step output."""
+def test_run_async_sched_update_requests_preserves_accepted_eos_output():
+    """No-overlap bookkeeping propagates accepted EOS without mutating step output."""
     context = _make_async_sched_context(total_request_count=3, paused_request_count=1)
-    context.request_metadata["termination_id"] = torch.tensor([99, 99, 2])
+    context.request_metadata["termination_id"] = torch.tensor([-1, 99, -1])
     context.get_max_sequence_lengths.return_value = torch.tensor([10, 10])
     controller = _make_async_sched_controller(context)
+    controller.num_speculative_tokens = 2
     sampled_tokens = torch.tensor([1, 2])
     sampled_mtp_tokens = torch.tensor([[3, 4], [5, 6]])
-    accepted_tokens = torch.tensor([7, 8])
+    accepted_tokens = torch.tensor([[99, 7], [8, -1]])
     sample_result = SimpleNamespace(
         sampled_tokens_cpu_view=sampled_tokens,
         sampled_mtp_tokens_cpu_view=sampled_mtp_tokens,
@@ -1415,7 +1416,7 @@ def test_run_async_sched_update_requests_preserves_pre_update_output():
     )
 
     def update_requests(active_mask, mutable_samples, mutable_mtp_samples):
-        assert active_mask.tolist() == [1, 0]
+        assert active_mask.tolist() == [0, 1]
         mutable_samples.fill_(-1)
         mutable_mtp_samples.fill_(-1)
         return {
@@ -1430,13 +1431,20 @@ def test_run_async_sched_update_requests_preserves_pre_update_output():
     )
 
     assert result.active_request_ids.tolist() == [11, 12]
-    assert result.finished_request_ids.tolist() == [12]
+    assert result.finished_request_ids.tolist() == [11]
+    assert result.termination_token_positions.tolist() == [0, -1]
     assert result.sampled_tokens_cpu.tolist() == [1, 2]
-    assert result.accepted_tokens_cpu.tolist() == [7, 8]
+    assert result.accepted_tokens_cpu.tolist() == [[99, 7], [8, -1]]
     assert result.newly_paused_request_ids.tolist() == [11]
     assert result.evict_request_ids.tolist() == [10]
     assert sampled_tokens.tolist() == [1, 2]
     assert sampled_mtp_tokens.tolist() == [[3, 4], [5, 6]]
+
+    step_result = controller._build_async_sched_step_result(
+        result, None, DecodeOnly(consumed=False, launched=False), None, None, count_compaction=False
+    )
+    assert step_result.output["termination_token_positions"].tolist() == [0, -1]
+    assert step_result.output["accepted_tokens"].tolist() == [[99, 7], [8, -1]]
 
 
 @pytest.mark.parametrize(
