@@ -2182,6 +2182,7 @@ class DynamicInferenceEngine(AbstractEngine):
         finished_handoff_ssm_slots: Optional[Dict[int, int]] = None,
         finished_handoff_decode_tokens: Optional[Dict[int, list[int]]] = None,
         prompt_logprob_updates: Optional[Dict[int, Dict[str, object]]] = None,
+        termination_token_positions: Optional[torch.Tensor] = None,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest]]:
         """
         Handles post-processing for requests after a step.
@@ -2210,6 +2211,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 needed to resume directly from imported prefill state on decode.
             prompt_logprob_updates: Allocator-owned sidecar references, prompt-row
                 counts, and any outgoing partial-chunk score row.
+            termination_token_positions: First termination-token position in each
+                logical output burst, or ``-1`` when no termination token was emitted.
 
         Returns:
             A list of active requests and completed requests as `DynamicInferenceRequest` objects
@@ -2239,6 +2242,11 @@ class DynamicInferenceEngine(AbstractEngine):
         # When accepted_tokens is None (no speculative decoding), use repeat([]) to provide
         # empty lists for each request, so the zip produces the correct number of iterations
         accepted_tokens_iter = repeat([]) if accepted_tokens is None else accepted_tokens.tolist()
+        termination_positions_iter = (
+            repeat(-1)
+            if termination_token_positions is None
+            else termination_token_positions.tolist()
+        )
 
         if self.num_speculative_tokens > 0 and accepted_tokens is not None:
             self._spec_steps += 1
@@ -2261,8 +2269,20 @@ class DynamicInferenceEngine(AbstractEngine):
             finished_handoff_decode_tokens or {},
         )
 
-        for req_idx, (request_id, tokens, accepted_tokens_list, request_log_probs) in enumerate(
-            zip(request_id_list, sample.tolist(), accepted_tokens_iter, log_probs_iter)
+        for req_idx, (
+            request_id,
+            tokens,
+            accepted_tokens_list,
+            termination_token_position,
+            request_log_probs,
+        ) in enumerate(
+            zip(
+                request_id_list,
+                sample.tolist(),
+                accepted_tokens_iter,
+                termination_positions_iter,
+                log_probs_iter,
+            )
         ):
 
             # Ensure tokens is always a list for consistent handling
@@ -2284,32 +2304,32 @@ class DynamicInferenceEngine(AbstractEngine):
 
             num_stop_word_trim = 0
             is_prefill = len(request.generated_tokens) == 0
+            termination_token_position = int(termination_token_position)
+
             if request_id != consumed_chunked_prefill_request_id:
                 # Skip appending token for requests being finished due to stop words
                 # (they already have their final token from the previous step)
-                # If the request already has more tokens, then we only append as much as is necessary
-                if (
-                    len(request.generated_tokens) + len(tokens)
-                    >= request.sampling_params.num_tokens_to_generate
-                ):
-                    keep = request.sampling_params.num_tokens_to_generate - len(
-                        request.generated_tokens
-                    )
-                    num_tokens_before_trim = len(tokens)
-                    tokens = tokens[:keep]
-                    # Drop only the excess *trailing* log probs / top-n so the counts stay
-                    # in sync. We must trim from the end, not the front: on a prefill step
-                    # request_log_probs covers the whole prompt and is laid out as
-                    # [<prompt log probs...>, <sampled token log prob>], so front-slicing
-                    # (e.g. [:keep] with keep == 0 when num_tokens_to_generate == 0) would
-                    # discard the prompt log probs that echo+logprobs requests need. In a
-                    # decode step all entries are generated, so trailing == front-equivalent.
-                    num_dropped = num_tokens_before_trim - len(tokens)
-                    if num_dropped > 0:
-                        if request_log_probs is not None:
-                            request_log_probs = request_log_probs[:-num_dropped]
-                        if top_n_logprobs is not None and req_idx in top_n_logprobs:
-                            top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_dropped]
+                # Apply output-length and EOS boundaries before
+                # appending so tokens, scores, top-n rows, and events share one suffix.
+                remaining_output_tokens = max(
+                    0,
+                    request.sampling_params.num_tokens_to_generate - len(request.generated_tokens),
+                )
+                keep = min(len(tokens), remaining_output_tokens)
+                if termination_token_position >= 0:
+                    assert termination_token_position < len(tokens)
+                    keep = min(keep, termination_token_position + 1)
+
+                num_dropped = len(tokens) - keep
+                tokens = tokens[:keep]
+                # Drop only the excess *trailing* log probs / top-n so the counts stay
+                # in sync. On a prefill step the generated score is the final row after
+                # prompt scores; on a decode step every row is generated.
+                if num_dropped > 0:
+                    if request_log_probs is not None:
+                        request_log_probs = request_log_probs[:-num_dropped]
+                    if top_n_logprobs is not None and req_idx in top_n_logprobs:
+                        top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_dropped]
                 if request_id not in self.stop_word_being_finished_ids:
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens += tokens
@@ -3315,6 +3335,7 @@ class DynamicInferenceEngine(AbstractEngine):
             evict_request_ids = step_result.get("evict_request_ids")
             sample = step_result["sample"]
             accepted_tokens = step_result["accepted_tokens"]
+            termination_token_positions = step_result.get("termination_token_positions")
             log_probs = step_result["log_probs"]
             top_n_logprobs = step_result.get("top_n_logprobs", None)
             prompt_logprob_updates = step_result.get("prompt_logprob_updates", None)
@@ -3339,6 +3360,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 accepted_tokens,
                 log_probs,
                 consumed_chunked_prefill_request_id=context_state["chunked_prefill_request_id"],
+                termination_token_positions=termination_token_positions,
                 top_n_logprobs=top_n_logprobs,
                 pre_fwd_active_token_count=context_state.get("active_token_count"),
                 pre_fwd_step_count=context_state.get("step_count"),
