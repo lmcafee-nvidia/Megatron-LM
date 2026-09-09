@@ -727,7 +727,9 @@ def get_gpt_mtp_block_spec(
     pp_rank: Optional[int] = None,
 ) -> MultiTokenPredictionBlockSubmodules:
     """GPT Multi-Token Prediction (MTP) block spec."""
-    if use_transformer_engine:
+    if config.transformer_impl == "inference_optimized":
+        backend = InferenceSpecProvider()
+    elif use_transformer_engine:
         backend: BackendSpecProvider = (
             KitchenSpecProvider(
                 fallback=TESpecProvider(),
