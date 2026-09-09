@@ -105,9 +105,49 @@ def test_terminal_position_uses_accepted_prefix_then_replacement():
     assert rejected_eos.tolist() == [-1]
 
 
+@pytest.mark.parametrize(
+    ("boundary", "accepted_count", "expected"),
+    [
+        pytest.param(None, 3, 3, id="no-boundary"),
+        pytest.param(0, 3, 1, id="first-accepted-position"),
+        pytest.param(1, 3, 2, id="second-accepted-position"),
+        pytest.param(0, 0, 3, id="first-replacement-position"),
+        pytest.param(2, 2, 3, id="replacement-position"),
+        pytest.param(-1, 3, 0, id="boundary-before-step"),
+    ],
+)
+def test_usable_proposal_count_follows_logical_boundary(boundary, accepted_count, expected):
+    assert (
+        DynamicInferenceEngine._get_usable_speculative_proposal_count(
+            num_speculative_tokens=3,
+            accepted_token_count=accepted_count,
+            terminal_token_position=boundary,
+        )
+        == expected
+    )
+    if boundary == -1:
+        request = _make_decode_request()
+        engine = _make_postprocess_engine(request, num_speculative_tokens=3)
+        engine.stop_word_being_finished_ids = {request.request_id}
+        engine.post_process_requests(
+            torch.tensor([request.request_id]),
+            torch.tensor([request.request_id]),
+            None,
+            0.0,
+            torch.tensor([23]),
+            torch.tensor([[20, 21, 22]]),
+            None,
+            -1,
+            termination_token_positions=torch.tensor([-1]),
+        )
+        assert request.generated_tokens == [10]
+        assert engine._spec_tokens_proposed_per_pos.tolist() == [0, 0, 0]
+        assert engine._spec_tokens_accepted_per_pos.tolist() == [0, 0, 0]
+
+
 @pytest.mark.parametrize("keep_stop", [False, True], ids=["strip-stop", "keep-stop"])
 def test_stop_boundary_output_is_aligned_for_keep_and_strip(keep_stop):
-    """Keep tokens, scores, and events aligned for either stop-retention mode."""
+    """Keep output aligned and count only proposals through the first stop endpoint."""
 
     class NoFullHistoryCopy(list):
         def __add__(self, other):
@@ -137,6 +177,8 @@ def test_stop_boundary_output_is_aligned_for_keep_and_strip(keep_stop):
     assert active_ids == [request.request_id]
     assert finished_records == []
     assert engine.stop_word_finished_request_ids == {request.request_id}
+    assert engine._spec_tokens_proposed_per_pos.tolist() == [1, 1, 0]
+    assert engine._spec_tokens_accepted_per_pos.tolist() == [1, 1, 0]
     assert request.generated_tokens == ([10, 20, 20] if keep_stop else [10])
     assert request.generated_log_probs == pytest.approx([-0.1, -0.2, -0.3] if keep_stop else [-0.1])
     assert len(request.generated_log_probs) == len(request.generated_tokens)
@@ -196,6 +238,38 @@ def test_eos_wins_same_endpoint_stop_and_keeps_all_metadata_aligned():
     ]
     assert generated_events == request.generated_tokens
     assert engine.stop_word_finished_request_ids == set()
+
+
+def test_length_boundary_trims_tokens_scores_and_proposal_metrics_together():
+    request = _make_decode_request(output_limit=2)
+    engine = _make_postprocess_engine(request, track_generated_token_events=True)
+
+    engine.post_process_requests(
+        request_ids=torch.tensor([request.request_id]),
+        finished_request_ids=torch.empty(0, dtype=torch.long),
+        evict_request_ids=None,
+        step_time=0.0,
+        sample=torch.tensor([22]),
+        accepted_tokens=torch.tensor([[20, 21]]),
+        log_probs=[[-0.2, -0.3, -0.4]],
+        consumed_chunked_prefill_request_id=-1,
+        termination_token_positions=torch.tensor([-1]),
+        top_n_logprobs={0: _top_n_rows([20, 21, 22])},
+    )
+
+    assert request.generated_tokens == [10, 20]
+    assert request.generated_log_probs == pytest.approx([-0.1, -0.2])
+    assert len(request.generated_top_n_logprobs) == 2
+    assert "20" in request.generated_top_n_logprobs[-1]
+    assert request.generated_top_n_logprobs[-1]["20"] == pytest.approx(-0.1)
+    assert engine._spec_tokens_proposed_per_pos.tolist() == [1, 0]
+    assert engine._spec_tokens_accepted_per_pos.tolist() == [1, 0]
+    generated_events = [
+        event.payload["token_id"]
+        for event in request.events
+        if event.type is DynamicInferenceEventType.GENERATED_TOKEN
+    ]
+    assert generated_events == request.generated_tokens
 
 
 def test_chunked_prefill_provisional_sample_is_not_output_or_metric_data():
@@ -402,6 +476,8 @@ class TestMtpAcceptedEosLifecycle(DynamicInferenceEngineTestBase):
         assert witness["mtp_depths"] == set(range(num_speculative_tokens))
         assert witness["accepted_eos_rows"] > 0
         assert witness["accepted_eos_with_suffix_rows"] > 0
+        assert engine._spec_tokens_accepted_per_pos.tolist() == [7, 4]
+        assert engine._spec_tokens_proposed_per_pos.tolist() == [7, 4]
         assert context.active_token_count == 0
         assert context.total_request_count == 0
         assert engine.requests == {}
