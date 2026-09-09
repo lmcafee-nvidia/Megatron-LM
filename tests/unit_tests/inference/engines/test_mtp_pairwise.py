@@ -91,6 +91,7 @@ class _MTPWitness:
     accepted_by_request: dict[int, list[int]] = field(default_factory=lambda: defaultdict(list))
     acceptance_batches: list[dict[int, int]] = field(default_factory=list)
     proposal_request_ids: list[tuple[int, ...]] = field(default_factory=list)
+    layer_request_ids: list[tuple[int, ...]] = field(default_factory=list)
     raw_depths: list[Optional[int]] = field(default_factory=list)
     logical_depths: list[int] = field(default_factory=list)
     rewinds: dict[int, list[tuple[int, int, int, int]]] = field(
@@ -214,6 +215,18 @@ def _install_mtp_witnesses(env, case: _Case, runtime: Counter) -> _MTPWitness:
                 _instrument_attention_runtime(module, runtime)
 
     if hasattr(model, "mtp"):
+        for layer in model.mtp.layers:
+            real_layer_forward = layer.forward_single_position
+
+            def observed_layer_forward(*args, _real=real_layer_forward, **kwargs):
+                request_ids = tuple(_active_request_ids(context))
+                result = _real(*args, **kwargs)
+                witness.layer_request_ids.append(request_ids)
+                runtime["real-mtp-layer-forward"] += 1
+                return result
+
+            layer.forward_single_position = observed_layer_forward
+
         for module in model.mtp.modules():
             class_name = type(module).__name__
             module_name = type(module).__module__
@@ -353,12 +366,15 @@ def _install_mtp_witnesses(env, case: _Case, runtime: Counter) -> _MTPWitness:
             hidden_states, next_token_ids, position_ids, depth=None, eager=False, cache_key=None
         ):
             nonlocal repeated_call_index
+            layer_calls_before = len(witness.layer_request_ids)
             hidden_states, logits = real_mtp(
                 hidden_states, next_token_ids, position_ids, depth, eager=eager, cache_key=cache_key
             )
             logical_depth = int(depth) if depth is not None else repeated_call_index % case.depth
             repeated_call_index += 1
             request_ids = _active_request_ids(context)
+            assert len(witness.layer_request_ids) == layer_calls_before + 1
+            assert witness.layer_request_ids[-1] == tuple(request_ids)
             runtime["real-mtp-forward"] += 1
             runtime["mtp-forward-with-batch-invariant"] += int(
                 context.batch_invariant_mode and is_batch_invariant_mode_enabled()
@@ -703,7 +719,9 @@ def _assert_mtp_active(session: _Session, case: _Case) -> None:
     assert runtime["real-base-forward"] > 0
     if parallel_state.is_pipeline_last_stage():
         assert runtime["real-mtp-forward"] > 0
+        assert runtime["real-mtp-layer-forward"] == runtime["real-mtp-forward"]
         assert runtime["mtp-position-id-forwards"] == runtime["real-mtp-forward"]
+        assert session.witness.layer_request_ids == session.witness.proposal_request_ids
     else:
         assert runtime["real-mtp-forward"] == 0
     assert runtime["mtp-verifier-calls"] > 0
