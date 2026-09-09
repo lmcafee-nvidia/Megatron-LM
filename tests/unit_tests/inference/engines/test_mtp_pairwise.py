@@ -1081,6 +1081,7 @@ class TestMTPPairwise(_DynamicEngineTestBase):
         if keep:
             _run_mtp_pair(case)
         else:
+            # Ordinary one-token steps exercise a separate cross-step strip contract.
             treatment = _run_session(_build_env(case, mtp_active=True), case)
             _assert_complete(treatment, case)
             _assert_mtp_active(treatment, case)
