@@ -699,6 +699,7 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
         suspend_chunked_id_after = None
         suspend_storage_bytes = None
         suspend_storage_pointers = None
+        target_decode_pending_from_no_overlap = False
 
         if chunked:
             _install_admission_observer(engine.context, admissions)
@@ -723,17 +724,29 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
                 return 0, 0
             return memory_buffer.untyped_storage().nbytes(), memory_buffer.data_ptr()
 
+        def target_is_active() -> bool:
+            active_ids = engine.context.request_ids[
+                engine.context.paused_request_count : engine.context.total_request_count
+            ]
+            return _TARGET_ID in active_ids.tolist()
+
         def step() -> None:
             nonlocal suspended, suspend_before, suspend_after
             nonlocal suspend_target_admission_count
             nonlocal suspend_chunked_id_before, suspend_chunked_id_after
             nonlocal suspend_storage_bytes, suspend_storage_pointers
+            nonlocal target_decode_pending_from_no_overlap
             runtime["max-waiting"] = max(runtime["max-waiting"], len(engine.waiting_request_ids))
             target_before = live_request(_TARGET_ID)
             generated_before = len(target_before.generated_tokens) if target_before else 0
             events_before = _generated_event_count(target_before) if target_before else 0
+            target_active_before = target_before is not None and target_is_active()
+            pending_handoff_before = target_decode_pending_from_no_overlap
+            target_decode_pending_from_no_overlap = False
             partial_count_before = len(partial_forward_ids)
             consumed_count_before = len(consumed_chunk_ids)
+            no_overlap_before = runtime["_run_async_sched_step_no_overlap"]
+            overlap_before = runtime["_run_async_sched_step_overlap"]
             counter_before = {key: runtime[key] for key in case.chunk_counters}
             consumed_counter_before = {key: runtime[key] for key in case.consumed_counters}
             proposed_before = int(engine._spec_tokens_proposed_per_pos.sum())
@@ -772,6 +785,29 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
                     )
 
             target_after = live_request(_TARGET_ID)
+            no_overlap_executed = runtime["_run_async_sched_step_no_overlap"] > no_overlap_before
+            overlap_executed = runtime["_run_async_sched_step_overlap"] > overlap_before
+            target_active_after = target_after is not None and target_is_active()
+            if case.name == "async-overlap-congestion":
+                if pending_handoff_before and overlap_executed:
+                    assert target_active_before
+                    assert target_before.remaining_prompt_length == 0
+                    assert engine.decode_only.consumed is True
+                    assert engine.decode_only.launched is True
+                    assert target_active_after
+                    assert target_after.remaining_prompt_length == 0
+                    assert len(target_after.generated_tokens) > generated_before
+                    runtime["target-no-overlap-to-overlap-handoff"] += 1
+                if (
+                    no_overlap_executed
+                    and engine.decode_only.launched is True
+                    and target_active_after
+                    and target_after.remaining_prompt_length == 0
+                    and runtime["target-partial:_run_async_sched_step_no_overlap"] > 0
+                ):
+                    target_decode_pending_from_no_overlap = True
+                    runtime["target-decode-launched-by-no-overlap"] += 1
+
             if target_after is not None and len(target_after.generated_tokens) > generated_before:
                 runtime["target-mtp-proposed"] += (
                     int(engine._spec_tokens_proposed_per_pos.sum()) - proposed_before
@@ -933,7 +969,8 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
             assert session.runtime["_run_async_sched_step_no_overlap"] == 0
             assert session.runtime["_run_async_sched_step_overlap"] == 0
         elif case.name == "async-overlap-congestion":
-            assert session.runtime["_run_async_sched_step_overlap"] > 0
+            assert session.runtime["target-decode-launched-by-no-overlap"] > 0
+            assert session.runtime["target-no-overlap-to-overlap-handoff"] > 0
 
         if case.suspend_mode is None:
             expected_length = _PREFIX_FOLLOWER_LENGTH if case.prefix_flow else _PROMPT_LENGTH
