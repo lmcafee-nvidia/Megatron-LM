@@ -386,6 +386,7 @@ class DynamicEngineTestConfig:
     cuda_graph_impl: Optional[str] = None
     force_build_cuda_graphs: bool = False
     transformer_impl: str = "local"
+    normalization: str = "LayerNorm"
     inference_moe_token_dispatcher_type: str = "nccl"
     # If False, do not build cuda graphs in the tests, even if
     # num_cuda_graphs is set.
@@ -398,6 +399,8 @@ class DynamicEngineTestConfig:
     static_kv_memory_pointers: bool = True
     track_generated_token_events: bool = False
     num_speculative_tokens: int = 0
+    mtp_num_layers: Optional[int] = None
+    mtp_use_repeated_layer: bool = False
     position_embedding_type: str = "learned_absolute"
     use_flashinfer_fused_rope: Optional[bool] = None
     sampling_backend: str = 'torch'
@@ -418,6 +421,11 @@ class DynamicEngineTestConfig:
     softmax_type: str = "vanilla"
 
     def __post_init__(self):
+
+        # Preserve the historical test-harness behavior while allowing tests to
+        # build dormant or repeated MTP layers independently of active speculation.
+        if self.mtp_num_layers is None:
+            self.mtp_num_layers = self.num_speculative_tokens
 
         # Compute max_sequence_length.
         if self.max_sequence_length is None:
@@ -612,7 +620,8 @@ class DynamicInferenceEngineTestBase:
             transformer_config = TransformerConfig(
                 params_dtype=torch.bfloat16,
                 num_layers=4,
-                mtp_num_layers=test_config.num_speculative_tokens,
+                mtp_num_layers=test_config.mtp_num_layers,
+                mtp_use_repeated_layer=test_config.mtp_use_repeated_layer,
                 hidden_size=(
                     test_config.hidden_size
                     if test_config.hidden_size is not None
@@ -670,7 +679,7 @@ class DynamicInferenceEngineTestBase:
                 normalization=(
                     "RMSNorm"
                     if test_config.transformer_impl == "inference_optimized"
-                    else "LayerNorm"
+                    else test_config.normalization
                 ),
                 softmax_type=test_config.softmax_type,
                 # inference optimized currently only supports RMS Norm
@@ -685,13 +694,15 @@ class DynamicInferenceEngineTestBase:
             if test_config.fp8 or test_config.transformer_impl == "transformer_engine":
                 layer_spec = get_gpt_layer_with_transformer_engine_spec(num_experts=num_experts)
             elif test_config.transformer_impl == "local":
-                layer_spec = get_gpt_layer_local_spec(num_experts=num_experts)
+                layer_spec = get_gpt_layer_local_spec(
+                    num_experts=num_experts, normalization=transformer_config.normalization
+                )
             elif test_config.transformer_impl == "inference_optimized":
                 layer_spec = get_gpt_layer_with_inference_spec(num_experts=num_experts)
 
             # MTP block spec (needed for speculative decoding).
             mtp_block_spec = None
-            if test_config.num_speculative_tokens > 0:
+            if test_config.mtp_num_layers > 0:
                 use_te = test_config.fp8 or test_config.transformer_impl == "transformer_engine"
                 mtp_block_spec = get_gpt_mtp_block_spec(
                     config=transformer_config, spec=layer_spec, use_transformer_engine=use_te
@@ -718,7 +729,8 @@ class DynamicInferenceEngineTestBase:
                 num_layers=(
                     3 if pp_size == 1 else 6
                 ),  # 1 Mamba layer, 1 attention layer, 1 MLP layer
-                mtp_num_layers=test_config.num_speculative_tokens,
+                mtp_num_layers=test_config.mtp_num_layers,
+                mtp_use_repeated_layer=test_config.mtp_use_repeated_layer,
                 hidden_size=256,  # The Mamba layer places several constraints on this
                 **hybrid_mixer_kwargs(test_config.ssm_mixer),
                 num_attention_heads=16,
@@ -774,9 +786,9 @@ class DynamicInferenceEngineTestBase:
             )
 
             # Hybrid model.
-            # When speculative tokens are configured, append MTP depth sections
+            # When MTP layers are configured, append their depth sections
             # to the hybrid layer pattern so the model creates MTP blocks.
-            mtp_suffix = "/M" * test_config.num_speculative_tokens
+            mtp_suffix = "/M" * test_config.mtp_num_layers
             recurrent_symbol = "G" if is_gdn else "M"
             if pp_size == 1:
                 mamba_pattern = recurrent_symbol + "*-" + mtp_suffix
@@ -4495,9 +4507,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             num_speculative_tokens=num_speculative_tokens,
             materialize_only_last_token_logits=materialize_only_last_token_logits,
             model_provider="gpt",
-            # Disable positional embeddings so speculative position IDs
-            # beyond max_sequence_length don't cause out-of-bounds lookups.
-            position_embedding_type="none",
+            position_embedding_type="rope",
+            use_flashinfer_fused_rope=False,
             sampling_backend=sampling_backend,
         )
         env = self._build_test_env(test_config)
@@ -4509,8 +4520,13 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         # then replace the output logits with deterministic values so all
         # speculative tokens are accepted and sampling is predictable.
         real_forward = unwrapped_model.forward
+        max_position_seen = -1
 
         def deterministic_forward(*args, **kwargs):
+            nonlocal max_position_seen
+            position_ids = kwargs.get("position_ids", args[1] if len(args) > 1 else None)
+            assert position_ids is not None
+            max_position_seen = max(max_position_seen, int(position_ids.max().item()))
             logits = real_forward(*args, **kwargs)
             # Overwrite with deterministic logits: always predict token 0.
             logits.zero_()
@@ -4571,6 +4587,11 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         ), f"Expected all tokens to be 0, got {finished_req.generated_tokens}"
 
         # Verify engine state is clean after completion.
+        assert max_position_seen < env.engine.context.max_sequence_length_for_model
+        if num_tokens_to_generate == 2 and num_speculative_tokens == 3:
+            assert max_position_seen >= max_sequence_length
+        if num_tokens_to_generate == 5 and num_speculative_tokens == 3:
+            assert max_position_seen == env.engine.context.max_sequence_length_for_model - 1
         assert env.engine.context.active_token_count == 0
         assert env.engine.context.total_request_count == 0
 
