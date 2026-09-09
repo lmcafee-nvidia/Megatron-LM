@@ -125,6 +125,24 @@ def test_usable_proposal_count_follows_logical_boundary(boundary, accepted_count
         )
         == expected
     )
+    if boundary == -1:
+        request = _make_decode_request()
+        engine = _make_postprocess_engine(request, num_speculative_tokens=3)
+        engine.stop_word_being_finished_ids = {request.request_id}
+        engine.post_process_requests(
+            torch.tensor([request.request_id]),
+            torch.tensor([request.request_id]),
+            None,
+            0.0,
+            torch.tensor([23]),
+            torch.tensor([[20, 21, 22]]),
+            None,
+            -1,
+            termination_token_positions=torch.tensor([-1]),
+        )
+        assert request.generated_tokens == [10]
+        assert engine._spec_tokens_proposed_per_pos.tolist() == [0, 0, 0]
+        assert engine._spec_tokens_accepted_per_pos.tolist() == [0, 0, 0]
 
 
 @pytest.mark.parametrize("keep_stop", [False, True], ids=["strip-stop", "keep-stop"])
