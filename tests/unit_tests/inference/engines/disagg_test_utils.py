@@ -60,14 +60,13 @@ def prompt(length):
 
 @contextmanager
 def real_engine(config, *, role=None, backend="nccl", weights=None):
-    # Reuse the existing tiny-model factory, substituting only its production
-    # engine composition. The model, controller, allocator and transport are real.
-    config_factory = partial(
-        dynamic_tests.TransformerConfig, flash_attention_version=config.flash_attention_version
-    )
-    with mock.patch.object(
-        dynamic_tests, "DynamicInferenceEngine", DisaggDynamicInferenceEngine
-    ), mock.patch.object(dynamic_tests, "TransformerConfig", config_factory):
+    # Reuse the real model factory with explicit attention and handoff configuration.
+    version = config.flash_attention_version
+    config_factory = partial(dynamic_tests.TransformerConfig, flash_attention_version=version)
+    with (
+        mock.patch.object(dynamic_tests, "DynamicInferenceEngine", DisaggDynamicInferenceEngine),
+        mock.patch.object(dynamic_tests, "TransformerConfig", config_factory),
+    ):
         engine = DynamicInferenceEngineTestBase._build_test_env(config).engine
     assert dist.get_backend() == "nccl"
     assert dist.get_world_size(engine.pg_collection.tp) == config.tensor_model_parallel_size
@@ -132,6 +131,7 @@ class ForwardWitness:
         self.steps = []
         self.graph_replays = 0
         self.fa4_calls = 0
+        self.pending_forwards = 0
         self._patches = []
 
     def _snapshot(self):
@@ -160,6 +160,8 @@ class ForwardWitness:
 
         def forward(*args, **kwargs):
             snapshot = self._snapshot()
+            if snapshot is not None and self.engine.controller._async_sched_logits.is_valid:
+                self.pending_forwards += 1
             result = original_forward(*args, **kwargs)
             if snapshot is not None:
                 self.steps.append(snapshot)
@@ -238,12 +240,12 @@ class _DeferredNcclPull:
         return self.real_handle is not None and self.real_handle.poll()
 
 
-def _enqueue_decode_handoff(engine, metadata, tokens, params):
+def _enqueue_decode_handoff(engine, metadata, tokens, params, request_id=101):
     """Allocate destinations before posting matched NCCL receives."""
 
     if not engine._kv_transfer_agent.is_push:
         return engine.add_request_with_kv_handoff(
-            101, tokens, params, metadata["kv_meta"], metadata["block_ids"]
+            request_id, tokens, params, metadata["kv_meta"], metadata["block_ids"]
         )
 
     patches = []
@@ -262,7 +264,7 @@ def _enqueue_decode_handoff(engine, metadata, tokens, params):
         patches.append(patch)
     try:
         future = engine.add_request_with_kv_handoff(
-            101, tokens, params, metadata["kv_meta"], metadata["block_ids"]
+            request_id, tokens, params, metadata["kv_meta"], metadata["block_ids"]
         )
     finally:
         for patch in reversed(patches):
@@ -285,20 +287,20 @@ def assert_import_equal(engine, pending, source, prompt_length):
         assert torch.equal(engine.context.mamba_ssm_states[:, slot].cpu(), source["recurrent"])
 
 
-def complete_transfer(engine, metadata, tokens, params, control):
+def complete_transfer(engine, metadata, tokens, params, control, request_id=101):
     """Drive real P2P/pull while both peers keep their storage alive."""
     is_source = dist.get_rank() % 2 == 0
     pending = None
     future = None
     if not is_source:
-        future = _enqueue_decode_handoff(engine, metadata, tokens, params)
+        future = _enqueue_decode_handoff(engine, metadata, tokens, params, request_id)
         assert len(engine._pending_kv_imports) == 1
         pending = engine._pending_kv_imports[0]
-        assert pending.request_id == 101
+        assert pending.request_id == request_id
     peer = exchange(None if is_source else decode_peer_meta(engine, pending), control)
     if is_source and engine._kv_transfer_agent.is_push:
-        engine.push_handoff_kv(101, [peer])
-        assert engine._pending_kv_pushes[-1][0] == 101
+        engine.push_handoff_kv(request_id, [peer])
+        assert engine._pending_kv_pushes[-1][0] == request_id
     handles = (
         [handle for _, group in engine._pending_kv_pushes for handle in group]
         if is_source

@@ -2,6 +2,8 @@
 
 """Collocated parity and exact transfer witnesses for real disaggregated engines."""
 
+from dataclasses import replace
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -72,12 +74,42 @@ def transport_world():
 def test_disagg_real_engine_parity(transport_world, backend, length, changes, count):
     config = disagg_config(**changes)
     tokens = prompt(length)
-    weights, expected = collocated_reference(config, tokens, sampling(count))
+    reference_config = replace(config, async_sched_mode=AsyncScheduleMode.LEGACY)
+    weights, expected = collocated_reference(reference_config, tokens, sampling(count))
     assert exchange(expected, transport_world) == expected
     source = dist.get_rank() % 2 == 0
+    async_decode = config.async_sched_mode == AsyncScheduleMode.ASYNC
+    chunked = changes.get("enable_chunked_prefill")
+    neighbor_tokens = [91, 92, 93, 94]
+    if async_decode or chunked:
+        with real_engine(reference_config, weights=weights) as reference:
+            future = reference.add_request(102, neighbor_tokens, sampling(16))
+            neighbor_expected = run_to_completion(reference, future).generated_tokens
     role = "prefill" if source else "decode"
     with real_engine(config, role=role, backend=backend, weights=weights) as engine:
         with ForwardWitness(engine) as witness:
+            neighbor = None
+            if async_decode:
+                metadata = None
+                if source:
+                    seed = engine.add_request(102, neighbor_tokens, sampling(1, do_kv_handoff=True))
+                    metadata = run_to_completion(engine, seed).disaggregated_params
+                metadata = exchange(metadata, transport_world)
+                _, seeded = complete_transfer(
+                    engine, metadata, neighbor_tokens, sampling(16), transport_world, 102
+                )
+                if source:
+                    engine._poll_pending_kv_pushes()
+                    engine.release_handoff_blocks(102)
+                else:
+                    admit_import(engine)
+                    neighbor = seeded
+                    engine.step_modern()
+                    assert engine.controller._async_sched_logits.is_valid
+            elif source and chunked:
+                neighbor = engine.add_request(102, neighbor_tokens, sampling(16))
+                engine.step_modern()
+                assert not neighbor.done() and engine.context.is_decode_only()
             metadata = state = None
             if source:
                 request = run_to_completion(
@@ -87,8 +119,9 @@ def test_disagg_real_engine_parity(transport_world, backend, length, changes, co
                 metadata, state = snapshot_source(engine, request)
                 assert len(metadata["block_ids"]) == (length + 15) // 16
                 assert witness.steps and all(step[2] for step in witness.steps)
-                if changes.get("enable_chunked_prefill"):
+                if chunked:
                     assert len({step[0] for step in witness.steps}) >= 3
+                    assert sum(102 in step[3] for step in witness.steps) >= 3
                 with pytest.raises(RuntimeError, match="handoff state remains pinned"):
                     engine.reset()
             transferred = exchange((metadata, state) if source else None, transport_world)
@@ -109,12 +142,17 @@ def test_disagg_real_engine_parity(transport_world, backend, length, changes, co
                     transferred.copy_(saved)
                     assert_import_equal(engine, pending, state, length)
                 assert pending.resume_tokens == expected[:1]
-                assert not engine.context.total_request_count
-                admit_import(engine)
+                if neighbor is None:
+                    assert not engine.context.total_request_count
+                    admit_import(engine)
+                else:
+                    assert engine._poll_pending_kv_imports() == 1
+                    engine.step_modern()  # Resolve the existing chain before normal import admission.
                 if count > 1:
-                    assert engine.context.request_ids[0].item() == 101
-                    assert engine.context.request_kv_length_offsets[0].item() == length
-                    assert not engine.context.request_in_prefill_status_tensor[0].item()
+                    row = engine.context.request_ids.tolist().index(101)
+                    if neighbor is None:
+                        assert engine.context.request_kv_length_offsets[row].item() == length
+                    assert not engine.context.request_in_prefill_status_tensor[row].item()
                     result = run_to_completion(engine, future)
                     assert witness.steps and all(not step[2] for step in witness.steps)
                     assert witness.steps[0][0] == length
@@ -122,13 +160,21 @@ def test_disagg_real_engine_parity(transport_world, backend, length, changes, co
                         assert witness.graph_replays > 0
                     if config.flash_attention_version == 4:
                         assert witness.fa4_calls > 0
+                    if neighbor is not None:
+                        assert witness.pending_forwards > 0
+                        assert any(102 in step[3] for step in witness.steps)
                 else:
                     assert future.done()
                     result = future.result().merge()
                     assert not witness.steps
                 assert result.generated_tokens == expected
                 assert result.num_cached_tokens == length
-                assert_released(engine)
+                if neighbor is None:
+                    assert_released(engine)
+            if neighbor is not None:
+                assert run_to_completion(engine, neighbor).generated_tokens == neighbor_expected
+                if not source:
+                    assert_released(engine)
             dist.barrier(group=transport_world)
             if source:
                 engine._poll_pending_kv_pushes()
