@@ -337,12 +337,28 @@ async def test_routed_model_kernels_match_direct(monkeypatch, options, signals, 
     prompt = list(range(4, 16))
     params = greedy_params(num_tokens_to_generate=4, return_prompt_tokens=True)
     async with routed_model(monkeypatch, **options) as harness:
+        finite = []
+        sample_kernel = (sampling := harness.engine.controller._sampling).sample_kernel
+        reduce = torch.distributed._functional_collectives.all_reduce
+
+        def observed_sample(logits, n, context, **kwargs):
+            if _active_target_ids(harness):
+                assert n == 1
+                gather_indices = kwargs.get("gather_indices")
+                rows = logits[gather_indices[:n]] if gather_indices is not None else logits[:n]
+                finite.append(torch.isfinite(rows[:, : harness.config.vocab_size]).all())
+            return sample_kernel(logits, n, context, **kwargs)
+
+        sampling.sample_kernel = observed_sample
         direct = await harness.direct(prompt, params)
+        assert finite and reduce(torch.stack(finite).all(), "min", torch.distributed.group.WORLD)
+        finite.clear()
         runtime = Counter()
         _instrument_scenario_runtime(
             SimpleNamespace(engine=harness.engine), SimpleNamespace(signals=signals), runtime
         )
         target = await _exercise_all_owners(harness, prompt, params, direct, runtime=runtime)
+        assert finite and reduce(torch.stack(finite).all(), "min", torch.distributed.group.WORLD)
         for counter in required:
             assert target[counter] > 0, counter
 
