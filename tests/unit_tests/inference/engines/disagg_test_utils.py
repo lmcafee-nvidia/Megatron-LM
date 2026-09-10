@@ -57,6 +57,9 @@ def real_engine(config, *, role=None, backend="nccl", weights=None):
     # engine composition. The model, controller, allocator and transport are real.
     with mock.patch.object(dynamic_tests, "DynamicInferenceEngine", DisaggDynamicInferenceEngine):
         engine = DynamicInferenceEngineTestBase._build_test_env(config).engine
+    assert dist.get_backend() == "nccl"
+    assert dist.get_world_size(engine.pg_collection.tp) == 1
+    assert dist.get_world_size(engine.pg_collection.pp) == 1
     model = engine.controller.inference_wrapped_model.model
     if weights is not None:
         model.load_state_dict(weights)
@@ -194,6 +197,60 @@ def decode_peer_meta(engine, pending):
     return metadata
 
 
+class _DeferredNcclPull:
+    """Start a real NCCL receive after the peers exchange destination metadata."""
+
+    def __init__(self, begin, args, kwargs):
+        self._begin = begin
+        self._args = args
+        self._kwargs = kwargs
+        self.real_handle = None
+
+    def _start(self):
+        if self.real_handle is None:
+            self.real_handle = self._begin(*self._args, **self._kwargs)
+        return self.real_handle
+
+    def wait(self):
+        self._start().wait()
+
+    def poll(self):
+        return self.real_handle is not None and self.real_handle.poll()
+
+
+def _enqueue_decode_handoff(engine, metadata, tokens, params):
+    """Allocate destinations before posting matched NCCL receives."""
+
+    if not engine._kv_transfer_agent.is_push:
+        return engine.add_request_with_kv_handoff(
+            101, tokens, params, metadata["kv_meta"], metadata["block_ids"]
+        )
+
+    patches = []
+    deferred = []
+    agents = [engine._kv_transfer_agent, *engine._ssm_transfer_agents.values()]
+    for agent in agents:
+        begin = agent.begin_pull_blocks
+
+        def defer(*args, _begin=begin, **kwargs):
+            handle = _DeferredNcclPull(_begin, args, kwargs)
+            deferred.append(handle)
+            return handle
+
+        patch = mock.patch.object(agent, "begin_pull_blocks", side_effect=defer)
+        patch.start()
+        patches.append(patch)
+    try:
+        future = engine.add_request_with_kv_handoff(
+            101, tokens, params, metadata["kv_meta"], metadata["block_ids"]
+        )
+    finally:
+        for patch in reversed(patches):
+            patch.stop()
+    assert len(deferred) == len(agents)
+    return future
+
+
 def assert_import_equal(engine, pending, source, prompt_length):
     # The last physical block can include uninitialized padding: compare only
     # tokens belonging to the transferred prompt, never the allocator tail.
@@ -214,22 +271,26 @@ def complete_transfer(engine, metadata, tokens, params, control):
     pending = None
     future = None
     if not is_source:
-        future = engine.add_request_with_kv_handoff(
-            101, tokens, params, metadata["kv_meta"], metadata["block_ids"]
-        )
+        future = _enqueue_decode_handoff(engine, metadata, tokens, params)
         assert len(engine._pending_kv_imports) == 1
         pending = engine._pending_kv_imports[0]
+        assert pending.request_id == 101
     peer = exchange(None if is_source else decode_peer_meta(engine, pending), control)
     if is_source and engine._kv_transfer_agent.is_push:
         engine.push_handoff_kv(101, [peer])
+        assert engine._pending_kv_pushes[-1][0] == 101
     handles = (
         [handle for _, group in engine._pending_kv_pushes for handle in group]
         if is_source
         else engine._pending_transfer_handles(pending)
     )
+    if engine._kv_transfer_agent.is_push or not is_source:
+        assert len(handles) == 1 + len(engine._ssm_transfer_agents)
     for handle in handles:
         handle.wait()
         assert handle.poll()
+        if isinstance(handle, _DeferredNcclPull):
+            assert handle.real_handle is not None
     dist.barrier(group=control)
     return pending, future
 

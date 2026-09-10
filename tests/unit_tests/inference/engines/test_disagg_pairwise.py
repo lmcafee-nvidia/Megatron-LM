@@ -29,7 +29,9 @@ from tests.unit_tests.test_utilities import Utils
 def transport_world():
     Utils.initialize_model_parallel()
     assert dist.get_world_size() >= 2 and dist.get_world_size() % 2 == 0
+    assert dist.get_backend() == "nccl"
     control = dist.new_group(backend="gloo")
+    assert dist.get_backend(control) == "gloo"
     yield control
     dist.destroy_process_group(control)
     Utils.destroy_model_parallel()
@@ -68,6 +70,7 @@ def test_disagg_real_engine_parity(transport_world, backend, length, changes, co
     config = disagg_config(**changes)
     tokens = prompt(length)
     weights, expected = collocated_reference(config, tokens, sampling(count))
+    assert exchange(expected, transport_world) == expected
     source = dist.get_rank() % 2 == 0
     role = "prefill" if source else "decode"
     with real_engine(config, role=role, backend=backend, weights=weights) as engine:
@@ -93,6 +96,15 @@ def test_disagg_real_engine_parity(transport_world, backend, length, changes, co
             )
             if not source:
                 assert_import_equal(engine, pending, state, length)
+                if length == 32:
+                    block = pending.local_blocks[0]
+                    transferred = engine.context.memory_buffer[0, 0, block, 0, 0, 0]
+                    saved = transferred.clone()
+                    transferred.copy_(saved + 1)
+                    with pytest.raises(AssertionError):
+                        assert_import_equal(engine, pending, state, length)
+                    transferred.copy_(saved)
+                    assert_import_equal(engine, pending, state, length)
                 assert pending.resume_tokens == expected[:1]
                 assert not engine.context.total_request_count
                 admit_import(engine)
