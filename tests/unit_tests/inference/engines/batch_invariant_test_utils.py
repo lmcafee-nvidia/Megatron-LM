@@ -2,6 +2,7 @@
 """Real-engine batch-invariance fixtures; backend groups run in fresh interpreters."""
 
 import gc
+import inspect
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -34,11 +35,43 @@ from megatron.core.transformer.custom_layers import batch_invariant_kernels as b
 from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from tests.unit_tests.models.test_gpt_model_batch_invariant import DummyTokenizer
 from tests.unit_tests.test_utilities import Utils
 
 TARGET = 101
 VOCAB = 128
+
+
+class DummyTokenizer:
+    """Minimal tokenizer isolated from unrelated model-test dependencies."""
+
+    def __init__(self, vocab_size, bos=None, eod=0, pad=0):
+        self.vocab_size = vocab_size
+        self.bos = bos
+        self.eod = eod
+        self.pad = pad
+
+    def tokenize(self, prompt):
+        if isinstance(prompt, str):
+            return [int(token) % self.vocab_size for token in prompt.strip().split()]
+        return list(prompt)
+
+    def detokenize(self, tokens, skip_special_tokens=False):
+        if isinstance(tokens, torch.Tensor):
+            tokens = tokens.tolist()
+        if skip_special_tokens and self.eod in tokens:
+            tokens = [token for token in tokens if token != self.eod]
+        return " ".join(str(token) for token in tokens)
+
+    @staticmethod
+    def offsets(tokens, text):
+        if isinstance(tokens, torch.Tensor):
+            tokens = tokens.tolist()
+        result = []
+        cursor = 0
+        for token in tokens:
+            result.append(cursor)
+            cursor += len(str(token)) + 1
+        return result
 
 
 @dataclass(frozen=True)
@@ -70,30 +103,32 @@ def invariant_runtime(case):
     assert fa_version in (3, 4)
     assert attention.HAVE_FA3 if fa_version == 3 else attention.HAVE_FA4
     assert bik.te_supports_batch_invariant_attention()
-    Utils.initialize_model_parallel(case.tp, case.pp)
     # Another test module can change these class attributes during collection.
     old_rounders = DynamicInferenceContext.TOKEN_ROUNDER, DynamicInferenceContext.REQUEST_ROUNDER
     DynamicInferenceContext.TOKEN_ROUNDER = 64
     DynamicInferenceContext.REQUEST_ROUNDER = 4
-    with pytest.MonkeyPatch.context() as patch:
-        for name, value in {
-            "NVTE_FUSED_ATTN": "0",
-            "NVTE_FLASH_ATTN": "1",
-            "NVTE_UNFUSED_ATTN": "0",
-        }.items():
-            patch.setenv(name, value)
-        bik.enable_batch_invariant_mode(backend=backend, collective="ordered")
-        try:
+    # Backend activation must precede distributed CUDA initialization and the
+    # first model/GEMM; each backend group starts in a fresh interpreter.
+    bik.enable_batch_invariant_mode(backend=backend, collective="ordered")
+    try:
+        Utils.initialize_model_parallel(case.tp, case.pp)
+        with pytest.MonkeyPatch.context() as patch:
+            for name, value in {
+                "NVTE_FUSED_ATTN": "0",
+                "NVTE_FLASH_ATTN": "1",
+                "NVTE_UNFUSED_ATTN": "0",
+            }.items():
+                patch.setenv(name, value)
             yield backend, fa_version
-        finally:
-            InferenceMode.unset_active()
-            bik.disable_batch_invariant_mode()
-            DynamicInferenceContext.TOKEN_ROUNDER, DynamicInferenceContext.REQUEST_ROUNDER = (
-                old_rounders
-            )
-            gc.collect()
-            torch.cuda.empty_cache()
-            Utils.destroy_model_parallel()
+    finally:
+        InferenceMode.unset_active()
+        bik.disable_batch_invariant_mode()
+        DynamicInferenceContext.TOKEN_ROUNDER, DynamicInferenceContext.REQUEST_ROUNDER = (
+            old_rounders
+        )
+        gc.collect()
+        torch.cuda.empty_cache()
+        Utils.destroy_model_parallel()
 
 
 def build_engine(case, backend, fa_version):
@@ -179,8 +214,16 @@ class ForwardWitness:
         self.steps = []
         self.current = None
         self.sample_steps = []
+        self.async_decisions = []
+        self.async_overlaps = []
+        self.retirement_events = []
+        self._active_async_overlap = None
         controller, ctx = engine.controller, engine.context
         original = controller._dynamic_step_forward_logits
+
+        def target_is_active():
+            active = ctx.request_ids[ctx.paused_request_count : ctx.total_request_count]
+            return bool((active == TARGET).any())
 
         def forward(input_ids, position_ids):
             n = ctx.active_token_count
@@ -203,6 +246,14 @@ class ForwardWitness:
                     replay=0,
                     attention=[],
                     gemms=[],
+                    rope=[],
+                    neighbor_queries={
+                        rid: int(ctx.request_query_lengths[idxs[0]])
+                        for rid in (201, 202)
+                        if (idxs := (ctx.request_ids[: ctx.total_request_count] == rid).nonzero())
+                        .flatten()
+                        .numel()
+                    },
                     target_row=int(rows[0]),
                 )
             try:
@@ -238,6 +289,8 @@ class ForwardWitness:
                 if self.current is not None:
                     if kind == "attention":
                         self.current[kind].append((name, kwargs.get("num_splits")))
+                    elif kind == "rope":
+                        self.current[kind].append((name, int(kwargs["positions"].numel())))
                     else:
                         tensors = [x for x in args if isinstance(x, torch.Tensor)]
                         self.current[kind].append(
@@ -245,6 +298,10 @@ class ForwardWitness:
                         )
                 return result
 
+            # CustomOpDef exposes its keyword signature through _init_fn. Without
+            # preserving it explicitly, production sees this wrapper as a Python
+            # function and silently drops required FA3 keyword arguments such as q.
+            call.__signature__ = inspect.signature(getattr(fn, "_init_fn", fn))
             patch.setattr(owner, name, call)
 
         for name in ("_flash_attn_forward", "flash_attn3_with_kvcache", "flash_attn4_varlen_func"):
@@ -258,6 +315,55 @@ class ForwardWitness:
 
             observe(linear, "general_gemm", "gemms")
             observe(layernorm_linear, "general_gemm", "gemms")
+        if ctx.use_flashinfer_fused_rope:
+            from flashinfer import rope
+
+            observe(rope, "apply_rope_with_cos_sin_cache", "rope")
+
+        should_overlap = engine._should_run_async_sched_overlap
+
+        @wraps(should_overlap)
+        def observe_overlap_decision():
+            decision = should_overlap()
+            self.async_decisions.append(
+                dict(
+                    target_active=target_is_active(),
+                    decision=decision,
+                    pending=controller._async_sched_logits.is_valid,
+                )
+            )
+            return decision
+
+        patch.setattr(engine, "_should_run_async_sched_overlap", observe_overlap_decision)
+        async_overlap = controller._run_async_sched_step_overlap
+        async_forward = controller._run_async_sched_forward
+
+        @wraps(async_overlap)
+        async def observe_async_overlap():
+            record = dict(
+                target_active=target_is_active(),
+                pending=controller._async_sched_logits.is_valid,
+                forwards=0,
+                returned_previous=False,
+            )
+            self._active_async_overlap = record
+            try:
+                result = await async_overlap()
+                record["returned_previous"] = result.output is not None
+                return result
+            finally:
+                self._active_async_overlap = None
+                if record["target_active"]:
+                    self.async_overlaps.append(record)
+
+        @wraps(async_forward)
+        def observe_async_forward(*args, **kwargs):
+            if self._active_async_overlap is not None:
+                self._active_async_overlap["forwards"] += 1
+            return async_forward(*args, **kwargs)
+
+        patch.setattr(controller, "_run_async_sched_step_overlap", observe_async_overlap)
+        patch.setattr(controller, "_run_async_sched_forward", observe_async_forward)
         replay = torch.cuda.CUDAGraph.replay
 
         def graph_replay(graph):
@@ -308,6 +414,19 @@ class ForwardWitness:
         assert all(name in expected and splits == 1 for name, splits in calls), calls
         assert any(step["gemms"] for step in self.steps), "no real target-containing GEMM call"
         assert all(step["physical"] % 64 == 0 for step in self.steps)
+        if self.engine.context.use_flashinfer_fused_rope:
+            assert any(step["rope"] for step in self.steps), "target never executed fused RoPE"
+        if self.engine.context.config.async_sched_mode == AsyncScheduleMode.ASYNC:
+            assert any(
+                item["target_active"] and item["decision"] for item in self.async_decisions
+            ), "target never reached the async-overlap admission path"
+            assert any(
+                item["target_active"]
+                and item["pending"]
+                and item["forwards"] == 1
+                and item["returned_previous"]
+                for item in self.async_overlaps
+            ), "target never consumed pending logits while launching an overlapping forward"
 
 
 def target_prompt(length):
@@ -329,12 +448,19 @@ def run_order(case, backend, fa_version, order, *, sampling=None):
     target_params = SamplingParams(**params)
     target = target_prompt(case.prompt_length)
     finished = {}
+    witness = None
 
     def step():
         result = engine.step_modern()
         for record in result["finished_request_records"]:
             req = record.merge(engine.controller.tokenizer)
             finished[req.request_id] = req
+            if witness is not None and req.request_id == 201:
+                witness.retirement_events.append(
+                    dict(
+                        target_active=TARGET in engine.requests, generated=len(req.generated_tokens)
+                    )
+                )
 
     def drain():
         for _ in range(256):
@@ -353,22 +479,33 @@ def run_order(case, backend, fa_version, order, *, sampling=None):
         witness = ForwardWitness(engine, patch)
         neighbors = list(range(201, 265))
 
-        def add_neighbors():
+        def add_neighbors(*, retire_early=False):
             for rid in neighbors:
                 # Real heterogeneous dispatch: stochastic target rows share their
                 # launch with both top-k and top-p requests, not neutral padding.
                 filters = dict(top_k=1)
                 if target_params.top_k != 1:
                     filters = dict(top_k=7) if rid % 2 else dict(top_p=0.8)
-                neighbor = SamplingParams(num_tokens_to_generate=6, termination_id=-1, **filters)
-                engine.add_request(rid, [rid % (VOCAB - 1)], neighbor)
+                output_length = 2 if retire_early and rid == 201 else 9 if rid == 202 else 6
+                neighbor = SamplingParams(
+                    num_tokens_to_generate=output_length, termination_id=-1, **filters
+                )
+                prompt = target_prompt(33) if rid == 202 else [rid % (VOCAB - 1)]
+                engine.add_request(rid, prompt, neighbor)
 
         if order == "back":
             add_neighbors()
         engine.add_request(TARGET, target, target_params)
         if order == "staggered":
-            step()
-            add_neighbors()
+            for _ in range(256):
+                if engine.get_request(TARGET).generated_tokens:
+                    break
+                step()
+            assert (
+                len(engine.get_request(TARGET).generated_tokens) == 1
+            ), "target did not reach exactly its first generated token before staggered arrivals"
+            assert TARGET not in finished, "target retired before staggered arrivals"
+            add_neighbors(retire_early=True)
         elif order == "front":
             add_neighbors()
         else:
@@ -392,6 +529,11 @@ def run_order(case, backend, fa_version, order, *, sampling=None):
             assert (
                 min(int(s["positions"].min()) for s in witness.steps) >= 256
             ), "target did not reuse its prefix"
+        if order == "staggered":
+            assert any(
+                event["target_active"] and event["generated"] == 2
+                for event in witness.retirement_events
+            ), "short neighbor did not retire while the target remained active"
     return finished[TARGET], witness
 
 

@@ -75,14 +75,20 @@ DENSE_CASES = [
 
 
 @pytest.mark.parametrize("case", DENSE_CASES, ids=lambda case: case.name)
-def test_dynamic_feature_batch_invariance(case):
+def test_dense_dynamic_feature_batch_invariance(case):
     with invariant_runtime(case) as (backend, version):
         reference = run_order(case, backend, version, "solo")
         contrasts = []
+        contrast_runs = {}
         for order in ("front", "back", "staggered"):
             result = run_order(case, backend, version, order)
             assert_same_target(reference, result)
             contrasts.extend(result[1].steps)
+            contrast_runs[order] = result[1]
+            assert any(
+                s["decode"] and s["physical"] == 128 and s["requests"] == 65
+                for s in result[1].steps
+            ), (case.name, order)
         # The target really moved, and live neighbors changed the physical decode
         # shape. Merely constructing 65 requests does not satisfy either witness.
         assert any(step["target_row"] > 0 for step in contrasts)
@@ -90,6 +96,13 @@ def test_dynamic_feature_batch_invariance(case):
         wide_decode = {s["physical"] for s in contrasts if s["decode"] and s["requests"] > 64}
         assert ref_decode == {64}, ref_decode
         assert 128 in wide_decode, wide_decode
+        assert any(
+            step["neighbor_queries"].get(202) == 33 for step in contrasts
+        ), "long neighbor prompt never shared a target forward"
+        assert any(
+            event["target_active"] and event["generated"] == 2
+            for event in contrast_runs["staggered"].retirement_events
+        )
         if case.prompt_length == 17:
             assert any(not s["decode"] and s["physical"] == 128 for s in contrasts)
         print("BI_WITNESS", case.name, backend, version, "decode_shapes", ref_decode, wide_decode)
@@ -118,6 +131,8 @@ def test_sampling_fixed_history_batch_invariance(backend, filters, mode):
         assert observed["requests"] == 65 and not any(observed["filters"])
         assert torch.equal(expected["logits"], observed["logits"])
         assert torch.equal(expected["log_probs"], observed["log_probs"])
+        assert {s["physical"] for s in reference[1].steps} == {64}
+        assert any(s["physical"] == 128 and s["requests"] == 65 for s in actual[1].steps)
         for result, sample in ((reference, expected), (actual, observed)):
             assert len(result[0].generated_tokens) == 1
             token = result[0].generated_tokens[0]
