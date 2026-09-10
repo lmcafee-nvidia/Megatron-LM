@@ -14,6 +14,7 @@ import zmq
 from megatron.core import dist_checkpointing
 from tests.unit_tests.inference.engines.disagg_test_utils import (
     ForwardWitness,
+    _enqueue_decode_handoff,
     assert_released,
     decode_peer_meta,
     disagg_config,
@@ -191,9 +192,7 @@ def test_real_model_heterogeneous_handoff(tmp_path, case):
                 decode_engine._setup_handoff_completion_tracking(hostname="127.0.0.1")
                 pending = future = None
                 if rank in chosen_decode:
-                    future = decode_engine.add_request_with_kv_handoff(
-                        101, tokens, sampling(), handoff["kv_meta"], handoff["block_ids"]
-                    )
+                    future = _enqueue_decode_handoff(decode_engine, handoff, tokens, sampling())
                     pending = decode_engine._pending_kv_imports[0]
                 peers = gather(
                     decode_peer_meta(decode_engine, pending) if pending is not None else None,
