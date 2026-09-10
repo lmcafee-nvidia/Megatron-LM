@@ -11,7 +11,7 @@ import os
 import pytest
 import torch
 from transformer_engine.pytorch.module import linear as te_linear
-from transformer_engine.pytorch.tensor import QuantizedTensor
+from transformer_engine.pytorch.tensor import QuantizedTensorStorage
 
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
 from megatron.core.fp8_utils import get_fp8_context
@@ -76,16 +76,18 @@ def test_dense_fp8_target_batch_invariance(monkeypatch, recipe):
         def quantized_gemm(*args, **kwargs):
             # Inspect the actual operands consumed by the native GEMM. BF16
             # source parameters alone cannot prove FP8 execution occurred.
-            operands = [arg for arg in args[:2] if isinstance(arg, QuantizedTensor)]
+            operands = [arg for arg in args[:2] if isinstance(arg, QuantizedTensorStorage)]
             assert len(operands) == 2, "dense path did not consume two quantized operands"
-            activation = next(arg for arg in operands if arg.shape[0] == current["rows"])
+            activation = next(
+                arg for arg in operands if arg.dequantize().shape[0] == current["rows"]
+            )
             decoded = activation.dequantize()
             begin = current["begin"]
             snapshot = decoded[begin : begin + 8].detach().clone()
             result = original(*args, **kwargs)
             calls.append(
                 dict(
-                    physical=activation.shape[0],
+                    physical=decoded.shape[0],
                     quantized_type=type(activation).__name__,
                     target_quantized=snapshot,
                     begin=begin,
@@ -122,12 +124,10 @@ def test_dense_fp8_target_batch_invariance(monkeypatch, recipe):
                 "max_target_error",
                 (output.float() - outputs[0].float()).abs().max().item(),
             )
-            assert output_equal, (
-                "accepted BI FP8 configuration changed target output",
-                recipe,
-                "quantized target equal",
-                quantized_equal,
-            )
+        assert all(torch.equal(output, outputs[0]) for output in outputs[1:]), (
+            "accepted BI FP8 configuration changed target output",
+            recipe,
+        )
     finally:
         bik.disable_batch_invariant_mode()
         Utils.destroy_model_parallel()
