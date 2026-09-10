@@ -2,8 +2,7 @@
 """Real quantized dense-GEMM probes for configurations accepted by BI mode.
 
 Use fresh native-TE processes with CUBLASLT_WORKSPACE_SIZE=0 before startup.
-Tensorwise current scaling runs on Hopper; select MXFP8 only on Blackwell.
-An accepted configuration is not assumed to provide the numerical invariant.
+Tensorwise admission is negative coverage; select real MXFP8 only on Blackwell.
 """
 
 import os
@@ -13,6 +12,7 @@ import torch
 from transformer_engine.pytorch.module import linear as te_linear
 from transformer_engine.pytorch.tensor import QuantizedTensorStorage
 
+from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -23,7 +23,41 @@ from megatron.core.utils import init_method_normal
 from tests.unit_tests.test_utilities import Utils
 
 
-@pytest.mark.parametrize("recipe", ["tensorwise", "mxfp8"])
+def _config(recipe, **overrides):
+    options = dict(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        use_cpu_initialization=True,
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        attention_backend=AttnBackend.flash,
+        flash_attention_version=3,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        batch_invariant_mode=True,
+        batch_invariant_backend="te_native",
+        fp8="e4m3",
+        fp8_recipe=recipe,
+    )
+    options.update(overrides)
+    return TransformerConfig(**options)
+
+
+@pytest.mark.parametrize("fp8", ["e4m3", "hybrid"])
+def test_dense_tensorwise_fp8_admission(fp8):
+    for recipe in ("tensorwise", Fp8Recipe.tensorwise):
+        with pytest.raises(AssertionError, match="activation scaling depends on neighboring"):
+            _config(recipe, fp8=fp8)
+    assert not _config("tensorwise", fp8=fp8, batch_invariant_mode=False).batch_invariant_mode
+    assert _config("tensorwise", fp8=None).fp8 is None
+    for recipe in ("delayed", "mxfp8", "blockwise", "custom"):
+        assert (
+            _config(recipe, fp8=fp8, fp8_quantizer_factory="builtins.object").fp8_recipe == recipe
+        )
+
+
+@pytest.mark.parametrize("recipe", ["mxfp8"])
 @torch.inference_mode()
 def test_dense_fp8_target_batch_invariance(monkeypatch, recipe):
     assert Utils.world_size == 1
@@ -32,26 +66,10 @@ def test_dense_fp8_target_batch_invariance(monkeypatch, recipe):
     bik.enable_batch_invariant_mode(backend="te_native", collective="ordered")
     Utils.initialize_model_parallel(1, 1)
     try:
-        if recipe == "mxfp8":
-            assert torch.cuda.get_device_capability()[0] >= 10, "MXFP8 profile needs Blackwell"
+        assert torch.cuda.get_device_capability()[0] >= 10, "MXFP8 profile needs Blackwell"
         torch.manual_seed(321)
         model_parallel_cuda_manual_seed(321, inference_rng_tracker=True, force_reset_rng=True)
-        config = TransformerConfig(
-            num_layers=1,
-            hidden_size=128,
-            num_attention_heads=4,
-            use_cpu_initialization=True,
-            params_dtype=torch.bfloat16,
-            bf16=True,
-            attention_backend=AttnBackend.flash,
-            flash_attention_version=3,
-            attention_dropout=0.0,
-            hidden_dropout=0.0,
-            batch_invariant_mode=True,
-            batch_invariant_backend="te_native",
-            fp8="e4m3",
-            fp8_recipe=recipe,
-        )
+        config = _config(recipe)
         # Reuse the same MCore TE adapter and FP8 context as the production
         # transformer path; no hand-written quantization or alternate GEMM.
         layer = (
@@ -117,9 +135,8 @@ def test_dense_fp8_target_batch_invariance(monkeypatch, recipe):
                 recipe,
                 call["quantized_type"],
                 call["physical"],
-                "target_quantized_equal",
+                "quantized/output_equal",
                 quantized_equal,
-                "target_output_equal",
                 output_equal,
                 "max_target_error",
                 (output.float() - outputs[0].float()).abs().max().item(),
