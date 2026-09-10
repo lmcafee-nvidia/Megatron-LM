@@ -268,6 +268,7 @@ class ForwardWitness:
             try:
                 result = original(input_ids, position_ids)
                 if self.current is not None:
+                    getattr(engine, "_bi_after_forward", lambda: None)()
                     if ctx.config.materialize_only_last_token_logits:
                         mapped = ctx.active_logit_idxs[: ctx.num_last_token_logits].cpu().long()
                         selected = torch.isin(mapped, rows)

@@ -159,9 +159,8 @@ def _build_model_engine(case, backend, version, *, mamba, engines, patch):
             return result
 
         patch.setattr(model, "compute_mtp_single_step", mtp_step)
-    original = controller._dynamic_step_forward_logits
 
-    def forward(inputs, positions):
+    def record_mamba_state():
         idx = target_index()
         # Capture identity before bookkeeping can recycle the target's recurrent slot.
         end = (
@@ -169,7 +168,6 @@ def _build_model_engine(case, backend, version, *, mamba, engines, patch):
             if idx is not None
             else None
         )
-        result = original(inputs, positions)
         if mamba and idx is not None:
             slot = int(ctx.mamba_metadata.request_to_mamba_state_idx[idx])
             counts = []
@@ -186,12 +184,11 @@ def _build_model_engine(case, backend, version, *, mamba, engines, patch):
                     ctx.is_decode_only(),
                     slot,
                     counts,
-                    ctx.mamba_ssm_states[:, slot].detach().clone().cpu(),
+                    ctx.mamba_ssm_states[:, slot].detach().clone(),
                 )
             )
-        return result
 
-    patch.setattr(controller, "_dynamic_step_forward_logits", forward)
+    engine._bi_after_forward = record_mamba_state
     if depth and graph:
         manager = model._mtp_cudagraph_manager
         for runner in manager.cudagraph_runners:
