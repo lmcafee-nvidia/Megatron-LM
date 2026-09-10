@@ -240,8 +240,8 @@ class ForwardWitness:
             if rows.numel():
                 request_idx = int(req_idxs[rows[0]])
                 self.current = dict(
-                    positions=ctx.token_to_pos_ids[rows].clone(),
-                    tokens=ctx.token_to_input_ids[rows].clone(),
+                    positions=position_ids[0, rows].clone().cpu(),
+                    tokens=input_ids[0, rows].clone().cpu(),
                     logical=n,
                     physical=int(input_ids.shape[1]),
                     decode=ctx.is_decode_only(),
@@ -275,8 +275,8 @@ class ForwardWitness:
                         logits = controller._all_logits_cuda[0, : ctx.num_last_token_logits][
                             selected.to("cuda")
                         ]
-                        self.current["positions"] = ctx.token_to_pos_ids[rows].clone()
-                        self.current["tokens"] = ctx.token_to_input_ids[rows].clone()
+                        self.current["positions"] = position_ids[0, rows].clone().cpu()
+                        self.current["tokens"] = input_ids[0, rows].clone().cpu()
                     else:
                         logits = controller._all_logits_cuda[0, rows.to("cuda")]
                     self.current["logits"] = logits.detach().clone().cpu()
