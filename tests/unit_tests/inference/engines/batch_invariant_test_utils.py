@@ -191,7 +191,7 @@ def build_engine(case, backend, fa_version):
         max_sequence_length=1024,
         buffer_size_gb=0.125,
         block_size_tokens=256,
-        max_requests=68,
+        max_requests=128,
         max_tokens=512,
         num_cuda_graphs=None,
         materialize_only_last_token_logits=False,
@@ -218,6 +218,8 @@ class ForwardWitness:
         self.async_overlaps = []
         self.retirement_events = []
         self._active_async_overlap = None
+        self.captures = engine.__dict__.setdefault("_bi_graph_captures", {})
+        self.capturing = None
         controller, ctx = engine.controller, engine.context
         original = controller._dynamic_step_forward_logits
 
@@ -244,6 +246,7 @@ class ForwardWitness:
                     requests=ctx.total_request_count - ctx.paused_request_count,
                     graph=ctx.using_cuda_graph_this_step(),
                     replay=0,
+                    captured_graphs=[],
                     attention=[],
                     gemms=[],
                     rope=[],
@@ -286,33 +289,36 @@ class ForwardWitness:
             @wraps(fn)
             def call(*args, **kwargs):
                 result = fn(*args, **kwargs)
-                if self.current is not None:
+                record = (
+                    self.captures[self.capturing]
+                    if torch.cuda.is_current_stream_capturing()
+                    else self.current
+                )
+                if record is not None:
                     if kind == "attention":
-                        self.current[kind].append((name, kwargs.get("num_splits")))
+                        record[kind].append((name, kwargs.get("num_splits")))
                     elif kind == "rope":
-                        self.current[kind].append((name, int(kwargs["positions"].numel())))
+                        record[kind].append((name, int(kwargs["positions"].numel())))
                     else:
                         tensors = [x for x in args if isinstance(x, torch.Tensor)]
-                        self.current[kind].append(
-                            (name, tuple(tensors[0].shape) if tensors else ())
-                        )
+                        record[kind].append((name, tuple(tensors[0].shape) if tensors else ()))
                 return result
 
-            # CustomOpDef exposes its keyword signature through _init_fn. Without
-            # preserving it explicitly, production sees this wrapper as a Python
-            # function and silently drops required FA3 keyword arguments such as q.
-            call.__signature__ = inspect.signature(getattr(fn, "_init_fn", fn))
+            # Preserve CustomOpDef's _init_fn signature: production otherwise
+            # drops required FA3 keyword arguments such as q from this wrapper.
+            if hasattr(fn, "_init_fn"):
+                call.__signature__ = inspect.signature(fn._init_fn)
             patch.setattr(owner, name, call)
 
         for name in ("_flash_attn_forward", "flash_attn3_with_kvcache", "flash_attn4_varlen_func"):
             observe(attention, name, "attention")
         for name in ("matmul_persistent", "_mm_deepgemm"):
             observe(bik, name, "gemms")
-        # Native TE modules bind their GEMM entrypoint locally, rather than looking
-        # it up through the shared cpp_extensions package at each invocation.
+        # Native TE binds GEMM locally; the other dense providers use torch.matmul.
         if bik.get_batch_invariant_backend() == "te_native":
             from transformer_engine.pytorch.module import layernorm_linear, linear
 
+            observe(torch, "matmul", "gemms")
             observe(linear, "general_gemm", "gemms")
             observe(layernorm_linear, "general_gemm", "gemms")
         if ctx.use_flashinfer_fused_rope:
@@ -364,12 +370,26 @@ class ForwardWitness:
 
         patch.setattr(controller, "_run_async_sched_step_overlap", observe_async_overlap)
         patch.setattr(controller, "_run_async_sched_forward", observe_async_forward)
+        capture_begin = torch.cuda.CUDAGraph.capture_begin
+
+        def graph_begin(graph, *args, **kwargs):
+            result = capture_begin(graph, *args, **kwargs)
+            self.capturing = graph
+            self.captures[graph] = dict(attention=[], gemms=[], rope=[])
+            return result
+
+        patch.setattr(torch.cuda.CUDAGraph, "capture_begin", graph_begin)
         replay = torch.cuda.CUDAGraph.replay
 
         def graph_replay(graph):
             result = replay(graph)
             if self.current is not None:
                 self.current["replay"] += 1
+                if graph in self.captures:
+                    if self.captures[graph]["attention"]:
+                        self.current["captured_graphs"].append(id(graph))
+                    for kind, calls in self.captures[graph].items():
+                        self.current[kind].extend(calls)
             return result
 
         patch.setattr(torch.cuda.CUDAGraph, "replay", graph_replay)
@@ -413,7 +433,11 @@ class ForwardWitness:
         )
         assert all(name in expected and splits == 1 for name, splits in calls), calls
         assert any(step["gemms"] for step in self.steps), "no real target-containing GEMM call"
-        assert all(step["physical"] % 64 == 0 for step in self.steps)
+        assert all(
+            step["physical"] % 64 == 0
+            for step in self.steps
+            if not self.engine.num_speculative_tokens or step["graph"] or not step["decode"]
+        )
         if self.engine.context.use_flashinfer_fused_rope:
             assert any(step["rope"] for step in self.steps), "target never executed fused RoPE"
         if self.engine.context.config.async_sched_mode == AsyncScheduleMode.ASYNC:
@@ -435,7 +459,15 @@ def target_prompt(length):
 
 def run_order(case, backend, fa_version, order, *, sampling=None):
     """Run identical target histories alone, moved in a batch, or amid arrivals."""
-    engine = build_engine(case, backend, fa_version)
+    with pytest.MonkeyPatch.context() as construction_patch:
+        create_graphs = DynamicInferenceEngine.create_cuda_graphs
+
+        def capture(engine, *args, **kwargs):
+            ForwardWitness(engine, construction_patch)
+            return create_graphs(engine, *args, **kwargs)
+
+        construction_patch.setattr(DynamicInferenceEngine, "create_cuda_graphs", capture)
+        engine = build_engine(case, backend, fa_version)
     params = dict(
         num_tokens_to_generate=6,
         top_k=1,
@@ -526,8 +558,8 @@ def run_order(case, backend, fa_version, order, *, sampling=None):
             assert engine.context.kv_block_allocator.get_total_used() == 0
         if case.context.get("num_cuda_graphs") is not None:
             assert any(
-                s["graph"] and s["replay"] for s in witness.steps
-            ), "target never replayed a graph"
+                s["graph"] and s["captured_graphs"] for s in witness.steps
+            ), "target never replayed a graph with observed captured attention"
         if case.context.get("enable_chunked_prefill"):
             chunks = [s for s in witness.steps if int(s["positions"][0]) < case.prompt_length - 1]
             assert len(chunks) >= 2, "target did not execute multiple prefill chunks"

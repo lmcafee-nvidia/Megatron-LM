@@ -161,8 +161,7 @@ def _build_model_engine(case, backend, version, *, mamba, engines, patch):
 
     def forward(inputs, positions):
         idx = target_index()
-        # Read identity/offset before a following async bookkeeping phase can
-        # recycle the request's recurrent slot for a neighboring request.
+        # Capture identity before bookkeeping can recycle the target's recurrent slot.
         end = (
             int(ctx.request_kv_length_offsets[idx] + ctx.request_query_lengths[idx])
             if idx is not None
@@ -279,7 +278,7 @@ def test_mamba_dynamic_batch_invariance(case):
 def test_mtp_dynamic_batch_invariance(depth, graph_mode):
     context = dict(num_speculative_tokens=depth)
     if graph_mode != "eager":
-        context.update(num_cuda_graphs=4, max_tokens=256)
+        context.update(num_cuda_graphs=-1, max_tokens=256)
     if graph_mode == "mixed":
         context.update(
             enable_chunked_prefill=True,
@@ -317,8 +316,14 @@ def test_mtp_dynamic_batch_invariance(depth, graph_mode):
             assert set(evidence["captured_inner_calls"]) == set(range(depth))
             assert evidence["replay"] > 0, "target did not replay the actual MTP graph"
         expected_widths = {
-            requests: ((requests * (depth + 1) + 63) // 64) * 64 for requests in (65, 64)
+            n: (
+                (n + 3) // 4 * 4 * (depth + 1)
+                if graph_mode == "eager"
+                else ((n * (depth + 1) + 63) // 64) * 64
+            )
+            for n in (1, 65, 64)
         }
+        assert any(s["decode"] and s["physical"] == expected_widths[1] for s in reference[1].steps)
         transitions = [
             (i, s["requests"])
             for i, s in enumerate(actual[1].steps)
@@ -333,10 +338,7 @@ def test_mtp_dynamic_batch_invariance(depth, graph_mode):
         assert all(requests in mtp_shapes for requests in (65, 64))
         print(
             "BI_MTP_WITNESS",
-            depth,
-            graph_mode,
-            backend,
-            version,
+            (depth, graph_mode, backend, version),
             "comparisons",
             compared,
             "verifier_physical",
