@@ -298,11 +298,8 @@ def _assert_target_variation_witnesses(witnesses):
 
 class TestVllmFusedMoeBatchInvariance:
 
-    @pytest.mark.parametrize("backend", ["triton", "te_native"])
     @pytest.mark.parametrize("activation_name", ["SWIGLU", "SQUARED_RELU"])
-    def test_target_bitwise_across_physical_shapes_and_routing(
-        self, monkeypatch, backend, activation_name
-    ):
+    def test_target_bitwise_across_physical_shapes_and_routing(self, monkeypatch, activation_name):
         import importlib
 
         from megatron.core.inference.moe import ActivationType
@@ -348,9 +345,11 @@ class TestVllmFusedMoeBatchInvariance:
         witnesses = []
         target_outputs = []
 
-        # Backend/collective selection precedes every CUDA allocation and the
-        # first GEMM in this test. Backend rows are run in fresh pytest workers
-        # by the lane commands (one -k invocation per backend).
+        # vLLM's FC1/FC2 both use its real Triton kernel under BI mode. Changing
+        # the global dense-GEMM backend does not change that executed path and
+        # is not a second MoE backend-coverage row. Dense TE contrasts live in
+        # the dynamic model tests; the registration test below is separate.
+        backend = "triton"
         assert not is_batch_invariant_mode_enabled(), "backend state leaked from another row"
         enable_batch_invariant_mode(backend=backend, collective="ordered")
         try:
@@ -484,6 +483,7 @@ class TestVllmFusedMoeBatchInvariance:
             disable_batch_invariant_mode()
 
         reference = target_outputs[0]
+        assert reference.abs().max() > 0, "target oracle received only zero expert outputs"
         for target_output in target_outputs[1:]:
             assert torch.equal(target_output, reference)
 
