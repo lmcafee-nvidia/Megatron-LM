@@ -151,6 +151,21 @@ async def test_routed_topology_matches_direct_on_every_owner(monkeypatch, overri
         direct = await harness.direct(prompt, params)
 
         def install(_target):
+            if harness.config.sequence_parallel:
+                from megatron.core.tensor_parallel import layers as tp_layers
+
+                all_gather = tp_layers.dist_all_gather_func
+
+                def traced_all_gather(output, input_, *args, **kwargs):
+                    result = all_gather(output, input_, *args, **kwargs)
+                    runtime["tp-collective:gather_from_sequence_parallel_region"] += 1
+                    runtime["tp-sp-gather-dimensions"] += int(
+                        output.shape[0]
+                        == input_.shape[0] * harness.config.tensor_model_parallel_size
+                    )
+                    return result
+
+                monkeypatch.setattr(tp_layers, "dist_all_gather_func", traced_all_gather)
             for module in harness.engine.controller.inference_wrapped_model.model.modules():
                 if "ParallelLinear" in type(module).__name__:
                     _instrument_parallel_runtime(module, runtime)
@@ -174,15 +189,6 @@ async def test_routed_topology_matches_direct_on_every_owner(monkeypatch, overri
 @pytest.mark.asyncio
 async def test_routed_cuda_graph_replays_for_every_target(monkeypatch):
     """Completed routed decode forwards invoke the production CUDA replay node."""
-    runtime = Counter()
-    replay = _CudagraphReplayNode.forward
-
-    def traced_replay(*args, **kwargs):
-        result = replay(*args, **kwargs)
-        runtime["cuda-graph-replay"] += 1
-        return result
-
-    monkeypatch.setattr(_CudagraphReplayNode, "forward", staticmethod(traced_replay))
     prompt = list(range(4, 16))
     params = greedy_params(num_tokens_to_generate=4, return_prompt_tokens=True)
     async with routed_model(
@@ -193,9 +199,19 @@ async def test_routed_cuda_graph_replays_for_every_target(monkeypatch):
         cuda_graph_max_tokens=16,
     ) as harness:
         direct = await harness.direct(prompt, params)
-        runtime.clear()
-        target = await _exercise_all_owners(harness, prompt, params, direct, runtime=runtime)
-        assert harness.engine.capture_stats is not None
+
+        def install(target):
+            replay = _CudagraphReplayNode.forward
+
+            def attributed_replay(*args, **kwargs):
+                result = replay(*args, **kwargs)
+                if _active_target_ids(harness):
+                    target.update(("model-forward", "decode-forward", "cuda-graph-replay"))
+                return result
+
+            monkeypatch.setattr(_CudagraphReplayNode, "forward", staticmethod(attributed_replay))
+
+        target = await _exercise_all_owners(harness, prompt, params, direct, install=install)
         assert target["cuda-graph-replay"] > 0
 
 
