@@ -53,9 +53,8 @@ async def test_routed_stochastic_first_step_distribution(
         owner_rank = torch.distributed.get_rank(group=h.engine.controller.dp_group)
         assert sampler._rng is rng
         assert rng.initial_seed() == h.config.random_seed + (owner_rank if offset_by_dp else 0)
-        joint = None
+        joint = mock.Mock(wraps=flashinfer.sampling.top_k_top_p_sampling_from_logits)
         if backend == "flashinfer" and all(filters):
-            joint = mock.Mock(wraps=flashinfer.sampling.top_k_top_p_sampling_from_logits)
             monkeypatch.setattr(flashinfer.sampling, "top_k_top_p_sampling_from_logits", joint)
 
         def observe(logits, n, context, **kwargs):
@@ -81,6 +80,8 @@ async def test_routed_stochastic_first_step_distribution(
         samples.clear()
         await h.start()
         await h.pause()
+        # Direct/reference and startup work cannot witness routed joint filtering.
+        joint.reset_mock()
         pending = []
         if h.rank == 0:
             pending = [c.add_request(prompt, copy.deepcopy(params)) for c in h.clients]
@@ -121,7 +122,7 @@ async def test_routed_stochastic_first_step_distribution(
             (rank, h.config.random_seed + (rank if offset_by_dp else 0))
             for rank in range(h.dp_size)
         ]
-        assert bool(joint and joint.call_count) == (backend == "flashinfer" and all(filters))
+        assert joint.call_count == int(backend == "flashinfer" and all(filters))
         print(f"sampling owner evidence: {sorted(evidence)}")
         h.assert_retired()
 
