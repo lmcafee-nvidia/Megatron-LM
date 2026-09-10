@@ -84,7 +84,8 @@ async def test_routed_output_matches_direct(monkeypatch, mode, streaming_interva
         assert any(step["prefill"] for step in h.witnesses)
         assert any(step["decode"] for step in h.witnesses)
         if mode == AsyncScheduleMode.ASYNC:
-            assert h.engine.context.async_sched_step_count > 0
+            async_steps = [step["async_step"] for step in h.witnesses]
+            assert max(async_steps) > min(async_steps)
         h.assert_retired()
 
 
