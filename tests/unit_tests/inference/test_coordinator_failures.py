@@ -26,7 +26,7 @@ class _ObservedSocket:
     """Count actual terminal frames without replacing transport or client parsing."""
 
     def __init__(self, socket):
-        self.socket, self.replies = socket, Counter()
+        self.socket, self.replies, self.receipts = socket, Counter(), Counter()
 
     def __getattr__(self, name):
         return getattr(self.socket, name)
@@ -34,6 +34,7 @@ class _ObservedSocket:
     def recv_multipart(self, *args, **kwargs):
         frames = self.socket.recv_multipart(*args, **kwargs)
         metadata = msgpack.unpackb(frames[0], raw=False)
+        self.receipts[Headers(metadata[0])] += 1
         if metadata[0] == Headers.ENGINE_REPLY.value:
             self.replies[metadata[1]] += 1
         return frames
@@ -41,12 +42,10 @@ class _ObservedSocket:
 
 class _CoordinatorRuntime:
     def __init__(self):
-        self.addresses = queue.Queue()
-        self.errors = queue.Queue()
-        self.processed = Counter()
-        self.ready = threading.Event()
+        self.addresses, self.errors = queue.Queue(), queue.Queue()
+        self.processed, self.senders = Counter(), {}
+        self.ready, self.coordinator = threading.Event(), None
         self.monitor_endpoint = "inproc://coordinator-monitor"
-        self.coordinator = None
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
         assert self.ready.wait(timeout=5.0)
@@ -67,6 +66,7 @@ class _CoordinatorRuntime:
             for header, handler in list(coordinator._handlers.items()):
 
                 def observed(*args, header=header, handler=handler):
+                    self.senders.setdefault(header, []).append(args[1])
                     result = handler(*args)
                     self.processed[header] += 1
                     return result
@@ -114,16 +114,13 @@ class _CoordinatorRuntime:
         await _eventually(disconnected, "coordinator did not observe disconnect")
 
     async def wait_for_engine(self, engine):
-        await _eventually(
-            lambda: engine.identity in self.coordinator.identities_of_data_parallel_ranks,
-            "engine did not register",
-        )
+        ranks = self.coordinator.identities_of_data_parallel_ranks
+        await _eventually(lambda: engine.identity in ranks, "engine did not register")
 
 
 class _EnginePeer:
     def __init__(self, address, identity):
-        self.identity = identity
-        self.context = zmq.Context()
+        self.identity, self.context = identity, zmq.Context()
         self.socket = self.context.socket(zmq.DEALER)
         self.socket.setsockopt(zmq.IDENTITY, identity)
         self.socket.connect(address)
@@ -131,8 +128,7 @@ class _EnginePeer:
 
     def receive_request(self):
         assert self.socket.poll(5000) & zmq.POLLIN, "engine did not receive request"
-        frames = self.socket.recv_multipart()
-        metadata = msgpack.unpackb(frames[0], raw=False)
+        metadata = msgpack.unpackb(self.socket.recv_multipart()[0], raw=False)
         assert Headers(metadata[0]) in (Headers.SUBMIT_REQUEST, Headers.SUBMIT_REQUEST_WITH_KV)
         return metadata[1]
 
@@ -207,6 +203,7 @@ async def test_engine_disconnect_fails_owned_request_and_ignores_late_reply(coor
     engine = _EnginePeer(runtime.address, b"removed-engine")
     first_client, second_client = [_start_client(runtime) for _ in range(2)]
     try:
+        client_identities = runtime.senders[Headers.CONNECT][-2:]
         await runtime.wait_for_engine(engine)
         futures = [
             first_client.add_request([1, 2], SamplingParams(num_tokens_to_generate=1)),
@@ -221,7 +218,6 @@ async def test_engine_disconnect_fails_owned_request_and_ignores_late_reply(coor
         )
         assert set(runtime.coordinator.request_id_to_rank.values()) == {engine.identity}
         assert runtime.coordinator._pending_counts.tolist() == [2]
-
         engine.disconnect()
         replies = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
         for reply in replies:
@@ -233,7 +229,6 @@ async def test_engine_disconnect_fails_owned_request_and_ignores_late_reply(coor
         )
         _assert_no_requests(runtime.coordinator)
         assert runtime.coordinator._pending_counts.size == 0
-
         for server_request_id in server_request_ids:
             engine.send_final(server_request_id)
         await _eventually(
@@ -242,9 +237,14 @@ async def test_engine_disconnect_fails_owned_request_and_ignores_late_reply(coor
         )
         runtime.assert_healthy()
         assert Counter(resolved) == Counter(futures)
-        for client in (first_client, second_client):
+        for client, client_identity in zip((first_client, second_client), client_identities):
+            runtime.coordinator.known_clients.remove(client_identity)
             client._connect_with_inference_coordinator(timeout_seconds=5)
             assert not client.listener_task.done()
+            assert client.socket.receipts[Headers.CONNECT_ACK] == 2
+        await _eventually(
+            lambda: runtime.processed[Headers.CONNECT] == 4, "barriers were not processed"
+        )
         assert first_client.socket.replies == second_client.socket.replies == {0: 1}
         _assert_no_requests(runtime.coordinator)
     finally:
@@ -278,7 +278,7 @@ async def test_no_engines_fails_submission_but_keeps_loop_alive(coordinator_runt
         resolved = []
         for pending in (old, future):
             pending.add_done_callback(resolved.append)
-        replies = await asyncio.wait_for(asyncio.gather(old, future), timeout=5.0)
+        replies = [await asyncio.wait_for(future, 5.0), await asyncio.wait_for(old, 5.0)]
         for reply in replies:
             _assert_reply(reply)
         assert Counter(resolved) == Counter([old, future])
@@ -332,7 +332,6 @@ async def test_closed_client_delivery_does_not_disrupt_live_client(coordinator_r
         runtime.assert_healthy()
         assert resolved == [live_future]
         assert live_client.socket.replies == {0: 1}
-
         if delivery == "partial":
             # A later final still owns cleanup even though its client is gone.
             engine.send_final(closed_request_id)
