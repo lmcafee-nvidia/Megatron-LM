@@ -112,7 +112,8 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         wire, and decoding it per request would cost this one serial loop far more
         than the prompt decode the split already removed.
 
-    Returns True (stopping the loop) if no engines are reachable.
+    If no engines are reachable, resolves the request as failed and leaves the
+    loop running so a replacement engine can register.
     """
     # Message from a known client
     if sender_identity not in coordinator.known_clients:
@@ -141,6 +142,9 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     coordinator.next_request_id += 1
     coordinator.request_id_to_client_id[request_id] = sender_identity
     coordinator.request_id_to_client_request_id[request_id] = client_request_id
+    if not hasattr(coordinator, "request_id_to_sampling_params"):
+        coordinator.request_id_to_sampling_params = {}
+    coordinator.request_id_to_sampling_params[request_id] = sampling_params
     coordinator.client_request_to_request_id[(sender_identity, client_request_id)] = request_id
 
     # Rebuilding the metadata frame is cheap: it holds neither prompt tokens nor
@@ -199,12 +203,11 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         if coordinator._send_to_engine(next_identity, [engine_metadata, prompt_frame, media_frame]):
             break
     else:
-        # If all engines have died, we are in an abnormal state, and must exit cleanly.
         logging.error("Coordinator: no reachable engines for request %d", request_id)
-        del coordinator.request_id_to_client_id[request_id]
-        del coordinator.request_id_to_client_request_id[request_id]
-        del coordinator.client_request_to_request_id[(sender_identity, client_request_id)]
-        return True
+        coordinator._fail_request(
+            request_id, "no reachable engines", sampling_params=sampling_params
+        )
+        return
 
     coordinator.request_id_to_rank[request_id] = next_identity
     coordinator._pending_counts[coordinator.identity_to_rank_index[next_identity]] += 1
@@ -263,6 +266,9 @@ def handle_submit_request_with_kv(coordinator, sender_identity, metadata, bodies
     coordinator.next_request_id += 1
     coordinator.request_id_to_client_id[request_id] = sender_identity
     coordinator.request_id_to_client_request_id[request_id] = client_request_id
+    if not hasattr(coordinator, "request_id_to_sampling_params"):
+        coordinator.request_id_to_sampling_params = {}
+    coordinator.request_id_to_sampling_params[request_id] = sampling_params
     coordinator.client_request_to_request_id[(sender_identity, client_request_id)] = request_id
 
     # Rebuilding the metadata frame is cheap: it holds no prompt tokens.
@@ -277,10 +283,10 @@ def handle_submit_request_with_kv(coordinator, sender_identity, metadata, bodies
             break
     else:
         logging.error("Coordinator: no reachable engines for handoff request %d", request_id)
-        del coordinator.request_id_to_client_id[request_id]
-        del coordinator.request_id_to_client_request_id[request_id]
-        del coordinator.client_request_to_request_id[(sender_identity, client_request_id)]
-        return True
+        coordinator._fail_request(
+            request_id, "no reachable engines", sampling_params=sampling_params
+        )
+        return
 
     coordinator.request_id_to_rank[request_id] = next_identity
     coordinator._pending_counts[coordinator.identity_to_rank_index[next_identity]] += 1
@@ -387,17 +393,10 @@ def handle_engine_reply(coordinator, sender_identity, metadata, bodies):
         logging.warning("Coordinator: ENGINE_REPLY from removed engine %r", sender_identity)
 
     for (fid, needs_detokenize), body in zip(metadata[1], bodies):
-        client_identity = coordinator.request_id_to_client_id[fid]
-        client_request_id = coordinator.request_id_to_client_request_id[fid]
-        del coordinator.request_id_to_client_id[fid]
-        del coordinator.request_id_to_client_request_id[fid]
-        del coordinator.client_request_to_request_id[(client_identity, client_request_id)]
-        assigned_rank = coordinator.request_id_to_rank.pop(fid, None)
-        if assigned_rank is not None:
-            idx = coordinator.identity_to_rank_index.get(assigned_rank)
-            if idx is not None:
-                assert coordinator._pending_counts[idx] >= 1
-                coordinator._pending_counts[idx] -= 1
+        if fid not in coordinator.request_id_to_client_id:
+            logging.warning("Coordinator: ignoring late reply for retired request %d", fid)
+            continue
+        client_identity, client_request_id, _ = coordinator._cleanup_request(fid)
 
         if needs_detokenize:
             # Detokenizing writes generated_text into the reply, so this one has
@@ -410,7 +409,7 @@ def handle_engine_reply(coordinator, sender_identity, metadata, bodies):
         reply_metadata = msgpack.packb(
             [Headers.ENGINE_REPLY.value, client_request_id], use_bin_type=True
         )
-        coordinator.router_socket.send_multipart([client_identity, reply_metadata, body])
+        coordinator._send_to_client(client_identity, [reply_metadata, body])
 
 
 @message_handler(Headers.ENGINE_REPLY_PARTIAL)
@@ -433,18 +432,23 @@ def handle_engine_reply_partial(coordinator, sender_identity, metadata, bodies):
         logging.warning("Coordinator: ENGINE_REPLY_PARTIAL from removed engine %r", sender_identity)
         return
     for request_id, body in zip(metadata[1], bodies):
-        client_identity = coordinator.request_id_to_client_id[request_id]
-        client_request_id = coordinator.request_id_to_client_request_id[request_id]
+        client_identity = coordinator.request_id_to_client_id.get(request_id)
+        client_request_id = coordinator.request_id_to_client_request_id.get(request_id)
+        if client_identity is None or client_request_id is None:
+            logging.warning(
+                "Coordinator: ignoring late partial reply for retired request %d", request_id
+            )
+            continue
         # Partial tokens are detokenized incrementally by the client-facing
         # streaming layer, so the body is always forwarded untouched.
-        coordinator.router_socket.send_multipart(
+        coordinator._send_to_client(
+            client_identity,
             [
-                client_identity,
                 msgpack.packb(
                     [Headers.ENGINE_REPLY_PARTIAL.value, client_request_id], use_bin_type=True
                 ),
                 body,
-            ]
+            ],
         )
 
 
