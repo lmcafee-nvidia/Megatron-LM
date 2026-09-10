@@ -6,7 +6,7 @@ from dataclasses import replace
 import pytest
 import torch
 
-from megatron.core.inference.config import KVCacheManagementMode
+from megatron.core.inference.config import KVCacheManagementMode as KVMode
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.inference.engines import batch_invariant_test_utils as fixture
@@ -112,10 +112,13 @@ def test_batch_invariant_terminal_contract(terminal):
         assert actual[1].sample_steps[0]["requests"] == 65
 
 
-@pytest.mark.parametrize("mode", list(KVCacheManagementMode))
-@pytest.mark.parametrize("static_pointers", [False, True])
+@pytest.mark.parametrize(
+    "mode,static_pointers",
+    [(m, s) for m in KVMode for s in (False, True) if s or m != KVMode.OFFLOAD],
+)
 def test_batch_invariant_suspend_resume(mode, static_pointers):
-    uses_uvm = static_pointers and mode == KVCacheManagementMode.RECOMPUTE
+    # Production RL validation rejects OFFLOAD without persistent graph pointers.
+    uses_uvm = static_pointers and mode == KVMode.RECOMPUTE
     case = fixture.Case(
         "suspend",
         context={
@@ -189,28 +192,24 @@ def test_batch_invariant_suspend_resume(mode, static_pointers):
                         torch.cuda.synchronize()
                         suspended_free = torch.cuda.mem_get_info()[0]
                         assert not context.is_tensor_state_allocated
-                        if mode == KVCacheManagementMode.OFFLOAD:
-                            if context._uses_torch_memory_saver:
-                                assert suspended_free > physical
-                            else:
-                                assert context.memory_buffer.untyped_storage().nbytes() == 0
-                                backup = context._offloadable_cpu_backups["memory_buffer"]
-                                assert torch.equal(backup[:, :, block, :stored], kv)
+                        if mode == KVMode.OFFLOAD:
+                            assert context._uses_torch_memory_saver
+                            assert suspended_free > physical
                             print("BI_OFFLOAD_WITNESS", block, stored, suspended_free)
-                        if mode == KVCacheManagementMode.RECOMPUTE:
+                        if mode == KVMode.RECOMPUTE:
                             assert len(record.requests) == segments + 1
                         engine.resume()
                         resumed = True
                         merged = record.merge()
                         assert tuple(merged.generated_tokens or []) == before
-                        if mode == KVCacheManagementMode.RECOMPUTE:
+                        if mode == KVMode.RECOMPUTE:
                             assert fixture.TARGET in engine.waiting_request_ids
                             assert not engine.get_request(fixture.TARGET).generated_tokens
                         else:
                             assert torch.equal(
                                 context.memory_buffer[:, :, block, :stored].cpu(), kv
                             )
-                        if static_pointers or mode == KVCacheManagementMode.PERSIST:
+                        if static_pointers or mode == KVMode.PERSIST:
                             assert context.memory_buffer.data_ptr() == pointer
                         print("BI_RESIDENCY_WITNESS", mode.value, live, len(before))
                         suspended = True
