@@ -142,8 +142,6 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     coordinator.next_request_id += 1
     coordinator.request_id_to_client_id[request_id] = sender_identity
     coordinator.request_id_to_client_request_id[request_id] = client_request_id
-    if not hasattr(coordinator, "request_id_to_sampling_params"):
-        coordinator.request_id_to_sampling_params = {}
     coordinator.request_id_to_sampling_params[request_id] = sampling_params
     coordinator.client_request_to_request_id[(sender_identity, client_request_id)] = request_id
 
@@ -266,8 +264,6 @@ def handle_submit_request_with_kv(coordinator, sender_identity, metadata, bodies
     coordinator.next_request_id += 1
     coordinator.request_id_to_client_id[request_id] = sender_identity
     coordinator.request_id_to_client_request_id[request_id] = client_request_id
-    if not hasattr(coordinator, "request_id_to_sampling_params"):
-        coordinator.request_id_to_sampling_params = {}
     coordinator.request_id_to_sampling_params[request_id] = sampling_params
     coordinator.client_request_to_request_id[(sender_identity, client_request_id)] = request_id
 
