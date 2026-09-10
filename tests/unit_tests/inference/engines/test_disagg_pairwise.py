@@ -120,8 +120,8 @@ def test_disagg_real_engine_parity(transport_world, backend, length, changes, co
                 assert len(metadata["block_ids"]) == (length + 15) // 16
                 assert witness.steps and all(step[2] for step in witness.steps)
                 if chunked:
-                    assert len({step[0] for step in witness.steps}) >= 3
-                    assert sum(102 in step[3] for step in witness.steps) >= 3
+                    mixed_offsets = {step[0] for step in witness.steps if 102 in step[3]}
+                    assert len(mixed_offsets) >= 3
                 with pytest.raises(RuntimeError, match="handoff state remains pinned"):
                     engine.reset()
             transferred = exchange((metadata, state) if source else None, transport_world)
@@ -146,8 +146,10 @@ def test_disagg_real_engine_parity(transport_world, backend, length, changes, co
                     assert not engine.context.total_request_count
                     admit_import(engine)
                 else:
+                    assert engine.controller._async_sched_logits.is_valid
+                    assert engine.context.total_request_count == 1
                     assert engine._poll_pending_kv_imports() == 1
-                    engine.step_modern()  # Resolve the existing chain before normal import admission.
+                    engine.step_modern()  # Resolve neighbor before normal import admission.
                 if count > 1:
                     row = engine.context.request_ids.tolist().index(101)
                     if neighbor is None:
@@ -161,8 +163,7 @@ def test_disagg_real_engine_parity(transport_world, backend, length, changes, co
                     if config.flash_attention_version == 4:
                         assert witness.fa4_calls > 0
                     if neighbor is not None:
-                        assert witness.pending_forwards > 0
-                        assert any(102 in step[3] for step in witness.steps)
+                        assert any(102 in step[3] for step in witness.pending_forwards)
                 else:
                     assert future.done()
                     result = future.result().merge()

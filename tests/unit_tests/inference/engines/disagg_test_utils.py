@@ -131,7 +131,7 @@ class ForwardWitness:
         self.steps = []
         self.graph_replays = 0
         self.fa4_calls = 0
-        self.pending_forwards = 0
+        self.pending_forwards = []
         self._patches = []
 
     def _snapshot(self):
@@ -161,7 +161,7 @@ class ForwardWitness:
         def forward(*args, **kwargs):
             snapshot = self._snapshot()
             if snapshot is not None and self.engine.controller._async_sched_logits.is_valid:
-                self.pending_forwards += 1
+                self.pending_forwards.append(snapshot)
             result = original_forward(*args, **kwargs)
             if snapshot is not None:
                 self.steps.append(snapshot)
