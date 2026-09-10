@@ -9,6 +9,7 @@ import threading
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
+import msgpack
 import torch
 import zmq
 
@@ -125,7 +126,9 @@ class RoutedModel:
         self.witnesses = []
         self.service = None
         self.sync_context = zmq.Context()
-        self.sync = AsyncZMQCommunicator(self.sync_context, process_group=None, hostname="127.0.0.1")
+        self.sync = AsyncZMQCommunicator(
+            self.sync_context, process_group=None, hostname="127.0.0.1"
+        )
 
     async def barrier(self):
         await asyncio.wait_for(self.sync.all_reduce_max(1), timeout=60)
@@ -135,7 +138,9 @@ class RoutedModel:
         future = self.engine.add_request(10001, prompt, copy.deepcopy(params))
         while self.engine.has_unfinished_requests():
             await self.engine.async_step()
-        result = (await future).merge().serialize()
+        result = msgpack.unpackb(
+            msgpack.packb((await future).merge().serialize(), use_bin_type=True), raw=False
+        )
         self.engine.reset()
         return result
 
