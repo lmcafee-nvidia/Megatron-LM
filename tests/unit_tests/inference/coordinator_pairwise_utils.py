@@ -198,6 +198,7 @@ class RoutedModel:
                 chunk=context.chunked_prefill_request_id,
                 tokens=context.active_token_count,
                 padded_tokens=context.padded_active_token_count,
+                async_step=context.async_sched_step_count,
                 cached={rid: self.engine.get_request(rid).num_cached_tokens for rid in ids},
             )
             result = forward(*args, **kwargs)
