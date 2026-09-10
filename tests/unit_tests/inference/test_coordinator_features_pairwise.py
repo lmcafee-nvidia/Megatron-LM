@@ -311,7 +311,8 @@ async def test_routed_hybrid_updates_owned_recurrent_state(monkeypatch, mixer):
         ({"fp8": True, "hidden_size": 128}, ("fp8",), ("fp8-quantized-forwards",)),
         (
             {
-                "hidden_size": 64,
+                # FI 0.6.6 NeoX D16 corrupts adjacent heads; exercise native D64.
+                "hidden_size": 256,
                 "position_embedding_type": "rope",
                 "use_flashinfer_fused_rope": True,
             },
