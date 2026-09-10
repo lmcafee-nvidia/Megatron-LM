@@ -77,8 +77,8 @@ def handle_connect(coordinator, sender_identity, metadata, bodies):
         return
 
     coordinator.known_clients.add(sender_identity)
-    coordinator.router_socket.send_multipart(
-        [sender_identity, msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)]
+    coordinator._send_to_client(
+        sender_identity, [msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)]
     )
 
 
