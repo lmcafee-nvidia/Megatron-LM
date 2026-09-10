@@ -567,6 +567,10 @@ def run_order(case, backend, fa_version, order, *, sampling=None):
             assert any(
                 s["graph"] and s["captured_graphs"] for s in witness.steps
             ), "target never replayed a graph with observed captured attention"
+        if case.context.get("use_cuda_graphs_for_non_decode_steps"):
+            assert any(
+                not s["decode"] and s["graph"] and s["captured_graphs"] for s in witness.steps
+            ), "no target nondecode replay with captured attention provenance"
         if case.context.get("enable_chunked_prefill"):
             chunks = [s for s in witness.steps if int(s["positions"][0]) < case.prompt_length - 1]
             assert len(chunks) >= 2, "target did not execute multiple prefill chunks"
