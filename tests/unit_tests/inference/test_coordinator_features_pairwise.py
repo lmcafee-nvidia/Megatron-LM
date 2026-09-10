@@ -51,11 +51,6 @@ def _install_target_attribution(harness, runtime):
     return target
 
 
-def _assert_output_matches_direct(output, direct):
-    for key in ("status", "generated_tokens", "prompt_tokens", "generated_text"):
-        assert output[key] == direct[key], key
-
-
 def _assert_every_owner_executed(harness, target):
     target_ids = {key[1] for key in target if isinstance(key, tuple) and key[0] == "request"}
     assert target["model-forward"] > 0
@@ -116,10 +111,13 @@ async def _exercise_all_owners(harness, prompt, params, direct, runtime=None, in
     await harness.unpause()
     if harness.rank == 0:
         outputs = await asyncio.wait_for(asyncio.gather(*pending), timeout=120)
-        for output in outputs:
-            _assert_output_matches_direct(output, direct)
     await harness.barrier()
     await harness.pause()
+    outputs = [outputs if harness.rank == 0 else None]
+    torch.distributed.broadcast_object_list(outputs, src=0)
+    for output in outputs[0]:
+        for key in ("status", "generated_tokens", "prompt_tokens", "generated_text"):
+            assert output[key] == direct[key], key
     _assert_every_owner_executed(harness, target)
     harness.assert_retired()
     return target
