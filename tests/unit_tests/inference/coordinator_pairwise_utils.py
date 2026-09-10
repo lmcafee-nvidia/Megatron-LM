@@ -42,19 +42,19 @@ async def until(predicate, timeout=30):
 class CoordinatorThread:
     """Run the unmodified blocking coordinator in its own socket-owning thread."""
 
-    def __init__(self, dp_size, tokenizer, **options):
+    def __init__(self, dp_size, tokenizer, *, setup=None, **options):
         self.events = []
         self.errors = []
         self.addresses = queue.Queue()
         self.ready = threading.Event()
         self.coordinator = None
         self.thread = threading.Thread(
-            target=self._run, args=(dp_size, tokenizer, options), daemon=True
+            target=self._run, args=(dp_size, tokenizer, setup, options), daemon=True
         )
         self.thread.start()
         self.address = self.addresses.get(timeout=30)
 
-    def _run(self, dp_size, tokenizer, options):
+    def _run(self, dp_size, tokenizer, setup, options):
         try:
             coordinator = DataParallelInferenceCoordinator(
                 pipe_connection=SimpleNamespace(send=self.addresses.put, close=lambda: None),
@@ -67,6 +67,8 @@ class CoordinatorThread:
             )
             self.coordinator = coordinator
             coordinator.router_socket.setsockopt(zmq.LINGER, 0)
+            if setup is not None:
+                setup(coordinator)
             for header, handler in list(coordinator._handlers.items()):
 
                 def observe(c, sender, metadata, bodies, handler=handler, header=header):
@@ -91,6 +93,7 @@ class CoordinatorThread:
             self.errors.append(error)
         finally:
             if self.coordinator is not None:
+                self.coordinator.router_socket.disable_monitor()
                 self.coordinator.stop()
 
     def assert_requests_retired(self):
