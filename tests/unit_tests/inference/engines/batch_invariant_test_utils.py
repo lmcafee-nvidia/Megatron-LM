@@ -270,8 +270,8 @@ class ForwardWitness:
                 if self.current is not None:
                     getattr(engine, "_bi_after_forward", lambda: None)()
                     if ctx.config.materialize_only_last_token_logits:
-                        mapped = ctx.active_logit_idxs[: ctx.num_last_token_logits].cpu().long()
-                        selected = torch.isin(mapped, rows)
+                        mapped = ctx.active_logit_idxs[: ctx.num_last_token_logits].long()
+                        selected = torch.isin(mapped, rows.to(mapped.device))
                         rows = mapped[selected]
                         logits = controller._all_logits_cuda[0, : ctx.num_last_token_logits][
                             selected.to("cuda")
@@ -306,9 +306,7 @@ class ForwardWitness:
                         record[kind].append((name, kwargs.get("num_splits")))
                     elif kind == "mla":
                         assert args[4] == 512 and args[1].shape[1] == 64
-                        record[kind].append(
-                            (tuple(args[0].shape), args[5].num_splits.cpu().clone())
-                        )
+                        record[kind].append((tuple(args[0].shape), args[5].num_splits.clone()))
                     elif kind == "rope":
                         record[kind].append((name, int(kwargs["positions"].numel())))
                     else:
