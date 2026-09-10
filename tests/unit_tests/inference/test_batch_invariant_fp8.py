@@ -57,7 +57,7 @@ def test_dense_tensorwise_fp8_admission(fp8):
         )
 
 
-@pytest.mark.parametrize("recipe", ["mxfp8"])
+@pytest.mark.parametrize("recipe", ["mxfp8", "delayed", "blockwise"])
 @torch.inference_mode()
 def test_dense_fp8_target_batch_invariance(monkeypatch, recipe):
     assert Utils.world_size == 1
@@ -66,7 +66,9 @@ def test_dense_fp8_target_batch_invariance(monkeypatch, recipe):
     bik.enable_batch_invariant_mode(backend="te_native", collective="ordered")
     Utils.initialize_model_parallel(1, 1)
     try:
-        assert torch.cuda.get_device_capability()[0] >= 10, "MXFP8 profile needs Blackwell"
+        assert (
+            recipe != "mxfp8" or torch.cuda.get_device_capability()[0] >= 10
+        ), "MXFP8 needs Blackwell"
         torch.manual_seed(321)
         model_parallel_cuda_manual_seed(321, inference_rng_tracker=True, force_reset_rng=True)
         config = _config(recipe)
@@ -132,9 +134,7 @@ def test_dense_fp8_target_batch_invariance(monkeypatch, recipe):
             output_equal = torch.equal(output, outputs[0])
             print(
                 "BI_FP8_WITNESS",
-                recipe,
-                call["quantized_type"],
-                call["physical"],
+                (recipe, call["quantized_type"], call["physical"]),
                 "quantized/output_equal",
                 quantized_equal,
                 output_equal,
