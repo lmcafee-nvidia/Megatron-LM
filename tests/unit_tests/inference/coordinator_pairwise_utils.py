@@ -112,14 +112,18 @@ class CoordinatorThread:
 class RoutedModel:
     """One real engine per model-parallel group plus rank-zero client controls."""
 
-    def __init__(self, config, **coordinator_options):
+    def __init__(self, config, engine_factory=None, **coordinator_options):
         self.config = config
         self.rank = torch.distributed.get_rank()
         self.dp_size = Utils.world_size // (
             config.tensor_model_parallel_size * config.pipeline_model_parallel_size
         )
         assert self.dp_size >= 2, "Routing rows require at least two DP replicas"
-        self.engine = DynamicInferenceEngineTestBase._build_test_env(config).engine
+        self.engine = (
+            engine_factory(config)
+            if engine_factory is not None
+            else DynamicInferenceEngineTestBase._build_test_env(config).engine
+        )
         self.tokenizer = DummyTokenizer(vocab_size=config.vocab_size, eod=-1)
         self.engine.controller.tokenizer = self.tokenizer
         self.coordinator_options = coordinator_options
@@ -246,8 +250,11 @@ class RoutedModel:
 
 
 @asynccontextmanager
-async def routed_model(monkeypatch, *, coordinator_options=None, **overrides):
-    """Build a small distributed model; configuration overrides are campaign-local."""
+async def routed_model(monkeypatch, *, coordinator_options=None, engine_factory=None, **overrides):
+    """Build a real distributed engine, optionally via a config-to-engine factory.
+
+    Backend globals must be selected by the caller before entering this fixture.
+    """
     monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1")
     settings = dict(
         num_requests=0,
@@ -268,7 +275,7 @@ async def routed_model(monkeypatch, *, coordinator_options=None, **overrides):
     harness = None
     try:
         with torch.inference_mode():
-            harness = RoutedModel(config, **(coordinator_options or {}))
+            harness = RoutedModel(config, engine_factory, **(coordinator_options or {}))
             yield harness
     finally:
         if harness is not None:
