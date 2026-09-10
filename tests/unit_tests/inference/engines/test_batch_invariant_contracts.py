@@ -22,8 +22,7 @@ from tests.unit_tests.inference.engines import batch_invariant_test_utils as fix
     ],
 )
 def test_batch_invariant_support_boundary(invalid, reason):
-    # Negative support classification only: these cases deliberately execute no
-    # model and receive no positive runtime pair-coverage credit.
+    # Negative support-only: deliberately no model execution or positive pair credit.
     kwargs = dict(
         num_layers=2,
         hidden_size=128,
@@ -62,15 +61,24 @@ def test_batch_invariant_output_contract(output):
         actual = fixture.run_order(case, backend, version, "back")
         fixture.assert_same_target(reference, actual)
         request = actual[0]
-        assert len(request.generated_tokens) == 6
+        assert request.succeeded() and request.generated_length == 6
+        assert len(request.generated_tokens) == len(request.generated_log_probs) == 6
         assert len(request.generated_top_n_logprobs) == 6
         assert all(len(row) == 3 for row in request.generated_top_n_logprobs)
+        assert [step["token"] for step in actual[1].sample_steps] == request.generated_tokens
+        for token, score, top_n in zip(
+            request.generated_tokens, request.generated_log_probs, request.generated_top_n_logprobs
+        ):
+            assert top_n[str(token)] == score
         if output == "skip-prompt":
             assert not request.prompt_log_probs and not request.prompt_top_n_logprobs
         else:
+            assert len(request.prompt_log_probs) == len(request.prompt_tokens) - 1
             assert len(request.prompt_top_n_logprobs) == len(request.prompt_tokens) - 1
         if output == "bos":
             assert request.prompt_tokens[0] == 1 and len(request.prompt_tokens) == 18
+        if output == "total-length":
+            assert len(request.prompt_tokens) + request.generated_length == 23
         assert actual[1].sample_steps[0]["requests"] == 65
 
 
@@ -96,24 +104,30 @@ def test_batch_invariant_terminal_contract(terminal):
         fixture.assert_same_target(reference, actual)
         fixture.assert_same_target(baseline, actual, require_trajectory=False)
         expected_count = {"eos": 1, "stop-kept": 2, "stop-trimmed": 0}[terminal]
-        assert len(actual[0].generated_tokens) == expected_count
+        assert actual[0].succeeded() and len(actual[0].generated_tokens) == expected_count
         assert len(actual[0].generated_log_probs or []) == expected_count
+        terminal_length = 1 if terminal == "eos" else 2
+        sampled = [step["token"] for step in actual[1].sample_steps]
+        assert sampled[:terminal_length] == tokens[:terminal_length]
         assert actual[1].sample_steps[0]["requests"] == 65
 
 
 @pytest.mark.parametrize("mode", list(KVCacheManagementMode))
 @pytest.mark.parametrize("static_pointers", [False, True])
 def test_batch_invariant_suspend_resume(mode, static_pointers):
+    uses_uvm = static_pointers and mode == KVCacheManagementMode.RECOMPUTE
     case = fixture.Case(
         "suspend",
         context={
             "kv_cache_management_mode": mode,
             "static_kv_memory_pointers": static_pointers,
+            "unified_memory_level": int(uses_uvm),
             "num_cuda_graphs": 4,
             "max_tokens": 128,
         },
     )
-    transitions = []
+    forwards = []
+    resumed_replays = []
     with (
         fixture.invariant_runtime(case) as (backend, version),
         pytest.MonkeyPatch.context() as patch,
@@ -124,27 +138,81 @@ def test_batch_invariant_suspend_resume(mode, static_pointers):
         def resumed_engine(*args, **kwargs):
             engine = build(*args, **kwargs)
             original = engine.step_modern
+            context = engine.context
             suspended = False
+            resumed = False
+
+            def active_ids():
+                active = context.request_ids[
+                    context.paused_request_count : context.total_request_count
+                ]
+                return tuple(map(int, active.tolist()))
+
+            forward = engine.controller._dynamic_step_forward_logits
+
+            def observe_forward(input_ids, position_ids):
+                ids = active_ids()
+                if fixture.TARGET in ids and context.is_decode_only():
+                    forwards.append((resumed, ids))
+                return forward(input_ids, position_ids)
+
+            patch.setattr(engine.controller, "_dynamic_step_forward_logits", observe_forward)
+            replay = torch.cuda.CUDAGraph.replay
+
+            def observe_replay(graph):
+                result = replay(graph)
+                if resumed and fixture.TARGET in active_ids():
+                    resumed_replays.append(active_ids())
+                return result
+
+            patch.setattr(torch.cuda.CUDAGraph, "replay", observe_replay)
 
             def step(*args, **kwargs):
-                nonlocal suspended
+                nonlocal resumed, suspended
                 result = original(*args, **kwargs)
-                if not suspended and fixture.TARGET in engine.requests:
+                if not suspended and forwards and fixture.TARGET in engine.requests:
                     request = engine.get_request(fixture.TARGET)
                     if len(request.generated_tokens or []) >= 2:
                         before = tuple(request.generated_tokens)
-                        pointer = engine.context.memory_buffer.data_ptr()
-                        active = engine.context.total_request_count
-                        assert active > 1, "suspension did not overlap live neighbors"
+                        live = forwards[-1][1]
+                        assert fixture.TARGET in live and set(live) - {fixture.TARGET}
+                        assert set(active_ids()) - {fixture.TARGET}
+                        pointer = context.memory_buffer.data_ptr()
+                        record = engine.requests[fixture.TARGET].record
+                        segments = len(record.requests)
+                        target_idx = int((context.request_ids == fixture.TARGET).nonzero()[0])
+                        block = int(context.request_to_kv_block_ids[target_idx, 0])
+                        stored = len(request.prompt_tokens) + len(before) - 1
+                        kv = context.memory_buffer[:, :, block, :stored].cpu().clone()
+                        physical = torch.cuda.mem_get_info()[0]
                         engine.suspend()
+                        torch.cuda.synchronize()
+                        suspended_free = torch.cuda.mem_get_info()[0]
+                        assert not context.is_tensor_state_allocated
+                        if mode == KVCacheManagementMode.OFFLOAD:
+                            if context._uses_torch_memory_saver:
+                                assert suspended_free > physical
+                            else:
+                                assert context.memory_buffer.untyped_storage().nbytes() == 0
+                                backup = context._offloadable_cpu_backups["memory_buffer"]
+                                assert torch.equal(backup[:, :, block, :stored], kv)
+                            print("BI_OFFLOAD_WITNESS", block, stored, suspended_free)
+                        if mode == KVCacheManagementMode.RECOMPUTE:
+                            assert len(record.requests) == segments + 1
                         engine.resume()
-                        # RECOMPUTE puts prior output into a checkpoint record;
-                        # the new live segment correctly has no generated tokens.
-                        merged = engine.requests[fixture.TARGET].record.merge()
+                        resumed = True
+                        merged = record.merge()
                         assert tuple(merged.generated_tokens or []) == before
-                        if static_pointers:
-                            assert engine.context.memory_buffer.data_ptr() == pointer
-                        transitions.append((mode.value, active, len(before)))
+                        if mode == KVCacheManagementMode.RECOMPUTE:
+                            assert fixture.TARGET in engine.waiting_request_ids
+                            assert not engine.get_request(fixture.TARGET).generated_tokens
+                        else:
+                            assert torch.equal(
+                                context.memory_buffer[:, :, block, :stored].cpu(), kv
+                            )
+                        if static_pointers or mode == KVCacheManagementMode.PERSIST:
+                            assert context.memory_buffer.data_ptr() == pointer
+                        print("BI_RESIDENCY_WITNESS", mode.value, live, len(before))
                         suspended = True
                 return result
 
@@ -154,9 +222,4 @@ def test_batch_invariant_suspend_resume(mode, static_pointers):
         patch.setattr(fixture, "build_engine", resumed_engine)
         actual = fixture.run_order(case, backend, version, "back")
         fixture.assert_same_target(reference, actual)
-        assert len(transitions) == 1
-        assert any(
-            s["decode"] and s["graph"] and s["replay"] and int(s["positions"][0]) >= 19
-            for s in actual[1].steps
-        )
-        print("BI_RESIDENCY_WITNESS", transitions, "static_pointers", static_pointers)
+        assert any(resumed for resumed, _ in forwards) and resumed_replays
