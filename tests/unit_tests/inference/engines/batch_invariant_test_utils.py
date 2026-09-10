@@ -374,6 +374,7 @@ class ForwardWitness:
         def graph_begin(graph, *args, **kwargs):
             result = capture_begin(graph, *args, **kwargs)
             self.capturing = graph
+            ctx._bi_capturing_graph = graph
             self.captures[graph] = dict(attention=[], gemms=[], rope=[], sinks=[], mla=[])
             return result
 

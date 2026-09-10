@@ -110,7 +110,7 @@ def _build_model_engine(case, backend, version, *, mamba, engines, patch):
         GPTInferenceWrapper(Float16Module(cfg, model).eval(), ctx),
         fixture.DummyTokenizer(fixture.VOCAB),
     )
-    evidence = dict(states=[], mtp=[], inner_calls={}, captured_inner_calls={}, replay=0)
+    evidence = dict(states=[], mtp=[], inner_calls=set(), replayed_depths=set())
 
     def target_index():
         selected = (
@@ -122,8 +122,10 @@ def _build_model_engine(case, backend, version, *, mamba, engines, patch):
         for d, layer in enumerate(model.mtp.layers):
 
             def inner_hook(module, args, kwargs, *, d=d):
-                key = "inner_calls" if target_index() is not None else "captured_inner_calls"
-                evidence[key][d] = evidence[key].get(d, 0) + 1
+                if torch.cuda.is_current_stream_capturing():
+                    ctx._bi_capturing_graph.__dict__.setdefault("_bi_mtp_depths", set()).add(d)
+                elif target_index() is not None:
+                    evidence["inner_calls"].add(d)
 
             layer.mtp_model_layer.register_forward_pre_hook(inner_hook, with_kwargs=True)
 
@@ -195,10 +197,10 @@ def _build_model_engine(case, backend, version, *, mamba, engines, patch):
         for runner in manager.cudagraph_runners:
             original_replay = runner.fwd_graph.replay
 
-            def replay(*, original_replay=original_replay):
+            def replay(*, original_replay=original_replay, graph=runner.fwd_graph):
                 result = original_replay()
                 if target_index() is not None:
-                    evidence["replay"] += 1
+                    evidence["replayed_depths"].update(graph.__dict__.get("_bi_mtp_depths", ()))
                 return result
 
             patch.setattr(runner.fwd_graph, "replay", replay)
@@ -309,12 +311,9 @@ def test_mtp_dynamic_batch_invariance(depth, graph_mode):
         compared, mtp_shapes = _assert_same_mtp(engines[0]._bi_model_evidence, evidence, depth)
         print("BI_MTP_LOGIT_WITNESS", depth, graph_mode, compared, mtp_shapes)
         if graph_mode == "eager":
-            assert set(evidence["inner_calls"]) == set(
-                range(depth)
-            ), "a real inner MTP depth never executed with the target"
+            assert evidence["inner_calls"] == set(range(depth)), "missing actual target MTP depth"
         else:
-            assert set(evidence["captured_inner_calls"]) == set(range(depth))
-            assert evidence["replay"] > 0, "target did not replay the actual MTP graph"
+            assert evidence["replayed_depths"] == set(range(depth)), "missing captured MTP replay"
         expected_widths = {
             n: (
                 (n + 3) // 4 * 4 * (depth + 1)
@@ -345,6 +344,6 @@ def test_mtp_dynamic_batch_invariance(depth, graph_mode):
             expected_widths,
             "mtp_rows",
             mtp_shapes,
-            "replay",
-            evidence["replay"],
+            "replayed_depths",
+            evidence["replayed_depths"],
         )
