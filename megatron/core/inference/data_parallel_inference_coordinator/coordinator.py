@@ -322,7 +322,7 @@ class DataParallelInferenceCoordinator:
         """
         affected_request_ids = [
             request_id
-            for request_id, assigned_identity in getattr(self, "request_id_to_rank", {}).items()
+            for request_id, assigned_identity in self.request_id_to_rank.items()
             if assigned_identity == identity
         ]
         for request_id in affected_request_ids:
@@ -400,7 +400,7 @@ class DataParallelInferenceCoordinator:
         """Release one request's client ownership and engine load exactly once."""
         client_identity = self.request_id_to_client_id.pop(request_id, None)
         client_request_id = self.request_id_to_client_request_id.pop(request_id, None)
-        sampling_params = getattr(self, "request_id_to_sampling_params", {}).pop(request_id, None)
+        sampling_params = self.request_id_to_sampling_params.pop(request_id, None)
         if client_identity is not None and client_request_id is not None:
             self.client_request_to_request_id.pop((client_identity, client_request_id), None)
 
