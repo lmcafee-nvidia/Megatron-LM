@@ -432,6 +432,9 @@ class DynamicInferenceEngine(AbstractEngine):
     def _reset_pending_kv_imports(self) -> None:
         """Hook overridden by the KV-handoff engine composition."""
 
+    def _cancel_kv_handoff(self, request_id: int) -> None:
+        """Hook overridden by the KV-handoff engine composition."""
+
     @property
     def pending_kv_import_count(self) -> int:
         """Number of decode requests awaiting a KV import (none here)."""
@@ -3539,6 +3542,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 self._record_handoff_completion_notification(int(data[1]), bool(data[2]))
             elif header == Headers.ABORT_REQUEST:
                 request_id = int(data[1])
+                self._cancel_kv_handoff(request_id)
                 entry = self.requests.get(request_id)
                 if entry is not None:
                     request = entry.record[-1]

@@ -3,6 +3,9 @@
 """Real allocator/backpressure and message-level disaggregation regressions."""
 
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
+from unittest import mock
 
 import msgpack
 import pytest
@@ -10,10 +13,13 @@ import torch
 import torch.distributed as dist
 import zmq
 
-from megatron.core.inference.config import PrefixCachingEvictionPolicy
+from megatron.core.inference.config import KVCacheManagementMode, PrefixCachingEvictionPolicy
+from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.headers import Headers
 from tests.unit_tests.inference.engines.disagg_test_utils import (
     ForwardWitness,
+    _DeferredNcclPull,
+    _enqueue_decode_handoff,
     assert_import_equal,
     assert_released,
     collocated_reference,
@@ -28,6 +34,45 @@ from tests.unit_tests.inference.engines.disagg_test_utils import (
 )
 from tests.unit_tests.inference.engines.test_disagg_pairwise import transport_world  # noqa: F401
 from tests.unit_tests.test_utilities import Utils
+
+
+def deliver_abort(engine, request_id):
+    """Deliver one ABORT through the production ZMQ receive handler."""
+
+    context = zmq.Context()
+    receiver, sender, publisher = (
+        context.socket(zmq.PAIR),
+        context.socket(zmq.PAIR),
+        context.socket(zmq.PUB),
+    )
+    address = f"inproc://abort-handoff-{uuid.uuid4().hex}"
+    receiver.bind(address)
+    sender.connect(address)
+    engine.is_mp_coordinator = True
+    engine.socket_for_receiving_requests = receiver
+    engine.model_parallel_publisher_socket = publisher
+    try:
+        sender.send_multipart(
+            [msgpack.packb([Headers.ABORT_REQUEST.value, request_id], use_bin_type=True)]
+        )
+        assert receiver.poll(1000)
+        assert engine.schedule_requests() == 1
+    finally:
+        for socket in (receiver, sender, publisher):
+            socket.close(linger=0)
+        context.term()
+
+
+def drain_deferred_without_posting(engine):
+    """Reserve a queued import before posting its matched production receive."""
+
+    begin = engine._kv_transfer_agent.begin_pull_blocks
+
+    def defer(*args, **kwargs):
+        return _DeferredNcclPull(begin, args, kwargs)
+
+    with mock.patch.object(engine._kv_transfer_agent, "begin_pull_blocks", side_effect=defer):
+        return engine._drain_deferred_kv_handoffs()
 
 
 @pytest.mark.parametrize("policy", list(PrefixCachingEvictionPolicy))
@@ -62,13 +107,13 @@ def test_real_handoff_capacity_fifo(transport_world, policy):
             allocator.release_memory_blocks(held[:2])
             assert engine._drain_deferred_kv_handoffs() == 0
             allocator.release_memory_blocks(held[2:3])
-            assert engine._drain_deferred_kv_handoffs() == 1
+            assert drain_deferred_without_posting(engine) == 1
             assert [item.request_id for item in engine._deferred_kv_handoffs] == [102]
         for index, rid in enumerate((101, 102)):
             pending = None
             if not source:
                 if index:
-                    assert engine._drain_deferred_kv_handoffs() == 1
+                    assert drain_deferred_without_posting(engine) == 1
                 assert len(engine._pending_kv_imports) == 1
                 pending = engine._pending_kv_imports[0]
                 assert pending.request_id == rid
@@ -117,25 +162,9 @@ def test_abort_capacity_queued_handoff_resolves_without_transfer():
             )
             assert not engine.requests and not engine._pending_kv_imports
             assert [item.request_id for item in engine._deferred_kv_handoffs] == [101]
-            context = zmq.Context()
-            receiver, sender, publisher = (
-                context.socket(zmq.PAIR),
-                context.socket(zmq.PAIR),
-                context.socket(zmq.PUB),
-            )
-            address = f"inproc://abort-handoff-{uuid.uuid4().hex}"
-            receiver.bind(address)
-            sender.connect(address)
-            engine.is_mp_coordinator = True
-            engine.socket_for_receiving_requests = receiver
-            engine.model_parallel_publisher_socket = publisher
             try:
-                sender.send_multipart(
-                    [msgpack.packb([Headers.ABORT_REQUEST.value, 101], use_bin_type=True)]
-                )
-                assert receiver.poll(1000)
                 with ForwardWitness(engine) as witness:
-                    assert engine.schedule_requests() == 1
+                    deliver_abort(engine, 101)
                 # Assert while capacity is still exhausted, before teardown can
                 # cancel anything or release the independently held blocks.
                 resolved = future.done()
@@ -143,12 +172,117 @@ def test_abort_capacity_queued_handoff_resolves_without_transfer():
                 assert not witness.steps
                 assert torch.equal(allocator.block_ref_counts[held], torch.ones_like(held))
             finally:
-                for socket in (receiver, sender, publisher):
-                    socket.close(linger=0)
-                context.term()
                 allocator.release_memory_blocks(held)
                 engine._reset_pending_kv_imports()
             assert resolved, "Delivered ABORT left a capacity-queued handoff future unresolved"
             assert retired, "Aborted handoff remained eligible for a later real transfer"
     finally:
         Utils.destroy_model_parallel()
+
+
+@torch.inference_mode()
+def test_abort_inflight_handoff_quarantines_until_real_nccl_settles(transport_world):
+    tokens = prompt(33)
+    source = dist.get_rank() % 2 == 0
+    with real_engine(disagg_config(), role="prefill" if source else "decode") as engine:
+        metadata = state = None
+        if source:
+            result = run_to_completion(
+                engine, engine.add_request(101, tokens, sampling(1, do_kv_handoff=True))
+            )
+            metadata, state = snapshot_source(engine, result)
+        peer = exchange((metadata, state) if source else None, transport_world)
+        if not source:
+            metadata, state = peer
+
+        pending = future = owned_blocks = None
+        if not source:
+            future = _enqueue_decode_handoff(engine, metadata, tokens, sampling())
+            pending = engine._pending_kv_imports[0]
+            owned_blocks = torch.tensor(
+                pending.local_blocks + pending.continuation_blocks, dtype=torch.int64
+            )
+            peer_meta = decode_peer_meta(engine, pending)
+            receive_started = Event()
+
+            def post_receive():
+                torch.cuda.set_device(dist.get_rank())
+                receive_started.set()
+                return pending.handle._start()
+
+            receive_poster = ThreadPoolExecutor(max_workers=1)
+            receive_post = receive_poster.submit(post_receive)
+            assert receive_started.wait(timeout=5) and not receive_post.done()
+        else:
+            peer_meta = None
+        peer_meta = exchange(peer_meta, transport_world)
+
+        witness = None
+        if not source:
+            with ForwardWitness(engine) as witness:
+                deliver_abort(engine, 101)
+            assert future.cancelled() and not engine._pending_kv_imports
+            assert engine._quarantined_kv_imports == [pending]
+            assert torch.equal(
+                engine.context.kv_block_allocator.block_ref_counts[owned_blocks],
+                torch.ones_like(owned_blocks, dtype=torch.int32),
+            )
+        dist.barrier(group=transport_world)
+
+        if source:
+            engine.push_handoff_kv(101, [peer_meta])
+            handles = engine._pending_kv_pushes[0][1]
+            blocks = engine._pinned_handoff_blocks[101]
+            assert (engine.context.kv_block_allocator.block_ref_counts[blocks] > 0).all()
+        else:
+            assert receive_post.result(timeout=30) is pending.handle.real_handle
+            receive_poster.shutdown()
+            handles = engine._pending_transfer_handles(pending)
+        for handle in handles:
+            handle.wait()
+            assert handle.poll()
+
+        if source:
+            assert engine._poll_pending_kv_pushes() == 1
+            engine.release_handoff_blocks(101)
+            engine.release_handoff_blocks(101)
+        else:
+            assert_import_equal(engine, pending, state, len(tokens))
+            assert engine._poll_pending_kv_imports() == 0
+            assert not engine._quarantined_kv_imports
+            assert (engine.context.kv_block_allocator.block_ref_counts[owned_blocks] == 0).all()
+            assert engine._poll_pending_kv_imports() == 0
+            assert not witness.steps and not engine._handoff_completion_notifications
+        assert_released(engine)
+
+
+@torch.inference_mode()
+def test_prefill_handoff_pin_survives_persist_suspend_until_release(transport_world):
+    source = dist.get_rank() % 2 == 0
+    with real_engine(disagg_config(), role="prefill" if source else "decode") as engine:
+        if source:
+            result = run_to_completion(
+                engine, engine.add_request(101, prompt(33), sampling(1, do_kv_handoff=True))
+            )
+            metadata, state = snapshot_source(engine, result)
+            blocks = metadata["block_ids"]
+            allocator = engine.context.kv_block_allocator
+            refs = allocator.block_ref_counts[blocks].clone()
+            assert engine.context.kv_cache_management_mode == KVCacheManagementMode.PERSIST
+
+            engine.suspend()
+            assert engine.state == EngineState.SUSPENDED
+            assert engine._pinned_handoff_blocks[101] == blocks
+            assert torch.equal(allocator.block_ref_counts[blocks], refs)
+            assert torch.equal(engine.context.memory_buffer[:, :, blocks].cpu(), state["kv"])
+
+            engine.resume()
+            assert engine.state == EngineState.RUNNING
+            assert engine._pinned_handoff_blocks[101] == blocks
+            assert torch.equal(allocator.block_ref_counts[blocks], refs)
+            assert torch.equal(engine.context.memory_buffer[:, :, blocks].cpu(), state["kv"])
+            engine.release_handoff_blocks(101)
+            engine.release_handoff_blocks(101)
+            assert (allocator.block_ref_counts[blocks] == 0).all()
+        dist.barrier(group=transport_world)
+        assert_released(engine)

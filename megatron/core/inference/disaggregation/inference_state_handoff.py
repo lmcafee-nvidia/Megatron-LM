@@ -188,6 +188,58 @@ class InferenceStateHandoffMixin:
             )
         self._handoff_completion_notifications.clear()
 
+    def _cancel_kv_handoff(self, request_id: int) -> None:
+        """Cancel an unadmitted decode handoff without reclaiming live destinations."""
+
+        deferred = deque()
+        while self._deferred_kv_handoffs:
+            handoff = self._deferred_kv_handoffs.popleft()
+            if handoff.request_id == request_id:
+                if not handoff.future.done():
+                    handoff.future.cancel()
+            else:
+                deferred.append(handoff)
+        self._deferred_kv_handoffs = deferred
+
+        pending_imports = deque()
+        while self._pending_kv_imports:
+            pending = self._pending_kv_imports.popleft()
+            if pending.request_id == request_id:
+                if not pending.future.done():
+                    pending.future.cancel()
+                # The transfer may still write these destinations. Remove the
+                # request from admission now, but retain its storage until all
+                # handles have reached a terminal state.
+                self._quarantined_kv_imports.append(pending)
+            else:
+                pending_imports.append(pending)
+        self._pending_kv_imports = pending_imports
+        self._handoff_completion_notifications.pop(request_id, None)
+        self._reap_quarantined_kv_imports()
+
+    def _reap_quarantined_kv_imports(self) -> int:
+        """Release canceled/failed import destinations after transfers settle."""
+
+        remaining = []
+        reaped = 0
+        for pending in self._quarantined_kv_imports:
+            settled = False
+            if pending.destinations_safe:
+                handles = self._pending_transfer_handles(pending)
+                try:
+                    settled = all(handle.poll() for handle in handles)
+                except TimeoutError:
+                    settled = False
+                except Exception:
+                    settled = self._wait_for_transfer_handles(*handles)
+            if settled:
+                self._release_pending_kv_import(pending)
+                reaped += 1
+            else:
+                remaining.append(pending)
+        self._quarantined_kv_imports = remaining
+        return reaped
+
     def schedule_waiting_requests(self) -> None:
         """Reject prompt scheduling on a dedicated disaggregated decode engine.
 
@@ -1143,6 +1195,7 @@ class InferenceStateHandoffMixin:
         Side: decode engine; pull and push transport paths.
         """
 
+        self._reap_quarantined_kv_imports()
         self._drain_deferred_kv_handoffs()
         if not self._pending_kv_imports:
             return 0
