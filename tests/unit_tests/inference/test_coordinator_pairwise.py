@@ -14,11 +14,7 @@ from megatron.core.inference.config import (
     PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.headers import Headers
-from tests.unit_tests.inference.coordinator_pairwise_utils import (
-    greedy_params,
-    routed_model,
-    until,
-)
+from tests.unit_tests.inference.coordinator_pairwise_utils import greedy_params, routed_model, until
 
 
 async def _collect(stream):
@@ -93,7 +89,10 @@ async def test_routed_output_matches_direct(monkeypatch, mode, streaming_interva
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "policy",
-    [PrefixCachingCoordinatorPolicy.LONGEST_PREFIX, PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK],
+    [
+        PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
+        PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK,
+    ],
 )
 async def test_routed_prefix_reuse_executes_on_warm_owner(monkeypatch, policy):
     """Affinity must lead to real KV reuse, not just matching shadow hashes."""
@@ -118,8 +117,6 @@ async def test_routed_prefix_reuse_executes_on_warm_owner(monkeypatch, policy):
             owners = [next(iter(e["after"].values())) for e in submits]
             assert len(owners) == 2 and owners[0] == owners[1]
         await h.barrier()
-        reused = any(
-            step["cached"].get(1, 0) >= 16 and 1 in step["ids"] for step in h.witnesses
-        )
+        reused = any(step["cached"].get(1, 0) >= 16 and 1 in step["ids"] for step in h.witnesses)
         assert await h.sync.all_reduce_max(int(reused)) == 1
         h.assert_retired()
