@@ -58,8 +58,8 @@ def real_engine(config, *, role=None, backend="nccl", weights=None):
     with mock.patch.object(dynamic_tests, "DynamicInferenceEngine", DisaggDynamicInferenceEngine):
         engine = DynamicInferenceEngineTestBase._build_test_env(config).engine
     assert dist.get_backend() == "nccl"
-    assert dist.get_world_size(engine.pg_collection.tp) == 1
-    assert dist.get_world_size(engine.pg_collection.pp) == 1
+    assert dist.get_world_size(engine.pg_collection.tp) == config.tensor_model_parallel_size
+    assert dist.get_world_size(engine.pg_collection.pp) == config.pipeline_model_parallel_size
     model = engine.controller.inference_wrapped_model.model
     if weights is not None:
         model.load_state_dict(weights)
