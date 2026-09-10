@@ -191,10 +191,14 @@ class InferenceStateHandoffMixin:
     def _cancel_kv_handoff(self, request_id: int) -> None:
         """Cancel an unadmitted decode handoff without reclaiming live destinations."""
 
+        matched = False
+        sampling_params = None
         deferred = deque()
         while self._deferred_kv_handoffs:
             handoff = self._deferred_kv_handoffs.popleft()
             if handoff.request_id == request_id:
+                matched = True
+                sampling_params = handoff.sampling_params
                 if not handoff.future.done():
                     handoff.future.cancel()
             else:
@@ -205,6 +209,8 @@ class InferenceStateHandoffMixin:
         while self._pending_kv_imports:
             pending = self._pending_kv_imports.popleft()
             if pending.request_id == request_id:
+                matched = True
+                sampling_params = pending.sampling_params
                 if not pending.future.done():
                     pending.future.cancel()
                 # The transfer may still write these destinations. Remove the
@@ -216,6 +222,17 @@ class InferenceStateHandoffMixin:
         self._pending_kv_imports = pending_imports
         self._handoff_completion_notifications.pop(request_id, None)
         self._reap_quarantined_kv_imports()
+        if (
+            matched
+            and request_id not in self.requests
+            and self.use_coordinator
+            and self.is_mp_coordinator
+        ):
+            self._fail_submission(request_id, sampling_params, asyncio.CancelledError())
+            failed_entry = self.requests.pop(request_id)
+            failed_request_id = self.failed_request_ids.pop()
+            assert failed_request_id == request_id
+            assert failed_entry.future.done()
 
     def _reap_quarantined_kv_imports(self) -> int:
         """Release canceled/failed import destinations after transfers settle."""

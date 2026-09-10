@@ -49,6 +49,7 @@ def deliver_abort(engine, request_id):
     receiver.bind(address)
     sender.connect(address)
     engine.is_mp_coordinator = True
+    engine.use_coordinator = engine.local_metadata_ledger_enabled = True
     engine.socket_for_receiving_requests = receiver
     engine.model_parallel_publisher_socket = publisher
     try:
@@ -57,10 +58,12 @@ def deliver_abort(engine, request_id):
         )
         assert receiver.poll(1000)
         assert engine.schedule_requests() == 1
+        reply = sender.recv_multipart() if sender.poll(1000) else None
     finally:
         for socket in (receiver, sender, publisher):
             socket.close(linger=0)
         context.term()
+    return reply
 
 
 def drain_deferred_without_posting(engine):
@@ -157,25 +160,34 @@ def test_abort_capacity_queued_handoff_resolves_without_transfer():
         with real_engine(disagg_config(), role="decode") as engine:
             allocator = engine.context.kv_block_allocator
             held = allocator.allocate_memory_blocks(allocator.pool_avail).clone()
+            params = sampling(detokenize_generations=False)
             future = engine.add_request_with_kv_handoff(
-                101, prompt(33), sampling(), {"resume_tokens": [9]}, [1, 2, 3]
+                101, prompt(33), params, {"resume_tokens": [9]}, [1, 2, 3]
             )
             assert not engine.requests and not engine._pending_kv_imports
             assert [item.request_id for item in engine._deferred_kv_handoffs] == [101]
             try:
                 with ForwardWitness(engine) as witness:
-                    deliver_abort(engine, 101)
+                    reply = deliver_abort(engine, 101)
                 # Assert while capacity is still exhausted, before teardown can
                 # cancel anything or release the independently held blocks.
                 resolved = future.cancelled()
                 retired = not engine._deferred_kv_handoffs and not engine._pending_kv_imports
                 assert not witness.steps
                 assert torch.equal(allocator.block_ref_counts[held], torch.ones_like(held))
+                assert resolved, "Delivered ABORT left a capacity-queued handoff future unresolved"
+                assert retired, "Aborted handoff remained eligible for a later real transfer"
+                assert not (
+                    engine.requests or engine.failed_request_ids or engine.local_metadata_ledger
+                )
+                assert reply is not None, "Delivered ABORT did not publish a terminal ENGINE_REPLY"
+                metadata, body = [msgpack.unpackb(frame, raw=False) for frame in reply]
+                assert metadata == [Headers.ENGINE_REPLY.value, [[101, False]]]
+                assert body["request_id"] == 101 and body["status"] == "FAILED"
+                assert deliver_abort(engine, 101) is None
             finally:
                 allocator.release_memory_blocks(held)
                 engine._reset_pending_kv_imports()
-            assert resolved, "Delivered ABORT left a capacity-queued handoff future unresolved"
-            assert retired, "Aborted handoff remained eligible for a later real transfer"
     finally:
         Utils.destroy_model_parallel()
 
@@ -226,13 +238,14 @@ def test_abort_inflight_handoff_quarantines_until_real_nccl_settles(transport_wo
         witness = None
         if not source:
             with ForwardWitness(engine) as witness:
-                deliver_abort(engine, 101)
+                reply = deliver_abort(engine, 101)
             assert future.cancelled() and not engine._pending_kv_imports
             assert engine._quarantined_kv_imports == [pending]
             assert torch.equal(
                 engine.context.kv_block_allocator.block_ref_counts[owned_blocks],
                 torch.ones_like(owned_blocks, dtype=torch.int32),
             )
+            assert reply is not None
         dist.barrier(group=transport_world)
 
         if source:
