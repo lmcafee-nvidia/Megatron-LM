@@ -9,6 +9,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from megatron.core.inference.sampling.flashinfer_sampling import FlashInferSampling
 from megatron.core.inference.sampling.torch_sampling import TorchSampling
 from megatron.core.inference.sampling_params import SamplingParams
 from tests.unit_tests.inference.engines.disagg_test_utils import (
@@ -53,11 +54,14 @@ def sampled_distributions(engine, records, params):
 
 @pytest.mark.parametrize("backend", ["torch", "flashinfer"])
 @pytest.mark.parametrize(
-    "filters", [{"top_k": 1}, {"top_k": 4}, {"top_p": 0.8}], ids=["greedy", "top-k", "top-p"]
+    "filters",
+    [{}, {"top_k": 1}, {"top_k": 4}, {"top_p": 0.8}],
+    ids=["temperature", "greedy", "top-k", "top-p"],
 )
 @torch.inference_mode()
 def test_handoff_stochastic_fixed_history(transport_world, backend, filters):
     config = disagg_config(sampling_backend=backend, offset_sampling_seed_by_dp_rank=False)
+    sampler_type = TorchSampling if backend == "torch" else FlashInferSampling
     tokens = prompt(33)
 
     def params(count, **changes):
@@ -67,6 +71,7 @@ def test_handoff_stochastic_fixed_history(transport_world, backend, filters):
 
     reference_samples = []
     with real_engine(config) as reference:
+        assert type(reference.controller._sampling) is sampler_type
         model = reference.controller.inference_wrapped_model.model
         for parameter in model.parameters():
             dist.broadcast(parameter.data, src=0)
@@ -79,6 +84,7 @@ def test_handoff_stochastic_fixed_history(transport_world, backend, filters):
     assert len(reference_samples) == 2
     source = dist.get_rank() % 2 == 0
     with real_engine(config, role="prefill" if source else "decode", weights=weights) as engine:
+        assert type(engine.controller._sampling) is sampler_type
         records = []
         with sampled_distributions(engine, records, params(2)), ForwardWitness(engine) as witness:
             metadata = state = None
