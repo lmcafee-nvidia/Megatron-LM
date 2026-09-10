@@ -44,6 +44,9 @@ def transport_world():
         pytest.param("nccl", 33, {}, 7, id="nccl-partial-tail"),
         pytest.param("nixl", 33, {}, 7, id="nixl-partial-tail"),
         pytest.param(
+            "nccl", 33, {"hidden_size": 256, "flash_attention_version": 4}, 7, id="fa4-d64"
+        ),
+        pytest.param(
             "nccl", 33, {"async_sched_mode": AsyncScheduleMode.ASYNC}, 7, id="async-decode"
         ),
         pytest.param(
@@ -117,6 +120,8 @@ def test_disagg_real_engine_parity(transport_world, backend, length, changes, co
                     assert witness.steps[0][0] == length
                     if changes.get("force_build_cuda_graphs"):
                         assert witness.graph_replays > 0
+                    if config.flash_attention_version == 4:
+                        assert witness.fa4_calls > 0
                 else:
                     assert future.done()
                     result = future.result().merge()

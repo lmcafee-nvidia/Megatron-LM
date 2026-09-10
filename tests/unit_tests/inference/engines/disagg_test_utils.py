@@ -5,7 +5,8 @@
 import asyncio
 import gc
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from functools import partial
 from unittest import mock
 
 import torch
@@ -15,6 +16,7 @@ from megatron.core.inference.config import AsyncScheduleMode
 from megatron.core.inference.disaggregation.engine import DisaggDynamicInferenceEngine
 from megatron.core.inference.inference_request import Status
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.transformer import attention
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from tests.unit_tests.inference.engines import test_dynamic_engine as dynamic_tests
 from tests.unit_tests.inference.engines.test_dynamic_engine import (
@@ -23,8 +25,13 @@ from tests.unit_tests.inference.engines.test_dynamic_engine import (
 )
 
 
+@dataclass
+class DisaggTestConfig(DynamicEngineTestConfig):
+    flash_attention_version: int | None = None
+
+
 def disagg_config(**changes):
-    return DynamicEngineTestConfig(
+    return DisaggTestConfig(
         **(
             dict(
                 num_requests=0,
@@ -55,7 +62,12 @@ def prompt(length):
 def real_engine(config, *, role=None, backend="nccl", weights=None):
     # Reuse the existing tiny-model factory, substituting only its production
     # engine composition. The model, controller, allocator and transport are real.
-    with mock.patch.object(dynamic_tests, "DynamicInferenceEngine", DisaggDynamicInferenceEngine):
+    config_factory = partial(
+        dynamic_tests.TransformerConfig, flash_attention_version=config.flash_attention_version
+    )
+    with mock.patch.object(
+        dynamic_tests, "DynamicInferenceEngine", DisaggDynamicInferenceEngine
+    ), mock.patch.object(dynamic_tests, "TransformerConfig", config_factory):
         engine = DynamicInferenceEngineTestBase._build_test_env(config).engine
     assert dist.get_backend() == "nccl"
     assert dist.get_world_size(engine.pg_collection.tp) == config.tensor_model_parallel_size
@@ -119,6 +131,7 @@ class ForwardWitness:
         self.request_id = request_id
         self.steps = []
         self.graph_replays = 0
+        self.fa4_calls = 0
         self._patches = []
 
     def _snapshot(self):
@@ -138,6 +151,12 @@ class ForwardWitness:
         wrapper = self.engine.controller.inference_wrapped_model
         original_forward = wrapper.run_one_forward_step
         original_replay = torch.cuda.CUDAGraph.replay
+        original_fa4 = attention.flash_attn4_varlen_func
+
+        def fa4(*args, **kwargs):
+            if self._snapshot() is not None:
+                self.fa4_calls += 1
+            return original_fa4(*args, **kwargs)
 
         def forward(*args, **kwargs):
             snapshot = self._snapshot()
@@ -157,6 +176,7 @@ class ForwardWitness:
         self._patches = [
             mock.patch.object(wrapper, "run_one_forward_step", side_effect=forward),
             mock.patch.object(torch.cuda.CUDAGraph, "replay", replay),
+            mock.patch.object(attention, "flash_attn4_varlen_func", side_effect=fa4),
         ]
         for patch in self._patches:
             patch.start()
