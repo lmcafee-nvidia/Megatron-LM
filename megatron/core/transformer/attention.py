@@ -557,6 +557,19 @@ class Attention(MegatronModule, ABC):
             self.config, vp_stage=None, pp_rank=get_pg_rank(self.pg_collection.pp)
         )
 
+    def _use_mla_absorption(self, inference_context) -> bool:
+        """Keep BI MLA arithmetic independent of neighboring prefill requests.
+
+        BI retains latent KV storage but uses the existing expanded attention
+        route for every batch, foregoing absorbed decode's memory/compute savings.
+        """
+        return bool(
+            getattr(self.config, "cache_mla_latents", False)
+            and inference_context is not None
+            and inference_context.is_decode_only()
+            and not self.batch_invariant_mode
+        )
+
     def _adjust_key_value_for_inference(
         self,
         inference_context: BaseInferenceContext,
@@ -727,13 +740,13 @@ class Attention(MegatronModule, ABC):
 
             if (
                 getattr(self.config, "cache_mla_latents", None)
-                and not inference_context.is_decode_only()
+                and not self._use_mla_absorption(inference_context)
             ):
-                # Doing unabsorbed MLA Attention with cached mla latents (prefill/mixed mode)
+                # Expand cached latents for prefill/mixed batches, or all BI batches.
                 kv_cache, _, block_table = inference_context.key_value_cache(
                     self.layer_number - pp_layer_offset
                 )
-                # Uncompress the KV cache for prefill/mixed mode
+                # Uncompress the KV cache for the unabsorbed attention route.
                 key, value = self.uncompress_kv_from_cache(kv_cache)
             else:
                 # Read key/value *pointer* tensors from cache.

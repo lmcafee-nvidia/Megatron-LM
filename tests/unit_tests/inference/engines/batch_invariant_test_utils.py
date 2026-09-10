@@ -34,6 +34,7 @@ from megatron.core.transformer import attention
 from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik
 from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -304,9 +305,13 @@ class ForwardWitness:
                 if record is not None:
                     if kind == "attention":
                         record[kind].append((name, kwargs.get("num_splits")))
+                        if self.model_config.multi_latent_attention:
+                            assert (kwargs["q"] if "q" in kwargs else args[0]).shape[-1] == 192
                     elif kind == "mla":
-                        assert args[4] == 512 and args[1].shape[1] == 64
-                        record[kind].append((tuple(args[0].shape), args[5].num_splits.clone()))
+                        assert args[1].shape[1:] == (64, 576)
+                        assert result[0].shape[1:] == (64, 64, 192)
+                        assert result[1].shape[1:] == (64, 64, 128)
+                        record[kind].append((tuple(args[1].shape), tuple(result[0].shape)))
                     elif kind == "rope":
                         record[kind].append((name, int(kwargs["positions"].numel())))
                     else:
@@ -322,7 +327,7 @@ class ForwardWitness:
 
         for name in ("_flash_attn_forward", "flash_attn3_with_kvcache", "flash_attn4_varlen_func"):
             observe(attention, name, "attention")
-        observe(attention, "flash_mla_with_kvcache", "mla")
+        observe(MLASelfAttention, "uncompress_kv_from_cache", "mla")
         for layout in ("varlen", "bshd"):
             observe(attention.Attention, f"_apply_sink_softmax_correction_{layout}", "sinks")
         for name in ("matmul_persistent", "_mm_deepgemm"):
@@ -435,7 +440,9 @@ class ForwardWitness:
         if self.model_config.softmax_type != "vanilla":
             assert any(s["sinks"] for s in self.steps), "target never executed sink correction"
         if self.model_config.multi_latent_attention:
-            assert any(s["decode"] and s["mla"] for s in self.steps), "target never executed MLA"
+            assert any(
+                s["decode"] and s["mla"] for s in self.steps
+            ), "no target latent-cache expansion"
         assert all(
             step["physical"] % 64 == 0
             for step in self.steps
