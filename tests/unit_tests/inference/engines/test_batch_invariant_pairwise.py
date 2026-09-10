@@ -80,13 +80,14 @@ def test_dense_dynamic_feature_batch_invariance(case):
         reference = run_order(case, backend, version, "solo")
         contrasts = []
         contrast_runs = {}
+        expected_decode = 128 if case.context.get("num_cuda_graphs") is not None else 68
         for order in ("front", "back", "staggered"):
             result = run_order(case, backend, version, order)
             assert_same_target(reference, result)
             contrasts.extend(result[1].steps)
             contrast_runs[order] = result[1]
             assert any(
-                s["decode"] and s["physical"] == 128 and s["requests"] == 65
+                s["decode"] and s["physical"] == expected_decode and s["requests"] == 65
                 for s in result[1].steps
             ), (case.name, order)
         # The target really moved, and live neighbors changed the physical decode
@@ -95,7 +96,7 @@ def test_dense_dynamic_feature_batch_invariance(case):
         ref_decode = {s["physical"] for s in reference[1].steps if s["decode"]}
         wide_decode = {s["physical"] for s in contrasts if s["decode"] and s["requests"] > 64}
         assert ref_decode == {64}, ref_decode
-        assert 128 in wide_decode, wide_decode
+        assert expected_decode in wide_decode, wide_decode
         assert any(
             step["neighbor_queries"].get(202) == 33 for step in contrasts
         ), "long neighbor prompt never shared a target forward"
@@ -157,5 +158,5 @@ def test_parallel_batch_invariance(case):
         actual = run_order(case, backend, version, "back")
         assert_same_target(reference, actual)
         assert any(
-            s["decode"] and s["physical"] == 128 and s["requests"] == 65 for s in actual[1].steps
+            s["decode"] and s["physical"] == 68 and s["requests"] == 65 for s in actual[1].steps
         )

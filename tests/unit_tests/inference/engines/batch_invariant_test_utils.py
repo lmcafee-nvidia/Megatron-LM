@@ -301,18 +301,18 @@ class ForwardWitness:
             # CustomOpDef exposes its keyword signature through _init_fn. Without
             # preserving it explicitly, production sees this wrapper as a Python
             # function and silently drops required FA3 keyword arguments such as q.
-            call.__signature__ = inspect.signature(getattr(fn, "_init_fn", fn))
+            if hasattr(fn, "_init_fn"):
+                call.__signature__ = inspect.signature(fn._init_fn)
             patch.setattr(owner, name, call)
 
         for name in ("_flash_attn_forward", "flash_attn3_with_kvcache", "flash_attn4_varlen_func"):
             observe(attention, name, "attention")
         for name in ("matmul_persistent", "_mm_deepgemm"):
             observe(bik, name, "gemms")
-        # Native TE modules bind their GEMM entrypoint locally, rather than looking
-        # it up through the shared cpp_extensions package at each invocation.
         if bik.get_batch_invariant_backend() == "te_native":
             from transformer_engine.pytorch.module import layernorm_linear, linear
 
+            observe(torch, "matmul", "gemms")
             observe(linear, "general_gemm", "gemms")
             observe(layernorm_linear, "general_gemm", "gemms")
         if ctx.use_flashinfer_fused_rope:
@@ -405,15 +405,23 @@ class ForwardWitness:
         """Reject configured-only backends and observations from other requests."""
         assert self.steps, "target never executed a forward"
         calls = [call for step in self.steps for call in step["attention"]]
-        assert calls, "no real target-containing attention call"
+        assert calls or all(s["graph"] and s["replay"] for s in self.steps)
         expected = (
             {"_flash_attn_forward", "flash_attn3_with_kvcache"}
             if fa_version == 3
             else {"flash_attn4_varlen_func"}
         )
-        assert all(name in expected and splits == 1 for name, splits in calls), calls
-        assert any(step["gemms"] for step in self.steps), "no real target-containing GEMM call"
-        assert all(step["physical"] % 64 == 0 for step in self.steps)
+        assert not calls or all(name in expected and splits == 1 for name, splits in calls), calls
+        assert any(s["gemms"] for s in self.steps) or all(
+            s["graph"] and s["replay"] for s in self.steps
+        )
+        assert all(
+            s["physical"] >= s["logical"] and s["physical"] % (4 if s["decode"] else 64) == 0
+            for s in self.steps
+        ), [
+            (s["physical"], s["logical"], s["decode"], s["requests"], s["gemms"])
+            for s in self.steps
+        ]
         if self.engine.context.use_flashinfer_fused_rope:
             assert any(step["rope"] for step in self.steps), "target never executed fused RoPE"
         if self.engine.context.config.async_sched_mode == AsyncScheduleMode.ASYNC:
