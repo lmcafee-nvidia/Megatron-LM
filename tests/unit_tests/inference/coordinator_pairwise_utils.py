@@ -164,6 +164,7 @@ class RoutedModel:
         )
         if self.rank == 0:
             await until(self.service.ready.is_set)
+            assert len(self.service.coordinator.identities_of_data_parallel_ranks) == self.dp_size
             for _ in range(self.dp_size):
                 client = InferenceClient(self.address)
                 client.start(connect_timeout_seconds=30)
@@ -176,9 +177,13 @@ class RoutedModel:
 
         def observed_forward(*args, **kwargs):
             context = self.engine.context
-            ids = context.request_ids[
-                context.paused_request_count : context.total_request_count
-            ].tolist()
+            ids = [
+                request_id
+                for request_id in context.request_ids[
+                    context.paused_request_count : context.total_request_count
+                ].tolist()
+                if request_id in self.engine.requests
+            ]
             snapshot = dict(
                 ids=ids,
                 prefill=context.num_prefill_requests,
@@ -190,7 +195,8 @@ class RoutedModel:
             )
             result = forward(*args, **kwargs)
             # Commit evidence only after the actual model forward returns.
-            self.witnesses.append(snapshot)
+            if ids:
+                self.witnesses.append(snapshot)
             return result
 
         model.forward = observed_forward

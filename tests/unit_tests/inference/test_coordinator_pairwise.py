@@ -54,6 +54,7 @@ async def test_routed_output_matches_direct(monkeypatch, mode, streaming_interva
         await h.unpause()
         if h.rank == 0:
             outputs = await asyncio.wait_for(asyncio.gather(*pending), timeout=60)
+            engine_request_ids = []
             for output in outputs:
                 if streaming_interval:
                     assert len([item for item in output if "final" in item]) == 1
@@ -68,16 +69,18 @@ async def test_routed_output_matches_direct(monkeypatch, mode, streaming_interva
                         assert len(part["new_log_probs"]) == len(part["new_tokens"])
                 else:
                     final = output
+                engine_request_ids.append(final["request_id"])
                 for key in ("status", "generated_tokens", "prompt_tokens"):
                     assert final[key] == direct[key], key
                 for key in ("prompt_log_probs", "generated_log_probs"):
                     torch.testing.assert_close(torch.tensor(final[key]), torch.tensor(direct[key]))
                 assert final["generated_text"] == h.tokenizer.detokenize(final["generated_tokens"])
+            assert sorted(engine_request_ids) == list(range(h.dp_size))
             replies = [e for e in h.service.events if e["header"] == Headers.ENGINE_REPLY]
             assert sum(len(e["metadata"][1]) for e in replies) == h.dp_size
         await h.barrier()
         assert h.witnesses, "Every DP replica must execute its assigned real request"
-        assert len({rid for step in h.witnesses for rid in step["ids"]}) == 1
+        assert {rid for step in h.witnesses for rid in step["ids"]} == {h.rank}
         assert any(step["prefill"] for step in h.witnesses)
         assert any(step["decode"] for step in h.witnesses)
         if mode == AsyncScheduleMode.ASYNC:
