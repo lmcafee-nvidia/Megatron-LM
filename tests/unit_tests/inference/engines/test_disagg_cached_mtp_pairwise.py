@@ -45,6 +45,8 @@ def test_cached_prefix_and_mtp_handoff(transport_world, mode):
         weights=weights,
     ) as engine:
         inner_calls = [0] * depth
+        pull_witness = []
+        oracle_mutations = 0
         hooks = []
         if depth:
             model = engine.controller.inference_wrapped_model.model
@@ -80,6 +82,7 @@ def test_cached_prefix_and_mtp_handoff(transport_world, mode):
                 if not source:
                     assert pull.call_count == 1
                     sent_source_blocks, imported_blocks = pull.call_args.args[1:]
+                    pull_witness.append((iteration, sent_source_blocks, imported_blocks))
                     expected_cached = 2 if cached and iteration else 0
                     assert pending.cached_prefix_block_count == expected_cached
                     assert len(imported_blocks) == len(metadata["block_ids"]) - expected_cached
@@ -88,12 +91,25 @@ def test_cached_prefix_and_mtp_handoff(transport_world, mode):
                         assert len(imported_blocks) == 1, "Only the uncached tail should transfer"
                         assert pending.local_blocks[:2] == previously_imported_prefix
                     assert_import_equal(engine, pending, state, len(tokens))
+                    if iteration == 0:
+                        value = engine.context.memory_buffer[0, 0, pending.local_blocks[0], 0, 0, 0]
+                        saved = value.clone()
+                        value.copy_(saved + 1)
+                        with pytest.raises(AssertionError):
+                            assert_import_equal(engine, pending, state, len(tokens))
+                        value.copy_(saved)
+                        assert_import_equal(engine, pending, state, len(tokens))
+                        oracle_mutations += 1
                     previously_imported_prefix = list(pending.local_blocks[:2])
                     transferred_inputs = list(pending.resume_tokens)
                     assert transferred_inputs == metadata["kv_meta"]["resume_tokens"]
                     if depth:
                         assert len(transferred_inputs) == 3
                         assert len(pending.continuation_blocks) == 1
+                        expected_resume_blocks = [
+                            pending.local_blocks[-1],
+                            *pending.continuation_blocks * 2,
+                        ]
                     admit_import(engine)
                     context = engine.context
                     assert context.request_query_lengths[0].item() == depth + 1
@@ -101,6 +117,8 @@ def test_cached_prefix_and_mtp_handoff(transport_world, mode):
                     assert context.token_to_pos_ids[: depth + 1].tolist() == list(
                         range(len(tokens), len(tokens) + depth + 1)
                     )
+                    if depth:
+                        assert context.token_to_block_idx[:3].tolist() == expected_resume_blocks
                     with ForwardWitness(engine) as witness:
                         actual = run_to_completion(engine, future)
                     assert actual.generated_tokens == expected
@@ -110,6 +128,14 @@ def test_cached_prefix_and_mtp_handoff(transport_world, mode):
                 dist.barrier(group=transport_world)
             if depth:
                 assert all(inner_calls), "Every inner MTP layer must execute for the handoff target"
+            print(
+                f"DISAGG_CACHED_MTP_WITNESS rank={dist.get_rank()} "
+                f"role={'prefill' if source else 'decode'} mode={mode} "
+                f"resume={metadata['kv_meta']['resume_tokens']} inner={inner_calls} "
+                f"blocks={expected_resume_blocks if depth and not source else []} "
+                f"pulls={pull_witness} oracle_mutations={oracle_mutations}",
+                flush=True,
+            )
             if source:
                 engine._poll_pending_kv_pushes()
                 engine.release_handoff_blocks(101)
