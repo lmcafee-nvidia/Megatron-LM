@@ -237,7 +237,7 @@ class ForwardWitness:
             ids = ctx.request_ids[req_idxs]
             rows = (ids == TARGET).nonzero().flatten()
             self.current = None
-            if rows.numel():
+            if rows.numel() and not ctx.is_creating_cuda_graphs:
                 request_idx = int(req_idxs[rows[0]])
                 self.current = dict(
                     positions=position_ids[0, rows].clone(),
