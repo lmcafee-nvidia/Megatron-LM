@@ -1,8 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Real quantized dense-GEMM probes for configurations accepted by BI mode.
+"""Real dense precision contracts; fresh native-TE/workspace-zero processes.
 
-Use fresh native-TE processes with CUBLASLT_WORKSPACE_SIZE=0 before startup.
-Tensorwise admission is negative coverage; select real MXFP8 only on Blackwell.
+Tensorwise FP8 and NVFP4 admission are negative; real MXFP8 requires Blackwell.
 """
 
 import os
@@ -12,7 +11,7 @@ import torch
 from transformer_engine.pytorch.module import linear as te_linear
 from transformer_engine.pytorch.tensor import QuantizedTensorStorage
 
-from megatron.core.enums import Fp8Recipe
+from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -148,3 +147,15 @@ def test_dense_fp8_target_batch_invariance(monkeypatch, recipe):
     finally:
         bik.disable_batch_invariant_mode()
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("recipe", ["nvfp4", Fp4Recipe.nvfp4])
+def test_dense_nvfp4_admission(recipe):
+    options = dict(fp8=None, fp4="e2m1", fp4_recipe=recipe)
+    with pytest.raises(AssertionError, match="NVFP4.*tensor-global"):
+        _config("delayed", **options)
+    assert _config("delayed", **options, batch_invariant_mode=False).fp4 == "e2m1"
+    options["fp4"] = None
+    assert _config("delayed", **options).fp4 is None
+    options.update(fp4="e2m1", fp4_recipe="custom", fp4_quantizer_factory="builtins.object")
+    assert _config("delayed", **options).fp4_recipe == "custom"
