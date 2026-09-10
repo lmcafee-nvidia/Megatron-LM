@@ -35,6 +35,15 @@ def model_config(tp, pp):
     return disagg_config(tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp)
 
 
+def load_canonical_model(model, checkpoint_path):
+    loaded = dist_checkpointing.load(model.sharded_state_dict(), checkpoint_path)
+    model.load_state_dict(loaded)
+    current = model.state_dict()
+    for name, value in loaded.items():
+        if torch.is_tensor(value):
+            assert torch.equal(current[name].cpu(), value.cpu()), name
+
+
 def canonical_kv(source_shards):
     """Reconstruct global coordinates independently of the production reshard planner."""
     first_meta, first_blocks = source_shards[0]
@@ -93,12 +102,26 @@ def admit_model_group(engine):
 
 
 @pytest.mark.parametrize(
-    "source_tp,source_pp,decode_tp,decode_pp",
-    [(2, 1, 1, 1), (1, 1, 2, 1), (1, 2, 1, 1), (2, 2, 1, 2)],
-    ids=["tp2-to-tp1", "tp1-to-tp2", "pp2-to-pp1", "tp2pp2-to-tp1pp2"],
+    "case",
+    [
+        ("nccl", 2, 1, 1, 1),
+        ("nccl", 1, 1, 2, 1),
+        ("nccl", 1, 2, 1, 1),
+        ("nccl", 2, 2, 1, 2),
+        ("nixl", 2, 1, 1, 1),
+        ("nixl", 1, 2, 1, 1),
+    ],
+    ids=[
+        "tp2-to-tp1",
+        "tp1-to-tp2",
+        "pp2-to-pp1",
+        "tp2pp2-to-tp1pp2",
+        "nixl-tp2-to-tp1",
+        "nixl-pp2-to-pp1",
+    ],
 )
 @torch.inference_mode()
-def test_real_model_heterogeneous_handoff(tmp_path, source_tp, source_pp, decode_tp, decode_pp):
+def test_real_model_heterogeneous_handoff(tmp_path, case):
     """Prefill and decode consume one checkpoint, not independent seeded models.
 
     Building topology replicas is collective across the test world; only a
@@ -106,6 +129,7 @@ def test_real_model_heterogeneous_handoff(tmp_path, source_tp, source_pp, decode
     Old source buffers remain alive after global model-group bootstrap switches
     to decode topology. Their engines retain explicit original group handles.
     """
+    backend, source_tp, source_pp, decode_tp, decode_pp = case
     Utils.initialize_model_parallel(source_tp, source_pp)
     control = dist.new_group(backend="gloo")
     rank = dist.get_rank()
@@ -121,6 +145,7 @@ def test_real_model_heterogeneous_handoff(tmp_path, source_tp, source_pp, decode
             # The checkpoint is the canonical source of truth and its access
             # integrity validation checks complete, non-overlapping weight shards.
             dist_checkpointing.save(model.sharded_state_dict(), checkpoint_path)
+            load_canonical_model(model, checkpoint_path)
             source_group = dist.get_process_group_ranks(source_engine.pg_collection.mp)
             source_groups = gather(source_group, control)
             chosen_source = source_groups[0]
@@ -128,7 +153,7 @@ def test_real_model_heterogeneous_handoff(tmp_path, source_tp, source_pp, decode
                 source_engine, source_engine.add_request(101, tokens, sampling())
             )
             expected = list(reference.generated_tokens)
-            source_engine.setup_kv_transfer("prefill", backend="nccl")
+            source_engine.setup_kv_transfer("prefill", backend=backend)
             with ForwardWitness(source_engine) as source_witness:
                 request = run_to_completion(
                     source_engine,
@@ -149,13 +174,11 @@ def test_real_model_heterogeneous_handoff(tmp_path, source_tp, source_pp, decode
             # This resets MPU globals only; the source engine and its registered
             # storage/explicit process groups remain alive through the transfer.
             Utils.initialize_model_parallel(decode_tp, decode_pp)
-            with real_engine(model_config(decode_tp, decode_pp), role="decode") as decode_engine:
+            with real_engine(
+                model_config(decode_tp, decode_pp), role="decode", backend=backend
+            ) as decode_engine:
                 decode_model = decode_engine.controller.inference_wrapped_model.model
-                loaded = dist_checkpointing.load(decode_model.sharded_state_dict(), checkpoint_path)
-                decode_model.load_state_dict(loaded)
-                for name, value in decode_model.state_dict().items():
-                    if torch.is_tensor(value):
-                        assert torch.equal(value.cpu(), loaded[name].cpu()), name
+                load_canonical_model(decode_model, checkpoint_path)
                 groups = gather(
                     dist.get_process_group_ranks(decode_engine.pg_collection.mp), control
                 )
@@ -176,7 +199,7 @@ def test_real_model_heterogeneous_handoff(tmp_path, source_tp, source_pp, decode
                     decode_peer_meta(decode_engine, pending) if pending is not None else None,
                     control,
                 )
-                if rank in chosen_source:
+                if backend == "nccl" and rank in chosen_source:
                     source_engine.push_handoff_kv(101, [peers[index] for index in chosen_decode])
                     for _, handles in source_engine._pending_kv_pushes:
                         for handle in handles:
