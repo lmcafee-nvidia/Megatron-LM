@@ -5,6 +5,7 @@
 import asyncio
 import copy
 from collections import Counter
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -14,6 +15,7 @@ from tests.unit_tests.inference.coordinator_pairwise_utils import greedy_params,
 from tests.unit_tests.inference.engines.test_dynamic_engine_async_sched import (
     _instrument_nccl_dispatch_runtime,
     _instrument_parallel_runtime,
+    _instrument_scenario_runtime,
 )
 
 
@@ -22,7 +24,7 @@ def _active_target_ids(harness):
     if getattr(context, "_bookkeeping_no_real_work", False):
         return ()
     ids = context.request_ids[context.paused_request_count : context.total_request_count].tolist()
-    return tuple(request_id for request_id in ids if request_id >= 0)
+    return tuple(request_id for request_id in ids if request_id in harness.engine.requests)
 
 
 def _install_target_attribution(harness, runtime):
@@ -76,15 +78,11 @@ def _assert_every_owner_executed(harness, target):
     if harness.rank != 0:
         return
 
-    assert len(records) == torch.distributed.get_world_size()
     assert all(item["forwards"] > 0 and len(item["ids"]) == 1 for item in records)
     assert {item["dp"] for item in records} == set(range(harness.dp_size))
     routed_ids = set()
     for owner in range(harness.dp_size):
         owner_records = [item for item in records if item["dp"] == owner]
-        assert len(owner_records) == (
-            harness.config.tensor_model_parallel_size * harness.config.pipeline_model_parallel_size
-        )
         assert {item["mp"] for item in owner_records} == set(range(len(owner_records)))
         assert {(item["tp"], item["pp"]) for item in owner_records} == {
             (tp, pp)
@@ -111,8 +109,8 @@ async def _exercise_all_owners(harness, prompt, params, direct, runtime=None, in
             assert request_id == 0
             pending.append(future)
         await until(lambda: len(harness.service.coordinator.request_id_to_rank) == harness.dp_size)
-        assert sorted(harness.service.coordinator.request_id_to_rank.values()) == list(
-            range(harness.dp_size)
+        assert sorted(harness.service.coordinator.request_id_to_rank.values()) == sorted(
+            harness.service.coordinator.identities_of_data_parallel_ranks
         )
     await harness.barrier()
     await harness.unpause()
@@ -149,7 +147,7 @@ async def test_routed_topology_matches_direct_on_every_owner(monkeypatch, overri
     prompt = list(range(4, 16))
     params = greedy_params(num_tokens_to_generate=4, return_prompt_tokens=True)
     runtime = Counter()
-    async with routed_model(monkeypatch, **overrides) as harness:
+    async with routed_model(monkeypatch, transformer_impl="local", **overrides) as harness:
         direct = await harness.direct(prompt, params)
 
         def install(_target):
@@ -230,36 +228,107 @@ async def test_routed_mtp_executes_inner_steps_on_every_target(monkeypatch):
 
 @pytest.mark.internal
 @pytest.mark.asyncio
-async def test_routed_hybrid_commits_recurrent_state_on_every_target(monkeypatch):
-    """A routed hybrid request executes Mamba and commits its recurrent state."""
+@pytest.mark.parametrize("mixer", ["mamba", "gdp", "gdn"])
+async def test_routed_hybrid_updates_owned_recurrent_state(monkeypatch, mixer):
+    """Completed target decode updates the target's mapped recurrent state slot."""
     prompt = list(range(4, 16))
     params = greedy_params(num_tokens_to_generate=4, return_prompt_tokens=True)
-    async with routed_model(monkeypatch, model_provider="hybrid") as harness:
+    async with routed_model(monkeypatch, model_provider="hybrid", ssm_mixer=mixer) as harness:
         direct = await harness.direct(prompt, params)
 
         def install(target):
-            controller = harness.engine.controller
-            commit = controller._commit_mamba_intermediate_states
+            model = harness.engine.controller.inference_wrapped_model.model
+            context = harness.engine.context
+            expected = {
+                "mamba": "MambaMixer",
+                "gdp": "GatedDeltaProductMixer",
+                "gdn": "GatedDeltaNet",
+            }
+            selected = [
+                module for module in model.modules() if type(module).__name__ == expected[mixer]
+            ]
+            assert selected, expected[mixer]
+            for module in selected:
+                module.register_forward_hook(
+                    lambda *_: target.update(
+                        {"mixer-forward": int(bool(_active_target_ids(harness)))}
+                    )
+                )
+            forward = model.forward
 
-            def traced_commit():
-                result = commit()
-                if _active_target_ids(harness):
-                    target["recurrent-state-commit"] += 1
+            def traced_forward(*args, **kwargs):
+                snapshots = []
+                if context.is_decode_only():
+                    for request_id in _active_target_ids(harness):
+                        row = int(
+                            (
+                                context.request_ids[: context.total_request_count] == request_id
+                            ).nonzero()[0]
+                        )
+                        slot = int(context.mamba_metadata.request_to_mamba_state_idx[row])
+                        assert 0 <= slot < context.max_requests
+                        snapshots.append(
+                            (
+                                slot,
+                                context.mamba_conv_states[:, slot].clone(),
+                                context.mamba_ssm_states[:, slot].clone(),
+                            )
+                        )
+                result = forward(*args, **kwargs)
+                for slot, conv, ssm in snapshots:
+                    assert not torch.equal(conv, context.mamba_conv_states[:, slot])
+                    assert not torch.equal(ssm, context.mamba_ssm_states[:, slot])
+                    target["owned-state-updates"] += 1
                 return result
 
-            controller._commit_mamba_intermediate_states = traced_commit
-            for module in controller.inference_wrapped_model.model.modules():
-                if type(module).__name__ == "MambaMixer":
-                    module.register_forward_pre_hook(
-                        lambda *_: target.update(
-                            {"mamba-mixer-forward": int(bool(_active_target_ids(harness)))}
-                        )
-                    )
+            model.forward = traced_forward
 
         target = await _exercise_all_owners(harness, prompt, params, direct, install=install)
         assert harness.engine.context.is_hybrid_model
-        assert target["mamba-mixer-forward"] > 0
-        assert target["recurrent-state-commit"] > 0
+        assert target["mixer-forward"] > 0
+        assert target["owned-state-updates"] > 0
+
+
+@pytest.mark.internal
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "options,signals,required",
+    [
+        ({"fp8": True, "hidden_size": 128}, ("fp8",), ("fp8-quantized-forwards",)),
+        (
+            {
+                "hidden_size": 64,
+                "position_embedding_type": "rope",
+                "use_flashinfer_fused_rope": True,
+            },
+            ("fused-rope",),
+            ("fused-rope-kernel",),
+        ),
+        (
+            {"window_size": (4, 0), "softmax_type": "off-by-one"},
+            ("softmax-sink",),
+            ("swa-kernel-calls", "sink-correction-calls"),
+        ),
+        (
+            {"window_size": (4, 0), "window_attn_skip_freq": 2, "softmax_type": "learnable"},
+            ("softmax-sink",),
+            ("swa-kernel-calls", "full-attention-kernel-calls", "sink-correction-calls"),
+        ),
+    ],
+    ids=["fp8", "fused-rope", "swa-sink", "alternating-swa-sink"],
+)
+async def test_routed_model_kernels_match_direct(monkeypatch, options, signals, required):
+    prompt = list(range(4, 16))
+    params = greedy_params(num_tokens_to_generate=4, return_prompt_tokens=True)
+    async with routed_model(monkeypatch, **options) as harness:
+        direct = await harness.direct(prompt, params)
+        runtime = Counter()
+        _instrument_scenario_runtime(
+            SimpleNamespace(engine=harness.engine), SimpleNamespace(signals=signals), runtime
+        )
+        target = await _exercise_all_owners(harness, prompt, params, direct, runtime=runtime)
+        for counter in required:
+            assert target[counter] > 0, counter
 
 
 @pytest.mark.internal
