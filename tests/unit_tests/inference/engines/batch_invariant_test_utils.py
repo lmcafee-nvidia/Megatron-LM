@@ -248,6 +248,7 @@ class ForwardWitness:
                     replay=0,
                     captured_graphs=[],
                     attention=[],
+                    sinks=[],
                     gemms=[],
                     rope=[],
                     neighbor_queries={
@@ -312,6 +313,8 @@ class ForwardWitness:
 
         for name in ("_flash_attn_forward", "flash_attn3_with_kvcache", "flash_attn4_varlen_func"):
             observe(attention, name, "attention")
+        for layout in ("varlen", "bshd"):
+            observe(attention.Attention, f"_apply_sink_softmax_correction_{layout}", "sinks")
         for name in ("matmul_persistent", "_mm_deepgemm"):
             observe(bik, name, "gemms")
         # Native TE binds GEMM locally; the other dense providers use torch.matmul.
@@ -375,7 +378,7 @@ class ForwardWitness:
         def graph_begin(graph, *args, **kwargs):
             result = capture_begin(graph, *args, **kwargs)
             self.capturing = graph
-            self.captures[graph] = dict(attention=[], gemms=[], rope=[])
+            self.captures[graph] = dict(attention=[], gemms=[], rope=[], sinks=[])
             return result
 
         patch.setattr(torch.cuda.CUDAGraph, "capture_begin", graph_begin)
@@ -433,6 +436,8 @@ class ForwardWitness:
         )
         assert all(name in expected and splits == 1 for name, splits in calls), calls
         assert any(step["gemms"] for step in self.steps), "no real target-containing GEMM call"
+        if self.engine.controller.inference_wrapped_model.model.config.softmax_type != "vanilla":
+            assert any(s["sinks"] for s in self.steps), "target never executed sink correction"
         assert all(
             step["physical"] % 64 == 0
             for step in self.steps
