@@ -3,12 +3,14 @@
 """Collocated parity and exact transfer witnesses for real disaggregated engines."""
 
 from dataclasses import replace
+from unittest import mock
 
 import pytest
 import torch
 import torch.distributed as dist
 
 from megatron.core.inference.config import AsyncScheduleMode
+from megatron.core.ssm.mamba_mixer import MambaMixer
 from tests.unit_tests.inference.engines.disagg_test_utils import (
     ForwardWitness,
     admit_import,
@@ -71,7 +73,8 @@ def transport_world():
     ],
 )
 @torch.inference_mode()
-def test_disagg_real_engine_parity(transport_world, backend, length, changes, count):
+@mock.patch.object(MambaMixer, "forward", autospec=True, side_effect=MambaMixer.forward)
+def test_disagg_real_engine_parity(mixer, transport_world, backend, length, changes, count):
     config = disagg_config(**changes)
     tokens = prompt(length)
     reference_config = replace(config, async_sched_mode=AsyncScheduleMode.LEGACY)
@@ -88,6 +91,7 @@ def test_disagg_real_engine_parity(transport_world, backend, length, changes, co
     role = "prefill" if source else "decode"
     with real_engine(config, role=role, backend=backend, weights=weights) as engine:
         with ForwardWitness(engine) as witness:
+            mixer.reset_mock()
             neighbor = None
             if async_decode:
                 metadata = None
@@ -176,6 +180,7 @@ def test_disagg_real_engine_parity(transport_world, backend, length, changes, co
                 assert run_to_completion(engine, neighbor).generated_tokens == neighbor_expected
                 if not source:
                     assert_released(engine)
+            assert config.model_provider != "hybrid" or mixer.call_count == len(witness.steps)
             dist.barrier(group=transport_world)
             if source:
                 engine._poll_pending_kv_pushes()
