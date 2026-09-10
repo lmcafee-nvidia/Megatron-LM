@@ -2947,7 +2947,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         (request.generated_log_probs or [])[already:emit_end]
                     )
                     partial["new_top_n_logprobs"] = list(
-                        (getattr(request, "generated_top_n_logprobs", None) or [])[already:]
+                        (getattr(request, "generated_top_n_logprobs", None) or [])[already:emit_end]
                     )
                     if already == 0 and not request.sampling_params.skip_prompt_log_probs:
                         partial["prompt_log_probs"] = list(
