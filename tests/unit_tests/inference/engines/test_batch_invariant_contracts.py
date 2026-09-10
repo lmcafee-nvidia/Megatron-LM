@@ -130,7 +130,6 @@ def test_batch_invariant_suspend_resume(mode, static_pointers):
         },
     )
     forwards = []
-    resumed_replays = []
     with (
         fixture.invariant_runtime(case) as (backend, version),
         pytest.MonkeyPatch.context() as patch,
@@ -151,24 +150,12 @@ def test_batch_invariant_suspend_resume(mode, static_pointers):
                 ]
                 return tuple(map(int, active.tolist()))
 
-            forward = engine.controller._dynamic_step_forward_logits
-
-            def observe_forward(input_ids, position_ids):
+            def observe_forward():
                 ids = active_ids()
                 if fixture.TARGET in ids and context.is_decode_only():
                     forwards.append((resumed, ids))
-                return forward(input_ids, position_ids)
 
-            patch.setattr(engine.controller, "_dynamic_step_forward_logits", observe_forward)
-            replay = torch.cuda.CUDAGraph.replay
-
-            def observe_replay(graph):
-                result = replay(graph)
-                if resumed and fixture.TARGET in active_ids():
-                    resumed_replays.append(active_ids())
-                return result
-
-            patch.setattr(torch.cuda.CUDAGraph, "replay", observe_replay)
+            engine._bi_after_forward = observe_forward
 
             def step(*args, **kwargs):
                 nonlocal resumed, suspended
@@ -221,4 +208,9 @@ def test_batch_invariant_suspend_resume(mode, static_pointers):
         patch.setattr(fixture, "build_engine", resumed_engine)
         actual = fixture.run_order(case, backend, version, "back")
         fixture.assert_same_target(reference, actual)
-        assert any(resumed for resumed, _ in forwards) and resumed_replays
+        decode_steps = [step for step in actual[1].steps if step["decode"]]
+        assert len(forwards) == len(decode_steps), "missing target residency forward observation"
+        assert any(
+            resumed and step["replay"] and step["captured_graphs"]
+            for (resumed, _), step in zip(forwards, decode_steps)
+        ), "no target-owned resumed replay with captured backend provenance"
