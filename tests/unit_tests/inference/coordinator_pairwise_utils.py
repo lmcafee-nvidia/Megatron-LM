@@ -104,6 +104,7 @@ class CoordinatorThread:
             "request_id_to_rank",
         ):
             assert not getattr(c, name), name
+        assert not getattr(c, "request_id_to_sampling_params", {})
         assert not c._pending_counts.any()
         assert self.thread.is_alive(), "Ordinary completion must not stop the service"
 
