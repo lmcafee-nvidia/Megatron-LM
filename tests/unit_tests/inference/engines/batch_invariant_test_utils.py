@@ -446,6 +446,8 @@ def run_order(case, backend, fa_version, order, *, sampling=None):
     params.update(case.sampling)
     params.update(sampling or {})
     target_params = SamplingParams(**params)
+    depth = case.context.get("num_speculative_tokens", 0)
+    short_neighbor_length = depth + 2
     target = target_prompt(case.prompt_length)
     finished = {}
     witness = None
@@ -486,7 +488,11 @@ def run_order(case, backend, fa_version, order, *, sampling=None):
                 filters = dict(top_k=1)
                 if target_params.top_k != 1:
                     filters = dict(top_k=7) if rid % 2 else dict(top_p=0.8)
-                output_length = 2 if retire_early and rid == 201 else 9 if rid == 202 else 6
+                output_length = (
+                    short_neighbor_length
+                    if retire_early and rid == 201
+                    else 9 if rid == 202 or depth else 6
+                )
                 neighbor = SamplingParams(
                     num_tokens_to_generate=output_length, termination_id=-1, **filters
                 )
@@ -502,8 +508,8 @@ def run_order(case, backend, fa_version, order, *, sampling=None):
                     break
                 step()
             assert (
-                len(engine.get_request(TARGET).generated_tokens) == 1
-            ), "target did not reach exactly its first generated token before staggered arrivals"
+                1 <= len(engine.get_request(TARGET).generated_tokens) <= depth + 1
+            ), "target did not finish its first sampling step before staggered arrivals"
             assert TARGET not in finished, "target retired before staggered arrivals"
             add_neighbors(retire_early=True)
         elif order == "front":
@@ -531,7 +537,7 @@ def run_order(case, backend, fa_version, order, *, sampling=None):
             ), "target did not reuse its prefix"
         if order == "staggered":
             assert any(
-                event["target_active"] and event["generated"] == 2
+                event["target_active"] and event["generated"] == short_neighbor_length
                 for event in witness.retirement_events
             ), "short neighbor did not retire while the target remained active"
     return finished[TARGET], witness
