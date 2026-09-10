@@ -22,10 +22,9 @@ from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
-from tests.unit_tests.inference.engines.test_dynamic_engine import (
-    DynamicEngineTestConfig,
-    DynamicInferenceEngineTestBase,
-)
+from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.module import Float16Module
+from tests.unit_tests.inference.engines import test_dynamic_engine as engine_tests
 from tests.unit_tests.inference.test_data_parallel_inference_coordinator import DummyTokenizer
 from tests.unit_tests.test_utilities import Utils
 
@@ -122,7 +121,7 @@ class RoutedModel:
         self.engine = (
             engine_factory(config)
             if engine_factory is not None
-            else DynamicInferenceEngineTestBase._build_test_env(config).engine
+            else engine_tests.DynamicInferenceEngineTestBase._build_test_env(config).engine
         )
         self.tokenizer = DummyTokenizer(vocab_size=config.vocab_size, eod=-1)
         self.engine.controller.tokenizer = self.tokenizer
@@ -266,7 +265,7 @@ async def routed_model(monkeypatch, *, coordinator_options=None, engine_factory=
         transformer_impl="transformer_engine",
     )
     settings.update(overrides)
-    config = DynamicEngineTestConfig(**settings)
+    config = engine_tests.DynamicEngineTestConfig(**settings)
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=config.tensor_model_parallel_size,
         pipeline_model_parallel_size=config.pipeline_model_parallel_size,
@@ -288,3 +287,48 @@ def greedy_params(**overrides):
     params = dict(num_tokens_to_generate=8, termination_id=-1, top_k=1)
     params.update(overrides)
     return SamplingParams(**params)
+
+
+def batch_invariant_engine(config):
+    """Construct native-TE BI modules; caller pins backend and rounders before CUDA."""
+    assert config.tensor_model_parallel_size == config.pipeline_model_parallel_size == 1
+    torch.manual_seed(config.random_seed)
+    engine_tests.model_parallel_cuda_manual_seed(
+        config.random_seed, inference_rng_tracker=True, force_reset_rng=True
+    )
+    model_config = engine_tests.TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        use_cpu_initialization=True,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        batch_invariant_mode=True,
+        batch_invariant_backend="te_native",
+        flash_attention_version=3,
+        normalization="RMSNorm",
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        attention_backend=AttnBackend.flash,
+        transformer_impl="transformer_engine",
+        nccl_all_reduce_for_prefill=False,
+        inference_rng_tracker=True,
+        inference_sampling_seed=config.random_seed,
+    )
+    model = (
+        engine_tests.GPTModel(
+            config=model_config,
+            transformer_layer_spec=engine_tests.get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=config.vocab_size,
+            max_sequence_length=config.max_sequence_length,
+            position_embedding_type="rope",
+        )
+        .cuda()
+        .eval()
+    )
+    context = engine_tests.DynamicInferenceEngineTestBase._build_inference_context(
+        config, model_config, []
+    )
+    wrapper = engine_tests.GPTInferenceWrapper(Float16Module(model_config, model).eval(), context)
+    controller = engine_tests.TextGenerationController(wrapper, DummyTokenizer(config.vocab_size))
+    return engine_tests.DynamicInferenceEngine(controller, context)
