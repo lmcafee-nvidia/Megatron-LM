@@ -1,11 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
-import queue
-import threading
-import time
 from collections import Counter
-from types import SimpleNamespace
 
 import msgpack
 import pytest
@@ -13,13 +9,11 @@ import torch
 import zmq
 from zmq.utils.monitor import recv_monitor_message
 
-from megatron.core.inference.data_parallel_inference_coordinator import (
-    DataParallelInferenceCoordinator,
-)
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
 from megatron.core.inference.sampling_params import SamplingParams
+from tests.unit_tests.inference.coordinator_pairwise_utils import CoordinatorThread, until
 
 
 class _ObservedSocket:
@@ -39,51 +33,23 @@ class _ObservedSocket:
         return frames
 
 
-class _CoordinatorRuntime:
+class _CoordinatorRuntime(CoordinatorThread):
     def __init__(self):
-        self.addresses, self.errors = queue.Queue(), queue.Queue()
-        self.processed = Counter()
-        self.ready, self.coordinator = threading.Event(), None
         self.monitor_endpoint = "inproc://coordinator-monitor"
-        self.thread = threading.Thread(target=self._run, daemon=True)
-        self.thread.start()
+        super().__init__(
+            0, None, setup=lambda c: c.router_socket.monitor(self.monitor_endpoint, zmq.EVENT_ALL)
+        )
         assert self.ready.wait(timeout=5.0)
-        self.address = self.addresses.get(timeout=1.0)
         self.monitor = self.coordinator.context.socket(zmq.PAIR)
         self.monitor.connect(self.monitor_endpoint)
 
-    def _run(self):
-        try:
-            coordinator = DataParallelInferenceCoordinator(
-                SimpleNamespace(send=self.addresses.put, close=lambda: None),
-                data_parallel_size=0,
-                tokenizer=None,
-                max_requests=8,
-                hostname="127.0.0.1",
-            )
-            self.coordinator = coordinator
-            for header, handler in list(coordinator._handlers.items()):
-
-                def observed(*args, header=header, handler=handler):
-                    result = handler(*args)
-                    self.processed[header] += 1
-                    return result
-
-                coordinator._handlers[header] = observed
-            coordinator.router_socket.monitor(self.monitor_endpoint, zmq.EVENT_ALL)
-            self.ready.set()
-            coordinator.start()
-        except BaseException as error:  # Surface background failures in the test thread.
-            self.errors.put(error)
-            self.ready.set()
-        finally:
-            if self.coordinator is not None:
-                self.coordinator.router_socket.disable_monitor()
-                self.coordinator.stop()
+    @property
+    def processed(self):
+        return Counter(event["header"] for event in self.events)
 
     def assert_healthy(self):
-        if not self.errors.empty():
-            raise AssertionError("coordinator thread failed") from self.errors.get_nowait()
+        if self.errors:
+            raise AssertionError("coordinator thread failed") from self.errors[0]
         assert self.thread.is_alive(), "coordinator loop exited unexpectedly"
 
     def shutdown(self):
@@ -100,8 +66,8 @@ class _CoordinatorRuntime:
         self.monitor.close(linger=0)
         self.thread.join(timeout=5.0)
         assert not self.thread.is_alive(), "coordinator thread did not stop"
-        if not self.errors.empty():
-            raise AssertionError("coordinator thread failed") from self.errors.get_nowait()
+        if self.errors:
+            raise AssertionError("coordinator thread failed") from self.errors[0]
 
     async def wait_for_disconnect(self):
         def disconnected():
@@ -173,12 +139,10 @@ def _start_client(runtime, *, deserialize=False):
 
 
 async def _eventually(predicate, message):
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError(message)
+    try:
+        await until(predicate, timeout=5.0)
+    except TimeoutError:
+        raise AssertionError(message) from None
 
 
 def _assert_reply(reply, status=Status.FAILED):
