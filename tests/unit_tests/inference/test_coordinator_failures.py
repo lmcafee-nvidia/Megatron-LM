@@ -26,7 +26,7 @@ class _ObservedSocket:
     """Count actual terminal frames without replacing transport or client parsing."""
 
     def __init__(self, socket):
-        self.socket, self.replies, self.receipts = socket, Counter(), Counter()
+        self.socket, self.replies = socket, Counter()
 
     def __getattr__(self, name):
         return getattr(self.socket, name)
@@ -34,7 +34,6 @@ class _ObservedSocket:
     def recv_multipart(self, *args, **kwargs):
         frames = self.socket.recv_multipart(*args, **kwargs)
         metadata = msgpack.unpackb(frames[0], raw=False)
-        self.receipts[Headers(metadata[0])] += 1
         if metadata[0] == Headers.ENGINE_REPLY.value:
             self.replies[metadata[1]] += 1
         return frames
@@ -43,7 +42,7 @@ class _ObservedSocket:
 class _CoordinatorRuntime:
     def __init__(self):
         self.addresses, self.errors = queue.Queue(), queue.Queue()
-        self.processed, self.senders = Counter(), {}
+        self.processed = Counter()
         self.ready, self.coordinator = threading.Event(), None
         self.monitor_endpoint = "inproc://coordinator-monitor"
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -66,7 +65,6 @@ class _CoordinatorRuntime:
             for header, handler in list(coordinator._handlers.items()):
 
                 def observed(*args, header=header, handler=handler):
-                    self.senders.setdefault(header, []).append(args[1])
                     result = handler(*args)
                     self.processed[header] += 1
                     return result
@@ -203,7 +201,6 @@ async def test_engine_disconnect_fails_owned_request_and_ignores_late_reply(coor
     engine = _EnginePeer(runtime.address, b"removed-engine")
     first_client, second_client = [_start_client(runtime) for _ in range(2)]
     try:
-        client_identities = runtime.senders[Headers.CONNECT][-2:]
         await runtime.wait_for_engine(engine)
         futures = [
             first_client.add_request([1, 2], SamplingParams(num_tokens_to_generate=1)),
@@ -237,16 +234,17 @@ async def test_engine_disconnect_fails_owned_request_and_ignores_late_reply(coor
         )
         runtime.assert_healthy()
         assert Counter(resolved) == Counter(futures)
-        for client, client_identity in zip((first_client, second_client), client_identities):
-            runtime.coordinator.known_clients.remove(client_identity)
-            client._connect_with_inference_coordinator(timeout_seconds=5)
+        # These real replies follow the already-observed late-handler completions.
+        engine.socket.send(b"")
+        await runtime.wait_for_engine(engine)
+        for client in (first_client, second_client):
+            barrier = client.add_request([9], SamplingParams(num_tokens_to_generate=1))
+            engine.send_final(engine.receive_request())
+            _assert_reply(await asyncio.wait_for(barrier, 5.0), Status.COMPLETED)
             assert not client.listener_task.done()
-            assert client.socket.receipts[Headers.CONNECT_ACK] == 2
-        await _eventually(
-            lambda: runtime.processed[Headers.CONNECT] == 4, "barriers were not processed"
-        )
-        assert first_client.socket.replies == second_client.socket.replies == {0: 1}
+        assert first_client.socket.replies == second_client.socket.replies == {0: 1, 1: 1}
         _assert_no_requests(runtime.coordinator)
+        assert runtime.coordinator._pending_counts.tolist() == [0]
     finally:
         first_client.stop()
         second_client.stop()
