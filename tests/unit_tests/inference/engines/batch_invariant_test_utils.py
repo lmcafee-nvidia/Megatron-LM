@@ -176,7 +176,7 @@ def build_engine(case, backend, fa_version):
     }
     spec_options = {"normalization": cfg.normalization} if cfg.transformer_impl == "local" else {}
     if cfg.multi_latent_attention:
-        spec_options["multi_latent_attention"] = True
+        spec_options.update(multi_latent_attention=True, qk_layernorm=cfg.qk_layernorm)
     model = (
         GPTModel(
             config=cfg,
@@ -319,7 +319,7 @@ class ForwardWitness:
             # drops required FA3 keyword arguments such as q from this wrapper.
             if hasattr(fn, "_init_fn"):
                 call.__signature__ = inspect.signature(fn._init_fn)
-            patch.setattr(owner, name, call)
+            patch.setattr(owner, name, staticmethod(call) if kind == "sinks" else call)
 
         for name in ("_flash_attn_forward", "flash_attn3_with_kvcache", "flash_attn4_varlen_func"):
             observe(attention, name, "attention")

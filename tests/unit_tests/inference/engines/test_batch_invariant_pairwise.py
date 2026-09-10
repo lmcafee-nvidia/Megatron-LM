@@ -22,7 +22,12 @@ DENSE_CASES = [
     Case("dense"),
     Case(
         "mla",
-        model=dict(multi_latent_attention=True, cache_mla_latents=True, num_attention_heads=64),
+        model=dict(
+            multi_latent_attention=True,
+            cache_mla_latents=True,
+            num_attention_heads=64,
+            qk_layernorm=True,
+        ),
         context={"block_size_tokens": 64},
     ),
     Case("async", context={"async_sched_mode": AsyncScheduleMode.ASYNC}),
