@@ -1,16 +1,17 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Real-socket regressions for coordinator peer failures."""
-
 import asyncio
 import queue
 import threading
 import time
-import uuid
+from collections import Counter
+from types import SimpleNamespace
 
 import msgpack
 import pytest
 import torch
+import zmq
+from zmq.utils.monitor import recv_monitor_message
 
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
@@ -20,41 +21,32 @@ from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
 from megatron.core.inference.sampling_params import SamplingParams
 
-try:
-    import zmq
-    from zmq.utils.monitor import recv_monitor_message
 
-    HAVE_ZMQ = True
-except ImportError:
-    HAVE_ZMQ = False
+class _ObservedSocket:
+    """Count actual terminal frames without replacing transport or client parsing."""
 
+    def __init__(self, socket):
+        self.socket, self.replies = socket, Counter()
 
-pytestmark = pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required")
+    def __getattr__(self, name):
+        return getattr(self.socket, name)
 
-
-class _AddressSink:
-    """Pipe-shaped sink used to construct the coordinator in its I/O thread."""
-
-    def __init__(self, addresses):
-        self.addresses = addresses
-
-    def send(self, address):
-        self.addresses.put(address)
-
-    def close(self):
-        pass
+    def recv_multipart(self, *args, **kwargs):
+        frames = self.socket.recv_multipart(*args, **kwargs)
+        metadata = msgpack.unpackb(frames[0], raw=False)
+        if metadata[0] == Headers.ENGINE_REPLY.value:
+            self.replies[metadata[1]] += 1
+        return frames
 
 
 class _CoordinatorRuntime:
-    """Run a production coordinator and expose its transport monitor to tests."""
-
     def __init__(self):
         self.addresses = queue.Queue()
         self.errors = queue.Queue()
+        self.processed = Counter()
         self.ready = threading.Event()
-        self.monitor_endpoint = f"inproc://coordinator-monitor-{uuid.uuid4().hex}"
+        self.monitor_endpoint = "inproc://coordinator-monitor"
         self.coordinator = None
-        self.monitor = None
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
         assert self.ready.wait(timeout=5.0)
@@ -65,13 +57,21 @@ class _CoordinatorRuntime:
     def _run(self):
         try:
             coordinator = DataParallelInferenceCoordinator(
-                _AddressSink(self.addresses),
+                SimpleNamespace(send=self.addresses.put, close=lambda: None),
                 data_parallel_size=0,
                 tokenizer=None,
                 max_requests=8,
                 hostname="127.0.0.1",
             )
             self.coordinator = coordinator
+            for header, handler in list(coordinator._handlers.items()):
+
+                def observed(*args, header=header, handler=handler):
+                    result = handler(*args)
+                    self.processed[header] += 1
+                    return result
+
+                coordinator._handlers[header] = observed
             coordinator.router_socket.monitor(self.monitor_endpoint, zmq.EVENT_ALL)
             self.ready.set()
             coordinator.start()
@@ -99,29 +99,28 @@ class _CoordinatorRuntime:
                 socket.send(msgpack.packb([Headers.SHUTDOWN.value], use_bin_type=True))
             socket.close(linger=0)
             context.term()
-        if self.monitor is not None:
-            self.monitor.close(linger=0)
+        self.monitor.close(linger=0)
         self.thread.join(timeout=5.0)
         assert not self.thread.is_alive(), "coordinator thread did not stop"
         if not self.errors.empty():
             raise AssertionError("coordinator thread failed") from self.errors.get_nowait()
 
     async def wait_for_disconnect(self):
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline:
-            try:
-                event = recv_monitor_message(self.monitor, flags=zmq.NOBLOCK)
-            except zmq.Again:
-                await asyncio.sleep(0.01)
-                continue
-            if event["event"] == zmq.EVENT_DISCONNECTED:
-                return
-        raise AssertionError("coordinator did not observe the client disconnect")
+        def disconnected():
+            while self.monitor.poll(0):
+                if recv_monitor_message(self.monitor)["event"] == zmq.EVENT_DISCONNECTED:
+                    return True
+
+        await _eventually(disconnected, "coordinator did not observe disconnect")
+
+    async def wait_for_engine(self, engine):
+        await _eventually(
+            lambda: engine.identity in self.coordinator.identities_of_data_parallel_ranks,
+            "engine did not register",
+        )
 
 
 class _EnginePeer:
-    """A real DEALER peer that speaks the engine side of the wire protocol."""
-
     def __init__(self, address, identity):
         self.identity = identity
         self.context = zmq.Context()
@@ -174,6 +173,7 @@ def coordinator_runtime():
 
 def _start_client(runtime, *, deserialize=False):
     client = InferenceClient(runtime.address, deserialize=deserialize)
+    client.socket = _ObservedSocket(client.socket)
     client.start(connect_timeout_seconds=5.0)
     return client
 
@@ -187,39 +187,34 @@ async def _eventually(predicate, message):
     raise AssertionError(message)
 
 
-def _assert_failed_reply(reply):
+def _assert_reply(reply, status=Status.FAILED):
     if isinstance(reply, DynamicInferenceRequest):
-        assert reply.status == Status.FAILED
-        event_types = [event.type.name for event in reply.events]
-    else:
-        assert reply["status"] == Status.FAILED.name
-        event_types = [event["type"] for event in reply["events"]]
-    assert event_types.count("FAIL") == 1
+        reply = reply.serialize()
+    assert reply["status"] == status.name
+    if status == Status.FAILED:
+        assert [event["type"] for event in reply["events"]].count("FAIL") == 1
 
 
 def _assert_no_requests(coordinator):
-    assert coordinator.request_id_to_client_id == {}
-    assert coordinator.request_id_to_client_request_id == {}
+    for field in ("client_id", "client_request_id", "rank", "sampling_params"):
+        assert not getattr(coordinator, f"request_id_to_{field}", {}), field
     assert coordinator.client_request_to_request_id == {}
-    assert coordinator.request_id_to_rank == {}
-    assert not getattr(coordinator, "request_id_to_sampling_params", {})
 
 
 @pytest.mark.asyncio
 async def test_engine_disconnect_fails_owned_request_and_ignores_late_reply(coordinator_runtime):
     runtime = coordinator_runtime
     engine = _EnginePeer(runtime.address, b"removed-engine")
-    first_client = _start_client(runtime)
-    second_client = _start_client(runtime)
+    first_client, second_client = [_start_client(runtime) for _ in range(2)]
     try:
-        await _eventually(
-            lambda: engine.identity in runtime.coordinator.identities_of_data_parallel_ranks,
-            "engine did not register",
-        )
+        await runtime.wait_for_engine(engine)
         futures = [
             first_client.add_request([1, 2], SamplingParams(num_tokens_to_generate=1)),
             second_client.add_request([3, 4], SamplingParams(num_tokens_to_generate=1)),
         ]
+        resolved = []
+        for future in futures:
+            future.add_done_callback(resolved.append)
         server_request_ids = [engine.receive_request(), engine.receive_request()]
         await _eventually(
             lambda: len(runtime.coordinator.request_id_to_rank) == 2, "unowned requests"
@@ -230,7 +225,7 @@ async def test_engine_disconnect_fails_owned_request_and_ignores_late_reply(coor
         engine.disconnect()
         replies = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
         for reply in replies:
-            _assert_failed_reply(reply)
+            _assert_reply(reply)
         assert {reply["request_id"] for reply in replies} == set(server_request_ids)
         await _eventually(
             lambda: engine.identity not in runtime.coordinator.identities_of_data_parallel_ranks,
@@ -239,11 +234,18 @@ async def test_engine_disconnect_fails_owned_request_and_ignores_late_reply(coor
         _assert_no_requests(runtime.coordinator)
         assert runtime.coordinator._pending_counts.size == 0
 
-        # Retirement already resolved these requests; queued finals must be safe no-ops.
         for server_request_id in server_request_ids:
             engine.send_final(server_request_id)
-        await asyncio.sleep(0.05)
+        await _eventually(
+            lambda: runtime.processed[Headers.ENGINE_REPLY] == len(server_request_ids),
+            "late finals were not processed",
+        )
         runtime.assert_healthy()
+        assert Counter(resolved) == Counter(futures)
+        for client in (first_client, second_client):
+            client._connect_with_inference_coordinator(timeout_seconds=5)
+            assert not client.listener_task.done()
+        assert first_client.socket.replies == second_client.socket.replies == {0: 1}
         _assert_no_requests(runtime.coordinator)
     finally:
         first_client.stop()
@@ -252,49 +254,45 @@ async def test_engine_disconnect_fails_owned_request_and_ignores_late_reply(coor
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("with_kv_handoff", "deserialize"),
-    [(False, False), (True, False), (False, True)],
-    ids=["plain", "kv-handoff", "deserialize"],
-)
-async def test_no_engines_fails_submission_but_keeps_loop_alive(
-    coordinator_runtime, with_kv_handoff, deserialize
-):
+@pytest.mark.parametrize("kind", ["plain", "kv-handoff", "deserialize"])
+async def test_no_engines_fails_submission_but_keeps_loop_alive(coordinator_runtime, kind):
     runtime = coordinator_runtime
-    client = _start_client(runtime, deserialize=deserialize)
+    client = _start_client(runtime, deserialize=kind == "deserialize")
     engine = _EnginePeer(runtime.address, b"unreachable-engine")
     try:
+        await runtime.wait_for_engine(engine)
+        old = client.add_request([7, 8], SamplingParams(num_tokens_to_generate=1))
+        old_server_id = engine.receive_request()
         await _eventually(
-            lambda: engine.identity in runtime.coordinator.identities_of_data_parallel_ranks,
-            "engine did not register",
+            lambda: runtime.coordinator.request_id_to_rank.get(old_server_id) == engine.identity,
+            "old request unowned",
         )
         engine.close()
         engine = None
         await runtime.wait_for_disconnect()
-
         params = SamplingParams(num_tokens_to_generate=1)
-        if with_kv_handoff:
+        if kind == "kv-handoff":
             future = client.add_request_with_kv_handoff([1, 2], params, {}, [])
         else:
             future = client.add_request([1, 2], params)
-        _assert_failed_reply(await asyncio.wait_for(future, timeout=5.0))
+        resolved = []
+        for pending in (old, future):
+            pending.add_done_callback(resolved.append)
+        replies = await asyncio.wait_for(asyncio.gather(old, future), timeout=5.0)
+        for reply in replies:
+            _assert_reply(reply)
+        assert Counter(resolved) == Counter([old, future])
+        assert client.socket.replies == {0: 1, 1: 1}
         _assert_no_requests(runtime.coordinator)
         runtime.assert_healthy()
-
-        # The failed mandatory send must not prevent replacement engines and later work.
         engine = _EnginePeer(runtime.address, b"replacement-engine")
-        await _eventually(
-            lambda: engine.identity in runtime.coordinator.identities_of_data_parallel_ranks,
-            "replacement engine did not register",
-        )
+        await runtime.wait_for_engine(engine)
         future = client.add_request([3, 4], SamplingParams(num_tokens_to_generate=1))
         server_request_id = engine.receive_request()
         engine.send_final(server_request_id)
         reply = await asyncio.wait_for(future, timeout=5.0)
-        if deserialize:
-            assert reply.status == Status.COMPLETED
-        else:
-            assert reply["status"] == Status.COMPLETED.name
+        _assert_reply(reply, Status.COMPLETED)
+        assert client.socket.replies == {0: 1, 1: 1, 2: 1}
         _assert_no_requests(runtime.coordinator)
     finally:
         client.stop()
@@ -307,18 +305,19 @@ async def test_no_engines_fails_submission_but_keeps_loop_alive(
 async def test_closed_client_delivery_does_not_disrupt_live_client(coordinator_runtime, delivery):
     runtime = coordinator_runtime
     engine = _EnginePeer(runtime.address, b"live-engine")
-    closed_client = _start_client(runtime)
-    live_client = _start_client(runtime)
+    closed_client, live_client = [_start_client(runtime) for _ in range(2)]
     closed = False
     try:
+        await runtime.wait_for_engine(engine)
         closed_stream = closed_client.add_request_streaming(
             [1, 2], SamplingParams(num_tokens_to_generate=2)
         )
         closed_request_id = engine.receive_request()
         live_future = live_client.add_request([3, 4], SamplingParams(num_tokens_to_generate=1))
+        resolved = []
+        live_future.add_done_callback(resolved.append)
         live_request_id = engine.receive_request()
         assert closed_request_id != live_request_id
-
         closed_client.stop()
         closed = True
         await runtime.wait_for_disconnect()
@@ -326,12 +325,13 @@ async def test_closed_client_delivery_does_not_disrupt_live_client(coordinator_r
             engine.send_partial(closed_request_id)
         else:
             engine.send_final(closed_request_id)
-        await asyncio.sleep(0.05)
-
+        # Same-peer FIFO makes this live reply a barrier after the failed delivery.
         engine.send_final(live_request_id)
         reply = await asyncio.wait_for(live_future, timeout=5.0)
         assert reply["status"] == Status.COMPLETED.name
         runtime.assert_healthy()
+        assert resolved == [live_future]
+        assert live_client.socket.replies == {0: 1}
 
         if delivery == "partial":
             # A later final still owns cleanup even though its client is gone.
