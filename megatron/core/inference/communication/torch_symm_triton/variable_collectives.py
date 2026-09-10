@@ -335,7 +335,7 @@ def multimem_reduce_scatter_v(
 
     reduce_f32 = output_tensor.dtype == torch.float32
     _multimem_reduce_scatter_v_kernel[(num_blocks, 1, 1)](
-        output_tensor.data_ptr(),
+        output_tensor,
         symm_mem_hdl.multicast_ptr,
         symm_mem_hdl.signal_pad_ptrs_dev,
         local_tokens=local_tokens,
