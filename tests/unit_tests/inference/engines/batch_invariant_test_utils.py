@@ -240,8 +240,8 @@ class ForwardWitness:
             if rows.numel():
                 request_idx = int(req_idxs[rows[0]])
                 self.current = dict(
-                    positions=position_ids[0, rows].clone().cpu(),
-                    tokens=input_ids[0, rows].clone().cpu(),
+                    positions=position_ids[0, rows].clone(),
+                    tokens=input_ids[0, rows].clone(),
                     logical=n,
                     physical=int(input_ids.shape[1]),
                     decode=ctx.is_decode_only(),
@@ -275,11 +275,11 @@ class ForwardWitness:
                         logits = controller._all_logits_cuda[0, : ctx.num_last_token_logits][
                             selected.to("cuda")
                         ]
-                        self.current["positions"] = position_ids[0, rows].clone().cpu()
-                        self.current["tokens"] = input_ids[0, rows].clone().cpu()
+                        self.current["positions"] = position_ids[0, rows].clone()
+                        self.current["tokens"] = input_ids[0, rows].clone()
                     else:
                         logits = controller._all_logits_cuda[0, rows.to("cuda")]
-                    self.current["logits"] = logits.detach().clone().cpu()
+                    self.current["logits"] = logits.detach().clone()
                     self.steps.append(self.current)
                 return result
             finally:
@@ -405,11 +405,11 @@ class ForwardWitness:
                 indices = kwargs.get("gather_indices")
                 selected = logits[:n] if indices is None else logits[indices[:n].long()]
                 processed = sampler.log_probs_kernel(selected, context)
-                token = int(result[target_row])
+                token = result[target_row].clone()
                 self.sample_steps.append(
                     dict(
-                        logits=selected[target_row].detach().clone().cpu(),
-                        log_probs=processed[target_row].detach().clone().cpu(),
+                        logits=selected[target_row].detach().clone(),
+                        log_probs=processed[target_row].detach().clone(),
                         token=token,
                         sampler=type(sampler).__name__,
                         requests=n,
