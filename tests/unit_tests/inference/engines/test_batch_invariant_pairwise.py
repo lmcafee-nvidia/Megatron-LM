@@ -20,6 +20,11 @@ from tests.unit_tests.inference.engines.batch_invariant_test_utils import (
 
 DENSE_CASES = [
     Case("dense"),
+    Case(
+        "mla",
+        model=dict(multi_latent_attention=True, cache_mla_latents=True, num_attention_heads=64),
+        context={"block_size_tokens": 64},
+    ),
     Case("async", context={"async_sched_mode": AsyncScheduleMode.ASYNC}),
     Case("local", model={"transformer_impl": "local"}),
     Case("optimized", model={"transformer_impl": "inference_optimized", "add_bias_linear": False}),

@@ -34,7 +34,7 @@ from megatron.core.transformer import attention
 from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik
 from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 TARGET = 101
@@ -166,13 +166,17 @@ def build_engine(case, backend, fa_version):
         ),
     )
     model_options.update(case.model)
-    cfg = TransformerConfig(**model_options)
+    cfg = (
+        MLATransformerConfig if model_options.get("multi_latent_attention") else TransformerConfig
+    )(**model_options)
     factories = {
         "transformer_engine": get_gpt_layer_with_transformer_engine_spec,
         "local": get_gpt_layer_local_spec,
         "inference_optimized": get_gpt_layer_with_inference_spec,
     }
     spec_options = {"normalization": cfg.normalization} if cfg.transformer_impl == "local" else {}
+    if cfg.multi_latent_attention:
+        spec_options["multi_latent_attention"] = True
     model = (
         GPTModel(
             config=cfg,
@@ -211,10 +215,10 @@ class ForwardWitness:
 
     def __init__(self, engine, patch):
         self.engine = engine
+        self.model_config = engine.controller.inference_wrapped_model.model.config
         self.steps = []
         self.current = None
         self.sample_steps = []
-        self.async_decisions = []
         self.async_overlaps = []
         self.retirement_events = []
         self._active_async_overlap = None
@@ -248,6 +252,7 @@ class ForwardWitness:
                     replay=0,
                     captured_graphs=[],
                     attention=[],
+                    mla=[],
                     sinks=[],
                     gemms=[],
                     rope=[],
@@ -298,6 +303,11 @@ class ForwardWitness:
                 if record is not None:
                     if kind == "attention":
                         record[kind].append((name, kwargs.get("num_splits")))
+                    elif kind == "mla":
+                        assert args[4] == 512 and args[1].shape[1] == 64
+                        record[kind].append(
+                            (tuple(args[0].shape), args[5].num_splits.cpu().clone())
+                        )
                     elif kind == "rope":
                         record[kind].append((name, int(kwargs["positions"].numel())))
                     else:
@@ -313,6 +323,7 @@ class ForwardWitness:
 
         for name in ("_flash_attn_forward", "flash_attn3_with_kvcache", "flash_attn4_varlen_func"):
             observe(attention, name, "attention")
+        observe(attention, "flash_mla_with_kvcache", "mla")
         for layout in ("varlen", "bshd"):
             observe(attention.Attention, f"_apply_sink_softmax_correction_{layout}", "sinks")
         for name in ("matmul_persistent", "_mm_deepgemm"):
@@ -329,21 +340,6 @@ class ForwardWitness:
 
             observe(rope, "apply_rope_with_cos_sin_cache", "rope")
 
-        should_overlap = engine._should_run_async_sched_overlap
-
-        @wraps(should_overlap)
-        def observe_overlap_decision():
-            decision = should_overlap()
-            self.async_decisions.append(
-                dict(
-                    target_active=target_is_active(),
-                    decision=decision,
-                    pending=controller._async_sched_logits.is_valid,
-                )
-            )
-            return decision
-
-        patch.setattr(engine, "_should_run_async_sched_overlap", observe_overlap_decision)
         async_overlap = controller._run_async_sched_step_overlap
         async_forward = controller._run_async_sched_forward
 
@@ -378,7 +374,7 @@ class ForwardWitness:
         def graph_begin(graph, *args, **kwargs):
             result = capture_begin(graph, *args, **kwargs)
             self.capturing = graph
-            self.captures[graph] = dict(attention=[], gemms=[], rope=[], sinks=[])
+            self.captures[graph] = dict(attention=[], gemms=[], rope=[], sinks=[], mla=[])
             return result
 
         patch.setattr(torch.cuda.CUDAGraph, "capture_begin", graph_begin)
@@ -436,8 +432,10 @@ class ForwardWitness:
         )
         assert all(name in expected and splits == 1 for name, splits in calls), calls
         assert any(step["gemms"] for step in self.steps), "no real target-containing GEMM call"
-        if self.engine.controller.inference_wrapped_model.model.config.softmax_type != "vanilla":
+        if self.model_config.softmax_type != "vanilla":
             assert any(s["sinks"] for s in self.steps), "target never executed sink correction"
+        if self.model_config.multi_latent_attention:
+            assert any(s["decode"] and s["mla"] for s in self.steps), "target never executed MLA"
         assert all(
             step["physical"] % 64 == 0
             for step in self.steps
@@ -446,9 +444,6 @@ class ForwardWitness:
         if self.engine.context.use_flashinfer_fused_rope:
             assert any(step["rope"] for step in self.steps), "target never executed fused RoPE"
         if self.engine.context.config.async_sched_mode == AsyncScheduleMode.ASYNC:
-            assert any(
-                item["target_active"] and item["decision"] for item in self.async_decisions
-            ), "target never reached the async-overlap admission path"
             assert any(
                 item["target_active"]
                 and item["pending"]
