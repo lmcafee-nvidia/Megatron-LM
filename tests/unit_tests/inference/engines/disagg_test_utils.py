@@ -106,18 +106,22 @@ def run_to_completion(engine, future, *, limit=256):
     raise AssertionError("Request did not complete within the bounded real-engine schedule")
 
 
-def collocated_reference(config, tokens, params):
+def canonical_weights(engine):
     # Broadcast actual weights; equal seeds alone are not an identity oracle.
+    model = engine.controller.inference_wrapped_model.model
+    for parameter in model.parameters():
+        dist.broadcast(parameter.data, src=0)
+    return {
+        name: value.detach().cpu().clone() if torch.is_tensor(value) else value
+        for name, value in model.state_dict().items()
+    }
+
+
+def collocated_reference(config, tokens, params):
     with real_engine(
         replace(config, num_cuda_graphs=None, force_build_cuda_graphs=False)
     ) as engine:
-        model = engine.controller.inference_wrapped_model.model
-        for parameter in model.parameters():
-            dist.broadcast(parameter.data, src=0)
-        weights = {
-            name: value.detach().cpu().clone() if torch.is_tensor(value) else value
-            for name, value in model.state_dict().items()
-        }
+        weights = canonical_weights(engine)
         result = run_to_completion(engine, engine.add_request(101, tokens, params))
         return weights, list(result.generated_tokens)
 

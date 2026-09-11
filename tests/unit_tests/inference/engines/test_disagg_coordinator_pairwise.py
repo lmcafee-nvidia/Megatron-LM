@@ -51,13 +51,8 @@ def coordinator_world():
 async def _async_barrier(group, timeout=180):
     """Synchronize without starving a local engine task."""
     work = dist.barrier(group=group, async_op=True)
-
-    async def poll():
-        while not work.is_completed():
-            await asyncio.sleep(0.01)
-        work.wait()
-
-    await asyncio.wait_for(poll(), timeout=timeout)
+    await _wait_for(work.is_completed, timeout)
+    work.wait()
 
 
 async def _wait_for(predicate, timeout=60):
@@ -111,13 +106,14 @@ async def _stop_services(engine, control, clients):
 
 
 @pytest.mark.parametrize(
-    "mode,streaming",
+    "mode,streaming,abort_deferred",
     [
-        pytest.param(AsyncScheduleMode.LEGACY, False, id="eager"),
-        pytest.param(AsyncScheduleMode.ASYNC, True, id="async-streaming"),
+        pytest.param(AsyncScheduleMode.LEGACY, False, False, id="eager"),
+        pytest.param(AsyncScheduleMode.ASYNC, True, False, id="async-streaming"),
+        pytest.param(AsyncScheduleMode.LEGACY, False, True, id="abort-capacity-deferred"),
     ],
 )
-def test_two_coordinator_nixl_handoff(coordinator_world, mode, streaming):
+def test_two_coordinator_nixl_handoff(coordinator_world, mode, streaming, abort_deferred):
     """Run a client-visible prefill -> NIXL import -> decode -> release flow."""
     config = disagg_config(async_sched_mode=mode)
     tokens = prompt(33)
@@ -126,17 +122,19 @@ def test_two_coordinator_nixl_handoff(coordinator_world, mode, streaming):
         weights, expected = collocated_reference(reference, tokens, sampling(7))
         asyncio.run(
             _run_coordinator_handoff(
-                coordinator_world, config, tokens, weights, expected, streaming
+                coordinator_world, config, tokens, weights, expected, streaming, abort_deferred
             )
         )
 
 
-async def _run_coordinator_handoff(coordinator_world, config, tokens, weights, expected, streaming):
+async def _run_coordinator_handoff(
+    coordinator_world, config, tokens, weights, expected, streaming, abort_deferred
+):
     control, role_dp = coordinator_world
     rank = dist.get_rank()
     role = "prefill" if rank % 2 == 0 else "decode"
     with torch.inference_mode():
-        local = {"source": None, "imported": None, "transfer": None}
+        local = {"source": None, "imported": None, "transfer": None, "terminal": []}
         with real_engine(config, role=role, backend="nixl", weights=weights) as engine:
             # Coordinator setup reads pg_collection.dp directly. Preserve every
             # model group from the real factory and replace only the role's DP group.
@@ -149,6 +147,7 @@ async def _run_coordinator_handoff(coordinator_world, config, tokens, weights, e
 
             original_capture = engine._capture_handoff_meta
             original_finalize = engine._finalize_kv_handoff_import
+            original_reply = engine._send_request_records_to_coordinator
 
             def capture_source(request, prepared):
                 original_capture(request, prepared)
@@ -166,11 +165,21 @@ async def _run_coordinator_handoff(coordinator_world, config, tokens, weights, e
                 }
                 original_finalize(pending)
 
+            def capture_reply(records):
+                if role == "decode":
+                    local["terminal"].extend(record.merge().serialize() for record in records)
+                original_reply(records)
+
             with (
-                RequestForwardWitness(engine, request_id=0) as witness,
+                RequestForwardWitness(
+                    engine, request_id=0 if role == "prefill" else int(abort_deferred)
+                ) as witness,
                 mock.patch.object(engine, "_capture_handoff_meta", side_effect=capture_source),
                 mock.patch.object(
                     engine, "_finalize_kv_handoff_import", side_effect=capture_import
+                ),
+                mock.patch.object(
+                    engine, "_send_request_records_to_coordinator", side_effect=capture_reply
                 ),
             ):
                 # The shared tiny-engine factory uses an unpicklable lambda tokenizer.
@@ -194,6 +203,8 @@ async def _run_coordinator_handoff(coordinator_world, config, tokens, weights, e
 
                 clients = ()
                 client_result = None
+                decode_client = None
+                handoff = None
                 if rank == 0:
                     prefill_client = InferenceClient(addresses["prefill"])
                     decode_client = InferenceClient(addresses["decode"])
@@ -215,6 +226,54 @@ async def _run_coordinator_handoff(coordinator_world, config, tokens, weights, e
                     assert handoff["kv_meta"]["agent_name"] == "prefill-rank0"
                     assert handoff["kv_meta"]["agent_metadata_b64"]
 
+                held = None
+                if abort_deferred and role == "decode":
+                    allocator = engine.context.kv_block_allocator
+                    held = allocator.allocate_memory_blocks(allocator.pool_avail).clone()
+
+                if abort_deferred:
+                    # Both decode replicas have exhausted real allocator capacity before
+                    # the public submission, so the selected destination must queue it.
+                    await _async_barrier(control)
+                    aborted_id = aborted_future = None
+                    if rank == 0:
+                        aborted_id = decode_client.next_request_id
+                        aborted_future = decode_client.add_request_with_kv_handoff(
+                            tokens,
+                            sampling(7, detokenize_generations=False),
+                            handoff["kv_meta"],
+                            handoff["block_ids"],
+                        )
+                    if rank == 1:
+                        await _wait_for(
+                            lambda: [item.request_id for item in engine._deferred_kv_handoffs]
+                            == [0]
+                        )
+                    await _async_barrier(control)
+
+                    if rank == 0:
+                        decode_client.abort_request(aborted_id)
+                        assert aborted_future.cancelled()
+                    if rank == 1:
+                        await _wait_for(
+                            lambda: not engine._deferred_kv_handoffs and local["terminal"]
+                        )
+                    if rank == 0:
+                        # Only a terminal reply routed back through the coordinator clears
+                        # this set; local Future cancellation alone cannot satisfy it.
+                        await _wait_for(lambda: aborted_id not in decode_client.aborted_request_ids)
+                        assert source_id in engine._pinned_handoff_blocks
+                    await _async_barrier(control)
+
+                    if role == "decode":
+                        assert not engine.requests
+                        assert not engine._pending_kv_imports
+                        assert not engine._deferred_kv_handoffs
+                        assert torch.equal(allocator.block_ref_counts[held], torch.ones_like(held))
+                        allocator.release_memory_blocks(held)
+                    await _async_barrier(control)
+
+                if rank == 0:
                     decode_params = sampling(7, streaming_interval=2, detokenize_generations=False)
                     if streaming:
                         stream = decode_client.add_request_with_kv_handoff_streaming(
@@ -241,6 +300,7 @@ async def _run_coordinator_handoff(coordinator_world, config, tokens, weights, e
                         "source_id": source_id,
                         "prefill_tokens": prefill_result["generated_tokens"],
                         "decode_tokens": decode_result["generated_tokens"],
+                        "abort_settled": abort_deferred,
                     }
 
                 # Ranks without clients keep yielding to their local engine task.
@@ -258,6 +318,7 @@ async def _run_coordinator_handoff(coordinator_world, config, tokens, weights, e
                     "source_id": local.get("source_id"),
                     "imported": local["imported"],
                     "transfer": local["transfer"],
+                    "terminal": local["terminal"],
                     "client_result": client_result,
                 }
                 gathered = [None] * dist.get_world_size(control)
@@ -277,10 +338,19 @@ async def _run_coordinator_handoff(coordinator_world, config, tokens, weights, e
                 assert all(not step[2] for step in decode_owners[0]["steps"])
                 assert decode_owners[0]["steps"][0][0] == len(tokens)
                 assert decode_owners[0]["transfer"] == {
-                    "request_id": 0,
+                    "request_id": int(abort_deferred),
                     "cached_blocks": 0,
                     "xfers": 1,
                 }
+                if abort_deferred:
+                    # A stale coordinator pending count would route request 1 to rank 3.
+                    # Returning to rank 1 proves the abort reply retired that load owner.
+                    terminal_owners = [item for item in gathered if item["terminal"]]
+                    assert [item["rank"] for item in terminal_owners] == [1]
+                    assert [
+                        (reply["request_id"], reply["status"])
+                        for reply in terminal_owners[0]["terminal"]
+                    ] == [(0, "FAILED"), (1, "COMPLETED")]
                 source_kv = source_owners[0]["source"]
                 imported_kv = decode_owners[0]["imported"]
                 corrupted = imported_kv.clone()
@@ -292,5 +362,6 @@ async def _run_coordinator_handoff(coordinator_world, config, tokens, weights, e
                 assert result["source_id"] == source_owners[0]["source_id"]
                 assert result["prefill_tokens"] == expected[:1]
                 assert result["decode_tokens"] == expected
+                assert result["abort_settled"] == abort_deferred
 
                 await _stop_services(engine, control, clients)

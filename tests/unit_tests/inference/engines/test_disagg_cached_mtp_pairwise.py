@@ -45,8 +45,6 @@ def test_cached_prefix_and_mtp_handoff(transport_world, mode):
         weights=weights,
     ) as engine:
         inner_calls = [0] * depth
-        pull_witness = []
-        oracle_mutations = 0
         hooks = []
         if depth:
             model = engine.controller.inference_wrapped_model.model
@@ -82,7 +80,6 @@ def test_cached_prefix_and_mtp_handoff(transport_world, mode):
                 if not source:
                     assert pull.call_count == 1
                     sent_source_blocks, imported_blocks = pull.call_args.args[1:]
-                    pull_witness.append((iteration, sent_source_blocks, imported_blocks))
                     expected_cached = 2 if cached and iteration else 0
                     assert pending.cached_prefix_block_count == expected_cached
                     assert len(imported_blocks) == len(metadata["block_ids"]) - expected_cached
@@ -99,7 +96,6 @@ def test_cached_prefix_and_mtp_handoff(transport_world, mode):
                             assert_import_equal(engine, pending, state, len(tokens))
                         value.copy_(saved)
                         assert_import_equal(engine, pending, state, len(tokens))
-                        oracle_mutations += 1
                     previously_imported_prefix = list(pending.local_blocks[:2])
                     transferred_inputs = list(pending.resume_tokens)
                     assert transferred_inputs == metadata["kv_meta"]["resume_tokens"]
@@ -128,14 +124,6 @@ def test_cached_prefix_and_mtp_handoff(transport_world, mode):
                 dist.barrier(group=transport_world)
             if depth:
                 assert all(inner_calls), "Every inner MTP layer must execute for the handoff target"
-            print(
-                f"DISAGG_CACHED_MTP_WITNESS rank={dist.get_rank()} "
-                f"role={'prefill' if source else 'decode'} mode={mode} "
-                f"resume={metadata['kv_meta']['resume_tokens']} inner={inner_calls} "
-                f"blocks={expected_resume_blocks if depth and not source else []} "
-                f"pulls={pull_witness} oracle_mutations={oracle_mutations}",
-                flush=True,
-            )
             if source:
                 engine._poll_pending_kv_pushes()
                 engine.release_handoff_blocks(101)

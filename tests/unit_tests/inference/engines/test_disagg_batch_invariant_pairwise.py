@@ -95,13 +95,7 @@ def test_disaggregated_prefill_is_batch_invariant(transport_world, monkeypatch):
     try:
         bik.enable_batch_invariant_mode(backend="te_native", collective="ordered")
         with du.real_engine(config) as reference:
-            model = reference.controller.inference_wrapped_model.model
-            for parameter in model.parameters():
-                dist.broadcast(parameter.data, src=0)
-            weights = {
-                name: value.detach().cpu().clone() if torch.is_tensor(value) else value
-                for name, value in model.state_dict().items()
-            }
+            weights = du.canonical_weights(reference)
             baseline, _, _ = _observe(reference, active)
             expected = du.run_to_completion(
                 reference, reference.add_request(101, tokens, params)

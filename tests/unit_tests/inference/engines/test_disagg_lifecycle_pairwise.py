@@ -14,11 +14,10 @@ import torch.distributed as dist
 import zmq
 
 from megatron.core.inference.config import KVCacheManagementMode, PrefixCachingEvictionPolicy
-from megatron.core.inference.engines.dynamic_engine import EngineState
+from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, EngineState
 from megatron.core.inference.headers import Headers
 from tests.unit_tests.inference.engines.disagg_test_utils import (
     ForwardWitness,
-    _DeferredNcclPull,
     _enqueue_decode_handoff,
     assert_import_equal,
     assert_released,
@@ -35,6 +34,28 @@ from tests.unit_tests.inference.engines.disagg_test_utils import (
 )
 from tests.unit_tests.inference.engines.test_disagg_pairwise import transport_world  # noqa: F401
 from tests.unit_tests.test_utilities import Utils
+
+
+def _suspend_observation(engine):
+    def owners():
+        return tuple(
+            tuple(map(id, getattr(engine, name)))
+            for name in ("_deferred_kv_handoffs", "_pending_kv_imports", "_quarantined_kv_imports")
+        )
+
+    before, error = owners(), None
+    with mock.patch.object(DynamicInferenceEngine, "suspend") as base:
+        try:
+            engine.suspend()
+        except RuntimeError as caught:
+            error = str(caught)
+    return error, base.call_count, owners() == before, engine.state == EngineState.RUNNING
+
+
+def _expected_suspend(mode):
+    if mode == KVCacheManagementMode.RECOMPUTE:
+        return "Cannot suspend while handoff transfers or admissions remain pending", 0, True, True
+    return None, 1, True, True
 
 
 def deliver_abort(engine, request_id):
@@ -65,13 +86,6 @@ def deliver_abort(engine, request_id):
             socket.close(linger=0)
         context.term()
     return reply
-
-
-def drain_deferred_without_posting(engine):
-    """Reserve a queued import before posting its matched production receive."""
-
-    with deferred_pulls(engine):
-        return engine._drain_deferred_kv_handoffs()
 
 
 @pytest.mark.parametrize("policy", list(PrefixCachingEvictionPolicy))
@@ -106,13 +120,15 @@ def test_real_handoff_capacity_fifo(transport_world, policy):
             allocator.release_memory_blocks(held[:2])
             assert engine._drain_deferred_kv_handoffs() == 0
             allocator.release_memory_blocks(held[2:3])
-            assert drain_deferred_without_posting(engine) == 1
+            with deferred_pulls(engine):
+                assert engine._drain_deferred_kv_handoffs() == 1
             assert [item.request_id for item in engine._deferred_kv_handoffs] == [102]
         for index, rid in enumerate((101, 102)):
             pending = None
             if not source:
                 if index:
-                    assert drain_deferred_without_posting(engine) == 1
+                    with deferred_pulls(engine):
+                        assert engine._drain_deferred_kv_handoffs() == 1
                 assert len(engine._pending_kv_imports) == 1
                 pending = engine._pending_kv_imports[0]
                 assert pending.request_id == rid
@@ -145,15 +161,17 @@ def test_real_handoff_capacity_fifo(transport_world, policy):
         assert_released(engine)
 
 
+@pytest.mark.parametrize("mode", [KVCacheManagementMode.PERSIST, KVCacheManagementMode.RECOMPUTE])
 @torch.inference_mode()
-def test_abort_capacity_queued_handoff_resolves_without_transfer():
+def test_abort_capacity_queued_handoff_resolves_without_transfer(mode):
     """A delivered ABORT must reach handoffs not yet present in engine.requests.
 
     This is a focused negative/lifecycle regression, not positive transfer credit.
     """
     Utils.initialize_model_parallel()
     try:
-        with real_engine(disagg_config(), role="decode") as engine:
+        config = disagg_config(kv_cache_management_mode=mode, static_kv_memory_pointers=False)
+        with real_engine(config, role="decode") as engine:
             allocator = engine.context.kv_block_allocator
             held = allocator.allocate_memory_blocks(allocator.pool_avail).clone()
             params = sampling(detokenize_generations=False)
@@ -163,6 +181,8 @@ def test_abort_capacity_queued_handoff_resolves_without_transfer():
             assert not engine.requests and not engine._pending_kv_imports
             assert [item.request_id for item in engine._deferred_kv_handoffs] == [101]
             try:
+                suspend_state = _suspend_observation(engine)
+                assert not future.done()
                 with ForwardWitness(engine) as witness:
                     reply = deliver_abort(engine, 101)
                 # Assert while capacity is still exhausted, before teardown can
@@ -181,6 +201,7 @@ def test_abort_capacity_queued_handoff_resolves_without_transfer():
                 assert metadata == [Headers.ENGINE_REPLY.value, [[101, False]]]
                 assert body["request_id"] == 101 and body["status"] == "FAILED"
                 assert deliver_abort(engine, 101) is None
+                assert suspend_state == _expected_suspend(mode)
             finally:
                 allocator.release_memory_blocks(held)
                 engine._reset_pending_kv_imports()
@@ -188,11 +209,13 @@ def test_abort_capacity_queued_handoff_resolves_without_transfer():
         Utils.destroy_model_parallel()
 
 
+@pytest.mark.parametrize("mode", [KVCacheManagementMode.PERSIST, KVCacheManagementMode.RECOMPUTE])
 @torch.inference_mode()
-def test_abort_inflight_handoff_quarantines_until_real_nccl_settles(transport_world):
+def test_abort_inflight_handoff_quarantines_until_real_nccl_settles(transport_world, mode):
     tokens = prompt(33)
     source = dist.get_rank() % 2 == 0
-    with real_engine(disagg_config(), role="prefill" if source else "decode") as engine:
+    config = disagg_config(kv_cache_management_mode=mode, static_kv_memory_pointers=False)
+    with real_engine(config, role="prefill" if source else "decode") as engine:
         metadata = state = None
         if source:
             result = run_to_completion(
@@ -231,8 +254,10 @@ def test_abort_inflight_handoff_quarantines_until_real_nccl_settles(transport_wo
             peer_meta = None
         peer_meta = exchange(peer_meta, transport_world)
 
-        witness = None
+        witness, suspend_states = None, []
         if not source:
+            suspend_states.append(_suspend_observation(engine))
+            assert not future.done()
             with ForwardWitness(engine) as witness:
                 reply = deliver_abort(engine, 101)
             assert future.cancelled() and not engine._pending_kv_imports
@@ -242,6 +267,7 @@ def test_abort_inflight_handoff_quarantines_until_real_nccl_settles(transport_wo
                 torch.ones_like(owned_blocks, dtype=torch.int32),
             )
             assert reply is not None
+            suspend_states.append(_suspend_observation(engine))
         dist.barrier(group=transport_world)
 
         if source:
@@ -269,6 +295,8 @@ def test_abort_inflight_handoff_quarantines_until_real_nccl_settles(transport_wo
             assert engine._poll_pending_kv_imports() == 0
             assert not witness.steps and not engine._handoff_completion_notifications
         assert_released(engine)
+        states = exchange(suspend_states if not source else None, transport_world)
+        assert (states if source else suspend_states) == [_expected_suspend(mode)] * 2
 
 
 @torch.inference_mode()

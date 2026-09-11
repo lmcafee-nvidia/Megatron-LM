@@ -435,6 +435,9 @@ class DynamicInferenceEngine(AbstractEngine):
     def _cancel_kv_handoff(self, request_id: int) -> None:
         """Hook overridden by the KV-handoff engine composition."""
 
+    def _reinitialize_handoff_after_resume(self) -> None:
+        """Refresh optional transfer resources before resumed work can run."""
+
     @property
     def pending_kv_import_count(self) -> int:
         """Number of decode requests awaiting a KV import (none here)."""
@@ -1288,6 +1291,7 @@ class DynamicInferenceEngine(AbstractEngine):
             torch.cuda.synchronize()
             self.context.reinitialize_inference_state_buffers()
             torch.cuda.synchronize()
+            self._reinitialize_handoff_after_resume()
             alloc_time = time.time() - alloc_time
 
             capture_time = time.time()
