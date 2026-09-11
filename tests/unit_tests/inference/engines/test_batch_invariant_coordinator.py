@@ -7,12 +7,15 @@ import pytest
 import torch
 import zmq
 
-from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
+from megatron.core.activations import squared_relu
+from megatron.core.inference.config import PrefixCachingCoordinatorPolicy as Policy
 from megatron.core.inference.engines.async_zmq_communicator import AsyncZMQCommunicator
 from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient
+from megatron.core.inference.moe import batch_invariant as moe_bi
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.transformer.moe import token_dispatcher_inference as dispatch
 from tests.unit_tests.inference.engines import batch_invariant_test_utils as bi
 from tests.unit_tests.inference.test_data_parallel_inference_coordinator import cleanup_engine
 
@@ -72,15 +75,33 @@ def _headers(observer, request_id):
 @pytest.mark.internal
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "policy",
+    "policy,progress",
     [
-        pytest.param(PrefixCachingCoordinatorPolicy.LONGEST_PREFIX, id="longest-prefix"),
-        pytest.param(PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK, id="first-block"),
+        pytest.param(Policy.LONGEST_PREFIX, None, id="longest-prefix"),
+        pytest.param(Policy.FIRST_PREFIX_BLOCK, None, id="first-block"),
+        pytest.param(Policy.LONGEST_PREFIX, (False, False, 1), id="ep-async"),
+        pytest.param(Policy.LONGEST_PREFIX, (True, False, 3), id="ep-sync"),
+        pytest.param(Policy.LONGEST_PREFIX, (False, True, 1), id="ep-disabled"),
     ],
 )
-async def test_live_coordinator_batch_invariance_and_output_contracts(policy):
+async def test_live_coordinator_batch_invariance_and_output_contracts(policy, progress):
+    model = {}
+    if progress is not None:
+        model = dict(
+            expert_model_parallel_size=2,
+            num_moe_experts=4,
+            moe_router_topk=2,
+            moe_grouped_gemm=True,
+            moe_router_dtype="fp32",
+            transformer_impl="inference_optimized",
+            inference_grouped_gemm_backend="vllm",
+            inference_moe_token_dispatcher_type="nvls",
+            activation_func=squared_relu,
+            add_bias_linear=False,
+        )
     case = bi.Case(
         "live-coordinator",
+        model=model,
         context=dict(
             enable_prefix_caching=True,
             prefix_caching_coordinator_policy=policy,
@@ -88,6 +109,13 @@ async def test_live_coordinator_batch_invariance_and_output_contracts(policy):
             prefix_cache_ttl_seconds=300.0,
         ),
     )
+    if progress is not None:
+        synchronous, disabled, interval = progress
+        case.context.update(
+            use_synchronous_zmq_collectives=synchronous,
+            disable_ep_consensus=disabled,
+            ep_consensus_interval=interval,
+        )
     client = None
     with bi.invariant_runtime(case) as (backend, fa_version):
         rank = torch.distributed.get_rank()
@@ -97,8 +125,6 @@ async def test_live_coordinator_batch_invariance_and_output_contracts(policy):
         test_communicator = AsyncZMQCommunicator(sync_context, process_group=None)
         try:
             address = await engine.start_listening_to_data_parallel_coordinator()
-            # Prefix matching must leave at least two computed tokens;257 would
-            # deliberately back off the256-token cache hit to zero skipped tokens.
             prompt = bi.target_prompt(258)
             await _sync(test_communicator)
             if rank == 0:
@@ -136,6 +162,31 @@ async def test_live_coordinator_batch_invariance_and_output_contracts(policy):
             with pytest.MonkeyPatch.context() as patch:
                 patch.setattr(bi, "TARGET", 2)
                 joint_witness = bi.ForwardWitness(engine, patch)
+                ep_calls, ep_sync = [], []
+                if progress is not None:
+                    ctx = engine.context
+                    for module, name, tensor in (
+                        (dispatch, "multimem_all_gatherv_3tensor", 3),
+                        (moe_bi, "ordered_reduce_scatter_v", 0),
+                    ):
+                        original = getattr(module, name)
+
+                        def collective(*args, fn=original, name=name, tensor=tensor, **kwargs):
+                            result = fn(*args, **kwargs)
+                            target = 2 in ctx.request_ids[: ctx.total_request_count]
+                            counter = engine._ep_consensus_loop_counter
+                            ep_calls.append((name, counter, target, args[tensor].shape[0]))
+                            return result
+
+                        patch.setattr(module, name, collective)
+                    consensus = engine.expert_parallel_zmq_communicator.all_reduce_max
+
+                    async def reduce(*args, **kwargs):
+                        result = await consensus(*args, **kwargs)
+                        ep_sync.append((engine._ep_consensus_loop_counter, kwargs["async_op"]))
+                        return result
+
+                    patch.setattr(engine.expert_parallel_zmq_communicator, "all_reduce_max", reduce)
                 admitted = []
                 admitted_events = {request_id: asyncio.Event() for request_id in (2, 3, 67)}
                 original_add = engine.add_request
@@ -173,6 +224,31 @@ async def test_live_coordinator_batch_invariance_and_output_contracts(policy):
                     )
                     joint_result = _stream_result(results[0])
                 await _sync(test_communicator)
+
+            if progress is not None:
+                if rank == 0:
+                    client.pause_engines()
+                await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), 30)
+                all_ep = [None, None]
+                torch.distributed.all_gather_object(all_ep, (ep_calls, ep_sync))
+                wide = [
+                    (i, call)
+                    for i, call in enumerate(all_ep[owner][0])
+                    if call[2] and call[3] == 128
+                ]
+                assert {call[0] for _, call in wide} == {
+                    "multimem_all_gatherv_3tensor",
+                    "ordered_reduce_scatter_v",
+                }
+                for index, call in wide:
+                    peer = all_ep[owner ^ 1][0][index]
+                    assert peer[0] == call[0] and not peer[2] and peer[3] == 0
+                for _, sync in all_ep:
+                    assert bool(sync) != disabled
+                    assert all(async_op != synchronous for _, async_op in sync)
+                if not disabled:
+                    seen = {counter for counter, _ in all_ep[owner][1]}
+                    assert {c[1] - 1 in seen for _, c in wide} == {True, interval == 1}
 
             assert engine.context.step_count > steps_before
             assert admitted == ([2, *range(4, 68)] if rank == owner else [3])
