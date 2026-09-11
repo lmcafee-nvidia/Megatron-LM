@@ -106,14 +106,17 @@ async def _stop_services(engine, control, clients):
 
 
 @pytest.mark.parametrize(
-    "mode,streaming,abort_deferred",
+    "mode,streaming,abort_deferred,native_failure",
     [
-        pytest.param(AsyncScheduleMode.LEGACY, False, False, id="eager"),
-        pytest.param(AsyncScheduleMode.ASYNC, True, False, id="async-streaming"),
-        pytest.param(AsyncScheduleMode.LEGACY, False, True, id="abort-capacity-deferred"),
+        pytest.param(AsyncScheduleMode.LEGACY, False, False, False, id="eager"),
+        pytest.param(AsyncScheduleMode.ASYNC, True, False, False, id="async-streaming"),
+        pytest.param(AsyncScheduleMode.LEGACY, False, True, False, id="abort-capacity-deferred"),
+        pytest.param(AsyncScheduleMode.LEGACY, False, False, True, id="native-import-failure"),
     ],
 )
-def test_two_coordinator_nixl_handoff(coordinator_world, mode, streaming, abort_deferred):
+def test_two_coordinator_nixl_handoff(
+    coordinator_world, mode, streaming, abort_deferred, native_failure
+):
     """Run a client-visible prefill -> NIXL import -> decode -> release flow."""
     config = disagg_config(async_sched_mode=mode)
     tokens = prompt(33)
@@ -122,17 +125,25 @@ def test_two_coordinator_nixl_handoff(coordinator_world, mode, streaming, abort_
         weights, expected = collocated_reference(reference, tokens, sampling(7))
         asyncio.run(
             _run_coordinator_handoff(
-                coordinator_world, config, tokens, weights, expected, streaming, abort_deferred
+                coordinator_world,
+                config,
+                tokens,
+                weights,
+                expected,
+                streaming,
+                abort_deferred,
+                native_failure,
             )
         )
 
 
 async def _run_coordinator_handoff(
-    coordinator_world, config, tokens, weights, expected, streaming, abort_deferred
+    coordinator_world, config, tokens, weights, expected, streaming, abort_deferred, native_failure
 ):
     control, role_dp = coordinator_world
     rank = dist.get_rank()
     role = "prefill" if rank % 2 == 0 else "decode"
+    rejected_first = abort_deferred or native_failure
     with torch.inference_mode():
         local = {"source": None, "imported": None, "transfer": None, "terminal": []}
         with real_engine(config, role=role, backend="nixl", weights=weights) as engine:
@@ -148,6 +159,22 @@ async def _run_coordinator_handoff(
             original_capture = engine._capture_handoff_meta
             original_finalize = engine._finalize_kv_handoff_import
             original_reply = engine._send_request_records_to_coordinator
+            original_submit = engine.add_request_with_kv_handoff
+
+            def capture_submission(request_id, *args):
+                if not native_failure or request_id != 0:
+                    return original_submit(request_id, *args)
+                agent = engine._kv_transfer_agent._agent
+                with (
+                    mock.patch.object(
+                        agent, "initialize_xfer", wraps=agent.initialize_xfer
+                    ) as begin,
+                    mock.patch.object(agent, "transfer", wraps=agent.transfer) as post,
+                ):
+                    future = original_submit(request_id, *args)
+                local["failed_future"] = future
+                local["native"] = (begin.call_count, post.call_count)
+                return future
 
             def capture_source(request, prepared):
                 original_capture(request, prepared)
@@ -172,7 +199,7 @@ async def _run_coordinator_handoff(
 
             with (
                 RequestForwardWitness(
-                    engine, request_id=0 if role == "prefill" else int(abort_deferred)
+                    engine, request_id=0 if role == "prefill" else int(rejected_first)
                 ) as witness,
                 mock.patch.object(engine, "_capture_handoff_meta", side_effect=capture_source),
                 mock.patch.object(
@@ -180,6 +207,9 @@ async def _run_coordinator_handoff(
                 ),
                 mock.patch.object(
                     engine, "_send_request_records_to_coordinator", side_effect=capture_reply
+                ),
+                mock.patch.object(
+                    engine, "add_request_with_kv_handoff", side_effect=capture_submission
                 ),
             ):
                 # The shared tiny-engine factory uses an unpicklable lambda tokenizer.
@@ -227,6 +257,40 @@ async def _run_coordinator_handoff(
                     assert handoff["kv_meta"]["agent_metadata_b64"]
 
                 held = None
+                failed_public = None
+                if native_failure:
+                    if rank == 0:
+                        # Native registration coverage rejects address zero before posting;
+                        # keep the real source allocation, agent blob and pins untouched.
+                        failed_public = decode_client.add_request_with_kv_handoff(
+                            tokens,
+                            sampling(7, detokenize_generations=False),
+                            dict(handoff["kv_meta"], base_addr=0),
+                            handoff["block_ids"],
+                        )
+                    if rank == 1:
+                        await _wait_for(
+                            lambda: local.get("failed_future") is not None
+                            and local["failed_future"].done()
+                        )
+                        local["native"] += (type(local["failed_future"].exception()).__name__,)
+                        local["failure_clean"] = not any(
+                            (
+                                engine.requests,
+                                engine.failed_request_ids,
+                                engine.waiting_request_ids,
+                                engine.context.total_request_count,
+                                engine._pending_kv_imports,
+                                engine._deferred_kv_handoffs,
+                                engine._quarantined_kv_imports,
+                                engine._handoff_completion_notifications,
+                            )
+                        )
+                    await _async_barrier(control)
+                    if rank == 0:
+                        # Bound delivery without cancelling the unresolved public future.
+                        await asyncio.wait([failed_public], timeout=5)
+                        assert source_id in engine._pinned_handoff_blocks
                 if abort_deferred and role == "decode":
                     allocator = engine.context.kv_block_allocator
                     held = allocator.allocate_memory_blocks(allocator.pool_avail).clone()
@@ -294,6 +358,19 @@ async def _run_coordinator_handoff(
                         )
                     assert decode_result["generated_tokens"] == expected
                     assert decode_result["num_cached_tokens"] == len(tokens)
+                    if native_failure:
+                        # Healthy public progress is the ordering boundary. Snapshot before
+                        # stop() cancels unresolved futures; assert only after clean shutdown.
+                        local["public_failure"] = (
+                            failed_public.result() if failed_public.done() else None
+                        )
+                        local["client_clean"] = not any(
+                            (
+                                decode_client.completion_futures,
+                                decode_client.request_submission_times,
+                                decode_client.aborted_request_ids,
+                            )
+                        )
                     prefill_client.release_handoff(source_id)
                     await _wait_for(lambda: not engine._pinned_handoff_blocks)
                     client_result = {
@@ -320,9 +397,25 @@ async def _run_coordinator_handoff(
                     "transfer": local["transfer"],
                     "terminal": local["terminal"],
                     "client_result": client_result,
+                    "native": local.get("native"),
+                    "failure_clean": local.get("failure_clean"),
+                    "public_failure": local.get("public_failure"),
+                    "client_clean": local.get("client_clean"),
                 }
                 gathered = [None] * dist.get_world_size(control)
                 dist.all_gather_object(gathered, evidence, group=control)
+                await _stop_services(engine, control, clients)
+
+                if native_failure:
+                    assert gathered[1]["native"][0] > 0
+                    assert gathered[1]["native"][1:] == (0, "nixlNotFoundError")
+                    assert gathered[1]["failure_clean"]
+                    failure = gathered[0]["public_failure"]
+                    assert (
+                        failure is not None
+                    ), "native import failed without a public terminal reply"
+                    assert (failure["request_id"], failure["status"]) == (0, "FAILED")
+                    assert gathered[0]["client_clean"]
 
                 source_owners = [item for item in gathered if item["source"] is not None]
                 decode_owners = [item for item in gathered if item["imported"] is not None]
@@ -338,13 +431,13 @@ async def _run_coordinator_handoff(
                 assert all(not step[2] for step in decode_owners[0]["steps"])
                 assert decode_owners[0]["steps"][0][0] == len(tokens)
                 assert decode_owners[0]["transfer"] == {
-                    "request_id": int(abort_deferred),
+                    "request_id": int(rejected_first),
                     "cached_blocks": 0,
                     "xfers": 1,
                 }
-                if abort_deferred:
+                if rejected_first:
                     # A stale coordinator pending count would route request 1 to rank 3.
-                    # Returning to rank 1 proves the abort reply retired that load owner.
+                    # Returning to rank 1 proves the terminal reply retired that load owner.
                     terminal_owners = [item for item in gathered if item["terminal"]]
                     assert [item["rank"] for item in terminal_owners] == [1]
                     assert [
@@ -363,5 +456,3 @@ async def _run_coordinator_handoff(
                 assert result["prefill_tokens"] == expected[:1]
                 assert result["decode_tokens"] == expected
                 assert result["abort_settled"] == abort_deferred
-
-                await _stop_services(engine, control, clients)
