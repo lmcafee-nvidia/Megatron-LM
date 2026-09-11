@@ -41,6 +41,7 @@ from megatron.core.inference.inference_request import (
     Status,
     compute_block_hashes_batched,
 )
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.utils import get_pg_rank, get_pg_size
 
 if TYPE_CHECKING:
@@ -81,6 +82,7 @@ class InferenceStateHandoffMixin:
         self._handoff_completion_notifications: dict[int, bool] = {}  # Request ID -> failed.
         self._pending_kv_pushes: list = []
         self._kv_transfer_role: str | None = None
+        self._kv_transfer_backend: str | None = None
 
     def suspend(self) -> None:
         """Reject destructive suspend while a handoff still owns source state."""
@@ -93,7 +95,61 @@ class InferenceStateHandoffMixin:
             raise RuntimeError(
                 "Cannot suspend while handoff state remains pinned; wait for RELEASE_KV"
             )
+        if self._handoff_storage_is_replaced() and (
+            self._deferred_kv_handoffs
+            or self._pending_kv_imports
+            or self._quarantined_kv_imports
+            or self._pending_kv_pushes
+        ):
+            raise RuntimeError(
+                "Cannot suspend while handoff transfers or admissions remain pending"
+            )
         super().suspend()
+        if self._kv_transfer_role is not None and self._handoff_storage_is_replaced():
+            # The coordinator sets this after suspend returns; keep failures
+            # non-runnable even if native deregistration prevents that return.
+            if self.state != EngineState.SUSPENDED:
+                self.state = EngineState.SUSPENDING
+            self._retire_handoff_agents()
+
+    def _handoff_storage_is_replaced(self) -> bool:
+        """Select nonstatic recompute, excluding retained-pointer modes."""
+        return (
+            self.context.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE
+            and not self.context.static_kv_memory_pointers
+            and not self.unified_memory_level
+        )
+
+    def _retire_handoff_agents(self) -> None:
+        """Invalidate descriptors, then release only successfully retired owners."""
+        self._kv_peer_metas = None
+        self._pp_kv_peer_metas = None
+        self._pp_ssm_peer_metas = None
+        for agent in [self._kv_transfer_agent, *self._ssm_transfer_agents.values()]:
+            close = getattr(agent, "close", None)
+            if close is not None:
+                close(strict=True)
+        # On failure all references remain, including the registration whose
+        # close failed. Retrying can safely skip already-closed registrations.
+        self._kv_transfer_agent = None
+        self._ssm_transfer_agents.clear()
+
+    def _reinitialize_handoff_after_resume(self) -> None:
+        """Rebind replacing storage before graphs, admission, or loop wakeup."""
+        if self._kv_transfer_role is None or not self._handoff_storage_is_replaced():
+            return
+        try:
+            self._retire_handoff_agents()
+            self.setup_kv_transfer(self._kv_transfer_role, self._kv_transfer_backend)
+        except Exception:
+            # setup keeps new registrations reachable as it constructs the
+            # local KV/SSM set. Failed cleanup must retain their buffer owners.
+            try:
+                self._retire_handoff_agents()
+            except Exception:  # noqa: BLE001 - preserve the initiating failure
+                logging.exception("Retaining handoff registrations after failed resume cleanup")
+            InferenceMode.unset_active()
+            raise
 
     def _setup_handoff_completion_tracking(self, hostname: str | None = None) -> None:
         """Create the CPU path used to aggregate model-parallel transfer completion."""
@@ -309,6 +365,7 @@ class InferenceStateHandoffMixin:
                 )
         self._kv_transfer_role = role
         backend_cls = construct_kv_transfer_backend_class(backend)
+        self._kv_transfer_backend = backend
 
         # Prefill output blocks stay pinned until the peer finishes reading
         # them. Decode requests consume imports but do not produce another
