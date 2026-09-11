@@ -1,17 +1,23 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from collections import Counter
 from contextlib import asynccontextmanager
 
 import pytest
+import torch
 
 from megatron.core.inference.config import CudaGraphSizingDistribution
 from megatron.core.transformer.cuda_graphs import _CudagraphReplayNode
 from tests.unit_tests.inference import test_coordinator_schedule_pairwise as schedule
-from tests.unit_tests.inference.test_coordinator_features_pairwise import _active_target_ids
+from tests.unit_tests.inference.coordinator_pairwise_utils import greedy_params, routed_model
+from tests.unit_tests.inference.test_coordinator_features_pairwise import (
+    _active_target_ids,
+    _instrument_nccl_dispatch_runtime,
+)
+
+pytestmark = [pytest.mark.internal, pytest.mark.asyncio]
 
 
-@pytest.mark.internal
-@pytest.mark.asyncio
 @pytest.mark.parametrize("all_prefills", [False, True])
 @pytest.mark.parametrize("distribution", list(CudaGraphSizingDistribution))
 async def test_routed_prefill_graph_selection(monkeypatch, all_prefills, distribution):
@@ -65,3 +71,68 @@ async def test_routed_prefill_graph_selection(monkeypatch, all_prefills, distrib
 
     monkeypatch.setattr(schedule, "routed_model", instrumented)
     await schedule.test_routed_chunk_partition_beside_decode(monkeypatch)
+
+
+@pytest.mark.parametrize("interval", [20, 3, None])
+@pytest.mark.parametrize("synchronous", [False, True])
+async def test_routed_idle_expert_progress(monkeypatch, interval, synchronous):
+    params = greedy_params(
+        num_tokens_to_generate=32, return_log_probs=True, skip_prompt_log_probs=True
+    )
+    async with routed_model(
+        monkeypatch,
+        expert_model_parallel_size=2,
+        use_moe_layer_spec=True,
+        transformer_impl="inference_optimized",
+        inference_moe_token_dispatcher_type="nccl",
+        disable_ep_consensus=interval is None,
+        ep_consensus_interval=interval or 20,
+        use_synchronous_zmq_collectives=synchronous,
+    ) as h:
+        assert h.dp_size == 2
+        runtime, spans, cadence = Counter(), {False: set(), True: set()}, []
+        model = h.engine.controller.inference_wrapped_model.model
+        for module in model.modules():
+            _instrument_nccl_dispatch_runtime(module, runtime)
+        forward, consensus = model.forward, h.engine._ep_establish_consensus
+
+        def observed(*args, **kwargs):
+            real, before = bool(_active_target_ids(h)), runtime["nccl-token-dispatches"]
+            result = forward(*args, **kwargs)
+            if h.engine.use_coordinator:
+                spans[real].update(range(before, runtime["nccl-token-dispatches"]))
+            return result
+
+        async def observed_consensus(work, *args, **kwargs):
+            if work and h.engine._last_ep_consensus[0]:
+                cadence.append(h.engine._ep_consensus_loop_counter)
+            return await consensus(work, *args, **kwargs)
+
+        monkeypatch.setattr(model, "forward", observed)
+        monkeypatch.setattr(h.engine, "_ep_establish_consensus", observed_consensus)
+        direct = await h.direct([4, 5, 6], params)
+        await h.start()
+        [result], owners, local_ids = await h.run_paused_batch([(0, [4, 5, 6], params)])
+        await h.pause()
+        assert local_ids == [(0, 0)] and len(owners) == 1
+        assert result["status"] == direct["status"] == "COMPLETED"
+        assert result["generated_tokens"] == direct["generated_tokens"]
+        assert all(
+            len(r["generated_log_probs"]) == 32
+            and torch.isfinite(torch.tensor(r["generated_log_probs"])).all()
+            for r in (direct, result)
+        )
+        records = [None] * h.dp_size
+        torch.distributed.all_gather_object(records, (spans, runtime, cadence))
+        owner = next(i for i, (s, _, _) in enumerate(records) if s[True])
+        real, idle = records[owner][0][True], records[1 - owner][0]
+        assert real and real <= idle[False] and not idle[True]
+        assert owners[0] == f"mp-coord-{owner}".encode()
+        for _, counters, _ in records:
+            assert counters["nccl-token-dispatches"] == counters["nccl-token-combines"] > 0
+            assert (
+                counters["nccl-combine-before-dispatch"] == counters["nccl-dispatch-inflight"] == 0
+            )
+        calls = records[owner][2]
+        assert (bool(calls) and all(c % interval == 0 for c in calls)) if interval else not calls
+        h.assert_retired()
