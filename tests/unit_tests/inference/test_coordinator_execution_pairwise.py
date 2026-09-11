@@ -38,7 +38,9 @@ async def test_routed_prefill_graph_selection(monkeypatch, all_prefills, distrib
                 ids, padded = _active_target_ids(h), c.padded_batch_dimensions
                 counts = (c.active_token_count, c.num_prefill_requests, c.num_decode_requests)
                 result = replay(ctx, runner, first, *inputs)
-                if any(len(h.engine.get_request(rid).prompt_tokens) == 65 for rid in ids):
+                if h.engine.use_coordinator and any(
+                    len(h.engine.get_request(rid).prompt_tokens) == 65 for rid in ids
+                ):
                     observations.append((padded, counts, inputs[0].shape[0]))
                 return result
 
@@ -50,9 +52,7 @@ async def test_routed_prefill_graph_selection(monkeypatch, all_prefills, distrib
                 for dim, _, physical in observations
             )
             expected = (
-                12
-                if distribution == CudaGraphSizingDistribution.LINEAR
-                else 16 if all_prefills else 8
+                12 if distribution == CudaGraphSizingDistribution.LINEAR else 8 * (1 + all_prefills)
             )
             mixed = any(
                 n == 7 and p and d and dim.token_count == expected
