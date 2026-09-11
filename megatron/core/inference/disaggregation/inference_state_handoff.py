@@ -293,13 +293,17 @@ class InferenceStateHandoffMixin:
         self._pending_kv_imports = pending_imports
         self._handoff_completion_notifications.pop(request_id, None)
         self._reap_quarantined_kv_imports()
-        if (
-            matched
-            and request_id not in self.requests
-            and self.use_coordinator
-            and self.is_mp_coordinator
-        ):
-            self._fail_submission(request_id, sampling_params, asyncio.CancelledError())
+        if matched:
+            self._publish_failed_kv_handoff(request_id, sampling_params, asyncio.CancelledError())
+
+    def _publish_failed_kv_handoff(
+        self, request_id: int, sampling_params: SamplingParams | None, error: BaseException
+    ) -> None:
+        """Publish an unadmitted handoff failure without retaining a batch entry."""
+
+        if request_id not in self.requests and self.use_coordinator and self.is_mp_coordinator:
+            self._fail_submission(request_id, sampling_params, error)
+            # An empty decode batch may never run ordinary failed-request cleanup.
             failed_entry = self.requests.pop(request_id)
             failed_request_id = self.failed_request_ids.pop()
             assert failed_request_id == request_id
@@ -1336,6 +1340,7 @@ class InferenceStateHandoffMixin:
                     )
                 if not pending.future.done():
                     pending.future.set_exception(exc)
+                self._publish_failed_kv_handoff(pending.request_id, pending.sampling_params, exc)
                 logging.exception("DISAGG_DECODE_PULL_FAILED request_id=%d", pending.request_id)
                 if failed:
                     continue
