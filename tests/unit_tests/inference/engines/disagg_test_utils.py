@@ -130,7 +130,7 @@ class ForwardWitness:
         self.request_id = request_id
         self.steps = []
         self.graph_replays = 0
-        self.fa4_calls = 0
+        self.attention_calls = 0
         self.pending_forwards = []
         self._patches = []
 
@@ -151,12 +151,14 @@ class ForwardWitness:
         wrapper = self.engine.controller.inference_wrapped_model
         original_forward = wrapper.run_one_forward_step
         original_replay = torch.cuda.CUDAGraph.replay
-        original_fa4 = attention.flash_attn4_varlen_func
+        version = wrapper.model.config.flash_attention_version
+        kernel = "flash_attn_with_kvcache" if version == 2 else "flash_attn4_varlen_func"
+        original_attention = getattr(attention, kernel)
 
-        def fa4(*args, **kwargs):
+        def native_attention(*args, **kwargs):
             if self._snapshot() is not None:
-                self.fa4_calls += 1
-            return original_fa4(*args, **kwargs)
+                self.attention_calls += 1
+            return original_attention(*args, **kwargs)
 
         def forward(*args, **kwargs):
             snapshot = self._snapshot()
@@ -178,7 +180,7 @@ class ForwardWitness:
         self._patches = [
             mock.patch.object(wrapper, "run_one_forward_step", side_effect=forward),
             mock.patch.object(torch.cuda.CUDAGraph, "replay", replay),
-            mock.patch.object(attention, "flash_attn4_varlen_func", side_effect=fa4),
+            mock.patch.object(attention, kernel, side_effect=native_attention),
         ]
         for patch in self._patches:
             patch.start()
