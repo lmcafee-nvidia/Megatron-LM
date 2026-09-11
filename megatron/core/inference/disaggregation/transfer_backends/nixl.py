@@ -184,7 +184,7 @@ class _NixlAgentContext:
         agent_config = nixl_agent_config(enable_prog_thread=True)
         self.agent_name = agent_name
         self.agent = nixl_agent(agent_name, agent_config)
-        self.known_peers: Dict[str, Any] = {}
+        self.known_peers: Dict[str, tuple[str | None, str]] = {}
         self.ref_count = 0
 
     def acquire(self) -> Any:
@@ -295,7 +295,7 @@ class NixlTransferBackend:
             _shared_context.release()
             raise
 
-        # Peer agent_name -> id returned by add_remote_agent.
+        # Peer agent_name -> (native metadata, resolved agent id), shared by KV/SSM.
         self._known_peers = _shared_context.known_peers
 
         logger.info(
@@ -361,17 +361,26 @@ class NixlTransferBackend:
         return meta
 
     def _ensure_peer_registered(self, peer_meta: Dict[str, Any]) -> str:
-        """Register the peer with NIXL on first use; return its agent id."""
+        """Load changed peer registrations only after their old reads have settled."""
         peer_name = peer_meta["agent_name"]
-        existing = self._known_peers.get(peer_name)
-        if existing is not None:
-            return existing
         metadata_b64 = peer_meta.get("agent_metadata_b64")
         if not metadata_b64:
             raise ValueError(f"peer_meta for {peer_name!r} is missing agent_metadata_b64")
+        existing = self._known_peers.get(peer_name)
+        if existing is not None:
+            if existing[0] == metadata_b64:
+                return existing[1]
+            # A source cannot replace its registrations while handoff pins
+            # remain. Successful RELEASE_KV, not local cancellation, settles
+            # that old-generation ownership before a changed blob arrives.
+            # If native removal fails, retain a non-reusable entry so a retry
+            # cannot mistake the still-registered old peer for a fresh load.
+            self._known_peers[peer_name] = (None, existing[1])
+            self._agent.remove_remote_agent(existing[1])
+            self._known_peers.pop(peer_name)
         peer_id = self._agent.add_remote_agent(base64.b64decode(metadata_b64))
         resolved = peer_id if peer_id else peer_name
-        self._known_peers[peer_name] = resolved
+        self._known_peers[peer_name] = (metadata_b64, resolved)
         logger.info(
             "NixlTransferBackend[%s] registered peer %s", self._agent_context.agent_name, peer_name
         )
@@ -736,7 +745,7 @@ class NixlTransferBackend:
             raise
         return xfer, ctx
 
-    def close(self) -> None:
+    def close(self, *, strict: bool = False) -> None:
         """Release this buffer registration and its reference to the shared agent."""
         if self._agent is None:
             return
@@ -745,10 +754,11 @@ class NixlTransferBackend:
         try:
             agent.deregister_memory(self._reg_handle)
         except Exception:  # noqa: BLE001 - shutdown path
+            if strict:
+                raise
             logger.exception("NixlTransferBackend: deregister_memory failed")
-        finally:
-            self._agent = None
-            self._agent_context = None
-            self._known_peers = {}
-            self._reg_handle = None
-            agent_context.release()
+        self._agent = None
+        self._agent_context = None
+        self._known_peers = {}
+        self._reg_handle = None
+        agent_context.release()
