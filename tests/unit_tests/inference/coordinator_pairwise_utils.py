@@ -221,6 +221,32 @@ class RoutedModel:
         await asyncio.wait_for(self.engine.wait_until(EngineState.RUNNING), timeout=60)
         await self.barrier()
 
+    async def run_paused_batch(self, submissions):
+        """Return replies, actual owners and client-local IDs for an ordered batch."""
+        await self.pause()
+        payload = [None]
+        if self.rank == 0:
+            pending, local_ids = [], []
+            coordinator = self.service.coordinator
+            for client, prompt, params in submissions:
+                request_id, future = self.clients[client].add_request_with_id(
+                    prompt, copy.deepcopy(params)
+                )
+                pending.append(future)
+                local_ids.append((client, request_id))
+                await until(lambda: len(coordinator.request_id_to_rank) == len(pending))
+            owners = dict(coordinator.request_id_to_rank)
+            assert all(
+                coordinator._pending_counts[index] == list(owners.values()).count(identity)
+                for identity, index in coordinator.identity_to_rank_index.items()
+            )
+        await self.unpause()
+        if self.rank == 0:
+            payload[0] = (await asyncio.wait_for(asyncio.gather(*pending), 120), owners, local_ids)
+        await self.barrier()
+        torch.distributed.broadcast_object_list(payload, src=0)
+        return payload[0]
+
     def assert_retired(self):
         assert not self.engine.requests
         assert not self.engine.waiting_request_ids

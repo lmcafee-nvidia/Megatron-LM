@@ -2,8 +2,6 @@
 
 """Real coordinator routing crossed with model topology and feature execution."""
 
-import asyncio
-import copy
 from collections import Counter
 from types import SimpleNamespace
 
@@ -11,12 +9,14 @@ import pytest
 import torch
 
 from megatron.core.transformer.cuda_graphs import _CudagraphReplayNode
-from tests.unit_tests.inference.coordinator_pairwise_utils import greedy_params, routed_model, until
+from tests.unit_tests.inference.coordinator_pairwise_utils import greedy_params, routed_model
 from tests.unit_tests.inference.engines.test_dynamic_engine_async_sched import (
     _instrument_nccl_dispatch_runtime,
     _instrument_parallel_runtime,
     _instrument_scenario_runtime,
 )
+
+pytestmark = [pytest.mark.internal, pytest.mark.asyncio]
 
 
 def _active_target_ids(harness):
@@ -53,27 +53,20 @@ def _install_target_attribution(harness, runtime):
 
 def _assert_every_owner_executed(harness, target, requests_per_client=1):
     target_ids = {key[1] for key in target if isinstance(key, tuple) and key[0] == "request"}
-    assert target["model-forward"] > 0
-    assert target["prefill-forward"] > 0
-    assert target["decode-forward"] > 0
-    assert len(target_ids) == requests_per_client
-
     groups = harness.engine.pg_collection
     record = {
-        "rank": harness.rank,
         "dp": torch.distributed.get_rank(groups.dp),
         "mp": torch.distributed.get_rank(groups.mp),
         "tp": torch.distributed.get_rank(groups.tp),
         "pp": torch.distributed.get_rank(groups.pp),
         "ids": sorted(target_ids),
-        "forwards": target["model-forward"],
+        "steps": [target[key] for key in ("model-forward", "prefill-forward", "decode-forward")],
     }
     records = [None] * torch.distributed.get_world_size()
     torch.distributed.all_gather_object(records, record)
-    if harness.rank != 0:
-        return
-
-    assert all(item["forwards"] > 0 and len(item["ids"]) == requests_per_client for item in records)
+    assert all(
+        min(item["steps"]) > 0 and len(item["ids"]) == requests_per_client for item in records
+    )
     assert {item["dp"] for item in records} == set(range(harness.dp_size))
     routed_ids = set()
     for owner in range(harness.dp_size):
@@ -100,26 +93,18 @@ async def _exercise_all_owners(
     target = _install_target_attribution(harness, runtime)
     if install is not None:
         install(target)
+    expected_ids = [
+        (client, local_id)
+        for client in range(harness.dp_size)
+        for local_id in range(requests_per_client)
+    ]
+    outputs, owners, local_ids = await harness.run_paused_batch(
+        [(client, prompt, params) for client, _ in expected_ids]
+    )
+    assert local_ids == expected_ids
+    assert sorted(Counter(owners.values()).values()) == [requests_per_client] * harness.dp_size
     await harness.pause()
-    pending = []
-    if harness.rank == 0:
-        for client in harness.clients:
-            for expected_id in range(requests_per_client):
-                request_id, future = client.add_request_with_id(prompt, copy.deepcopy(params))
-                assert request_id == expected_id
-                pending.append(future)
-        router = harness.service.coordinator
-        await until(lambda: len(router.request_id_to_rank) == harness.dp_size * requests_per_client)
-        assert router._pending_counts.tolist() == [requests_per_client] * harness.dp_size
-    await harness.barrier()
-    await harness.unpause()
-    if harness.rank == 0:
-        outputs = await asyncio.wait_for(asyncio.gather(*pending), timeout=120)
-    await harness.barrier()
-    await harness.pause()
-    outputs = [outputs if harness.rank == 0 else None]
-    torch.distributed.broadcast_object_list(outputs, src=0)
-    for output in outputs[0]:
+    for output in outputs:
         for key in ("status", "generated_tokens", "prompt_tokens", "generated_text"):
             assert output[key] == direct[key], key
     _assert_every_owner_executed(harness, target, requests_per_client)
@@ -127,8 +112,6 @@ async def _exercise_all_owners(
     return target
 
 
-@pytest.mark.internal
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -187,8 +170,6 @@ async def test_routed_topology_matches_direct_on_every_owner(monkeypatch, overri
                 assert target["tp-collective:reduce_from_tensor_model_parallel_region"] > 0
 
 
-@pytest.mark.internal
-@pytest.mark.asyncio
 async def test_routed_cuda_graph_replays_for_every_target(monkeypatch):
     """Completed routed decode forwards invoke the production CUDA replay node."""
     prompt = list(range(4, 16))
@@ -217,8 +198,6 @@ async def test_routed_cuda_graph_replays_for_every_target(monkeypatch):
         assert target["cuda-graph-replay"] > 0
 
 
-@pytest.mark.internal
-@pytest.mark.asyncio
 async def test_routed_mtp_executes_inner_steps_on_every_target(monkeypatch):
     """Coordinator-owned speculative decoding calls the real inner MTP model step."""
     prompt = list(range(4, 16))
@@ -244,8 +223,6 @@ async def test_routed_mtp_executes_inner_steps_on_every_target(monkeypatch):
         assert int(harness.engine._spec_tokens_proposed_per_pos.sum()) > 0
 
 
-@pytest.mark.internal
-@pytest.mark.asyncio
 @pytest.mark.parametrize("mixer", ["mamba", "gdp", "gdn"])
 async def test_routed_hybrid_updates_owned_recurrent_state(monkeypatch, mixer):
     """Completed target decode updates the target's mapped recurrent state slot."""
@@ -307,8 +284,6 @@ async def test_routed_hybrid_updates_owned_recurrent_state(monkeypatch, mixer):
         assert target["owned-state-updates"] > 0
 
 
-@pytest.mark.internal
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "options,signals,required",
     [
@@ -367,8 +342,6 @@ async def test_routed_model_kernels_match_direct(monkeypatch, options, signals, 
             assert target[counter] > 0, counter
 
 
-@pytest.mark.internal
-@pytest.mark.asyncio
 async def test_routed_moe_participates_in_ep_collectives(monkeypatch):
     """Every coordinator target dispatches and combines through its EP collective."""
     prompt = list(range(4, 16))

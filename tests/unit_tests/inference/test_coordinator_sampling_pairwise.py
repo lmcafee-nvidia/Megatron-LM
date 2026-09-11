@@ -3,14 +3,13 @@
 """Sampling oracles separate deterministic forward results from shared RNG draws."""
 
 import asyncio
-import copy
 from unittest import mock
 
 import flashinfer
 import pytest
 import torch
 
-from tests.unit_tests.inference.coordinator_pairwise_utils import greedy_params, routed_model, until
+from tests.unit_tests.inference.coordinator_pairwise_utils import greedy_params, routed_model
 
 pytestmark = [pytest.mark.internal, pytest.mark.asyncio]
 
@@ -79,25 +78,16 @@ async def test_routed_stochastic_first_step_distribution(
         _, direct_logits, direct_distribution, _ = samples[0]
         samples.clear()
         await h.start()
-        await h.pause()
         # Direct/reference and startup work cannot witness routed joint filtering.
         joint.reset_mock()
-        pending = []
-        if h.rank == 0:
-            pending = [c.add_request(prompt, copy.deepcopy(params)) for c in h.clients]
-            await until(lambda: len(h.service.coordinator.request_id_to_rank) == h.dp_size)
-            assert h.service.coordinator._pending_counts.tolist() == [1] * h.dp_size
-        await h.barrier()
-        await h.unpause()
-        results = []
-        if h.rank == 0:
-            results = await asyncio.wait_for(asyncio.gather(*pending), timeout=60)
-            assert all(len(r["generated_tokens"]) == 1 for r in results)
-            assert all(len(r["generated_log_probs"]) == 1 for r in results)
-        box = [results]
-        torch.distributed.broadcast_object_list(box, src=0)
-        results = box[0]
-        await h.barrier()
+        results, owners, local_ids = await h.run_paused_batch(
+            [(client, prompt, params) for client in range(h.dp_size)]
+        )
+        assert local_ids == [(client, 0) for client in range(h.dp_size)]
+        assert len(set(owners.values())) == h.dp_size
+        assert all(
+            len(r["generated_tokens"]) == len(r["generated_log_probs"]) == 1 for r in results
+        )
         assert len(samples) == 1, "One-token requests sample exactly one distribution"
         ids, logits, distribution, tokens = samples[0]
         assert len(ids) == 1 and ids[0] != 10001
@@ -226,7 +216,9 @@ async def test_routed_bos_stop_after_metadata_compaction(monkeypatch, keep, skip
         top_n_logprobs=3,
         detokenize_stop_sequence=keep,
     )
-    async with routed_model(monkeypatch, sampling_backend="torch", hidden_size=128) as h:
+    async with routed_model(
+        monkeypatch, hidden_size=128, materialize_only_last_token_logits=False
+    ) as h:
         h.tokenizer.bos = 3
         direct = await h.direct([3, 4, 5], params)
         params.stop_words = [h.tokenizer.detokenize(direct["generated_tokens"][:2])]
@@ -242,24 +234,13 @@ async def test_routed_bos_stop_after_metadata_compaction(monkeypatch, keep, skip
         monkeypatch.setattr(sampler, "sample_kernel", observe)
         await h.start()
         samples.clear()
-        await h.pause()
-        payload = [None]
-        if h.rank == 0:
-            pending = []
-            short = greedy_params(num_tokens_to_generate=1, top_k=4, temperature=0.7)
-            for choice in (short, short, params):
-                pending.append(h.clients[0].add_request("4 5", choice))
-                await until(lambda: len(h.service.coordinator.request_id_to_rank) == len(pending))
-            owners = dict(h.service.coordinator.request_id_to_rank)
-        await h.unpause()
-        if h.rank == 0:
-            payload[0] = (await asyncio.wait_for(asyncio.gather(*pending), 60), owners)
-        await h.barrier()
-        torch.distributed.broadcast_object_list(payload, src=0)
-        (short, filler, target), owners = payload[0]
+        short = greedy_params(num_tokens_to_generate=1, top_k=4, temperature=0.7)
+        (short, filler, target), owners, _ = await h.run_paused_batch(
+            [(0, "4 5", choice) for choice in (short, short, params)]
+        )
         first, other, last = (result["request_id"] for result in (short, filler, target))
         assert owners[first] == owners[last] != owners[other]
-        assert target["status"] == "COMPLETED" and target["prompt_tokens"] == [3, 4, 5]
+        assert target["status"] == "COMPLETED" and target["prompt_tokens"][1] == [3, 4, 5]
         assert target["generated_tokens"] == direct["generated_tokens"][:2] * keep
         for key in ("generated_log_probs", "generated_top_n_logprobs"):
             assert len(target[key]) == 2 * keep

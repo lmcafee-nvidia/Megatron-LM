@@ -28,8 +28,8 @@ async def test_routed_chunk_partition_beside_decode(monkeypatch):
         await h.start()
         parts = []
         target = [None, None]
-        model = h.engine.controller.inference_wrapped_model.model
-        forward = model.forward
+        controller = h.engine.controller
+        forward = controller._dynamic_step_forward_logits
 
         def observe(*args, **kwargs):
             c = h.engine.context
@@ -44,7 +44,7 @@ async def test_routed_chunk_partition_beside_decode(monkeypatch):
             parts.extend(snapshot)
             return result
 
-        monkeypatch.setattr(model, "forward", observe)
+        monkeypatch.setattr(controller, "_dynamic_step_forward_logits", observe)
         await h.pause()
         if h.rank == 0:
             _, decode_owner, a = await _submit_paused(h, [4, 5, 6, 7], params)
