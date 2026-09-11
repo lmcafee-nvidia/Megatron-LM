@@ -281,17 +281,10 @@ def _assert_target_variation_witnesses(witnesses):
         loads = witness["expert_loads"]
         assert max(loads) > min(loads), f"expert load is not unequal: {loads}"
 
+    by_layout = {(w["hidden_shape"][0], w["position"]): w for w in witnesses}
+    assert len(by_layout) == len(witnesses) == 6
     for physical_rows in (64, 128, 256):
-        front = next(
-            w
-            for w in witnesses
-            if w["hidden_shape"][0] == physical_rows and w["position"] == "front"
-        )
-        back = next(
-            w
-            for w in witnesses
-            if w["hidden_shape"][0] == physical_rows and w["position"] == "back"
-        )
+        front, back = (by_layout[physical_rows, position] for position in ("front", "back"))
         assert front["target_rows"] == tuple(range(8))
         assert back["target_rows"] == tuple(range(physical_rows - 8, physical_rows))
 
@@ -304,8 +297,6 @@ class TestVllmFusedMoeBatchInvariance:
 
         from megatron.core.inference.moe import ActivationType
         from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-            disable_batch_invariant_mode,
-            enable_batch_invariant_mode,
             get_batch_invariant_backend,
             get_batch_invariant_collective,
             is_batch_invariant_mode_enabled,
@@ -351,8 +342,7 @@ class TestVllmFusedMoeBatchInvariance:
         # the dynamic model tests; the registration test below is separate.
         backend = "triton"
         assert not is_batch_invariant_mode_enabled(), "backend state leaked from another row"
-        enable_batch_invariant_mode(backend=backend, collective="ordered")
-        try:
+        with set_batch_invariant_mode(True, backend=backend):
             assert get_batch_invariant_backend() == backend
             assert get_batch_invariant_collective() == "ordered"
             torch.manual_seed(11)
@@ -380,16 +370,9 @@ class TestVllmFusedMoeBatchInvariance:
             # preserving two distinct experts for every co-batch row.
             second_expert = torch.where(first_expert == 0, 1, 0)
             cobatch_routing = torch.stack((first_expert, second_expert), dim=1).long()
-            fc1 = (
-                torch.randn(
-                    num_experts, fc1_width, hidden_size, device="cuda", dtype=torch.bfloat16
-                )
-                * 0.02
-            )
-            fc2 = (
-                torch.randn(num_experts, hidden_size, ffn, device="cuda", dtype=torch.bfloat16)
-                * 0.02
-            )
+            weight_options = dict(device="cuda", dtype=torch.bfloat16)
+            fc1 = torch.randn(num_experts, fc1_width, hidden_size, **weight_options) * 0.02
+            fc2 = torch.randn(num_experts, hidden_size, ffn, **weight_options) * 0.02
 
             for physical_rows in (64, 128, 256):
                 cobatch_count = physical_rows - target_count
@@ -401,18 +384,17 @@ class TestVllmFusedMoeBatchInvariance:
                 co_routing = cobatch_routing[:cobatch_count].index_select(0, permutation)
 
                 for position in ("front", "back"):
-                    if position == "front":
-                        hidden = torch.cat((target_hidden, co_hidden))
-                        probs = torch.cat((target_probs, co_probs))
-                        routing = torch.cat((target_routing, co_routing))
-                        target_rows = torch.arange(target_count, device="cuda")
-                    else:
-                        hidden = torch.cat((co_hidden, target_hidden))
-                        probs = torch.cat((co_probs, target_probs))
-                        routing = torch.cat((co_routing, target_routing))
-                        target_rows = torch.arange(
-                            physical_rows - target_count, physical_rows, device="cuda"
+                    hidden, probs, routing = (
+                        torch.cat(
+                            (target, neighbors) if position == "front" else (neighbors, target)
                         )
+                        for target, neighbors in zip(
+                            (target_hidden, target_probs, target_routing),
+                            (co_hidden, co_probs, co_routing),
+                        )
+                    )
+                    start = 0 if position == "front" else physical_rows - target_count
+                    target_rows = torch.arange(start, start + target_count, device="cuda")
 
                     assert hidden.shape == (physical_rows, hidden_size)
                     assert routing.shape == (physical_rows, topk)
@@ -479,9 +461,6 @@ class TestVllmFusedMoeBatchInvariance:
                     }
                     witnesses.append(witness)
                     print("batch_invariant_moe_witness", witness)
-        finally:
-            disable_batch_invariant_mode()
-
         reference = target_outputs[0]
         assert reference.abs().max() > 0, "target oracle received only zero expert outputs"
         for target_output in target_outputs[1:]:
@@ -492,27 +471,13 @@ class TestVllmFusedMoeBatchInvariance:
         # Causal false-green controls: mutating the real execution witnesses
         # to hide physical or routing variation must trip the corresponding
         # oracle while leaving the target-output oracle untouched.
-        fixed_shape = [
-            {
-                **witness,
-                "hidden_shape": witnesses[0]["hidden_shape"],
-                "routing_shape": witnesses[0]["routing_shape"],
-            }
-            for witness in witnesses
-        ]
-        with pytest.raises(AssertionError, match="physical shape witness"):
-            _assert_target_variation_witnesses(fixed_shape)
-
-        fixed_routing = [
-            {
-                **witness,
-                "expert_loads": witnesses[0]["expert_loads"],
-                "target_segment_offsets": witnesses[0]["target_segment_offsets"],
-            }
-            for witness in witnesses
-        ]
-        with pytest.raises(AssertionError, match="routing/load witness"):
-            _assert_target_variation_witnesses(fixed_routing)
+        for fields, message in (
+            (("hidden_shape", "routing_shape"), "physical shape witness"),
+            (("expert_loads", "target_segment_offsets"), "routing/load witness"),
+        ):
+            frozen = {name: witnesses[0][name] for name in fields}
+            with pytest.raises(AssertionError, match=message):
+                _assert_target_variation_witnesses([{**w, **frozen} for w in witnesses])
 
 
 # ---------------------------------------------------------------------------
