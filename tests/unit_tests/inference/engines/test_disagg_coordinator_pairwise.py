@@ -51,13 +51,8 @@ def coordinator_world():
 async def _async_barrier(group, timeout=180):
     """Synchronize without starving a local engine task."""
     work = dist.barrier(group=group, async_op=True)
-
-    async def poll():
-        while not work.is_completed():
-            await asyncio.sleep(0.01)
-        work.wait()
-
-    await asyncio.wait_for(poll(), timeout=timeout)
+    await _wait_for(work.is_completed, timeout)
+    work.wait()
 
 
 async def _wait_for(predicate, timeout=60):

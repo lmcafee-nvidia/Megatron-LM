@@ -31,12 +31,15 @@ from tests.unit_tests.test_utilities import Utils
 
 @contextmanager
 def sampled_distributions(engine, records, params):
+    assert not engine.controller._enable_cuda_graph
     sampler = engine.controller._sampling
     original = sampler.sample_kernel
 
     def observe(logits, n, context, **kwargs):
         assert n == 1, "This fixed-history oracle deliberately owns one sampled request"
         indices = kwargs.get("gather_indices")
+        assert (indices is None) == context.config.materialize_only_last_token_logits
+        assert logits.shape[0] == (n if indices is None else context.padded_active_token_count)
         selected = logits[:n] if indices is None else logits[indices[:n]]
         raw = selected.detach().float().cpu().clone()
         output = original(logits, n, context, **kwargs)
@@ -60,7 +63,11 @@ def sampled_distributions(engine, records, params):
 )
 @torch.inference_mode()
 def test_handoff_stochastic_fixed_history(transport_world, backend, filters):
-    config = disagg_config(sampling_backend=backend, offset_sampling_seed_by_dp_rank=False)
+    config = disagg_config(
+        sampling_backend=backend,
+        offset_sampling_seed_by_dp_rank=False,
+        materialize_only_last_token_logits=filters.get("top_k") != 4,
+    )
     sampler_type = TorchSampling if backend == "torch" else FlashInferSampling
     tokens = prompt(33)
 

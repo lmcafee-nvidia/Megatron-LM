@@ -74,11 +74,7 @@ def transport_world():
         pytest.param(
             "nccl",
             33,
-            {
-                "num_cuda_graphs": 2,
-                "force_build_cuda_graphs": True,
-                "cuda_graph_all_prefills": True,
-            },
+            {"num_cuda_graphs": 2, "force_build_cuda_graphs": True},
             7,
             id="decode-graph",
         ),
