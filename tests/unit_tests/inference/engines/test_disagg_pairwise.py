@@ -64,7 +64,12 @@ def transport_world():
         pytest.param(
             "nccl",
             129,
-            {"enable_chunked_prefill": True, "context_max_tokens": 64},
+            {
+                "enable_chunked_prefill": True,
+                "context_max_tokens": 64,
+                "num_cuda_graphs": 2,
+                "force_build_cuda_graphs": True,
+            },
             7,
             id="chunked-prefill",
         ),
@@ -137,14 +142,16 @@ def test_disagg_real_engine_parity(mixer, rope, transport_world, backend, length
                 if chunked:
                     mixed_offsets = {step[0] for step in witness.steps if 102 in step[3]}
                     assert len(mixed_offsets) >= 3
+                    assert all(102 in step[3] for step in witness.steps)
                 with pytest.raises(RuntimeError, match="handoff state remains pinned"):
                     engine.reset()
             transferred = exchange((metadata, state) if source else None, transport_world)
             if not source:
                 metadata, state = transferred
-            pending, future = complete_transfer(
-                engine, metadata, tokens, sampling(count), transport_world
-            )
+            params = sampling(count)
+            if count == 1:
+                params.num_tokens_to_generate, params.num_tokens_total = None, length + count
+            pending, future = complete_transfer(engine, metadata, tokens, params, transport_world)
             if not source:
                 assert_import_equal(engine, pending, state, length)
                 if length == 32:
@@ -180,6 +187,8 @@ def test_disagg_real_engine_parity(mixer, rope, transport_world, backend, length
                     result = future.result().merge()
                     assert not witness.steps
                 assert result.generated_tokens == expected
+                assert result.sampling_params.num_tokens_to_generate == count
+                assert result.sampling_params.num_tokens_total is None
                 assert result.num_cached_tokens == length
                 if neighbor is None:
                     assert_released(engine)
