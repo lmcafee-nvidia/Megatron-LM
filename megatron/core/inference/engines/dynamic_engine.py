@@ -2175,14 +2175,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Additionally, chunked prefill request do not finish.
                 active_request_ids.append(request_id)
 
-            # When a stop word was found mid-speculative-batch, trim log probs
-            # and top_n_logprobs to match the truncated generated_tokens.
-            if num_stop_word_trim > 0:
-                if request_log_probs is not None:
-                    request_log_probs = request_log_probs[:-num_stop_word_trim]
-                if top_n_logprobs is not None and req_idx in top_n_logprobs:
-                    top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_stop_word_trim]
-
             # Process requested log_probs (unified for both regular and chunked prefill)
             # Skip for requests being finished due to stop words — tokens are not
             # appended for these requests, so log probs must also be skipped to keep
@@ -2264,6 +2256,15 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.prompt_top_n_logprobs.append(logit_dict)
                     else:
                         request.generated_top_n_logprobs.append(logit_dict)
+
+            # A stop sequence can span forwards. Retain prompt metadata and trim
+            # the complete generated suffix, including scores from earlier steps.
+            if num_stop_word_trim > 0:
+                retained = len(request.generated_tokens)
+                if request.generated_log_probs is not None:
+                    request.generated_log_probs = request.generated_log_probs[:retained]
+                if request.generated_top_n_logprobs is not None:
+                    request.generated_top_n_logprobs = request.generated_top_n_logprobs[:retained]
 
         # Handle evicted requests.
         if evict_request_ids is not None and evict_request_ids.numel() > 0:
