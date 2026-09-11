@@ -751,14 +751,18 @@ class NixlTransferBackend:
             return
         agent = self._agent
         agent_context = self._agent_context
+        retired = False
         try:
             agent.deregister_memory(self._reg_handle)
+            retired = True
         except Exception:  # noqa: BLE001 - shutdown path
             if strict:
                 raise
             logger.exception("NixlTransferBackend: deregister_memory failed")
-        self._agent = None
-        self._agent_context = None
-        self._known_peers = {}
-        self._reg_handle = None
-        agent_context.release()
+        finally:
+            if retired or not strict:
+                self._agent = None
+                self._agent_context = None
+                self._known_peers = {}
+                self._reg_handle = None
+                agent_context.release()
