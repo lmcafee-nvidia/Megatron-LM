@@ -5,6 +5,7 @@
 import asyncio
 import time
 from contextlib import ExitStack, contextmanager
+from copy import deepcopy
 from pathlib import Path
 from unittest import mock
 
@@ -14,6 +15,7 @@ import torch.distributed as dist
 import zmq
 
 from megatron.core import dist_checkpointing
+from megatron.core.inference.disaggregation.utils import transfer_peer_records
 from tests.unit_tests.inference.engines.disagg_test_utils import (
     ForwardWitness,
     _enqueue_decode_handoff,
@@ -140,7 +142,7 @@ def assert_logical_import(engine, pending, full, prompt_length):
         assert torch.equal(actual, full[:, layers, index, :count, heads])
 
 
-def admit_model_group(engine):
+def admit_model_group(engine, failed=False):
     engine._report_completed_kv_imports()
     tracker = engine._handoff_completion_tracker
     if tracker.world_size == 1:
@@ -153,15 +155,16 @@ def admit_model_group(engine):
     notifications = []
     if tracker.is_coordinator:
         deadline = time.monotonic() + 10
-        while not notifications and time.monotonic() < deadline:
-            notifications = tracker.drain_completed()
-        assert notifications == [(101, False)]
+        while (not notifications or tracker._reports) and time.monotonic() < deadline:
+            notifications.extend(tracker.drain_completed())
+        assert notifications == [(101, failed)]
+        assert not tracker._reports
     src_rank = dist.get_process_group_ranks(engine.pg_collection.mp)[0]
     payload = [notifications]
     dist.broadcast_object_list(payload, src=src_rank, group=engine.pg_collection.mp)
     for request_id, failed in payload[0]:
         engine._record_handoff_completion_notification(request_id, failed)
-    assert engine._admit_pending_kv_imports() == 1
+    assert engine._admit_pending_kv_imports() == int(not failed)
     assert not engine._pending_kv_imports
     assert not engine.waiting_request_ids
 
@@ -178,6 +181,7 @@ def admit_model_group(engine):
         ("nccl", 2, 1, 2, 1, "local"),
         ("nccl", 2, 1, 2, 1, "inference_optimized"),
         ("nccl", 2, 1, 1, 1, "transformer_engine", "hybrid"),
+        ("nixl", 2, 1, 2, 1, "transformer_engine", "gpt", True),
     ],
     ids=[
         "tp2-to-tp1",
@@ -189,6 +193,7 @@ def admit_model_group(engine):
         "local-tp2",
         "inference-optimized-tp2",
         "hybrid-tp2-to-tp1",
+        "native-prepare-failure-tp2",
     ],
 )
 @torch.inference_mode()
@@ -203,6 +208,7 @@ def test_real_model_heterogeneous_handoff(tmp_path, case):
     backend, source_tp, source_pp, decode_tp, decode_pp, *implementation = case
     transformer_impl = implementation[0] if implementation else "transformer_engine"
     model_provider = implementation[1] if len(implementation) > 1 else "gpt"
+    failure = len(implementation) > 2
     Utils.initialize_model_parallel(source_tp, source_pp)
     control = dist.new_group(backend="gloo")
     rank = dist.get_rank()
@@ -280,9 +286,32 @@ def test_real_model_heterogeneous_handoff(tmp_path, case):
                 decode_engine._setup_handoff_completion_tracking(hostname="127.0.0.1")
                 pending = future = None
                 mixer_seen = True
+                native_failure_seen = True
                 if rank in chosen_decode:
-                    future = _enqueue_decode_handoff(decode_engine, handoff, tokens, sampling())
+                    bad_peer = failure and rank == chosen_decode[0]
+                    if bad_peer:
+                        handoff = deepcopy(handoff)
+                        for meta, _ in transfer_peer_records(handoff["kv_meta"], block_ids):
+                            meta["base_addr"] = 0
+                    with ExitStack() as stack:
+                        if failure:
+                            agent = decode_engine._kv_transfer_agent._agent
+                            prepare = stack.enter_context(
+                                mock.patch.object(
+                                    agent, "initialize_xfer", wraps=agent.initialize_xfer
+                                )
+                            )
+                            post = stack.enter_context(
+                                mock.patch.object(agent, "transfer", wraps=agent.transfer)
+                            )
+                        future = _enqueue_decode_handoff(decode_engine, handoff, tokens, sampling())
                     pending = decode_engine._pending_kv_imports[0]
+                    if failure:
+                        native_failure_seen = prepare.call_count > 0 and (
+                            (pending.local_error is not None and post.call_count == 0)
+                            if bad_peer
+                            else (pending.local_error is None and post.call_count > 0)
+                        )
                 peers = gather(
                     decode_peer_meta(decode_engine, pending) if pending is not None else None,
                     control,
@@ -294,7 +323,18 @@ def test_real_model_heterogeneous_handoff(tmp_path, case):
                             handle.wait()
                             assert handle.poll()
                     assert source_engine._poll_pending_kv_pushes() == 1
-                if rank in chosen_decode:
+                if failure and rank in chosen_decode:
+                    for handle in decode_engine._pending_transfer_handles(pending):
+                        handle.wait()
+                        assert handle.poll()
+                    if not bad_peer:
+                        assert_logical_import(decode_engine, pending, full, len(tokens))
+                    admit_model_group(decode_engine, failed=True)
+                    assert future.done() and isinstance(future.exception(), RuntimeError)
+                    assert not decode_engine.context.total_request_count
+                    assert not decode_engine._quarantined_kv_imports
+                    assert_released(decode_engine)
+                if rank in chosen_decode and not failure:
                     for handle in decode_engine._pending_transfer_handles(pending):
                         handle.wait()
                         assert handle.poll()
@@ -342,6 +382,7 @@ def test_real_model_heterogeneous_handoff(tmp_path, case):
                     socket.close(linger=0)
                 decode_engine.zmq_context.term()
                 assert all(gather(mixer_seen, control))
+                assert all(gather(native_failure_seen, control))
     finally:
         dist.destroy_process_group(control)
         Utils.destroy_model_parallel()
