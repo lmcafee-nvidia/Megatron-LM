@@ -202,11 +202,11 @@ async def test_live_coordinator_batch_invariance_and_output_contracts(policy):
                 ), [(s["logical"], s["physical"], s["requests"]) for s in joint_witness.steps]
                 pair = (None, baseline_witness), (None, joint_witness)
                 bi.assert_same_target(*pair, require_trajectory=False)
-                saved = joint_witness.steps[0]["logits"][0].clone()
-                joint_witness.steps[0]["logits"][0, 0] += 1
+                saved = joint_witness.steps[0]["logits"]
+                joint_witness.steps[0]["logits"] = saved + 1
                 with pytest.raises(AssertionError, match="target logits changed"):
                     bi.assert_same_target(*pair, require_trajectory=False)
-                joint_witness.steps[0]["logits"][0] = saved
+                joint_witness.steps[0]["logits"] = saved
         finally:
             await cleanup_engine(engine, client, timeout=30)
             if rank == 0:
