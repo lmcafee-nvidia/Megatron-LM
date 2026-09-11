@@ -31,7 +31,7 @@ from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from tests.unit_tests.inference.coordinator_pairwise_utils import greedy_params, routed_model, until
+from tests.unit_tests.inference.coordinator_pairwise_utils import greedy_params, routed_model
 
 
 def _install_vlm(h, monkeypatch, dynamic, allow_stale):
@@ -149,13 +149,16 @@ def _install_vlm(h, monkeypatch, dynamic, allow_stale):
 @pytest.mark.internal
 @pytest.mark.asyncio
 @pytest.mark.parametrize("policy", list(MediaCacheCoordinatorPolicy))
-@pytest.mark.parametrize("dynamic", [False, True], ids=["clip", "radio-dynamic"])
+@pytest.mark.parametrize(
+    "dynamic", [False, True, "video"], ids=["clip", "radio-dynamic", "radio-video"]
+)
 @pytest.mark.parametrize("allow_stale", [False, True], ids=["invalidate", "retain"])
 async def test_routed_media_affinity_uses_real_cached_embeddings(
     monkeypatch, policy, dynamic, allow_stale
 ):
     prompt = [*range(4, 20), 99, 20, 21]
     params = greedy_params(return_prompt_tokens=True)
+    modality = "video" if dynamic == "video" else "image"
     if dynamic:
         pixels = torch.arange(32 * 48 * 3).remainder(251).byte().reshape(32, 48, 3)
         image_config = ImageProcessingConfig(
@@ -168,7 +171,14 @@ async def test_routed_media_affinity_uses_real_cached_embeddings(
 
         def raw_media(values):
             imgs, imgs_sizes = preprocess_image(Image.fromarray(values.numpy()), image_config)
-            return {"imgs": imgs, "imgs_sizes": imgs_sizes}
+            media = {"imgs": imgs, "imgs_sizes": imgs_sizes}
+            if dynamic == "video":
+                media.update(
+                    imgs=torch.cat((imgs, imgs.flip(1)), dim=1),
+                    imgs_sizes=imgs_sizes.repeat(2, 1),
+                    num_frames=torch.tensor([2]),
+                )
+            return media
 
         image_a = raw_media(pixels)
         image_b = raw_media(pixels.flip(1).contiguous())
@@ -190,7 +200,7 @@ async def test_routed_media_affinity_uses_real_cached_embeddings(
         },
     ) as h:
         assert h.dp_size == 2, "This owner-selection schedule is a two-replica row"
-        admissions = _install_vlm(h, monkeypatch, dynamic, allow_stale)
+        admissions = _install_vlm(h, monkeypatch, bool(dynamic), allow_stale)
         references = []
         for media in (image_a, image_b):
             future = h.engine.add_request(10001, prompt, copy.deepcopy(params), **media)
@@ -200,20 +210,10 @@ async def test_routed_media_affinity_uses_real_cached_embeddings(
             h.engine.reset()
         admissions.clear()
         await h.start()
-        await h.pause()
-        if h.rank == 0:
-            text = h.clients[0].add_request([4, 5, 6], copy.deepcopy(params))
-            await until(lambda: len(h.service.coordinator.request_id_to_rank) == 1)
-            warm = h.clients[1].add_request(
-                prompt, copy.deepcopy(params), multi_modal_data={"image": image_a}
-            )
-            await until(lambda: len(h.service.coordinator.request_id_to_rank) == 2)
-        await h.barrier()
-        await h.unpause()
-        if h.rank == 0:
-            _, result = await asyncio.wait_for(asyncio.gather(text, warm), timeout=60)
-            assert result["generated_tokens"] == references[0]
-        await h.barrier()
+        submissions = [(0, [4, 5, 6], params), (1, prompt, params, {modality: image_a})]
+        outputs, _, local_ids = await h.run_paused_batch(submissions)
+        assert local_ids == [(0, 0), (1, 0)]
+        assert outputs[1]["generated_tokens"] == references[0]
         cache_before = {
             key: embedding.detach().cpu().clone()
             for key, embedding in h.engine._vision_embedding_cache.items()
@@ -243,7 +243,7 @@ async def test_routed_media_affinity_uses_real_cached_embeddings(
             for media, expected in zip((image_a, image_b), references):
                 result = await asyncio.wait_for(
                     h.clients[0].add_request(
-                        prompt, copy.deepcopy(params), multi_modal_data={"image": media}
+                        prompt, copy.deepcopy(params), multi_modal_data={modality: media}
                     ),
                     timeout=60,
                 )
@@ -290,7 +290,7 @@ async def test_routed_media_affinity_uses_real_cached_embeddings(
             0 if allow_stale and policy == MediaCacheCoordinatorPolicy.AFFINITY else 1,
             1,
         )
-        expected_positions = 6 if dynamic else 4
+        expected_positions = 12 if dynamic == "video" else 6 if dynamic else 4
         for request_id, count in zip(targets, expected_calls):
             assert by_id[request_id][3] == by_id[request_id][4] == count
             assert any(
