@@ -53,6 +53,8 @@ def test_nonpersist_suspend_rejects_owned_source_state(
     with dtu.real_engine(config, role="prefill" if source else "decode", backend=backend) as engine:
         engine.controller.tokenizer.tokenize = NullTokenizer(config.vocab_size).text_to_ids
         engine.controller.tokenizer.bos = None
+        engine.suspend()
+        engine.resume()
         metadata = state = guard = publication = None
         if source:
             request = dtu.run_to_completion(
