@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Dict
 
 import torch
 
+from megatron.core.inference.config import KVCacheManagementMode
 from megatron.core.inference.disaggregation.decode_admission import (
     additional_decode_blocks,
     admit_prefilled_decode,
@@ -33,6 +34,7 @@ from megatron.core.inference.disaggregation.utils import (
     drop_transfer_prefix_blocks,
     transfer_block_count,
 )
+from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.inference_request import (
     DynamicInferenceEvent,
     DynamicInferenceEventType,
@@ -79,6 +81,19 @@ class InferenceStateHandoffMixin:
         self._handoff_completion_notifications: dict[int, bool] = {}  # Request ID -> failed.
         self._pending_kv_pushes: list = []
         self._kv_transfer_role: str | None = None
+
+    def suspend(self) -> None:
+        """Reject destructive suspend while a handoff still owns source state."""
+
+        if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
+            return
+        if self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST and (
+            self._pinned_handoff_blocks or self._pinned_handoff_ssm_slots
+        ):
+            raise RuntimeError(
+                "Cannot suspend while handoff state remains pinned; wait for RELEASE_KV"
+            )
+        super().suspend()
 
     def _setup_handoff_completion_tracking(self, hostname: str | None = None) -> None:
         """Create the CPU path used to aggregate model-parallel transfer completion."""
