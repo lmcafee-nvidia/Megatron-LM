@@ -168,8 +168,6 @@ def test_disagg_real_engine_parity(mixer, transport_world, backend, length, chan
                     assert witness.steps[0][0] == length
                     if changes.get("force_build_cuda_graphs"):
                         assert witness.graph_replays > 0
-                    if config.flash_attention_version in (2, 4):
-                        assert witness.attention_calls > 0
                     if neighbor is not None:
                         assert any(102 in step[3] for step in witness.pending_forwards)
                 else:
@@ -192,3 +190,5 @@ def test_disagg_real_engine_parity(mixer, transport_world, backend, length, chan
                 engine.release_handoff_blocks(101)
                 engine.release_handoff_blocks(101)
                 assert_released(engine)
+            if not source and config.flash_attention_version in (2, 4):
+                assert witness.attention_calls > 0
