@@ -82,7 +82,6 @@ def test_ssm_slot_pressure_defers_real_handoffs(mixer, transport_world, monkeypa
                         result = du.run_to_completion(engine, futures[index])
                     assert result.generated_tokens == expected and mixer.call_count > 0
                     assert witness.steps and all(not step[2] for step in witness.steps)
-                    assert all(torch.all(value[:, held[1:]] == 7.25) for value in states.values())
                 else:
                     assert engine._poll_pending_kv_pushes() == 1
                     engine.release_handoff_blocks(rid)
@@ -90,6 +89,7 @@ def test_ssm_slot_pressure_defers_real_handoffs(mixer, transport_world, monkeypa
             if not source:
                 for slot in held[1:]:
                     slots.free_slot(int(slot))
+                assert all(torch.all(value[:, held[1:]] == 7.25) for value in states.values())
             assert slots.mamba_state_free_slot_count == slots.max_requests
             assert sorted(slots.mamba_state_free_slots.tolist()) == list(range(slots.max_requests))
             du.assert_released(engine)
