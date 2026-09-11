@@ -220,6 +220,7 @@ class ForwardWitness:
         self.engine = engine
         self.model_config = engine.controller.inference_wrapped_model.model.config
         self.steps = []
+        self.dummy_steps = []
         self.current = None
         self.sample_steps = []
         self.async_overlaps = []
@@ -232,7 +233,7 @@ class ForwardWitness:
 
         def target_is_active():
             active = ctx.request_ids[ctx.paused_request_count : ctx.total_request_count]
-            return bool((active == TARGET).any())
+            return TARGET in engine.requests and bool((active == TARGET).any())
 
         def forward(input_ids, position_ids):
             n = ctx.active_token_count
@@ -240,7 +241,12 @@ class ForwardWitness:
             ids = ctx.request_ids[req_idxs]
             rows = (ids == TARGET).nonzero().flatten()
             self.current = None
-            if rows.numel() and not ctx.is_creating_cuda_graphs:
+            dummy = ctx._bookkeeping_no_real_work and not ctx.is_creating_cuda_graphs
+            if (
+                rows.numel()
+                and TARGET in engine.requests
+                and not (dummy or ctx.is_creating_cuda_graphs)
+            ):
                 request_idx = int(req_idxs[rows[0]])
                 self.current = dict(
                     positions=position_ids[0, rows].clone(),
@@ -268,9 +274,15 @@ class ForwardWitness:
                     },
                     target_row=int(rows[0]),
                 )
+            elif dummy:
+                self.current = dict(
+                    physical=input_ids.shape[1], attention=[], gemms=[], rope=[], sinks=[], mla=[]
+                )
             try:
                 result = original(input_ids, position_ids)
-                if self.current is not None:
+                if dummy:
+                    self.dummy_steps.append(self.current)
+                elif self.current is not None:
                     getattr(engine, "_bi_after_forward", lambda: None)()
                     if ctx.config.materialize_only_last_token_logits:
                         mapped = ctx.active_logit_idxs[: ctx.num_last_token_logits].long()
@@ -389,7 +401,7 @@ class ForwardWitness:
 
         def graph_replay(graph):
             result = replay(graph)
-            if self.current is not None:
+            if self.current is not None and "replay" in self.current:
                 self.current["replay"] += 1
                 if graph in self.captures:
                     if self.captures[graph]["attention"]:

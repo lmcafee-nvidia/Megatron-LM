@@ -85,8 +85,9 @@ def _headers(observer, request_id):
     ],
 )
 async def test_live_coordinator_batch_invariance_and_output_contracts(policy, progress):
+    synchronous, disabled, interval = progress or (False, False, 1)
     model = {}
-    if progress is not None:
+    if progress is not None and not disabled:
         model = dict(
             expert_model_parallel_size=2,
             num_moe_experts=4,
@@ -110,7 +111,6 @@ async def test_live_coordinator_batch_invariance_and_output_contracts(policy, pr
         ),
     )
     if progress is not None:
-        synchronous, disabled, interval = progress
         case.context.update(
             use_synchronous_zmq_collectives=synchronous,
             disable_ep_consensus=disabled,
@@ -173,20 +173,30 @@ async def test_live_coordinator_batch_invariance_and_output_contracts(policy, pr
 
                         def collective(*args, fn=original, name=name, tensor=tensor, **kwargs):
                             result = fn(*args, **kwargs)
-                            target = 2 in ctx.request_ids[: ctx.total_request_count]
+                            target = 2 in engine.requests and not ctx._bookkeeping_no_real_work
+                            target = target and 2 in ctx.request_ids[: ctx.total_request_count]
                             counter = engine._ep_consensus_loop_counter
-                            ep_calls.append((name, counter, target, args[tensor].shape[0]))
+                            real = ctx.gpu_view.real_token_count.clone()
+                            routing = args[4].clone() if tensor == 3 else None
+                            ep_calls.append(
+                                (name, counter, target, args[tensor].shape[0], real, routing)
+                            )
                             return result
 
                         patch.setattr(module, name, collective)
-                    consensus = engine.expert_parallel_zmq_communicator.all_reduce_max
+                    communicator, name = (
+                        (engine, "_ep_establish_consensus")
+                        if disabled
+                        else (engine.expert_parallel_zmq_communicator, "all_reduce_max")
+                    )
+                    consensus = getattr(communicator, name)
 
                     async def reduce(*args, **kwargs):
                         result = await consensus(*args, **kwargs)
-                        ep_sync.append((engine._ep_consensus_loop_counter, kwargs["async_op"]))
+                        ep_sync.append((engine._ep_consensus_loop_counter, kwargs))
                         return result
 
-                    patch.setattr(engine.expert_parallel_zmq_communicator, "all_reduce_max", reduce)
+                    patch.setattr(communicator, name, reduce)
                 admitted = []
                 admitted_events = {request_id: asyncio.Event() for request_id in (2, 3, 67)}
                 original_add = engine.add_request
@@ -229,23 +239,36 @@ async def test_live_coordinator_batch_invariance_and_output_contracts(policy, pr
                 if rank == 0:
                     client.pause_engines()
                 await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), 30)
+                ep_calls = [
+                    tuple(value.cpu() if torch.is_tensor(value) else value for value in call)
+                    for call in ep_calls
+                ]
                 all_ep = [None, None]
                 torch.distributed.all_gather_object(all_ep, (ep_calls, ep_sync))
+                if disabled:
+                    assert not ep_calls and not ep_sync
+                    assert any(
+                        s["physical"] == 64 and s["attention"] and s["gemms"]
+                        for s in joint_witness.dummy_steps
+                    ), "missing actual disabled-consensus dummy model"
                 wide = [
                     (i, call)
                     for i, call in enumerate(all_ep[owner][0])
-                    if call[2] and call[3] == 128
+                    if call[2] and call[3] == 128 and call[4] == 65
                 ]
-                assert {call[0] for _, call in wide} == {
-                    "multimem_all_gatherv_3tensor",
-                    "ordered_reduce_scatter_v",
-                }
+                assert {call[0] for _, call in wide} == (
+                    set()
+                    if disabled
+                    else {"multimem_all_gatherv_3tensor", "ordered_reduce_scatter_v"}
+                )
                 for index, call in wide:
                     peer = all_ep[owner ^ 1][0][index]
-                    assert peer[0] == call[0] and not peer[2] and peer[3] == 0
+                    assert peer[0] == call[0] and not peer[2] and peer[3] == 64 and peer[4] == 0
+                    if peer[5] is not None:
+                        assert (peer[5] == -1).all(), "idle peer routed a real token"
                 for _, sync in all_ep:
                     assert bool(sync) != disabled
-                    assert all(async_op != synchronous for _, async_op in sync)
+                    assert all(kwargs["async_op"] != synchronous for _, kwargs in sync)
                 if not disabled:
                     seen = {counter for counter, _ in all_ep[owner][1]}
                     assert {c[1] - 1 in seen for _, c in wide} == {True, interval == 1}
