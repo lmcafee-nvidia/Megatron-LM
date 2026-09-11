@@ -48,6 +48,9 @@ def transport_world():
         pytest.param("nccl", 33, {}, 7, id="nccl-partial-tail"),
         pytest.param("nixl", 33, {}, 7, id="nixl-partial-tail"),
         pytest.param(
+            "nccl", 33, dict(context_block_size_tokens=256, flash_attention_version=2), 7, id="fa2"
+        ),
+        pytest.param(
             "nccl", 33, {"hidden_size": 256, "flash_attention_version": 4}, 7, id="fa4-d64"
         ),
         pytest.param(
@@ -121,7 +124,8 @@ def test_disagg_real_engine_parity(mixer, transport_world, backend, length, chan
                 )
                 assert request.generated_tokens == expected[:1]
                 metadata, state = snapshot_source(engine, request)
-                assert len(metadata["block_ids"]) == (length + 15) // 16
+                block_size = engine.context.block_size_tokens
+                assert len(metadata["block_ids"]) == (length + block_size - 1) // block_size
                 assert witness.steps and all(step[2] for step in witness.steps)
                 if chunked:
                     mixed_offsets = {step[0] for step in witness.steps if 102 in step[3]}
@@ -164,8 +168,6 @@ def test_disagg_real_engine_parity(mixer, transport_world, backend, length, chan
                     assert witness.steps[0][0] == length
                     if changes.get("force_build_cuda_graphs"):
                         assert witness.graph_replays > 0
-                    if config.flash_attention_version == 4:
-                        assert witness.fa4_calls > 0
                     if neighbor is not None:
                         assert any(102 in step[3] for step in witness.pending_forwards)
                 else:
@@ -188,3 +190,5 @@ def test_disagg_real_engine_parity(mixer, transport_world, backend, length, chan
                 engine.release_handoff_blocks(101)
                 engine.release_handoff_blocks(101)
                 assert_released(engine)
+            if not source and config.flash_attention_version in (2, 4):
+                assert witness.attention_calls > 0

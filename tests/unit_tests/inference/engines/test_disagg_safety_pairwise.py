@@ -11,6 +11,7 @@ import torch.distributed as dist
 from megatron.core.inference.config import KVCacheManagementMode
 from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.utils import InferenceMode
+from megatron.core.models.gpt import GPTModel
 from megatron.core.ssm.mamba_mixer import MambaMixer
 from tests.unit_tests.inference.engines import disagg_test_utils as dtu
 from tests.unit_tests.inference.engines.test_disagg_pairwise import transport_world  # noqa: F401
@@ -31,8 +32,9 @@ def _error(call):
     [pytest.param("gpt", "nixl", id="kv-nixl"), pytest.param("hybrid", "nccl", id="ssm-nccl")],
 )
 @torch.inference_mode()
+@mock.patch.object(GPTModel, "forward", autospec=True, side_effect=GPTModel.forward)
 @mock.patch.object(MambaMixer, "forward", autospec=True, side_effect=MambaMixer.forward)
-def test_nonpersist_suspend_rejects_owned_source_state(mixer, transport_world, model, backend):
+def test_nonpersist_suspend_rejects_owned_source_state(mixer, gpt, transport_world, model, backend):
     """Owned KV/SSM publications reject suspend before its first mutation."""
 
     rank = dist.get_rank()
@@ -86,6 +88,8 @@ def test_nonpersist_suspend_rejects_owned_source_state(mixer, transport_world, m
                 ssm_slot,
                 backend != "nixl" or metadata["kv_meta"]["base_addr"] == buffer.data_ptr(),
                 mixer.call_count,
+                gpt.call_count,
+                request.generated_tokens[0],
             )
 
         peer = dtu.exchange(
@@ -93,12 +97,14 @@ def test_nonpersist_suspend_rejects_owned_source_state(mixer, transport_world, m
         )
         if not source:
             metadata, state, guard, publication = peer
-        pending, future = dtu.complete_transfer(
-            engine, metadata, tokens, dtu.sampling(1), transport_world
-        )
+        assert metadata["kv_meta"]["resume_tokens"] == [publication[6]]
+        params = dtu.sampling(7)
+        params.termination_id = publication[6]
+        pending, future = dtu.complete_transfer(engine, metadata, tokens, params, transport_world)
 
         destination_release = None
         if not source:
+            assert pending.sampling_params.num_tokens_to_generate == 7
             dtu.assert_import_equal(engine, pending, state, len(tokens))
             owned = pending.local_blocks + pending.continuation_blocks
             refs_before = engine.context.kv_block_allocator.block_ref_counts[owned].clone()
@@ -107,14 +113,15 @@ def test_nonpersist_suspend_rejects_owned_source_state(mixer, transport_world, m
             ) as release:
                 dtu.admit_import(engine)
                 second_poll = engine._poll_pending_kv_imports()
-            result = future.result().merge()
+            result = dtu.run_to_completion(engine, future)
             destination_release = (
                 release.call_count,
                 second_poll,
                 bool((refs_before > 0).all()),
                 bool((engine.context.kv_block_allocator.block_ref_counts[owned] == 0).all()),
             )
-            assert result.generated_tokens == metadata["kv_meta"]["resume_tokens"]
+            assert result.generated_tokens == [publication[6]]
+            assert gpt.call_count == mixer.call_count == 0
         dist.barrier(group=transport_world)
 
         source_release = None
@@ -145,16 +152,9 @@ def test_nonpersist_suspend_rejects_owned_source_state(mixer, transport_world, m
         peer_release = dtu.exchange((source_release, destination_release), transport_world)
         observed_source = source_release if source else peer_release[0]
         observed_destination = destination_release if not source else peer_release[1]
-        print(
-            f"SOURCE_PIN_SUSPEND rank={rank} model={model} backend={backend} "
-            f"publication={publication} guard={guard} source_release={observed_source} "
-            f"destination_release={observed_destination}",
-            flush=True,
-        )
-
         assert publication[0] and all(ref > 0 for ref in publication[1])
         assert (publication[2] is not None) == (model == "hybrid")
-        assert publication[3] and (model != "hybrid" or publication[4] > 0)
+        assert publication[3] and publication[4 if model == "hybrid" else 5] > 0
         assert observed_source == (1, 1, True, True)
         assert observed_destination == (1, 0, True, True)
         assert guard[:2] == ([None, None], ("RuntimeError", _PIN_ERROR))

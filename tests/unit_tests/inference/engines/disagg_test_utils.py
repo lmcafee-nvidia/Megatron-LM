@@ -4,7 +4,7 @@
 
 import asyncio
 import gc
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from functools import partial
 from unittest import mock
@@ -130,7 +130,7 @@ class ForwardWitness:
         self.request_id = request_id
         self.steps = []
         self.graph_replays = 0
-        self.fa4_calls = 0
+        self.attention_calls = 0
         self.pending_forwards = []
         self._patches = []
 
@@ -151,12 +151,14 @@ class ForwardWitness:
         wrapper = self.engine.controller.inference_wrapped_model
         original_forward = wrapper.run_one_forward_step
         original_replay = torch.cuda.CUDAGraph.replay
-        original_fa4 = attention.flash_attn4_varlen_func
+        version = wrapper.model.config.flash_attention_version
+        kernel = "flash_attn_with_kvcache" if version == 2 else "flash_attn4_varlen_func"
+        original_attention = getattr(attention, kernel)
 
-        def fa4(*args, **kwargs):
+        def native_attention(*args, **kwargs):
             if self._snapshot() is not None:
-                self.fa4_calls += 1
-            return original_fa4(*args, **kwargs)
+                self.attention_calls += 1
+            return original_attention(*args, **kwargs)
 
         def forward(*args, **kwargs):
             snapshot = self._snapshot()
@@ -178,7 +180,7 @@ class ForwardWitness:
         self._patches = [
             mock.patch.object(wrapper, "run_one_forward_step", side_effect=forward),
             mock.patch.object(torch.cuda.CUDAGraph, "replay", replay),
-            mock.patch.object(attention, "flash_attn4_varlen_func", side_effect=fa4),
+            mock.patch.object(attention, kernel, side_effect=native_attention),
         ]
         for patch in self._patches:
             patch.start()
@@ -240,6 +242,23 @@ class _DeferredNcclPull:
         return self.real_handle is not None and self.real_handle.poll()
 
 
+@contextmanager
+def deferred_pulls(engine):
+    """Reserve KV and SSM destinations before posting matched real receives."""
+
+    deferred = []
+    with ExitStack() as stack:
+        for agent in [engine._kv_transfer_agent, *engine._ssm_transfer_agents.values()]:
+
+            def defer(*args, _begin=agent.begin_pull_blocks, **kwargs):
+                handle = _DeferredNcclPull(_begin, args, kwargs)
+                deferred.append(handle)
+                return handle
+
+            stack.enter_context(mock.patch.object(agent, "begin_pull_blocks", side_effect=defer))
+        yield deferred
+
+
 def _enqueue_decode_handoff(engine, metadata, tokens, params, request_id=101):
     """Allocate destinations before posting matched NCCL receives."""
 
@@ -247,29 +266,11 @@ def _enqueue_decode_handoff(engine, metadata, tokens, params, request_id=101):
         return engine.add_request_with_kv_handoff(
             request_id, tokens, params, metadata["kv_meta"], metadata["block_ids"]
         )
-
-    patches = []
-    deferred = []
-    agents = [engine._kv_transfer_agent, *engine._ssm_transfer_agents.values()]
-    for agent in agents:
-        begin = agent.begin_pull_blocks
-
-        def defer(*args, _begin=begin, **kwargs):
-            handle = _DeferredNcclPull(_begin, args, kwargs)
-            deferred.append(handle)
-            return handle
-
-        patch = mock.patch.object(agent, "begin_pull_blocks", side_effect=defer)
-        patch.start()
-        patches.append(patch)
-    try:
+    with deferred_pulls(engine) as deferred:
         future = engine.add_request_with_kv_handoff(
             request_id, tokens, params, metadata["kv_meta"], metadata["block_ids"]
         )
-    finally:
-        for patch in reversed(patches):
-            patch.stop()
-    assert len(deferred) == len(agents)
+    assert len(deferred) == 1 + len(engine._ssm_transfer_agents)
     return future
 
 
