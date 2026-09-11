@@ -85,10 +85,12 @@ async def test_routed_idle_expert_progress(monkeypatch, interval, synchronous):
         use_moe_layer_spec=True,
         transformer_impl="inference_optimized",
         inference_moe_token_dispatcher_type="nccl",
-        disable_ep_consensus=interval is None,
-        ep_consensus_interval=interval or 20,
-        use_synchronous_zmq_collectives=synchronous,
     ) as h:
+        h.engine.disable_ep_consensus, h.engine.ep_consensus_interval = (
+            interval is None,
+            interval or 20,
+        )
+        h.engine.use_synchronous_zmq_collectives = synchronous
         assert h.dp_size == 2
         runtime, spans, cadence = Counter(), {False: set(), True: set()}, []
         model = h.engine.controller.inference_wrapped_model.model
