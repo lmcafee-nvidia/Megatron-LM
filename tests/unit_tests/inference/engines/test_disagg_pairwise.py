@@ -79,6 +79,18 @@ def transport_world():
         pytest.param(
             "nccl",
             33,
+            {
+                "num_cuda_graphs": 2,
+                "force_build_cuda_graphs": True,
+                "cuda_graph_max_tokens": 16,
+                "cuda_graph_all_prefills": True,
+            },
+            7,
+            id="all-prefills-graph-budget",
+        ),
+        pytest.param(
+            "nccl",
+            33,
             {"num_cuda_graphs": 2, "force_build_cuda_graphs": True},
             7,
             id="decode-graph",
@@ -211,3 +223,9 @@ def test_disagg_real_engine_parity(mixer, rope, transport_world, backend, length
                 assert rope.call_count > 0
             if changes.get("force_build_cuda_graphs"):
                 assert witness.graph_replays > 0
+            if source and changes.get("cuda_graph_all_prefills"):
+                assert changes["cuda_graph_max_tokens"] < length
+                source_shapes = [shape for shape in witness.graph_shapes if shape[1] > 0]
+                assert source_shapes
+                assert all(shape[0] >= length for shape in source_shapes)
+                assert any(shape[0] > changes["cuda_graph_max_tokens"] for shape in source_shapes)
