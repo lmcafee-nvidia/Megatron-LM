@@ -176,6 +176,7 @@ def test_batch_invariant_real_nixl_handoff(length):
                     101, tokens, _params(4), metadata["kv_meta"], metadata["block_ids"]
                 )
                 pending = engine._pending_kv_imports[0]
+                assert len(pending.continuation_blocks) == int(length == 256)
                 owned = pending.local_blocks + pending.continuation_blocks
                 assert (engine.context.kv_block_allocator.block_ref_counts[owned] > 0).all()
                 handle = pending.handle
