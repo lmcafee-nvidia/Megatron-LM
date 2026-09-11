@@ -81,17 +81,15 @@ async def test_routed_idle_expert_progress(monkeypatch, interval, synchronous):
     )
     async with routed_model(
         monkeypatch,
-        expert_model_parallel_size=2,
+        expert_model_parallel_size=2 if interval else 1,
         use_moe_layer_spec=True,
         transformer_impl="inference_optimized",
         inference_moe_token_dispatcher_type="nccl",
     ) as h:
-        h.engine.disable_ep_consensus, h.engine.ep_consensus_interval = (
-            interval is None,
-            interval or 20,
-        )
+        h.engine.disable_ep_consensus = interval is None
+        h.engine.ep_consensus_interval = interval or 20
         h.engine.use_synchronous_zmq_collectives = synchronous
-        assert h.dp_size == 2
+        assert h.dp_size == 2 and h.engine.ep_world_size == (2 if interval else 1)
         runtime, spans, cadence = Counter(), {False: set(), True: set()}, []
         model = h.engine.controller.inference_wrapped_model.model
         for module in model.modules():
@@ -106,6 +104,7 @@ async def test_routed_idle_expert_progress(monkeypatch, interval, synchronous):
             return result
 
         async def observed_consensus(work, *args, **kwargs):
+            runtime["ep-consensus-calls"] += int(h.engine.use_coordinator)
             if work and h.engine._last_ep_consensus[0]:
                 cadence.append(h.engine._ep_consensus_loop_counter)
             return await consensus(work, *args, **kwargs)
@@ -128,9 +127,10 @@ async def test_routed_idle_expert_progress(monkeypatch, interval, synchronous):
         torch.distributed.all_gather_object(records, (spans, runtime, cadence))
         owner = next(i for i, (s, _, _) in enumerate(records) if s[True])
         real, idle = records[owner][0][True], records[1 - owner][0]
-        assert real and real <= idle[False] and not idle[True]
+        assert real and idle[False] and not idle[True] and (not interval or real <= idle[False])
         assert owners[0] == f"mp-coord-{owner}".encode()
         for _, counters, _ in records:
+            assert interval or not counters["ep-consensus-calls"]
             assert counters["nccl-token-dispatches"] == counters["nccl-token-combines"] > 0
             assert (
                 counters["nccl-combine-before-dispatch"] == counters["nccl-dispatch-inflight"] == 0
