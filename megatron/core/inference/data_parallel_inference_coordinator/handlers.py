@@ -400,9 +400,9 @@ def handle_engine_reply(coordinator, sender_identity, metadata, bodies):
                 coordinator._pending_counts[idx] -= 1
 
         if needs_detokenize:
-            # Detokenizing writes generated_text into the reply, so this one has
-            # to be decoded and re-encoded. Clients that detokenize for
-            # themselves (the OpenAI frontend does) never take this path.
+            # Detokenization writes generated_text into the reply, so the body must
+            # be unpacked and repacked. The OpenAI endpoints detokenize in the
+            # frontend and never take this path.
             finished_request = msgpack.unpackb(body, raw=False)
             coordinator.finalize_text(finished_request)
             body = msgpack.packb(finished_request, use_bin_type=True)
