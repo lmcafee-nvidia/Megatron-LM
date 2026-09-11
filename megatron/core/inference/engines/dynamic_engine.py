@@ -1401,7 +1401,7 @@ class DynamicInferenceEngine(AbstractEngine):
         return finished_request
 
     def _send_requests_to_coordinator(self, requests: List[DynamicInferenceRequest]) -> None:
-        """Send completed or failed flat requests from the MP coordinator."""
+        """Send completed or failed flat requests from model-parallel rank 0."""
 
         if self.local_metadata_ledger_enabled:
             # Failed requests are sent immediately but remain in the engine until the
