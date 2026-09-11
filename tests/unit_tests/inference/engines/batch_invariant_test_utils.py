@@ -19,6 +19,7 @@ from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper 
     GPTInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -34,6 +35,7 @@ from megatron.core.transformer import attention
 from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik
 from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -112,7 +114,11 @@ def invariant_runtime(case):
     # first model/GEMM; each backend group starts in a fresh interpreter.
     bik.enable_batch_invariant_mode(backend=backend, collective="ordered")
     try:
-        Utils.initialize_model_parallel(case.tp, case.pp)
+        Utils.initialize_model_parallel(
+            case.tp,
+            case.pp,
+            expert_model_parallel_size=case.model.get("expert_model_parallel_size", 1),
+        )
         with pytest.MonkeyPatch.context() as patch:
             for name, value in {
                 "NVTE_FUSED_ATTN": "0",
@@ -122,6 +128,9 @@ def invariant_runtime(case):
                 patch.setenv(name, value)
             yield backend, fa_version
     finally:
+        if case.model.get("expert_model_parallel_size", 1) > 1:
+            NVLSAllGatherVDispatcher._delete_buffers()
+            SymmetricMemoryManager.destroy()
         InferenceMode.unset_active()
         bik.disable_batch_invariant_mode()
         DynamicInferenceContext.TOKEN_ROUNDER, DynamicInferenceContext.REQUEST_ROUNDER = (
@@ -176,6 +185,7 @@ def build_engine(case, backend, fa_version):
         "inference_optimized": get_gpt_layer_with_inference_spec,
     }
     spec_options = {"normalization": cfg.normalization} if cfg.transformer_impl == "local" else {}
+    spec_options["num_experts"] = cfg.num_moe_experts
     if cfg.multi_latent_attention:
         spec_options.update(multi_latent_attention=True, qk_layernorm=cfg.qk_layernorm)
     model = (
