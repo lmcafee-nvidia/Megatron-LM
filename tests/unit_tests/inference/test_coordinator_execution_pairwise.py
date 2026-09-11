@@ -8,12 +8,9 @@ import torch
 
 from megatron.core.inference.config import CudaGraphSizingDistribution
 from megatron.core.transformer.cuda_graphs import _CudagraphReplayNode
+from tests.unit_tests.inference import test_coordinator_features_pairwise as features
 from tests.unit_tests.inference import test_coordinator_schedule_pairwise as schedule
 from tests.unit_tests.inference.coordinator_pairwise_utils import greedy_params, routed_model
-from tests.unit_tests.inference.test_coordinator_features_pairwise import (
-    _active_target_ids,
-    _instrument_nccl_dispatch_runtime,
-)
 
 pytestmark = [pytest.mark.internal, pytest.mark.asyncio]
 
@@ -41,7 +38,7 @@ async def test_routed_prefill_graph_selection(monkeypatch, all_prefills, distrib
 
             def observed(ctx, runner, first, *inputs):
                 c = h.engine.context
-                ids, padded = _active_target_ids(h), c.padded_batch_dimensions
+                ids, padded = features._active_target_ids(h), c.padded_batch_dimensions
                 counts = (c.active_token_count, c.num_prefill_requests, c.num_decode_requests)
                 result = replay(ctx, runner, first, *inputs)
                 if h.engine.use_coordinator and any(
@@ -57,9 +54,8 @@ async def test_routed_prefill_graph_selection(monkeypatch, all_prefills, distrib
                 or dim.token_count != physical
                 for dim, _, physical in observations
             )
-            expected = (
-                12 if distribution == CudaGraphSizingDistribution.LINEAR else 8 * (1 + all_prefills)
-            )
+            is_linear = distribution == CudaGraphSizingDistribution.LINEAR
+            expected = 12 if is_linear else 8 * (1 + all_prefills)
             mixed = any(
                 n == 7 and p and d and dim.token_count == expected
                 for dim, (n, p, d), _ in observations
@@ -76,63 +72,69 @@ async def test_routed_prefill_graph_selection(monkeypatch, all_prefills, distrib
 @pytest.mark.parametrize("interval", [20, 3, None])
 @pytest.mark.parametrize("synchronous", [False, True])
 async def test_routed_idle_expert_progress(monkeypatch, interval, synchronous):
-    params = greedy_params(
-        num_tokens_to_generate=32, return_log_probs=True, skip_prompt_log_probs=True
-    )
+    params = greedy_params(num_tokens_to_generate=32, return_log_probs=True)
+    params.skip_prompt_log_probs = True
     async with routed_model(
         monkeypatch,
-        expert_model_parallel_size=2,
+        expert_model_parallel_size=2 if interval else 1,
         use_moe_layer_spec=True,
         transformer_impl="inference_optimized",
         inference_moe_token_dispatcher_type="nccl",
-        disable_ep_consensus=interval is None,
-        ep_consensus_interval=interval or 20,
-        use_synchronous_zmq_collectives=synchronous,
     ) as h:
-        assert h.dp_size == 2
+        h.engine.disable_ep_consensus = interval is None
+        h.engine.ep_consensus_interval = interval or 20
+        h.engine.use_synchronous_zmq_collectives = synchronous
+        assert h.dp_size == 2 and h.engine.pg_collection.ep.size() == (2 if interval else 1)
         runtime, spans, cadence = Counter(), {False: set(), True: set()}, []
+        span_key = "nccl-token-dispatches" if interval else "model-forwards"
         model = h.engine.controller.inference_wrapped_model.model
         for module in model.modules():
-            _instrument_nccl_dispatch_runtime(module, runtime)
+            features._instrument_nccl_dispatch_runtime(module, runtime)
         forward, consensus = model.forward, h.engine._ep_establish_consensus
 
         def observed(*args, **kwargs):
-            real, before = bool(_active_target_ids(h)), runtime["nccl-token-dispatches"]
+            real, before = bool(features._active_target_ids(h)), runtime[span_key]
             result = forward(*args, **kwargs)
             if h.engine.use_coordinator:
-                spans[real].update(range(before, runtime["nccl-token-dispatches"]))
+                runtime["model-forwards"] += 1
+                spans[real].update(range(before, runtime[span_key]))
             return result
 
+        def observed_dummy(dummy=h.engine.controller.dummy_forward):
+            dummy()
+            runtime["dummy-forwards"] += int(h.engine.use_coordinator)
+
         async def observed_consensus(work, *args, **kwargs):
+            runtime["ep-consensus-calls"] += int(h.engine.use_coordinator)
             if work and h.engine._last_ep_consensus[0]:
                 cadence.append(h.engine._ep_consensus_loop_counter)
             return await consensus(work, *args, **kwargs)
 
         monkeypatch.setattr(model, "forward", observed)
+        monkeypatch.setattr(h.engine.controller, "dummy_forward", observed_dummy)
         monkeypatch.setattr(h.engine, "_ep_establish_consensus", observed_consensus)
         direct = await h.direct([4, 5, 6], params)
         await h.start()
+        await h.pause()
+        runtime.clear()
+        spans, cadence = {False: set(), True: set()}, []
         [result], owners, local_ids = await h.run_paused_batch([(0, [4, 5, 6], params)])
         await h.pause()
         assert local_ids == [(0, 0)] and len(owners) == 1
         assert result["status"] == direct["status"] == "COMPLETED"
         assert result["generated_tokens"] == direct["generated_tokens"]
-        assert all(
-            len(r["generated_log_probs"]) == 32
-            and torch.isfinite(torch.tensor(r["generated_log_probs"])).all()
-            for r in (direct, result)
-        )
+        scores = torch.tensor([r["generated_log_probs"] for r in (direct, result)])
+        assert scores.shape == (2, 32) and torch.isfinite(scores).all()
         records = [None] * h.dp_size
         torch.distributed.all_gather_object(records, (spans, runtime, cadence))
-        owner = next(i for i, (s, _, _) in enumerate(records) if s[True])
+        owner = next(i for i in range(h.dp_size) if owners[0] == f"mp-coord-{i}".encode())
         real, idle = records[owner][0][True], records[1 - owner][0]
-        assert real and real <= idle[False] and not idle[True]
-        assert owners[0] == f"mp-coord-{owner}".encode()
-        for _, counters, _ in records:
-            assert counters["nccl-token-dispatches"] == counters["nccl-token-combines"] > 0
-            assert (
-                counters["nccl-combine-before-dispatch"] == counters["nccl-dispatch-inflight"] == 0
-            )
+        assert real and idle[False] and not idle[True] and (not interval or real <= idle[False])
+        for _, stats, _ in records:
+            assert interval or not stats["ep-consensus-calls"]
+            assert interval or stats["dummy-forwards"] > 0
+            assert stats["nccl-token-dispatches"] == stats["nccl-token-combines"] >= bool(interval)
+            assert stats["nccl-combine-before-dispatch"] == stats["nccl-dispatch-inflight"] == 0
         calls = records[owner][2]
         assert (bool(calls) and all(c % interval == 0 for c in calls)) if interval else not calls
         h.assert_retired()

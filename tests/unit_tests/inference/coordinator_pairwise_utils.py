@@ -228,9 +228,9 @@ class RoutedModel:
         if self.rank == 0:
             pending, local_ids = [], []
             coordinator = self.service.coordinator
-            for client, prompt, params in submissions:
+            for client, prompt, params, *media in submissions:
                 request_id, future = self.clients[client].add_request_with_id(
-                    prompt, copy.deepcopy(params)
+                    prompt, copy.deepcopy(params), multi_modal_data=media[0] if media else None
                 )
                 pending.append(future)
                 local_ids.append((client, request_id))
