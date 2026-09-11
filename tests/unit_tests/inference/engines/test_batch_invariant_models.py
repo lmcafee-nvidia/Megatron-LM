@@ -25,7 +25,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.mamba_mixer import MambaMixer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
+from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.inference.engines import batch_invariant_test_utils as fixture
@@ -37,6 +37,7 @@ def _build_model_engine(case, backend, version, *, mamba, engines, patch):
     depth = case.context.get("num_speculative_tokens", 0)
     graph = case.context.get("num_cuda_graphs") is not None
     cfg = TransformerConfig(
+        **fixture.model_defaults(backend, version),
         num_layers=3 if mamba else 2,
         hidden_size=256 if mamba else 128,
         num_attention_heads=8 if mamba else 4,
@@ -46,23 +47,9 @@ def _build_model_engine(case, backend, version, *, mamba, engines, patch):
         mamba_state_dim=16,
         is_hybrid_model=mamba,
         mtp_num_layers=depth or None,
-        params_dtype=torch.bfloat16,
-        bf16=True,
-        normalization="RMSNorm",
-        use_cpu_initialization=True,
-        hidden_dropout=0.0,
-        attention_dropout=0.0,
-        attention_backend=AttnBackend.flash,
-        flash_attention_version=version,
-        batch_invariant_mode=True,
-        batch_invariant_backend=backend,
-        transformer_impl="transformer_engine",
         tensor_model_parallel_size=case.tp,
         pipeline_model_parallel_size=case.pp,
         sequence_parallel=case.sp,
-        inference_rng_tracker=True,
-        inference_sampling_seed=333,
-        nccl_all_reduce_for_prefill=False,
         cuda_graph_impl="local" if graph else "none",
         inference_cuda_graph_scope=(
             InferenceCudaGraphScope.block if graph else InferenceCudaGraphScope.none

@@ -11,7 +11,6 @@ from megatron.core.inference.model_inference_wrappers.multimodal import vlm_infe
 from megatron.core.models.gpt import gpt_layer_specs
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -24,29 +23,16 @@ CACHE_REQUEST = 102
 
 def _config(layers, hidden, heads, backend, fa_version):
     return TransformerConfig(
+        **fixture.model_defaults(backend, fa_version),
         num_layers=layers,
         hidden_size=hidden,
         num_attention_heads=heads,
         ffn_hidden_size=4 * hidden,
-        use_cpu_initialization=True,
-        hidden_dropout=0.0,
-        attention_dropout=0.0,
-        normalization="RMSNorm",
-        params_dtype=torch.bfloat16,
-        bf16=True,
-        attention_backend=AttnBackend.flash,
-        flash_attention_version=fa_version,
-        transformer_impl="transformer_engine",
-        batch_invariant_mode=True,
-        batch_invariant_backend=backend,
         batch_invariant_collective="ordered",
-        nccl_all_reduce_for_prefill=False,
-        inference_rng_tracker=True,
-        inference_sampling_seed=333,
     )
 
 
-def _build_engine(case, backend, fa_version, *, modality, engines):
+def _build_engine(case, backend, fa_version, *, modality, engines, wire=False):
     torch.manual_seed(321)
     model_parallel_cuda_manual_seed(
         321, inference_rng_tracker=True, use_cudagraphable_rng=False, force_reset_rng=True
@@ -79,18 +65,17 @@ def _build_engine(case, backend, fa_version, *, modality, engines):
     ).cuda()
     model = Float16Module(language, model).eval()
     assert all(parameter.dtype == torch.bfloat16 for parameter in model.parameters())
-    context = fixture.DynamicInferenceContext(
-        language,
-        fixture.InferenceConfig(
-            max_sequence_length=256,
-            buffer_size_gb=0.125,
-            block_size_tokens=64,
-            max_requests=128,
-            max_tokens=256,
-            materialize_only_last_token_logits=False,
-            vision_embedding_cache_max_bytes=1 << 20,
-        ),
+    options = dict(
+        max_sequence_length=256,
+        buffer_size_gb=0.125,
+        block_size_tokens=64,
+        max_requests=128,
+        max_tokens=256,
+        materialize_only_last_token_logits=False,
+        vision_embedding_cache_max_bytes=1 << 20,
     )
+    options.update(case.context)
+    context = fixture.DynamicInferenceContext(language, fixture.InferenceConfig(**options))
     tokenizer = fixture.DummyTokenizer(fixture.VOCAB, bos=1, eod=fixture.VOCAB - 1)
     tokenizer.convert_tokens_to_ids = lambda token: MEDIA_TOKEN if token == "<image>" else None
     wrapper = vlm_inference_wrapper.VLMInferenceWrapper(model, context)
@@ -150,7 +135,8 @@ def _build_engine(case, backend, fa_version, *, modality, engines):
             kwargs.update(media_kwargs)
         return add_request(request_id, prompt, *args, **kwargs)
 
-    engine.add_request = add_media
+    engine.add_request = add_request if wire else add_media
+    engine._bi_wire_media = {modality: media_kwargs}
     engine._bi_media_evidence = evidence
     engine._bi_decoder_inputs = decoder_inputs
     engines.append(engine)

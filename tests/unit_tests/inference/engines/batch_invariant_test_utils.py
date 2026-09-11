@@ -19,6 +19,7 @@ from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper 
     GPTInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -34,34 +35,20 @@ from megatron.core.transformer import attention
 from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik
 from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
+from tests.unit_tests.inference.test_data_parallel_inference_coordinator import (
+    DummyTokenizer as _DummyTokenizer,
+)
 from tests.unit_tests.test_utilities import Utils
 
 TARGET = 101
 VOCAB = 128
 
 
-class DummyTokenizer:
-    """Minimal tokenizer isolated from unrelated model-test dependencies."""
-
-    def __init__(self, vocab_size, bos=None, eod=0, pad=0):
-        self.vocab_size = vocab_size
-        self.bos = bos
-        self.eod = eod
-        self.pad = pad
-
-    def tokenize(self, prompt):
-        if isinstance(prompt, str):
-            return [int(token) % self.vocab_size for token in prompt.strip().split()]
-        return list(prompt)
-
-    def detokenize(self, tokens, skip_special_tokens=False):
-        if isinstance(tokens, torch.Tensor):
-            tokens = tokens.tolist()
-        if skip_special_tokens and self.eod in tokens:
-            tokens = [token for token in tokens if token != self.eod]
-        return " ".join(str(token) for token in tokens)
+class DummyTokenizer(_DummyTokenizer):
+    """Reuse the coordinator's integer tokenizer with score-offset support."""
 
     @staticmethod
     def offsets(tokens, text):
@@ -112,7 +99,11 @@ def invariant_runtime(case):
     # first model/GEMM; each backend group starts in a fresh interpreter.
     bik.enable_batch_invariant_mode(backend=backend, collective="ordered")
     try:
-        Utils.initialize_model_parallel(case.tp, case.pp)
+        Utils.initialize_model_parallel(
+            case.tp,
+            case.pp,
+            expert_model_parallel_size=case.model.get("expert_model_parallel_size", 1),
+        )
         with pytest.MonkeyPatch.context() as patch:
             for name, value in {
                 "NVTE_FUSED_ATTN": "0",
@@ -122,6 +113,9 @@ def invariant_runtime(case):
                 patch.setenv(name, value)
             yield backend, fa_version
     finally:
+        if case.model.get("expert_model_parallel_size", 1) > 1:
+            NVLSAllGatherVDispatcher._delete_buffers()
+            SymmetricMemoryManager.destroy()
         InferenceMode.unset_active()
         bik.disable_batch_invariant_mode()
         DynamicInferenceContext.TOKEN_ROUNDER, DynamicInferenceContext.REQUEST_ROUNDER = (
@@ -132,17 +126,9 @@ def invariant_runtime(case):
         Utils.destroy_model_parallel()
 
 
-def build_engine(case, backend, fa_version):
-    """Build the same tiny, real model for every ordering of a case."""
-    torch.manual_seed(321)
-    model_parallel_cuda_manual_seed(
-        321, inference_rng_tracker=True, use_cudagraphable_rng=False, force_reset_rng=True
-    )
-    graphed = case.context.get("num_cuda_graphs") is not None
-    model_options = dict(
-        num_layers=2 if case.pp == 1 else 4,
-        hidden_size=128,
-        num_attention_heads=4,
+def model_defaults(backend, fa_version):
+    """Common identical model settings; architecture-specific options stay local."""
+    return dict(
         use_cpu_initialization=True,
         hidden_dropout=0.0,
         attention_dropout=0.0,
@@ -157,6 +143,21 @@ def build_engine(case, backend, fa_version):
         nccl_all_reduce_for_prefill=False,
         inference_rng_tracker=True,
         inference_sampling_seed=333,
+    )
+
+
+def build_engine(case, backend, fa_version):
+    """Build the same tiny, real model for every ordering of a case."""
+    torch.manual_seed(321)
+    model_parallel_cuda_manual_seed(
+        321, inference_rng_tracker=True, use_cudagraphable_rng=False, force_reset_rng=True
+    )
+    graphed = case.context.get("num_cuda_graphs") is not None
+    model_options = dict(
+        **model_defaults(backend, fa_version),
+        num_layers=2 if case.pp == 1 else 4,
+        hidden_size=128,
+        num_attention_heads=4,
         tensor_model_parallel_size=case.tp,
         pipeline_model_parallel_size=case.pp,
         sequence_parallel=case.sp,
@@ -176,6 +177,7 @@ def build_engine(case, backend, fa_version):
         "inference_optimized": get_gpt_layer_with_inference_spec,
     }
     spec_options = {"normalization": cfg.normalization} if cfg.transformer_impl == "local" else {}
+    spec_options["num_experts"] = cfg.num_moe_experts
     if cfg.multi_latent_attention:
         spec_options.update(multi_latent_attention=True, qk_layernorm=cfg.qk_layernorm)
     model = (
@@ -218,6 +220,7 @@ class ForwardWitness:
         self.engine = engine
         self.model_config = engine.controller.inference_wrapped_model.model.config
         self.steps = []
+        self.dummy_steps = []
         self.current = None
         self.sample_steps = []
         self.async_overlaps = []
@@ -230,7 +233,7 @@ class ForwardWitness:
 
         def target_is_active():
             active = ctx.request_ids[ctx.paused_request_count : ctx.total_request_count]
-            return bool((active == TARGET).any())
+            return TARGET in engine.requests and bool((active == TARGET).any())
 
         def forward(input_ids, position_ids):
             n = ctx.active_token_count
@@ -238,7 +241,12 @@ class ForwardWitness:
             ids = ctx.request_ids[req_idxs]
             rows = (ids == TARGET).nonzero().flatten()
             self.current = None
-            if rows.numel() and not ctx.is_creating_cuda_graphs:
+            dummy = ctx._bookkeeping_no_real_work and not ctx.is_creating_cuda_graphs
+            if (
+                rows.numel()
+                and TARGET in engine.requests
+                and not (dummy or ctx.is_creating_cuda_graphs)
+            ):
                 request_idx = int(req_idxs[rows[0]])
                 self.current = dict(
                     positions=position_ids[0, rows].clone(),
@@ -266,9 +274,15 @@ class ForwardWitness:
                     },
                     target_row=int(rows[0]),
                 )
+            elif dummy:
+                self.current = dict(
+                    physical=input_ids.shape[1], attention=[], gemms=[], rope=[], sinks=[], mla=[]
+                )
             try:
                 result = original(input_ids, position_ids)
-                if self.current is not None:
+                if dummy:
+                    self.dummy_steps.append(self.current)
+                elif self.current is not None:
                     getattr(engine, "_bi_after_forward", lambda: None)()
                     if ctx.config.materialize_only_last_token_logits:
                         mapped = ctx.active_logit_idxs[: ctx.num_last_token_logits].long()
@@ -387,7 +401,7 @@ class ForwardWitness:
 
         def graph_replay(graph):
             result = replay(graph)
-            if self.current is not None:
+            if self.current is not None and "replay" in self.current:
                 self.current["replay"] += 1
                 if graph in self.captures:
                     if self.captures[graph]["attention"]:
