@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+import threading
 from collections import Counter
 
 import msgpack
@@ -309,3 +310,32 @@ async def test_closed_client_delivery_does_not_disrupt_live_client(coordinator_r
             closed_client.stop()
         live_client.stop()
         engine.close()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_before_connect_ack(coordinator_runtime, monkeypatch):
+    runtime = coordinator_runtime
+    received, release = [], threading.Event()
+    original = runtime.coordinator._handlers[Headers.CONNECT]
+
+    def delayed(c, sender, metadata, bodies):
+        received.append(sender)
+        assert release.wait(5.0)
+        return original(c, sender, metadata, bodies)
+
+    monkeypatch.setitem(runtime.coordinator._handlers, Headers.CONNECT, delayed)
+    client = InferenceClient(runtime.address)
+    try:
+        client.socket.send(msgpack.packb([Headers.CONNECT.value], use_bin_type=True))
+        await _eventually(lambda: received, "CONNECT was not received")
+        client.stop()
+        await runtime.wait_for_disconnect()
+        release.set()
+        await _eventually(lambda: runtime.errors or runtime.processed[Headers.CONNECT], "stalled")
+        runtime.assert_healthy()
+        assert received[0] not in runtime.coordinator.known_clients
+        client = _start_client(runtime)
+    finally:
+        release.set()
+        runtime.coordinator._handlers[Headers.CONNECT] = original
+        client.stop()

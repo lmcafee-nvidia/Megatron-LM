@@ -51,12 +51,12 @@ def _install_target_attribution(harness, runtime):
     return target
 
 
-def _assert_every_owner_executed(harness, target):
+def _assert_every_owner_executed(harness, target, requests_per_client=1):
     target_ids = {key[1] for key in target if isinstance(key, tuple) and key[0] == "request"}
     assert target["model-forward"] > 0
     assert target["prefill-forward"] > 0
     assert target["decode-forward"] > 0
-    assert len(target_ids) == 1, "Each rank must execute its sole routed target"
+    assert len(target_ids) == requests_per_client
 
     groups = harness.engine.pg_collection
     record = {
@@ -73,7 +73,7 @@ def _assert_every_owner_executed(harness, target):
     if harness.rank != 0:
         return
 
-    assert all(item["forwards"] > 0 and len(item["ids"]) == 1 for item in records)
+    assert all(item["forwards"] > 0 and len(item["ids"]) == requests_per_client for item in records)
     assert {item["dp"] for item in records} == set(range(harness.dp_size))
     routed_ids = set()
     for owner in range(harness.dp_size):
@@ -84,13 +84,17 @@ def _assert_every_owner_executed(harness, target):
             for tp in range(harness.config.tensor_model_parallel_size)
             for pp in range(harness.config.pipeline_model_parallel_size)
         }
-        owner_ids = {item["ids"][0] for item in owner_records}
-        assert len(owner_ids) == 1
+        owner_id_sets = {tuple(item["ids"]) for item in owner_records}
+        assert len(owner_id_sets) == 1
+        owner_ids = set(owner_id_sets.pop())
+        assert routed_ids.isdisjoint(owner_ids)
         routed_ids.update(owner_ids)
-    assert len(routed_ids) == harness.dp_size
+    assert routed_ids == set(range(harness.dp_size * requests_per_client))
 
 
-async def _exercise_all_owners(harness, prompt, params, direct, runtime=None, install=None):
+async def _exercise_all_owners(
+    harness, prompt, params, direct, runtime=None, install=None, requests_per_client=1
+):
     runtime = Counter() if runtime is None else runtime
     await harness.start()
     target = _install_target_attribution(harness, runtime)
@@ -100,13 +104,13 @@ async def _exercise_all_owners(harness, prompt, params, direct, runtime=None, in
     pending = []
     if harness.rank == 0:
         for client in harness.clients:
-            request_id, future = client.add_request_with_id(prompt, copy.deepcopy(params))
-            assert request_id == 0
-            pending.append(future)
-        await until(lambda: len(harness.service.coordinator.request_id_to_rank) == harness.dp_size)
-        assert sorted(harness.service.coordinator.request_id_to_rank.values()) == sorted(
-            harness.service.coordinator.identities_of_data_parallel_ranks
-        )
+            for expected_id in range(requests_per_client):
+                request_id, future = client.add_request_with_id(prompt, copy.deepcopy(params))
+                assert request_id == expected_id
+                pending.append(future)
+        router = harness.service.coordinator
+        await until(lambda: len(router.request_id_to_rank) == harness.dp_size * requests_per_client)
+        assert router._pending_counts.tolist() == [requests_per_client] * harness.dp_size
     await harness.barrier()
     await harness.unpause()
     if harness.rank == 0:
@@ -118,7 +122,7 @@ async def _exercise_all_owners(harness, prompt, params, direct, runtime=None, in
     for output in outputs[0]:
         for key in ("status", "generated_tokens", "prompt_tokens", "generated_text"):
             assert output[key] == direct[key], key
-    _assert_every_owner_executed(harness, target)
+    _assert_every_owner_executed(harness, target, requests_per_client)
     harness.assert_retired()
     return target
 
@@ -311,7 +315,8 @@ async def test_routed_hybrid_updates_owned_recurrent_state(monkeypatch, mixer):
         ({"fp8": True, "hidden_size": 128}, ("fp8",), ("fp8-quantized-forwards",)),
         (
             {
-                "hidden_size": 64,
+                # FI 0.6.6 NeoX D16 corrupts adjacent heads; exercise native D64.
+                "hidden_size": 256,
                 "position_embedding_type": "rope",
                 "use_flashinfer_fused_rope": True,
             },
@@ -335,6 +340,7 @@ async def test_routed_model_kernels_match_direct(monkeypatch, options, signals, 
     prompt = list(range(4, 16))
     params = greedy_params(num_tokens_to_generate=4, return_prompt_tokens=True)
     async with routed_model(monkeypatch, **options) as harness:
+        missing = torch.tensor(False, device="cuda")
         finite = []
         sample_kernel = (sampling := harness.engine.controller._sampling).sample_kernel
         reduce = torch.distributed._functional_collectives.all_reduce
@@ -349,14 +355,14 @@ async def test_routed_model_kernels_match_direct(monkeypatch, options, signals, 
 
         sampling.sample_kernel = observed_sample
         direct = await harness.direct(prompt, params)
-        assert finite and reduce(torch.stack(finite).all(), "min", torch.distributed.group.WORLD)
+        assert reduce(torch.stack(finite or [missing]).all(), "min", torch.distributed.group.WORLD)
         finite.clear()
         runtime = Counter()
         _instrument_scenario_runtime(
             SimpleNamespace(engine=harness.engine), SimpleNamespace(signals=signals), runtime
         )
         target = await _exercise_all_owners(harness, prompt, params, direct, runtime=runtime)
-        assert finite and reduce(torch.stack(finite).all(), "min", torch.distributed.group.WORLD)
+        assert reduce(torch.stack(finite or [missing]).all(), "min", torch.distributed.group.WORLD)
         for counter in required:
             assert target[counter] > 0, counter
 

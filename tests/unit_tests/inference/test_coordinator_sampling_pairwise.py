@@ -12,9 +12,9 @@ import torch
 
 from tests.unit_tests.inference.coordinator_pairwise_utils import greedy_params, routed_model, until
 
+pytestmark = [pytest.mark.internal, pytest.mark.asyncio]
 
-@pytest.mark.internal
-@pytest.mark.asyncio
+
 @pytest.mark.parametrize("offset_by_dp", [False, True], ids=["shared-seed", "rank-seed"])
 @pytest.mark.parametrize("logprobs_mode", ["raw_logprobs", "processed_logprobs"])
 @pytest.mark.parametrize(
@@ -127,8 +127,6 @@ async def test_routed_stochastic_first_step_distribution(
         h.assert_retired()
 
 
-@pytest.mark.internal
-@pytest.mark.asyncio
 @pytest.mark.parametrize("interval", [1, 3])
 async def test_routed_stream_holdback_keeps_top_n_scores_aligned(monkeypatch, interval):
     """Withheld stop-prefix tokens must not leak their top-N scores in a partial."""
@@ -180,8 +178,6 @@ async def test_routed_stream_holdback_keeps_top_n_scores_aligned(monkeypatch, in
         h.assert_retired()
 
 
-@pytest.mark.internal
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "echo,detokenize,eos",
     [(False, False, False), (True, True, False), (True, False, False), (False, False, True)],
@@ -217,4 +213,63 @@ async def test_routed_output_opt_ins(monkeypatch, echo, detokenize, eos):
                 assert result["generated_text"] is None
             assert any(0 in step["ids"] for step in h.witnesses)
         await h.barrier()
+        h.assert_retired()
+
+
+@pytest.mark.parametrize("keep,skip", [(False, False), (False, True), (True, False), (True, True)])
+async def test_routed_bos_stop_after_metadata_compaction(monkeypatch, keep, skip):
+    params = greedy_params(
+        num_tokens_to_generate=4,
+        return_prompt_tokens=True,
+        return_log_probs=True,
+        skip_prompt_log_probs=skip,
+        top_n_logprobs=3,
+        detokenize_stop_sequence=keep,
+    )
+    async with routed_model(monkeypatch, sampling_backend="torch") as h:
+        h.tokenizer.bos = 3
+        direct = await h.direct([3, 4, 5], params)
+        params.stop_words = [h.tokenizer.detokenize(direct["generated_tokens"][:2])]
+        params.add_BOS = True
+        sampler, samples = h.engine.controller._sampling, []
+        sample = sampler.sample_kernel
+
+        def observe(logits, n, context, **kwargs):
+            ids = context.request_ids[: context.total_request_count].tolist()
+            samples.append((ids, context.active_request_metadata["top_k"][: len(ids)].tolist()))
+            return sample(logits, n, context, **kwargs)
+
+        monkeypatch.setattr(sampler, "sample_kernel", observe)
+        await h.start()
+        samples.clear()
+        await h.pause()
+        payload = [None]
+        if h.rank == 0:
+            pending = []
+            short = greedy_params(num_tokens_to_generate=1, top_k=4, temperature=0.7)
+            for choice in (short, short, params):
+                pending.append(h.clients[0].add_request("4 5", choice))
+                await until(lambda: len(h.service.coordinator.request_id_to_rank) == len(pending))
+            owners = dict(h.service.coordinator.request_id_to_rank)
+        await h.unpause()
+        if h.rank == 0:
+            payload[0] = (await asyncio.wait_for(asyncio.gather(*pending), 60), owners)
+        await h.barrier()
+        torch.distributed.broadcast_object_list(payload, src=0)
+        (short, filler, target), owners = payload[0]
+        first, other, last = (result["request_id"] for result in (short, filler, target))
+        assert owners[first] == owners[last] != owners[other]
+        assert target["status"] == "COMPLETED" and target["prompt_tokens"] == [3, 4, 5]
+        assert target["generated_tokens"] == direct["generated_tokens"][:2] * keep
+        for key in ("generated_log_probs", "generated_top_n_logprobs"):
+            assert len(target[key]) == 2 * keep
+        assert target["generated_log_probs"] == [
+            scores[str(token)]
+            for token, scores in zip(target["generated_tokens"], target["generated_top_n_logprobs"])
+        ]
+        for key in ("prompt_log_probs", "prompt_top_n_logprobs"):
+            assert target[key] == direct[key]
+        assert await h.sync.all_reduce_max(
+            ([first, last], [4, 1]) in samples, ([last], [1]) in samples
+        ) == (1, 1)
         h.assert_retired()
