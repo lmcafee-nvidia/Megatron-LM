@@ -221,27 +221,16 @@ async def test_routed_allocator_pressure_preserves_victim_identity(monkeypatch):
         monkeypatch.setattr(context, "resume_paused_requests", resume_spy)
         monkeypatch.setattr(context, "update_requests", observed_update)
         await h.start()
-        await h.pause()
-        route = [None]
-        if h.rank == 0:
-            count = h.dp_size * (allocator.pool_size - 2)
-            pending = [
-                h.clients[0].add_request(prompt, copy.deepcopy(params)) for _ in range(count)
-            ]
-            await until(lambda: len(h.service.coordinator.request_id_to_rank) == count)
-            route[0] = dict(h.service.coordinator.request_id_to_rank)
-        torch.distributed.broadcast_object_list(route, src=0)
-        await h.unpause()
-        if h.rank == 0:
-            finals = await asyncio.wait_for(asyncio.gather(*pending), timeout=60)
-            reference = (direct["generated_tokens"], direct["status"])
-            assert [(r["generated_tokens"], r["status"]) for r in finals] == [reference] * count
-        await h.barrier()
+        count = h.dp_size * (allocator.pool_size - 2)
+        finals, owners, local_ids = await h.run_paused_batch([(0, prompt, params)] * count)
+        reference = (direct["generated_tokens"], direct["status"])
+        assert [(r["generated_tokens"], r["status"]) for r in finals] == [reference] * count
+        assert local_ids == [(0, request_id) for request_id in range(count)]
         [(shape, paused, evicted)] = transitions
         assert resume_spy.call_args_list[0].args[1].shape == (allocator.pool_size - 2,)
         assert paused == evicted and shape == (1,)
         target = evicted[0]
-        assert route[0][target] == f"mp-coord-{h.rank}".encode()
+        assert owners[target] == f"mp-coord-{h.rank}".encode()
         assert sum(bool(s["prefill"]) for s in h.witnesses if target in s["ids"]) >= 2
         h.assert_retired()
 
