@@ -134,6 +134,7 @@ class ForwardWitness:
         self.request_id = request_id
         self.steps = []
         self.graph_replays = 0
+        self.graph_shapes = []
         self.attention_calls = 0
         self.pending_forwards = []
         self._patches = []
@@ -179,6 +180,14 @@ class ForwardWitness:
             if snapshot is not None:
                 self.graph_replays += 1
                 self.steps.append(snapshot)
+                dimensions = self.engine.context.padded_batch_dimensions
+                self.graph_shapes.append(
+                    (
+                        int(dimensions.token_count),
+                        int(dimensions.prefill_req_count),
+                        int(dimensions.decode_req_count),
+                    )
+                )
             return result
 
         self._patches = [

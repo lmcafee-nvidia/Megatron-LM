@@ -4,7 +4,9 @@
 
 import asyncio
 import time
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
+from unittest import mock
 
 import pytest
 import torch
@@ -32,8 +34,14 @@ def gather(value, control):
     return values
 
 
-def model_config(tp, pp):
-    return disagg_config(tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp)
+def model_config(tp, pp, transformer_impl="transformer_engine", model_provider="gpt"):
+    return disagg_config(
+        tensor_model_parallel_size=tp,
+        pipeline_model_parallel_size=pp,
+        transformer_impl=transformer_impl,
+        sequence_parallel=transformer_impl == "inference_optimized",
+        model_provider=model_provider,
+    )
 
 
 def load_canonical_model(model, checkpoint_path):
@@ -43,6 +51,43 @@ def load_canonical_model(model, checkpoint_path):
     for name, value in loaded.items():
         if torch.is_tensor(value):
             assert torch.equal(current[name].cpu(), value.cpu()), name
+
+
+@contextmanager
+def implementation_witness(model):
+    """Observe real target layers and inference-optimized TP collectives."""
+    events = {"layers": [], "gathers": [], "scatters": []}
+    layer_types = {
+        "ColumnParallelLinear",
+        "RowParallelLinear",
+        "InferenceLayerNormColumnParallelLinear",
+        "InferenceColumnParallelLinear",
+        "InferenceRowParallelLinear",
+    }
+    with ExitStack() as stack:
+        for module in model.modules():
+            class_name = type(module).__name__
+            if class_name in layer_types:
+                original_forward = module.forward
+
+                def forward(*args, _forward=original_forward, _name=class_name, **kwargs):
+                    result = _forward(*args, **kwargs)
+                    events["layers"].append((_name, tuple(args[0].shape)))
+                    return result
+
+                stack.enter_context(mock.patch.object(module, "forward", side_effect=forward))
+            for method, key in (("_all_gather", "gathers"), ("_matmul_reduce_scatter", "scatters")):
+                if not hasattr(module, method):
+                    continue
+                original_collective = getattr(module, method)
+
+                def collective(*args, _call=original_collective, _key=key, **kwargs):
+                    output = _call(*args, **kwargs)
+                    events[_key].append((int(args[0].shape[0]), int(output.shape[0])))
+                    return output
+
+                stack.enter_context(mock.patch.object(module, method, side_effect=collective))
+        yield events
 
 
 def canonical_kv(source_shards):
@@ -62,6 +107,24 @@ def canonical_kv(source_shards):
         full[:, lo:hi, :, :, head_lo : head_lo + heads] = values
     assert covered.all(), "Source model shards did not cover the global KV layout"
     return full
+
+
+def canonical_ssm(source_shards):
+    """Reconstruct TP-sharded Mamba bands without using the reshard planner."""
+    ordered = sorted(source_shards, key=lambda shard: shard[0]["ssm_layout"]["tp_rank"])
+    layout = ordered[0][0]["ssm_layout"]
+    dims = layout["dims"]
+    tp_size = layout["tp_size"]
+    inner = dims["nheads"] * dims["headdim"] // tp_size
+    group = dims["ngroups"] * dims["d_state"] // tp_size
+    conv = [shard[1]["conv"] for shard in ordered]
+    bands = ((0, inner), (inner, inner + group), (inner + group, inner + 2 * group))
+    return {
+        "conv": torch.cat(
+            [torch.cat([value[:, lo:hi] for value in conv], dim=1) for lo, hi in bands], dim=1
+        ),
+        "recurrent": torch.cat([shard[1]["recurrent"] for shard in ordered], dim=1),
+    }
 
 
 def assert_logical_import(engine, pending, full, prompt_length):
@@ -111,6 +174,9 @@ def admit_model_group(engine):
         ("nccl", 2, 2, 1, 2),
         ("nixl", 2, 1, 1, 1),
         ("nixl", 1, 2, 1, 1),
+        ("nccl", 2, 1, 2, 1, "local"),
+        ("nccl", 2, 1, 2, 1, "inference_optimized"),
+        ("nccl", 2, 1, 1, 1, "transformer_engine", "hybrid"),
     ],
     ids=[
         "tp2-to-tp1",
@@ -119,6 +185,9 @@ def admit_model_group(engine):
         "tp2pp2-to-tp1pp2",
         "nixl-tp2-to-tp1",
         "nixl-pp2-to-pp1",
+        "local-tp2",
+        "inference-optimized-tp2",
+        "hybrid-tp2-to-tp1",
     ],
 )
 @torch.inference_mode()
@@ -130,7 +199,9 @@ def test_real_model_heterogeneous_handoff(tmp_path, case):
     Old source buffers remain alive after global model-group bootstrap switches
     to decode topology. Their engines retain explicit original group handles.
     """
-    backend, source_tp, source_pp, decode_tp, decode_pp = case
+    backend, source_tp, source_pp, decode_tp, decode_pp, *implementation = case
+    transformer_impl = implementation[0] if implementation else "transformer_engine"
+    model_provider = implementation[1] if len(implementation) > 1 else "gpt"
     Utils.initialize_model_parallel(source_tp, source_pp)
     control = dist.new_group(backend="gloo")
     rank = dist.get_rank()
@@ -141,7 +212,9 @@ def test_real_model_heterogeneous_handoff(tmp_path, case):
     dist.barrier(group=control)
     tokens = prompt(33)
     try:
-        with real_engine(model_config(source_tp, source_pp)) as source_engine:
+        with real_engine(
+            model_config(source_tp, source_pp, transformer_impl, model_provider)
+        ) as source_engine:
             model = source_engine.controller.inference_wrapped_model.model
             # The checkpoint is the canonical source of truth and its access
             # integrity validation checks complete, non-overlapping weight shards.
@@ -169,6 +242,18 @@ def test_real_model_heterogeneous_handoff(tmp_path, case):
             )
             shards = gather(local_shard if rank in chosen_source else None, control)
             full = canonical_kv([shards[index] for index in chosen_source])
+            full_ssm = None
+            if model_provider == "hybrid":
+                slot = source_engine._pinned_handoff_ssm_slots[101]
+                source_ssm = (
+                    source_engine._ssm_transfer_agents["conv"].export_meta(),
+                    {
+                        "conv": source_engine.context.mamba_conv_states[:, slot].cpu().clone(),
+                        "recurrent": source_engine.context.mamba_ssm_states[:, slot].cpu().clone(),
+                    },
+                )
+                ssm_shards = gather(source_ssm if rank in chosen_source else None, control)
+                full_ssm = canonical_ssm([ssm_shards[index] for index in chosen_source])
             handoff = gather(
                 request.disaggregated_params if rank == chosen_source[0] else None, control
             )[chosen_source[0]]
@@ -176,7 +261,9 @@ def test_real_model_heterogeneous_handoff(tmp_path, case):
             # storage/explicit process groups remain alive through the transfer.
             Utils.initialize_model_parallel(decode_tp, decode_pp)
             with real_engine(
-                model_config(decode_tp, decode_pp), role="decode", backend=backend
+                model_config(decode_tp, decode_pp, transformer_impl, model_provider),
+                role="decode",
+                backend=backend,
             ) as decode_engine:
                 decode_model = decode_engine.controller.inference_wrapped_model.model
                 load_canonical_model(decode_model, checkpoint_path)
@@ -210,13 +297,36 @@ def test_real_model_heterogeneous_handoff(tmp_path, case):
                         handle.wait()
                         assert handle.poll()
                     assert_logical_import(decode_engine, pending, full, len(tokens))
+                    if full_ssm is not None:
+                        slot = pending.ssm.live_slot
+                        assert torch.equal(
+                            decode_engine.context.mamba_conv_states[:, slot].cpu(), full_ssm["conv"]
+                        )
+                        assert torch.equal(
+                            decode_engine.context.mamba_ssm_states[:, slot].cpu(),
+                            full_ssm["recurrent"],
+                        )
                     assert not decode_engine.context.total_request_count
                     admit_model_group(decode_engine)
-                    with ForwardWitness(decode_engine) as witness:
+                    with (
+                        ForwardWitness(decode_engine) as witness,
+                        implementation_witness(decode_model) as native,
+                    ):
                         actual = run_to_completion(decode_engine, future)
                     assert actual.generated_tokens == expected
                     assert witness.steps and all(not step[2] for step in witness.steps)
                     assert witness.steps[0][0] == len(tokens)
+                    if transformer_impl == "local":
+                        assert any(name == "ColumnParallelLinear" for name, _ in native["layers"])
+                    elif transformer_impl == "inference_optimized":
+                        assert any(name.startswith("Inference") for name, _ in native["layers"])
+                        assert native["gathers"] and native["scatters"]
+                        assert all(
+                            after == before * decode_tp for before, after in native["gathers"]
+                        )
+                        assert all(
+                            before == after * decode_tp for before, after in native["scatters"]
+                        )
                     assert_released(decode_engine)
                     decode_engine._loop.run_until_complete(asyncio.sleep(0))
                 dist.barrier(group=control)
