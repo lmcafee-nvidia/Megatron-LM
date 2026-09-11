@@ -6,12 +6,15 @@ from unittest import mock
 import pytest
 import torch
 
+from megatron.core.inference import unified_memory as unified_memory_module
 from megatron.core.inference.config import AsyncScheduleMode, KVCacheManagementMode
 from megatron.core.inference.contexts import dynamic_context as dynamic_context_module
 from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.headers import Headers
 from megatron.core.transformer.cuda_graphs import _CudaGraphRunner
 from tests.unit_tests.inference.coordinator_pairwise_utils import greedy_params, routed_model, until
+from tests.unit_tests.inference.engines import test_dynamic_engine as engine_tests
+from tests.unit_tests.inference.test_coordinator_features_pairwise import _exercise_all_owners
 
 
 async def _pause_active(h, monkeypatch, prompt, params):
@@ -197,4 +200,105 @@ async def test_routed_epoch_change_reaches_all_engines(monkeypatch, synchronous)
             assert final["generated_tokens"] == direct["generated_tokens"]
             assert (final["policy_epoch"], final["kv_cache_epoch"]) == ([[0, 7]], [[0, 7]])
         await h.barrier()
+        h.assert_retired()
+
+
+@pytest.mark.internal
+@pytest.mark.asyncio
+async def test_routed_allocator_pressure_preserves_victim_identity(monkeypatch):
+    prompt, params = list(range(4, 20)), greedy_params()
+    async with routed_model(
+        monkeypatch,
+        context_buffer_size_gb=0.00004,
+        context_paused_buffer_size_gb=0.000008,
+    ) as h:
+        direct = await h.direct(prompt, params)
+        context, transitions = h.engine.context, []
+        allocator, update = context.kv_block_allocator, context.update_requests
+        assert (allocator.pool_size, allocator.paused_limit) == (5, 1)
+
+        def observed_update(*args, **kwargs):
+            result = update(*args, **kwargs)
+            evicted = result["evict_request_ids"]
+            if evicted is not None:
+                paused = result["newly_paused_request_ids"]
+                transitions.append((paused.shape, paused.flatten().tolist(), evicted.tolist()))
+            return result
+
+        monkeypatch.setattr(context, "update_requests", observed_update)
+        await h.start()
+        await h.pause()
+        route = [None]
+        if h.rank == 0:
+            count = h.dp_size * (allocator.pool_size - 2)
+            pending = [
+                h.clients[0].add_request(prompt, copy.deepcopy(params)) for _ in range(count)
+            ]
+            await until(lambda: len(h.service.coordinator.request_id_to_rank) == count)
+            route[0] = dict(h.service.coordinator.request_id_to_rank)
+        torch.distributed.broadcast_object_list(route, src=0)
+        await h.unpause()
+        if h.rank == 0:
+            finals = await asyncio.wait_for(asyncio.gather(*pending), timeout=60)
+            reference = (direct["generated_tokens"], direct["status"])
+            assert [(r["generated_tokens"], r["status"]) for r in finals] == [reference] * count
+        await h.barrier()
+        [(shape, paused, evicted)] = transitions
+        assert paused == evicted and shape == (1,)
+        target = evicted[0]
+        assert route[0][target] == f"mp-coord-{h.rank}".encode()
+        assert sum(bool(s["prefill"]) for s in h.witnesses if target in s["ids"]) >= 2
+        h.assert_retired()
+
+
+@pytest.mark.internal
+@pytest.mark.asyncio
+async def test_routed_uvm_drained_reset_preserves_live_controls(monkeypatch):
+    config_constructor = engine_tests.InferenceConfig.__init__
+    pool_spy = mock.Mock(wraps=unified_memory_module.MemPool)
+
+    def uvm_config(config, *args, **kwargs):
+        kwargs["unified_memory_level"] = 1
+        config_constructor(config, *args, **kwargs)
+
+    def engine_factory(config):
+        with mock.patch.object(engine_tests.InferenceConfig, "__init__", uvm_config):
+            return engine_tests.DynamicInferenceEngineTestBase._build_test_env(config).engine
+
+    monkeypatch.setattr(unified_memory_module, "MemPool", pool_spy)
+    prompt, params = list(range(4, 20)), greedy_params()
+    async with routed_model(monkeypatch, engine_factory=engine_factory) as h:
+        context = h.engine.context
+        assert context.unified_memory_level == 1
+        assert pool_spy.call_count == 1
+        assert pool_spy.call_args.kwargs["allocator"] is unified_memory_module._alloc
+        pointer, end = context.memory_buffer.data_ptr(), context.memory_buffer.nbytes
+        assert any(
+            s["address"] <= pointer and pointer + end <= s["address"] + s["total_size"]
+            for s in context.unified_memory_mempool.snapshot()
+        )
+        unified_memory_module.advise_managed_tensor_preferred_location(
+            context.memory_buffer, device=-1
+        )
+        unified_memory_module.prefetch_managed_tensor(context.memory_buffer, device=-1)
+        unified_memory_module.prefetch_managed_tensor(context.memory_buffer, device=h.rank)
+        torch.cuda.synchronize()
+        direct = await h.direct(prompt, params)
+        await _exercise_all_owners(h, prompt, params, direct)
+        names = ("_cond", "_state_events", "_pending_signals", "world_zmq_communicator")
+        runtime = {name: getattr(h.engine, name) for name in names}
+        h.engine.reset()
+        assert all(getattr(h.engine, name) is value for name, value in runtime.items())
+        assert h.engine.use_coordinator and h.engine.state == EngineState.PAUSED
+        assert h.engine._state_events[EngineState.PAUSED].is_set()
+        await h.barrier()
+        await h.unpause()
+        if h.rank == 0:
+            final = await asyncio.wait_for(h.clients[0].add_request(prompt, params), 60)
+            assert (final["generated_tokens"], final["status"]) == (
+                direct["generated_tokens"],
+                direct["status"],
+            )
+        await h.barrier()
+        assert h.witnesses
         h.assert_retired()
