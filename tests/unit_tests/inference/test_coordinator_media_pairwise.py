@@ -5,19 +5,24 @@ import copy
 
 import pytest
 import torch
+from PIL import Image
 
 from megatron.core.inference.config import (
+    ImageProcessingConfig,
     MediaCacheCoordinatorPolicy,
     PrefixCachingCoordinatorPolicy,
     PrefixCachingEvictionPolicy,
 )
-from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
+from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, EngineState
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (
     VLMInferenceWrapper,
 )
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
+)
+from megatron.core.inference.text_generation_server.dynamic_text_gen_server.image_preprocessing import (
+    preprocess_image,
 )
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
@@ -29,7 +34,7 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.inference.coordinator_pairwise_utils import greedy_params, routed_model, until
 
 
-def _install_vlm(h, monkeypatch):
+def _install_vlm(h, monkeypatch, dynamic, allow_stale):
     language = h.engine.controller.model_config
     language.language_model_type = "dummy"
     config = dict(
@@ -40,7 +45,7 @@ def _install_vlm(h, monkeypatch):
         use_cpu_initialization=True,
     )
     vision = TransformerConfig(**config)
-    vision.vision_model_type = "clip"
+    vision.vision_model_type = "radio" if dynamic else "clip"
     projection = TransformerConfig(
         **{
             **config,
@@ -66,6 +71,9 @@ def _install_vlm(h, monkeypatch):
             img_h=32,
             img_w=32,
             patch_dim=16,
+            dynamic_resolution=dynamic,
+            class_token_len=0 if dynamic else None,
+            radio_disable_cpe=dynamic,
         )
         .cuda()
         .to(torch.bfloat16)
@@ -73,6 +81,7 @@ def _install_vlm(h, monkeypatch):
     )
     context = h.engine.context
     context.config.vision_embedding_cache_max_bytes = 1024 * 1024
+    context.config.allow_stale_multimodal_embeddings = allow_stale
     wrapper = VLMInferenceWrapper(model, context)
     wrapper.prep_model_for_inference()
     monkeypatch.setattr(h.tokenizer, "convert_tokens_to_ids", lambda token: 99, raising=False)
@@ -93,7 +102,16 @@ def _install_vlm(h, monkeypatch):
         before = dict(calls)
         request = build(**kwargs)
         delta = tuple(calls[name] - before[name] for name in calls)
-        admissions.append((request.request_id, h.rank, request.block_hash_salt, *delta))
+        admissions.append(
+            (
+                request.request_id,
+                h.rank,
+                request.block_hash_salt,
+                *delta,
+                h.engine._weight_epoch,
+                request.image_embeddings.detach().cpu(),
+            )
+        )
         return request
 
     monkeypatch.setattr(h.engine, "_build_vlm_request", build_request)
@@ -131,15 +149,36 @@ def _install_vlm(h, monkeypatch):
 @pytest.mark.internal
 @pytest.mark.asyncio
 @pytest.mark.parametrize("policy", list(MediaCacheCoordinatorPolicy))
-async def test_routed_media_affinity_uses_real_cached_embeddings(monkeypatch, policy):
+@pytest.mark.parametrize("dynamic", [False, True], ids=["clip", "radio-dynamic"])
+@pytest.mark.parametrize("allow_stale", [False, True], ids=["invalidate", "retain"])
+async def test_routed_media_affinity_uses_real_cached_embeddings(
+    monkeypatch, policy, dynamic, allow_stale
+):
     prompt = [*range(4, 20), 99, 20, 21]
     params = greedy_params(return_prompt_tokens=True)
-    image_a = dict(
-        imgs=torch.arange(3 * 32 * 32, dtype=torch.float32).reshape(1, 3, 32, 32) / 3072,
-        num_tiles=torch.tensor([1]),
-        num_img_embeddings_per_tile=4,
-    )
-    image_b = {**image_a, "imgs": image_a["imgs"].flip(-1).contiguous()}
+    if dynamic:
+        pixels = torch.arange(32 * 48 * 3).remainder(251).byte().reshape(32, 48, 3)
+        image_config = ImageProcessingConfig(
+            patch_dim=16,
+            dynamic_resolution=True,
+            dynamic_resolution_max_patches=6,
+            pixel_mean=[0.0] * 3,
+            pixel_std=[1.0] * 3,
+        )
+
+        def raw_media(values):
+            imgs, imgs_sizes = preprocess_image(Image.fromarray(values.numpy()), image_config)
+            return {"imgs": imgs, "imgs_sizes": imgs_sizes}
+
+        image_a = raw_media(pixels)
+        image_b = raw_media(pixels.flip(1).contiguous())
+    else:
+        image_a = dict(
+            imgs=torch.arange(3 * 32 * 32, dtype=torch.float32).reshape(1, 3, 32, 32) / 3072,
+            num_tiles=torch.tensor([1]),
+            num_img_embeddings_per_tile=4,
+        )
+        image_b = {**image_a, "imgs": image_a["imgs"].flip(-1).contiguous()}
     async with routed_model(
         monkeypatch,
         enable_prefix_caching=True,
@@ -151,7 +190,7 @@ async def test_routed_media_affinity_uses_real_cached_embeddings(monkeypatch, po
         },
     ) as h:
         assert h.dp_size == 2, "This owner-selection schedule is a two-replica row"
-        admissions = _install_vlm(h, monkeypatch)
+        admissions = _install_vlm(h, monkeypatch, dynamic, allow_stale)
         references = []
         for media in (image_a, image_b):
             future = h.engine.add_request(10001, prompt, copy.deepcopy(params), **media)
@@ -174,6 +213,33 @@ async def test_routed_media_affinity_uses_real_cached_embeddings(monkeypatch, po
         if h.rank == 0:
             _, result = await asyncio.wait_for(asyncio.gather(text, warm), timeout=60)
             assert result["generated_tokens"] == references[0]
+        await h.barrier()
+        cache_before = {
+            key: embedding.detach().cpu().clone()
+            for key, embedding in h.engine._vision_embedding_cache.items()
+        }
+        assert set(cache_before) == {row[2] for row in admissions}
+        await h.pause()
+        if h.rank == 0:
+            h.clients[0].suspend_engines()
+        await asyncio.wait_for(h.engine.wait_until(EngineState.SUSPENDED), timeout=60)
+        assert h.engine._weight_epoch == 0
+        if allow_stale:
+            assert set(h.engine._vision_embedding_cache) == set(cache_before)
+            assert all(
+                torch.equal(h.engine._vision_embedding_cache[key].cpu(), value)
+                for key, value in cache_before.items()
+            )
+        else:
+            assert not h.engine._vision_embedding_cache
+        await h.barrier()
+        if h.rank == 0:
+            h.clients[0].resume_engines()
+        await asyncio.wait_for(h.engine.wait_until(EngineState.RESUMED), timeout=60)
+        assert h.engine._weight_epoch == 1 and h.engine.state == EngineState.PAUSED
+        await h.barrier()
+        await h.unpause()
+        if h.rank == 0:
             for media, expected in zip((image_a, image_b), references):
                 result = await asyncio.wait_for(
                     h.clients[0].add_request(
@@ -184,6 +250,8 @@ async def test_routed_media_affinity_uses_real_cached_embeddings(monkeypatch, po
                 assert result["generated_tokens"] == expected
             submits = [e for e in h.service.events if e["header"] == Headers.SUBMIT_REQUEST]
             assert len(submits) == 4
+            assert submits[0]["sender"] == submits[2]["sender"] == submits[3]["sender"]
+            assert submits[1]["sender"] != submits[0]["sender"]
             routes = []
             for event in submits:
                 new_ids = set(event["after"]) - set(event["before"])
@@ -217,14 +285,25 @@ async def test_routed_media_affinity_uses_real_cached_embeddings(monkeypatch, po
             for rid, owner in route_info[1:]
         )
 
-        expected_calls = (1, 0 if policy == MediaCacheCoordinatorPolicy.AFFINITY else 1, 1)
+        expected_calls = (
+            1,
+            0 if allow_stale and policy == MediaCacheCoordinatorPolicy.AFFINITY else 1,
+            1,
+        )
+        expected_positions = 6 if dynamic else 4
         for request_id, count in zip(targets, expected_calls):
             assert by_id[request_id][3] == by_id[request_id][4] == count
             assert any(
-                request_id in step[1] and step[2] > 0 and step[3] for step in all_witnesses
+                request_id in step[1] and step[2] == expected_positions and step[3]
+                for step in all_witnesses
             ), f"Request {request_id} must consume its own projected image embeddings"
 
-        assert by_id[warm_id][2] == by_id[repeat_id][2] != by_id[different_id][2]
+        assert by_id[warm_id][5] == 0
+        assert by_id[repeat_id][5] == by_id[different_id][5] == 1
+        assert by_id[repeat_id][2] == f"w1\0{by_id[warm_id][2]}"
+        assert by_id[repeat_id][2] != by_id[different_id][2]
+        assert torch.equal(by_id[warm_id][6], by_id[repeat_id][6])
+        assert not torch.equal(by_id[warm_id][6], by_id[different_id][6])
         different_steps = [step for step in all_witnesses if different_id in step[1]]
         assert different_steps and all(step[4][different_id] == 0 for step in different_steps)
         h.assert_retired()
