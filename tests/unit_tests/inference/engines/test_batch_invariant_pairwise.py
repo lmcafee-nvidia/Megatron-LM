@@ -123,8 +123,10 @@ def test_dense_dynamic_feature_batch_invariance(case):
     "filters", [dict(top_k=7, top_p=0.0), dict(top_k=0, top_p=0.8)], ids=["top-k", "top-p"]
 )
 @pytest.mark.parametrize("mode", ["raw_logprobs", "processed_logprobs"])
-def test_sampling_fixed_history_batch_invariance(backend, filters, mode):
+@pytest.mark.parametrize("offset_by_dp", [False, True])
+def test_sampling_fixed_history_batch_invariance(backend, filters, mode, offset_by_dp):
     case = Case("sampling", context={"sampling_backend": backend, "logprobs_mode": mode})
+    case.context["offset_sampling_seed_by_dp_rank"] = offset_by_dp
     # Stop the target after one real sample. No stochastic sampled token enters
     # a subsequent target forward, so solo and co-batched histories are identical.
     params = dict(num_tokens_to_generate=1, temperature=0.7, skip_prompt_log_probs=True, **filters)
@@ -143,7 +145,10 @@ def test_sampling_fixed_history_batch_invariance(backend, filters, mode):
         assert torch.equal(expected["log_probs"], observed["log_probs"])
         assert {s["physical"] for s in reference[1].steps} == {64}
         assert any(s["physical"] == 128 and s["requests"] == 65 for s in actual[1].steps)
+        # TP=PP=1 in this case, so WORLD rank is the actual DP rank.
+        seed = 333 + (torch.distributed.get_rank() if offset_by_dp else 0)
         for result, sample in ((reference, expected), (actual, observed)):
+            assert result[1].engine.controller.sampling_rng.initial_seed() == seed
             assert len(result[0].generated_tokens) == 1
             token = result[0].generated_tokens[0]
             assert token == sample["token"]
