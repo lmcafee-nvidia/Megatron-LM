@@ -165,17 +165,18 @@ async def test_live_coordinator_batch_invariance_and_output_contracts(policy, pr
                 ep_calls, ep_sync = [], []
                 if progress is not None:
                     ctx = engine.context
-                    for module, name, tensor in (
-                        (dispatch, "multimem_all_gatherv_3tensor", 3),
-                        (moe_bi, "ordered_reduce_scatter_v", 0),
+                    for module, name in (
+                        (dispatch, "multimem_all_gatherv_3tensor"),
+                        (moe_bi, "ordered_reduce_scatter_v"),
                     ):
                         original = getattr(module, name)
 
-                        def collective(*args, fn=original, name=name, tensor=tensor, **kwargs):
+                        def collective(*args, fn=original, name=name, **kwargs):
                             result = fn(*args, **kwargs)
                             target = 2 in ctx.request_ids[: ctx.total_request_count]
                             counter = engine._ep_consensus_loop_counter
-                            ep_calls.append((name, counter, target, args[tensor].shape[0]))
+                            rows = ctx.gpu_view.real_token_count.item()
+                            ep_calls.append((name, counter, target, rows))
                             return result
 
                         patch.setattr(module, name, collective)
@@ -231,11 +232,8 @@ async def test_live_coordinator_batch_invariance_and_output_contracts(policy, pr
                 await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), 30)
                 all_ep = [None, None]
                 torch.distributed.all_gather_object(all_ep, (ep_calls, ep_sync))
-                wide = [
-                    (i, call)
-                    for i, call in enumerate(all_ep[owner][0])
-                    if call[2] and call[3] == 128
-                ]
+                calls = all_ep[owner][0]
+                wide = [(i, call) for i, call in enumerate(calls) if call[2] and call[3] == 128]
                 assert {call[0] for _, call in wide} == {
                     "multimem_all_gatherv_3tensor",
                     "ordered_reduce_scatter_v",
