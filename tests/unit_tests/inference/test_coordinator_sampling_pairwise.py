@@ -226,7 +226,7 @@ async def test_routed_bos_stop_after_metadata_compaction(monkeypatch, keep, skip
         top_n_logprobs=3,
         detokenize_stop_sequence=keep,
     )
-    async with routed_model(monkeypatch, sampling_backend="torch") as h:
+    async with routed_model(monkeypatch, sampling_backend="torch", hidden_size=128) as h:
         h.tokenizer.bos = 3
         direct = await h.direct([3, 4, 5], params)
         params.stop_words = [h.tokenizer.detokenize(direct["generated_tokens"][:2])]
