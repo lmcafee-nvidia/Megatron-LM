@@ -121,7 +121,7 @@ async def test_routed_native_model_modes_match_direct(monkeypatch, mode):
                 else:
                     assert all(mode.upper() + "Tensor" in type(a).__name__ for a in args[:2])
                     assert context.padded_active_token_count == 128
-                    assert any(a.shape[0] == 128 for a in args[:2])
+                    assert any(a.size(0) == 128 for a in args[:2])
                 phase = "decode" if context.is_decode_only() else "prefill"
                 runtime[f"{mode}-{phase}"] += 1
                 return result
