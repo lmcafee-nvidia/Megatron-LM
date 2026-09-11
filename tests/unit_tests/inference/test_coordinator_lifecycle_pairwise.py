@@ -16,6 +16,8 @@ from tests.unit_tests.inference.coordinator_pairwise_utils import greedy_params,
 from tests.unit_tests.inference.engines import test_dynamic_engine as engine_tests
 from tests.unit_tests.inference.test_coordinator_features_pairwise import _exercise_all_owners
 
+pytestmark = [pytest.mark.internal, pytest.mark.asyncio]
+
 
 async def _pause_active(h, monkeypatch, prompt, params):
     arrived, release = asyncio.Event(), asyncio.Event()
@@ -48,8 +50,6 @@ async def _pause_active(h, monkeypatch, prompt, params):
     return future
 
 
-@pytest.mark.internal
-@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", list(AsyncScheduleMode))
 @pytest.mark.parametrize("residency", list(KVCacheManagementMode))
 async def test_routed_suspend_resumes_active_request(monkeypatch, mode, residency):
@@ -133,8 +133,6 @@ async def test_routed_suspend_resumes_active_request(monkeypatch, mode, residenc
         h.assert_retired()
 
 
-@pytest.mark.internal
-@pytest.mark.asyncio
 @pytest.mark.parametrize("active", [False, True], ids=["queued", "active"])
 async def test_routed_abort_retires_only_cancelled_request(monkeypatch, active):
     prompt, params = list(range(4, 20)), greedy_params(num_tokens_to_generate=16)
@@ -167,8 +165,6 @@ async def test_routed_abort_retires_only_cancelled_request(monkeypatch, active):
         h.assert_retired()
 
 
-@pytest.mark.internal
-@pytest.mark.asyncio
 @pytest.mark.parametrize("synchronous", [False, True])
 async def test_routed_epoch_change_reaches_all_engines(monkeypatch, synchronous):
     """A paused generation update reaches idle peers and the active request."""
@@ -203,8 +199,6 @@ async def test_routed_epoch_change_reaches_all_engines(monkeypatch, synchronous)
         h.assert_retired()
 
 
-@pytest.mark.internal
-@pytest.mark.asyncio
 async def test_routed_allocator_pressure_preserves_victim_identity(monkeypatch):
     prompt, params = list(range(4, 20)), greedy_params()
     async with routed_model(
@@ -249,8 +243,6 @@ async def test_routed_allocator_pressure_preserves_victim_identity(monkeypatch):
         h.assert_retired()
 
 
-@pytest.mark.internal
-@pytest.mark.asyncio
 async def test_routed_uvm_drained_reset_preserves_live_controls(monkeypatch):
     config_constructor = engine_tests.InferenceConfig.__init__
     pool_spy = mock.Mock(wraps=unified_memory_module.MemPool)
@@ -289,6 +281,7 @@ async def test_routed_uvm_drained_reset_preserves_live_controls(monkeypatch):
         assert all(getattr(h.engine, name) is value for name, value in runtime.items())
         assert h.engine.use_coordinator and h.engine.state == EngineState.PAUSED
         assert h.engine._state_events[EngineState.PAUSED].is_set()
+        h.witnesses.clear()
         await h.barrier()
         await h.unpause()
         if h.rank == 0:
@@ -298,5 +291,5 @@ async def test_routed_uvm_drained_reset_preserves_live_controls(monkeypatch):
                 direct["status"],
             )
         await h.barrier()
-        assert h.witnesses
+        assert await h.sync.all_reduce_max(bool(h.witnesses)) == 1
         h.assert_retired()

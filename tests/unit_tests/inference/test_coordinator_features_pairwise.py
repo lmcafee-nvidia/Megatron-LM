@@ -18,6 +18,8 @@ from tests.unit_tests.inference.engines.test_dynamic_engine_async_sched import (
     _instrument_scenario_runtime,
 )
 
+pytestmark = [pytest.mark.internal, pytest.mark.asyncio]
+
 
 def _active_target_ids(harness):
     context = harness.engine.context
@@ -127,8 +129,6 @@ async def _exercise_all_owners(
     return target
 
 
-@pytest.mark.internal
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -187,8 +187,6 @@ async def test_routed_topology_matches_direct_on_every_owner(monkeypatch, overri
                 assert target["tp-collective:reduce_from_tensor_model_parallel_region"] > 0
 
 
-@pytest.mark.internal
-@pytest.mark.asyncio
 async def test_routed_cuda_graph_replays_for_every_target(monkeypatch):
     """Completed routed decode forwards invoke the production CUDA replay node."""
     prompt = list(range(4, 16))
@@ -217,8 +215,6 @@ async def test_routed_cuda_graph_replays_for_every_target(monkeypatch):
         assert target["cuda-graph-replay"] > 0
 
 
-@pytest.mark.internal
-@pytest.mark.asyncio
 async def test_routed_mtp_executes_inner_steps_on_every_target(monkeypatch):
     """Coordinator-owned speculative decoding calls the real inner MTP model step."""
     prompt = list(range(4, 16))
@@ -244,8 +240,6 @@ async def test_routed_mtp_executes_inner_steps_on_every_target(monkeypatch):
         assert int(harness.engine._spec_tokens_proposed_per_pos.sum()) > 0
 
 
-@pytest.mark.internal
-@pytest.mark.asyncio
 @pytest.mark.parametrize("mixer", ["mamba", "gdp", "gdn"])
 async def test_routed_hybrid_updates_owned_recurrent_state(monkeypatch, mixer):
     """Completed target decode updates the target's mapped recurrent state slot."""
@@ -307,8 +301,6 @@ async def test_routed_hybrid_updates_owned_recurrent_state(monkeypatch, mixer):
         assert target["owned-state-updates"] > 0
 
 
-@pytest.mark.internal
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "options,signals,required",
     [
@@ -367,8 +359,6 @@ async def test_routed_model_kernels_match_direct(monkeypatch, options, signals, 
             assert target[counter] > 0, counter
 
 
-@pytest.mark.internal
-@pytest.mark.asyncio
 async def test_routed_moe_participates_in_ep_collectives(monkeypatch):
     """Every coordinator target dispatches and combines through its EP collective."""
     prompt = list(range(4, 16))
