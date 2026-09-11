@@ -392,12 +392,7 @@ def test_dynamic_inference_request_serialize_strips_event_add_engine():
     ),
     [
         (False, None, None, None),  # default: prompt state dropped from payload
-        (
-            True,
-            ("tensor", [1, 2, 3, 4]),
-            ("tensor", [1, 99, 4]),
-            ("tensor", [1, 2, 3, 4]),
-        ),
+        (True, ("tensor", [1, 2, 3, 4]), ("tensor", [1, 99, 4]), ("tensor", [1, 2, 3, 4])),
     ],
 )
 def test_dynamic_inference_request_serialize_return_prompt_tokens(
