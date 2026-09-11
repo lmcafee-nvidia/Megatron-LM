@@ -11,7 +11,6 @@ from megatron.core.inference.model_inference_wrappers.multimodal import vlm_infe
 from megatron.core.models.gpt import gpt_layer_specs
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -24,25 +23,12 @@ CACHE_REQUEST = 102
 
 def _config(layers, hidden, heads, backend, fa_version):
     return TransformerConfig(
+        **fixture.model_defaults(backend, fa_version),
         num_layers=layers,
         hidden_size=hidden,
         num_attention_heads=heads,
         ffn_hidden_size=4 * hidden,
-        use_cpu_initialization=True,
-        hidden_dropout=0.0,
-        attention_dropout=0.0,
-        normalization="RMSNorm",
-        params_dtype=torch.bfloat16,
-        bf16=True,
-        attention_backend=AttnBackend.flash,
-        flash_attention_version=fa_version,
-        transformer_impl="transformer_engine",
-        batch_invariant_mode=True,
-        batch_invariant_backend=backend,
         batch_invariant_collective="ordered",
-        nccl_all_reduce_for_prefill=False,
-        inference_rng_tracker=True,
-        inference_sampling_seed=333,
     )
 
 

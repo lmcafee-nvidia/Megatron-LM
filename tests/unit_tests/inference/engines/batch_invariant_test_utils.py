@@ -36,32 +36,17 @@ from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
+from tests.unit_tests.inference.test_data_parallel_inference_coordinator import (
+    DummyTokenizer as _DummyTokenizer,
+)
 from tests.unit_tests.test_utilities import Utils
 
 TARGET = 101
 VOCAB = 128
 
 
-class DummyTokenizer:
-    """Minimal tokenizer isolated from unrelated model-test dependencies."""
-
-    def __init__(self, vocab_size, bos=None, eod=0, pad=0):
-        self.vocab_size = vocab_size
-        self.bos = bos
-        self.eod = eod
-        self.pad = pad
-
-    def tokenize(self, prompt):
-        if isinstance(prompt, str):
-            return [int(token) % self.vocab_size for token in prompt.strip().split()]
-        return list(prompt)
-
-    def detokenize(self, tokens, skip_special_tokens=False):
-        if isinstance(tokens, torch.Tensor):
-            tokens = tokens.tolist()
-        if skip_special_tokens and self.eod in tokens:
-            tokens = [token for token in tokens if token != self.eod]
-        return " ".join(str(token) for token in tokens)
+class DummyTokenizer(_DummyTokenizer):
+    """Reuse the coordinator's integer tokenizer with score-offset support."""
 
     @staticmethod
     def offsets(tokens, text):
@@ -132,17 +117,9 @@ def invariant_runtime(case):
         Utils.destroy_model_parallel()
 
 
-def build_engine(case, backend, fa_version):
-    """Build the same tiny, real model for every ordering of a case."""
-    torch.manual_seed(321)
-    model_parallel_cuda_manual_seed(
-        321, inference_rng_tracker=True, use_cudagraphable_rng=False, force_reset_rng=True
-    )
-    graphed = case.context.get("num_cuda_graphs") is not None
-    model_options = dict(
-        num_layers=2 if case.pp == 1 else 4,
-        hidden_size=128,
-        num_attention_heads=4,
+def model_defaults(backend, fa_version):
+    """Common identical model settings; architecture-specific options stay local."""
+    return dict(
         use_cpu_initialization=True,
         hidden_dropout=0.0,
         attention_dropout=0.0,
@@ -157,6 +134,21 @@ def build_engine(case, backend, fa_version):
         nccl_all_reduce_for_prefill=False,
         inference_rng_tracker=True,
         inference_sampling_seed=333,
+    )
+
+
+def build_engine(case, backend, fa_version):
+    """Build the same tiny, real model for every ordering of a case."""
+    torch.manual_seed(321)
+    model_parallel_cuda_manual_seed(
+        321, inference_rng_tracker=True, use_cudagraphable_rng=False, force_reset_rng=True
+    )
+    graphed = case.context.get("num_cuda_graphs") is not None
+    model_options = dict(
+        **model_defaults(backend, fa_version),
+        num_layers=2 if case.pp == 1 else 4,
+        hidden_size=128,
+        num_attention_heads=4,
         tensor_model_parallel_size=case.tp,
         pipeline_model_parallel_size=case.pp,
         sequence_parallel=case.sp,
