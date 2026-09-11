@@ -207,6 +207,7 @@ async def test_routed_allocator_pressure_preserves_victim_identity(monkeypatch):
         direct = await h.direct(prompt, params)
         context, transitions = h.engine.context, []
         allocator, update = context.kv_block_allocator, context.update_requests
+        resume_spy = mock.Mock(wraps=context.resume_paused_requests)
         assert (allocator.pool_size, allocator.paused_limit) == (5, 1)
 
         def observed_update(*args, **kwargs):
@@ -217,6 +218,7 @@ async def test_routed_allocator_pressure_preserves_victim_identity(monkeypatch):
                 transitions.append((paused.shape, paused.flatten().tolist(), evicted.tolist()))
             return result
 
+        monkeypatch.setattr(context, "resume_paused_requests", resume_spy)
         monkeypatch.setattr(context, "update_requests", observed_update)
         await h.start()
         await h.pause()
@@ -236,6 +238,7 @@ async def test_routed_allocator_pressure_preserves_victim_identity(monkeypatch):
             assert [(r["generated_tokens"], r["status"]) for r in finals] == [reference] * count
         await h.barrier()
         [(shape, paused, evicted)] = transitions
+        assert resume_spy.call_args_list[0].args[1].shape == (allocator.pool_size - 2,)
         assert paused == evicted and shape == (1,)
         target = evicted[0]
         assert route[0][target] == f"mp-coord-{h.rank}".encode()
@@ -259,8 +262,7 @@ async def test_routed_uvm_drained_reset_preserves_live_controls(monkeypatch):
     prompt, params = list(range(4, 20)), greedy_params()
     async with routed_model(monkeypatch, engine_factory=engine_factory) as h:
         context = h.engine.context
-        assert context.unified_memory_level == 1
-        assert pool_spy.call_count == 1
+        assert context.unified_memory_level == pool_spy.call_count == 1
         assert pool_spy.call_args.kwargs["allocator"] is unified_memory_module._alloc
         pointer, end = context.memory_buffer.data_ptr(), context.memory_buffer.nbytes
         assert any(
@@ -282,14 +284,12 @@ async def test_routed_uvm_drained_reset_preserves_live_controls(monkeypatch):
         assert h.engine.use_coordinator and h.engine.state == EngineState.PAUSED
         assert h.engine._state_events[EngineState.PAUSED].is_set()
         h.witnesses.clear()
+        reference = direct["generated_tokens"], direct["status"]
         await h.barrier()
         await h.unpause()
         if h.rank == 0:
             final = await asyncio.wait_for(h.clients[0].add_request(prompt, params), 60)
-            assert (final["generated_tokens"], final["status"]) == (
-                direct["generated_tokens"],
-                direct["status"],
-            )
+            assert (final["generated_tokens"], final["status"]) == reference
         await h.barrier()
         assert await h.sync.all_reduce_max(bool(h.witnesses)) == 1
         h.assert_retired()
