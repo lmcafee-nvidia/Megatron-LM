@@ -13,6 +13,7 @@ from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt import GPTModel
 from megatron.core.ssm.mamba_mixer import MambaMixer
+from megatron.core.tokenizers.text.libraries.null_tokenizer import NullTokenizer
 from tests.unit_tests.inference.engines import disagg_test_utils as dtu
 from tests.unit_tests.inference.engines.test_disagg_pairwise import transport_world  # noqa: F401
 
@@ -31,10 +32,13 @@ def _error(call):
     ("model", "backend"),
     [pytest.param("gpt", "nixl", id="kv-nixl"), pytest.param("hybrid", "nccl", id="ssm-nccl")],
 )
+@pytest.mark.parametrize("stop_keep", [None, False, True], ids=["eos", "stop-strip", "stop-keep"])
 @torch.inference_mode()
 @mock.patch.object(GPTModel, "forward", autospec=True, side_effect=GPTModel.forward)
 @mock.patch.object(MambaMixer, "forward", autospec=True, side_effect=MambaMixer.forward)
-def test_nonpersist_suspend_rejects_owned_source_state(mixer, gpt, transport_world, model, backend):
+def test_nonpersist_suspend_rejects_owned_source_state(
+    mixer, gpt, transport_world, model, backend, stop_keep
+):
     """Owned KV/SSM publications reject suspend before its first mutation."""
 
     rank = dist.get_rank()
@@ -47,6 +51,8 @@ def test_nonpersist_suspend_rejects_owned_source_state(mixer, gpt, transport_wor
         static_kv_memory_pointers=False,
     )
     with dtu.real_engine(config, role="prefill" if source else "decode", backend=backend) as engine:
+        engine.controller.tokenizer.tokenize = NullTokenizer(config.vocab_size).text_to_ids
+        engine.controller.tokenizer.bos = None
         metadata = state = guard = publication = None
         if source:
             request = dtu.run_to_completion(
@@ -98,8 +104,11 @@ def test_nonpersist_suspend_rejects_owned_source_state(mixer, gpt, transport_wor
         if not source:
             metadata, state, guard, publication = peer
         assert metadata["kv_meta"]["resume_tokens"] == [publication[6]]
+        assert engine.controller.tokenizer.tokenize(str(publication[6])) == [publication[6]]
         params = dtu.sampling(7)
-        params.termination_id = publication[6]
+        params.termination_id = publication[6] if stop_keep is None else -1
+        params.stop_words = [] if stop_keep is None else [str(publication[6])]
+        params.detokenize_stop_sequence = bool(stop_keep)
         pending, future = dtu.complete_transfer(engine, metadata, tokens, params, transport_world)
 
         destination_release = None
@@ -120,7 +129,7 @@ def test_nonpersist_suspend_rejects_owned_source_state(mixer, gpt, transport_wor
                 bool((refs_before > 0).all()),
                 bool((engine.context.kv_block_allocator.block_ref_counts[owned] == 0).all()),
             )
-            assert result.generated_tokens == [publication[6]]
+            assert result.generated_tokens == ([] if stop_keep is False else [publication[6]])
             assert gpt.call_count == mixer.call_count == 0
         dist.barrier(group=transport_world)
 

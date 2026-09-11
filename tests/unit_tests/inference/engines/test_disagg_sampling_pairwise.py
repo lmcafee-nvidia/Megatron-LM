@@ -17,6 +17,7 @@ from tests.unit_tests.inference.engines.disagg_test_utils import (
     admit_import,
     assert_import_equal,
     assert_released,
+    canonical_weights,
     complete_transfer,
     disagg_config,
     exchange,
@@ -79,13 +80,7 @@ def test_handoff_stochastic_fixed_history(transport_world, backend, filters):
     reference_samples = []
     with real_engine(config) as reference:
         assert type(reference.controller._sampling) is sampler_type
-        model = reference.controller.inference_wrapped_model.model
-        for parameter in model.parameters():
-            dist.broadcast(parameter.data, src=0)
-        weights = {
-            name: value.detach().cpu().clone() if torch.is_tensor(value) else value
-            for name, value in model.state_dict().items()
-        }
+        weights = canonical_weights(reference)
         with sampled_distributions(reference, reference_samples, params(2)):
             expected = run_to_completion(reference, reference.add_request(101, tokens, params(2)))
     assert len(reference_samples) == 2
