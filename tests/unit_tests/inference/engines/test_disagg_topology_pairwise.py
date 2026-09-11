@@ -330,7 +330,10 @@ def test_real_model_heterogeneous_handoff(tmp_path, case):
                     if not bad_peer:
                         assert_logical_import(decode_engine, pending, full, len(tokens))
                     admit_model_group(decode_engine, failed=True)
-                    assert future.done() and isinstance(future.exception(), RuntimeError)
+                    assert future.done()
+                    assert type(future.exception()).__name__ == (
+                        "nixlNotFoundError" if bad_peer else "RuntimeError"
+                    )
                     assert not decode_engine.context.total_request_count
                     assert not decode_engine._quarantined_kv_imports
                     assert_released(decode_engine)
