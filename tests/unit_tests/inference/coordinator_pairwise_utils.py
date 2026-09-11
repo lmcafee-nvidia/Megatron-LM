@@ -236,7 +236,10 @@ class RoutedModel:
                 local_ids.append((client, request_id))
                 await until(lambda: len(coordinator.request_id_to_rank) == len(pending))
             owners = dict(coordinator.request_id_to_rank)
-            assert coordinator._pending_counts.sum() == len(pending)
+            assert all(
+                coordinator._pending_counts[index] == list(owners.values()).count(identity)
+                for identity, index in coordinator.identity_to_rank_index.items()
+            )
         await self.unpause()
         if self.rank == 0:
             payload[0] = (await asyncio.wait_for(asyncio.gather(*pending), 120), owners, local_ids)
