@@ -4,7 +4,7 @@
 
 import asyncio
 import gc
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from functools import partial
 from unittest import mock
@@ -242,6 +242,23 @@ class _DeferredNcclPull:
         return self.real_handle is not None and self.real_handle.poll()
 
 
+@contextmanager
+def deferred_pulls(engine):
+    """Reserve KV and SSM destinations before posting matched real receives."""
+
+    deferred = []
+    with ExitStack() as stack:
+        for agent in [engine._kv_transfer_agent, *engine._ssm_transfer_agents.values()]:
+
+            def defer(*args, _begin=agent.begin_pull_blocks, **kwargs):
+                handle = _DeferredNcclPull(_begin, args, kwargs)
+                deferred.append(handle)
+                return handle
+
+            stack.enter_context(mock.patch.object(agent, "begin_pull_blocks", side_effect=defer))
+        yield deferred
+
+
 def _enqueue_decode_handoff(engine, metadata, tokens, params, request_id=101):
     """Allocate destinations before posting matched NCCL receives."""
 
@@ -249,29 +266,11 @@ def _enqueue_decode_handoff(engine, metadata, tokens, params, request_id=101):
         return engine.add_request_with_kv_handoff(
             request_id, tokens, params, metadata["kv_meta"], metadata["block_ids"]
         )
-
-    patches = []
-    deferred = []
-    agents = [engine._kv_transfer_agent, *engine._ssm_transfer_agents.values()]
-    for agent in agents:
-        begin = agent.begin_pull_blocks
-
-        def defer(*args, _begin=begin, **kwargs):
-            handle = _DeferredNcclPull(_begin, args, kwargs)
-            deferred.append(handle)
-            return handle
-
-        patch = mock.patch.object(agent, "begin_pull_blocks", side_effect=defer)
-        patch.start()
-        patches.append(patch)
-    try:
+    with deferred_pulls(engine) as deferred:
         future = engine.add_request_with_kv_handoff(
             request_id, tokens, params, metadata["kv_meta"], metadata["block_ids"]
         )
-    finally:
-        for patch in reversed(patches):
-            patch.stop()
-    assert len(deferred) == len(agents)
+    assert len(deferred) == 1 + len(engine._ssm_transfer_agents)
     return future
 
 
