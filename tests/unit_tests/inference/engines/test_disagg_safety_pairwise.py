@@ -109,6 +109,7 @@ def test_nonpersist_suspend_rejects_owned_source_state(
         params.termination_id = publication[6] if stop_keep is None else -1
         params.stop_words = [] if stop_keep is None else [str(publication[6])]
         params.detokenize_stop_sequence = bool(stop_keep)
+        expected_tokens = [] if stop_keep is False else [publication[6]]
         pending, future = dtu.complete_transfer(engine, metadata, tokens, params, transport_world)
 
         destination_release = None
@@ -128,9 +129,8 @@ def test_nonpersist_suspend_rejects_owned_source_state(
                 second_poll,
                 bool((refs_before > 0).all()),
                 bool((engine.context.kv_block_allocator.block_ref_counts[owned] == 0).all()),
+                (result.generated_tokens, gpt.call_count, mixer.call_count),
             )
-            assert result.generated_tokens == ([] if stop_keep is False else [publication[6]])
-            assert gpt.call_count == mixer.call_count == 0
         dist.barrier(group=transport_world)
 
         source_release = None
@@ -165,6 +165,6 @@ def test_nonpersist_suspend_rejects_owned_source_state(
         assert (publication[2] is not None) == (model == "hybrid")
         assert publication[3] and publication[4 if model == "hybrid" else 5] > 0
         assert observed_source == (1, 1, True, True)
-        assert observed_destination == (1, 0, True, True)
+        assert observed_destination == (1, 0, True, True, (expected_tokens, 0, 0))
         assert guard[:2] == ([None, None], ("RuntimeError", _PIN_ERROR))
         assert guard[2:] == (True, True, True, 0, "RUNNING", True)
