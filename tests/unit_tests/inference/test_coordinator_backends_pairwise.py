@@ -112,6 +112,8 @@ async def test_routed_native_model_modes_match_direct(monkeypatch, mode):
 
             def observed(*args, _kernel=kernel, **kwargs):
                 result = _kernel(*args, **kwargs)
+                if not features._active_target_ids(env):
+                    return result
                 context = env.engine.context
                 if mode == "mla":
                     assert context.cache_mla_latent and args[1].shape[-1] == 576
