@@ -22,6 +22,10 @@ from megatron.core.inference.config import (
     PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.contexts.dynamic_context import DynamoHelper
+from megatron.core.inference.disaggregation.engine import DisaggDynamicInferenceEngine
+from megatron.core.inference.disaggregation.inference_state_handoff import (
+    InferenceStateHandoffMixin,
+)
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.engines.dynamic_engine import EngineState, _get_decode_only_log_state
 from megatron.core.inference.inference_request import (
@@ -51,13 +55,17 @@ from tests.unit_tests.inference.engines.test_dynamic_engine import set_rounder a
 from tests.unit_tests.test_utilities import Utils
 
 
-def _make_engine(async_sched_mode=AsyncScheduleMode.ASYNC, **overrides):
-    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+def _make_engine(
+    async_sched_mode=AsyncScheduleMode.ASYNC, engine_cls=DynamicInferenceEngine, **overrides
+):
+    engine = engine_cls.__new__(engine_cls)
     context = SimpleNamespace(
         config=SimpleNamespace(async_sched_mode=async_sched_mode),
         is_hybrid_model=False,
         enable_prefix_caching=False,
         num_prefill_requests=0,
+        total_request_count=0,
+        max_requests=8,
         can_prepare_requests=mock.Mock(return_value=True),
         active_token_count=0,
         max_tokens=8,
@@ -206,6 +214,23 @@ def test_async_sched_overlap_probe_routes_schedulable_chunk_to_no_overlap():
     engine.get_request = mock.Mock(return_value=SimpleNamespace(request_id=10))
 
     assert not engine._should_run_async_sched_overlap()
+
+
+def test_ready_handoff_uses_safe_no_overlap_admission_point():
+    """A completed import cannot join the batch before pending logits are consumed."""
+
+    engine = _make_engine(engine_cls=DisaggDynamicInferenceEngine)
+    engine._initialize_disaggregation_state()
+    engine.waiting_request_ids = deque()
+    engine._pending_kv_imports.append(SimpleNamespace(request_id=7, resume_tokens=[55]))
+    engine._handoff_completion_notifications[7] = False
+
+    assert not engine._should_run_async_sched_overlap()
+
+    # Keep overlap enabled while the active batch is full; the normal lifecycle
+    # boundary will select no-overlap once capacity becomes available.
+    engine.context.total_request_count = engine.context.max_requests
+    assert engine._should_run_async_sched_overlap()
 
 
 @pytest.mark.parametrize(
@@ -494,9 +519,7 @@ _ASYNC_PAIR_SCENARIOS = (
             "max_sequence_length": 544,
             "context_block_size_tokens": 256,
             "context_max_tokens": 384,
-            "inference_config_overrides": {
-                "prefix_caching_eviction_policy": PrefixCachingEvictionPolicy.LRU
-            },
+            "prefix_caching_eviction_policy": PrefixCachingEvictionPolicy.LRU,
         },
         request_profile="prefix",
         signals=("chunked", "prefix-hit"),
@@ -511,10 +534,8 @@ _ASYNC_PAIR_SCENARIOS = (
             "force_build_cuda_graphs": True,
             "use_cuda_graphs_for_non_decode_steps": False,
             "inference_cuda_graph_scope": InferenceCudaGraphScope.block,
-            "inference_config_overrides": {
-                "cuda_graph_sizing_distribution": CudaGraphSizingDistribution.EXPONENTIAL,
-                "cuda_graph_max_tokens": 16,
-            },
+            "cuda_graph_sizing_distribution": CudaGraphSizingDistribution.EXPONENTIAL,
+            "cuda_graph_max_tokens": 16,
         },
         signals=("cuda-graph", "graph-decode-config"),
     ),
@@ -525,10 +546,8 @@ _ASYNC_PAIR_SCENARIOS = (
         config={
             "num_cuda_graphs": 4,
             "force_build_cuda_graphs": True,
-            "inference_config_overrides": {
-                "cuda_graph_max_tokens": 16,
-                "cuda_graph_mixed_prefill_count": 2,
-            },
+            "cuda_graph_max_tokens": 16,
+            "cuda_graph_mixed_prefill_count": 2,
         },
         signals=("cuda-graph", "graph-bounded-config"),
     ),
@@ -543,11 +562,9 @@ _ASYNC_PAIR_SCENARIOS = (
             "force_build_cuda_graphs": True,
             "cuda_graph_all_prefills": True,
             "inference_cuda_graph_scope": InferenceCudaGraphScope.layer,
-            "inference_config_overrides": {
-                "cuda_graph_mixed_prefill_count": 2,
-                "cuda_graph_sizing_distribution": CudaGraphSizingDistribution.LINEAR,
-                "cuda_graph_max_tokens": 24,
-            },
+            "cuda_graph_mixed_prefill_count": 2,
+            "cuda_graph_sizing_distribution": CudaGraphSizingDistribution.LINEAR,
+            "cuda_graph_max_tokens": 24,
         },
         signals=("cuda-graph", "graph-mixed-config"),
     ),
@@ -574,6 +591,22 @@ _ASYNC_PAIR_SCENARIOS = (
         signals=("flashinfer", "sampled", "temperature-filter", "top-k-filter", "top-p-filter"),
         prerequisite="flashinfer",
         parity="reproducible",
+    ),
+    _pair_scenario(
+        "raw-prompt-top-n-logprobs",
+        "logprobs:raw",
+        "logprobs:prompt",
+        "logprobs:top-n",
+        "logits:full",
+        config={"return_log_probs": True, "materialize_only_last_token_logits": False},
+        sampling=(
+            {"return_log_probs": True, "top_n_logprobs": 2},
+            {"return_log_probs": True, "top_n_logprobs": 5},
+        ),
+        signals=("full-logits", "logprobs", "top-n"),
+        # Different forward batch shapes may exchange a near-tied, non-selected
+        # final candidate; the harness still requires exact async-repeat top-N.
+        exact_top_n=False,
     ),
     _pair_scenario(
         "processed-skip-prompt-logprobs",
@@ -631,6 +664,26 @@ _ASYNC_PAIR_SCENARIOS = (
         signals=("mtp",),
     ),
     _pair_scenario(
+        "mtp-graph-heterogeneous-logprobs",
+        "speculation:mtp-depth-two",
+        "interaction:mtp-graph-metadata-compaction",
+        config={
+            "num_speculative_tokens": 2,
+            "num_cuda_graphs": 4,
+            "force_build_cuda_graphs": True,
+            "materialize_only_last_token_logits": False,
+        },
+        sampling=(
+            {"return_log_probs": True, "skip_prompt_log_probs": False, "top_n_logprobs": 2},
+            {"return_log_probs": False, "skip_prompt_log_probs": True},
+            {"return_log_probs": True, "skip_prompt_log_probs": True, "top_n_logprobs": 4},
+        ),
+        signals=("cuda-graph", "logprobs", "metadata-compaction", "mtp", "top-n"),
+        # MTP changes the forward batch shape; near-tied non-selected alternatives
+        # may exchange the final top-N slot while selected-token parity remains exact.
+        exact_top_n=False,
+    ),
+    _pair_scenario(
         "hybrid-mamba",
         "model:hybrid-mamba",
         "interaction:mamba-state-compaction",
@@ -655,10 +708,22 @@ _ASYNC_PAIR_SCENARIOS = (
     _pair_scenario(
         "fp8-transformer-engine",
         "precision:fp8",
-        config={"fp8": True},
+        config={"fp8": True, "hidden_size": 128},
         signals=("fp8",),
         prerequisite="fp8",
         atol=5.0e-3,
+        parity="reproducible",
+    ),
+    _pair_scenario(
+        "flashinfer-fused-rope",
+        "kernel:flashinfer-fused-rope",
+        config={
+            "hidden_size": 64,
+            "position_embedding_type": "rope",
+            "use_flashinfer_fused_rope": True,
+        },
+        signals=("fused-rope",),
+        prerequisite="flashinfer",
         parity="reproducible",
     ),
     _pair_scenario(
@@ -674,6 +739,21 @@ _ASYNC_PAIR_SCENARIOS = (
         "attention:learnable-sink",
         config={"window_size": (4, 0), "window_attn_skip_freq": 2, "softmax_type": "learnable"},
         signals=("softmax-sink", "swa-alternating"),
+    ),
+)
+
+_ASYNC_SUSPEND_RESUME_SCENARIOS = (
+    _pair_scenario(
+        "offload-suspend-resume",
+        "kv:offload",
+        config={"kv_cache_management_mode": "offload", "static_kv_memory_pointers": False},
+        signals=("offload", "suspend-resume"),
+    ),
+    _pair_scenario(
+        "recompute-suspend-resume",
+        "kv:recompute",
+        config={"kv_cache_management_mode": "recompute", "static_kv_memory_pointers": False},
+        signals=("recompute", "suspend-resume"),
     ),
 )
 
@@ -702,6 +782,7 @@ _ASYNC_PARALLEL_SCENARIOS = (
         "interaction:moe-ep-ordering",
         config={
             "expert_model_parallel_size": 2,
+            "use_moe_layer_spec": True,
             "inference_moe_token_dispatcher_type": "nccl",
             "transformer_impl": "inference_optimized",
         },
@@ -715,7 +796,7 @@ _ASYNC_PARALLEL_SCENARIOS = (
             "tensor_model_parallel_size": 2,
             "sequence_parallel": True,
             "transformer_impl": "inference_optimized",
-            "inference_config_overrides": {"offset_sampling_seed_by_dp_rank": False},
+            "offset_sampling_seed_by_dp_rank": False,
         },
         sampling=({"temperature": 0.8, "top_k": 8},),
         signals=(
@@ -1093,7 +1174,7 @@ def _instrument_scenario_runtime(env, scenario, runtime):
             from megatron.core.inference.sampling import flashinfer_sampling
 
             flashinfer_kernels = {
-                "sampling_from_probs": (),
+                "sampling_from_logits": (),
                 "top_k_sampling_from_probs": ("top-k-filter",),
                 "top_p_sampling_from_probs": ("top-p-filter",),
                 "top_k_top_p_sampling_from_logits": ("top-k-filter", "top-p-filter"),
@@ -1409,6 +1490,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     env.engine.controller._async_sched_logits.is_valid
                 )
                 env.engine.resume()
+                for request_id in env.engine.resume_request_ids:
+                    env.requests[request_id] = env.engine.get_request(request_id)
                 runtime["pending-after-resume"] += int(
                     env.engine.controller._async_sched_logits.is_valid
                 )
@@ -1462,16 +1545,22 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["sampling-backend:torch"] > 0
         if "persist" in signals:
             assert context.kv_cache_management_mode == KVCacheManagementMode.PERSIST
+        if "offload" in signals:
+            assert context.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
+        if "recompute" in signals:
+            assert context.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE
         if "static-pointers" in signals:
             assert context.static_kv_memory_pointers
         if "suspend-resume" in signals:
-            assert runtime["suspend-resume"] == runtime["static-pointer-preserved"] == 1
-            assert (
-                runtime["pending-before-suspend"]
-                == runtime["pending-after-suspend"]
-                == runtime["pending-after-resume"]
-                == 1
-            )
+            assert runtime["suspend-resume"] == runtime["pending-before-suspend"] == 1
+            if "recompute" in signals:
+                assert runtime["pending-after-suspend"] == 0
+                assert runtime["pending-after-resume"] == 0
+            else:
+                assert runtime["pending-after-suspend"] == 1
+                assert runtime["pending-after-resume"] == 1
+            if "static-pointers" in signals:
+                assert runtime["static-pointer-preserved"] == 1
         if "dp-offset" in signals:
             assert context.config.offset_sampling_seed_by_dp_rank
         if "last-logits" in signals:
@@ -1868,6 +1957,19 @@ class TestAsyncSchedulePairwise(_AsyncPairwiseHarness):
             delete_cuda_graphs()
             torch.cuda.empty_cache()
 
+    @pytest.mark.parametrize(
+        "scenario", _ASYNC_SUSPEND_RESUME_SCENARIOS, ids=lambda case: case.name
+    )
+    @torch.inference_mode()
+    def test_async_suspend_resume_mode_matches_legacy(self, scenario):
+        """Real OFFLOAD and RECOMPUTE cycles preserve output parity."""
+        try:
+            self._assert_scenario_pair(scenario)
+        finally:
+            gc.collect()
+            delete_cuda_graphs()
+            torch.cuda.empty_cache()
+
 
 @pytest.mark.internal
 @pytest.mark.skipif(
@@ -1927,6 +2029,8 @@ def test_async_reset_clears_pending_logits():
     engine.controller = _controller_with_pending_logits()
     engine.num_speculative_tokens = 1
     engine._loop = None
+    engine._vision_embedding_cache = {}
+    engine._vision_embedding_cache_bytes = 0
 
     with (
         mock.patch(
@@ -1967,6 +2071,8 @@ def test_async_suspend_pending_logits_lifecycle(mode, preserve_pending):
     engine.waiting_request_ids = deque()
     engine.requests = {}
     engine.use_coordinator = False
+    engine._vision_embedding_cache = {}
+    engine._vision_embedding_cache_bytes = 0
 
     with (
         mock.patch.object(DynamicInferenceEngine, "suspend_resume_ctx", return_value=nullcontext()),
@@ -1981,6 +2087,116 @@ def test_async_suspend_pending_logits_lifecycle(mode, preserve_pending):
         )
     else:
         assert engine.controller._async_sched_logits.token_row_indices is None
+
+
+@pytest.mark.parametrize(
+    ("survivor_idxs", "expected_token_rows"),
+    [
+        pytest.param([0, 2], [0, 1, 4, 5], id="monotonic-with-gap"),
+        pytest.param([3, 1, 2], [6, 7, 2, 3, 4, 5], id="nonmonotonic"),
+    ],
+)
+def test_async_compaction_preserves_all_request_metadata(survivor_idxs, expected_token_rows):
+    """Middle-row completion compacts every metadata field into survivor order."""
+    controller = TextGenerationController.__new__(TextGenerationController)
+    controller.num_speculative_tokens = 1
+    controller._enable_cuda_graph = False
+    original_logits = torch.arange(32).reshape(1, 8, 4)
+    controller._all_logits_cuda = original_logits.clone()
+    controller._async_sched_logits = AsyncScheduleLogitsState()
+    controller._async_sched_logits.set_pending(4, torch.arange(8))
+
+    metadata = {
+        "temperature": torch.tensor([0.5, 0.7, 0.9, 1.1]),
+        "top_k": torch.tensor([2, 4, 8, 16]),
+        "top_p": torch.tensor([0.1, 0.2, 0.3, 0.4]),
+        "termination_id": torch.tensor([90, 91, 92, 93]),
+        "return_log_probs": torch.tensor([True, False, True, False]),
+        "skip_prompt_log_probs": torch.tensor([False, True, False, True]),
+        "top_n_logprobs": torch.tensor([2, 0, 5, 1]),
+        "custom_metadata": torch.tensor([101, 202, 303, 404]),
+    }
+    gpu_view = SimpleNamespace(
+        temperature=metadata["temperature"].clone(),
+        top_k=metadata["top_k"].clone(),
+        top_p=metadata["top_p"].clone(),
+    )
+    context = SimpleNamespace(active_request_metadata=metadata, gpu_view=gpu_view)
+    controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
+    expected = {label: values[survivor_idxs].clone() for label, values in metadata.items()}
+
+    controller._compact_async_sched_logits(torch.tensor(survivor_idxs))
+
+    for label, values in expected.items():
+        assert torch.equal(
+            context.active_request_metadata[label][: len(survivor_idxs)], values
+        ), label
+    assert torch.equal(gpu_view.temperature[: len(survivor_idxs)], expected["temperature"])
+    assert torch.equal(gpu_view.top_k[: len(survivor_idxs)], expected["top_k"])
+    assert torch.equal(gpu_view.top_p[: len(survivor_idxs)], expected["top_p"])
+    assert torch.equal(controller._all_logits_cuda, original_logits[:, expected_token_rows])
+    assert torch.equal(
+        controller._async_sched_logits.token_row_indices, torch.tensor(expected_token_rows)
+    )
+
+
+def test_post_process_enforces_per_request_logprob_policy():
+    """Post-processing must honor opt-outs and require requested logprobs."""
+    requests = []
+    for request_id, return_log_probs in enumerate((True, False)):
+        request = DynamicInferenceRequest(
+            request_id=request_id,
+            prompt_tokens=torch.tensor([1, 2], dtype=torch.int64),
+            sampling_params=SamplingParams(
+                num_tokens_to_generate=2,
+                termination_id=-1,
+                return_log_probs=return_log_probs,
+                skip_prompt_log_probs=True,
+            ),
+        )
+        request.add_event_add_engine()
+        requests.append(request)
+
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.context = SimpleNamespace(kv_block_allocator=SimpleNamespace())
+    engine.requests = {
+        request.request_id: SimpleNamespace(record=[request]) for request in requests
+    }
+    engine.finished_request_count = 0
+    engine.evicted_request_count = 0
+    engine.track_generated_token_events = False
+    engine.num_speculative_tokens = 0
+    engine.stop_word_being_finished_ids = set()
+    engine.stop_word_finished_request_ids = set()
+
+    active_request_ids, finished_records = engine.post_process_requests(
+        request_ids=torch.tensor([0, 1], dtype=torch.int64),
+        finished_request_ids=torch.empty(0, dtype=torch.int64),
+        evict_request_ids=None,
+        step_time=0.0,
+        sample=torch.tensor([11, 22], dtype=torch.int64),
+        accepted_tokens=None,
+        log_probs=[[-1.0], [-2.0]],
+        consumed_chunked_prefill_request_id=-1,
+    )
+
+    assert active_request_ids == [0, 1]
+    assert finished_records == []
+    assert requests[0].generated_log_probs == [-1.0]
+    assert requests[1].prompt_log_probs is None
+    assert requests[1].generated_log_probs is None
+
+    with pytest.raises(AssertionError, match="requested log probs, but none were produced"):
+        engine.post_process_requests(
+            request_ids=torch.tensor([0], dtype=torch.int64),
+            finished_request_ids=torch.empty(0, dtype=torch.int64),
+            evict_request_ids=None,
+            step_time=0.0,
+            sample=torch.tensor([33], dtype=torch.int64),
+            accepted_tokens=None,
+            log_probs=None,
+            consumed_chunked_prefill_request_id=-1,
+        )
 
 
 def test_async_negative_routing_replay():
@@ -2015,3 +2231,26 @@ def test_async_negative_skip_bookkeeping():
     )
     with pytest.raises(AssertionError, match="requires request bookkeeping"):
         asyncio.run(controller.async_generate_output_tokens_dynamic_batch(skip_bookkeeping=True))
+
+
+def test_base_engine_rejects_kv_handoff_commands():
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+
+    assert InferenceStateHandoffMixin not in DynamicInferenceEngine.mro()
+    assert engine.pending_kv_import_count == 0
+    with pytest.raises(RuntimeError, match="SUBMIT_REQUEST_WITH_KV"):
+        engine.add_request_with_kv_handoff(1, [], SamplingParams(), {}, [])
+    with pytest.raises(RuntimeError, match="RELEASE_KV"):
+        engine.release_handoff_blocks(1)
+
+
+def test_disagg_engine_resolves_handoff_methods_from_mixin():
+    assert DisaggDynamicInferenceEngine.mro()[:3] == [
+        DisaggDynamicInferenceEngine,
+        InferenceStateHandoffMixin,
+        DynamicInferenceEngine,
+    ]
+    assert (
+        DisaggDynamicInferenceEngine.add_request_with_kv_handoff
+        is InferenceStateHandoffMixin.add_request_with_kv_handoff
+    )
