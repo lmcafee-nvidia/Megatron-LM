@@ -148,7 +148,7 @@ def test_sampling_fixed_history_batch_invariance(backend, filters, mode, offset_
         # TP=PP=1 in this case, so WORLD rank is the actual DP rank.
         seed = 333 + (torch.distributed.get_rank() if offset_by_dp else 0)
         for result, sample in ((reference, expected), (actual, observed)):
-            assert result[1].engine.controller.sampling_rng.initial_seed() == seed
+            assert result[1].engine.controller._sampling._rng.initial_seed() == seed
             assert len(result[0].generated_tokens) == 1
             token = result[0].generated_tokens[0]
             assert token == sample["token"]
