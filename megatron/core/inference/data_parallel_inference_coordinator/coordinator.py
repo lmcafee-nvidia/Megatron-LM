@@ -609,10 +609,12 @@ class DataParallelInferenceCoordinator:
             self._register_rank_identity(sender_identity)
 
     def finalize_text(self, finished_request: dict) -> None:
-        """Populate generated text in a serialized finished request.
+        """Populate ``generated_text`` by detokenizing a finished request's tokens.
 
-        The coordinator owns terminal text finalization for distributed requests,
-        allowing it to overlap decoding with model execution.
+        The coordinator does this only when ``detokenize_generations`` is enabled.
+        The ``/v1/chat/completions`` and ``/v1/completions`` handlers disable it,
+        so their reply bodies pass through unchanged and the frontend detokenizes
+        the generated token IDs while formatting the response.
 
         Args:
             finished_request (dict): The serialized merged request containing the
