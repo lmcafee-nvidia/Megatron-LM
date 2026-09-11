@@ -41,7 +41,7 @@ async def test_routed_prefill_graph_selection(monkeypatch, all_prefills, distrib
                 if h.engine.use_coordinator and any(
                     len(h.engine.get_request(rid).prompt_tokens) == 65 for rid in ids
                 ):
-                    observations.append((padded, counts, inputs[0].shape[0]))
+                    observations.append((padded, counts, inputs[0].shape[1]))
                 return result
 
             monkeypatch.setattr(_CudagraphReplayNode, "forward", staticmethod(observed))
