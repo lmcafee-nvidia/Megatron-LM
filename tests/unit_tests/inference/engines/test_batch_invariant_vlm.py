@@ -7,8 +7,8 @@ from functools import partial, wraps
 import pytest
 import torch
 
-from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import VLMInferenceWrapper
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_submodules
+from megatron.core.inference.model_inference_wrappers.multimodal import vlm_inference_wrapper
+from megatron.core.models.gpt import gpt_layer_specs
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
@@ -54,7 +54,7 @@ def _build_engine(case, backend, fa_version, *, modality, engines):
     projection = _config(1, 128, 1, backend, fa_version)
     language.language_model_type = "dummy"
     vision.vision_model_type = "radio"
-    submodules = get_gpt_layer_with_transformer_engine_submodules()
+    submodules = gpt_layer_specs.get_gpt_layer_with_transformer_engine_submodules()
     model = LLaVAModel(
         language_transformer_config=language,
         language_transformer_layer_spec=ModuleSpec(module=TransformerLayer, submodules=deepcopy(submodules)),
@@ -87,7 +87,7 @@ def _build_engine(case, backend, fa_version, *, modality, engines):
     )
     tokenizer = fixture.DummyTokenizer(fixture.VOCAB, bos=1, eod=fixture.VOCAB - 1)
     tokenizer.convert_tokens_to_ids = lambda token: MEDIA_TOKEN if token == "<image>" else None
-    wrapper = VLMInferenceWrapper(model, context)
+    wrapper = vlm_inference_wrapper.VLMInferenceWrapper(model, context)
     evidence = []
     vision_forward = wrapper._forward_vision_encoder
 
