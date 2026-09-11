@@ -8,6 +8,7 @@ from unittest import mock
 import pytest
 import torch
 import torch.distributed as dist
+from flashinfer.rope import apply_rope_with_cos_sin_cache
 
 from megatron.core.inference.config import AsyncScheduleMode
 from megatron.core.ssm.mamba_mixer import MambaMixer
@@ -51,7 +52,11 @@ def transport_world():
             "nccl", 33, dict(context_block_size_tokens=256, flash_attention_version=2), 7, id="fa2"
         ),
         pytest.param(
-            "nccl", 33, {"hidden_size": 256, "flash_attention_version": 4}, 7, id="fa4-d64"
+            "nccl",
+            33,
+            {"hidden_size": 256, "flash_attention_version": 4, "position_embedding_type": "rope"},
+            7,
+            id="fa4-d64",
         ),
         pytest.param(
             "nccl", 33, {"async_sched_mode": AsyncScheduleMode.ASYNC}, 7, id="async-decode"
@@ -69,15 +74,20 @@ def transport_world():
         pytest.param(
             "nccl",
             33,
-            {"num_cuda_graphs": 2, "force_build_cuda_graphs": True},
+            {
+                "num_cuda_graphs": 2,
+                "force_build_cuda_graphs": True,
+                "cuda_graph_all_prefills": True,
+            },
             7,
             id="decode-graph",
         ),
     ],
 )
 @torch.inference_mode()
+@mock.patch("flashinfer.rope.apply_rope_with_cos_sin_cache", wraps=apply_rope_with_cos_sin_cache)
 @mock.patch.object(MambaMixer, "forward", autospec=True, side_effect=MambaMixer.forward)
-def test_disagg_real_engine_parity(mixer, transport_world, backend, length, changes, count):
+def test_disagg_real_engine_parity(mixer, rope, transport_world, backend, length, changes, count):
     config = disagg_config(**changes)
     tokens = prompt(length)
     reference_config = replace(config, async_sched_mode=AsyncScheduleMode.LEGACY)
@@ -95,6 +105,7 @@ def test_disagg_real_engine_parity(mixer, transport_world, backend, length, chan
     with real_engine(config, role=role, backend=backend, weights=weights) as engine:
         with ForwardWitness(engine) as witness:
             mixer.reset_mock()
+            rope.reset_mock()
             neighbor = None
             if async_decode:
                 metadata = None
@@ -166,8 +177,6 @@ def test_disagg_real_engine_parity(mixer, transport_world, backend, length, chan
                     result = run_to_completion(engine, future)
                     assert witness.steps and all(not step[2] for step in witness.steps)
                     assert witness.steps[0][0] == length
-                    if changes.get("force_build_cuda_graphs"):
-                        assert witness.graph_replays > 0
                     if neighbor is not None:
                         assert any(102 in step[3] for step in witness.pending_forwards)
                 else:
@@ -192,3 +201,7 @@ def test_disagg_real_engine_parity(mixer, transport_world, backend, length, chan
                 assert_released(engine)
             if not source and config.flash_attention_version in (2, 4):
                 assert witness.attention_calls > 0
+            if config.position_embedding_type == "rope":
+                assert rope.call_count > 0
+            if changes.get("force_build_cuda_graphs"):
+                assert witness.graph_replays > 0

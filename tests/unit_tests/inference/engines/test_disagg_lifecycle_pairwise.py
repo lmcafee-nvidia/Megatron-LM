@@ -18,7 +18,6 @@ from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.headers import Headers
 from tests.unit_tests.inference.engines.disagg_test_utils import (
     ForwardWitness,
-    _DeferredNcclPull,
     _enqueue_decode_handoff,
     assert_import_equal,
     assert_released,
@@ -67,13 +66,6 @@ def deliver_abort(engine, request_id):
     return reply
 
 
-def drain_deferred_without_posting(engine):
-    """Reserve a queued import before posting its matched production receive."""
-
-    with deferred_pulls(engine):
-        return engine._drain_deferred_kv_handoffs()
-
-
 @pytest.mark.parametrize("policy", list(PrefixCachingEvictionPolicy))
 @torch.inference_mode()
 def test_real_handoff_capacity_fifo(transport_world, policy):
@@ -106,13 +98,15 @@ def test_real_handoff_capacity_fifo(transport_world, policy):
             allocator.release_memory_blocks(held[:2])
             assert engine._drain_deferred_kv_handoffs() == 0
             allocator.release_memory_blocks(held[2:3])
-            assert drain_deferred_without_posting(engine) == 1
+            with deferred_pulls(engine):
+                assert engine._drain_deferred_kv_handoffs() == 1
             assert [item.request_id for item in engine._deferred_kv_handoffs] == [102]
         for index, rid in enumerate((101, 102)):
             pending = None
             if not source:
                 if index:
-                    assert drain_deferred_without_posting(engine) == 1
+                    with deferred_pulls(engine):
+                        assert engine._drain_deferred_kv_handoffs() == 1
                 assert len(engine._pending_kv_imports) == 1
                 pending = engine._pending_kv_imports[0]
                 assert pending.request_id == rid
