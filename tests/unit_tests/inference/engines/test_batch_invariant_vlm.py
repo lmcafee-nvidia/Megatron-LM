@@ -77,7 +77,7 @@ def _build_engine(case, backend, fa_version, *, modality, engines, wire=False):
     options.update(case.context)
     context = fixture.DynamicInferenceContext(language, fixture.InferenceConfig(**options))
     tokenizer = fixture.DummyTokenizer(fixture.VOCAB, bos=1, eod=fixture.VOCAB - 1)
-    tokenizer.convert_tokens_to_ids = lambda token: MEDIA_TOKEN if token == "<image>" else None
+    tokenizer.convert_tokens_to_ids = {"<image>": MEDIA_TOKEN}.get
     wrapper = vlm_inference_wrapper.VLMInferenceWrapper(model, context)
     evidence = []
     vision_forward = wrapper._forward_vision_encoder
