@@ -95,7 +95,7 @@ class InferenceStateHandoffMixin:
             raise RuntimeError(
                 "Cannot suspend while handoff state remains pinned; wait for RELEASE_KV"
             )
-        if self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST and (
+        if self._handoff_storage_is_replaced() and (
             self._deferred_kv_handoffs
             or self._pending_kv_imports
             or self._quarantined_kv_imports
