@@ -797,19 +797,25 @@ class DynamicInferenceRequest(InferenceRequest):
         nvtx_range_push("DynamicInferenceRequest.serialize")
 
         # The prompt length is always reported (needed for usage.prompt_tokens),
-        # but the prompt_tokens and remaining_prompt_tokens tensors are dropped from
-        # the wire payload unless the client asked for them back (return_prompt_tokens).
-        # This keeps both prompt tensors off the engine->coordinator->API path. Null
-        # them around super() so neither tensor is serialized, then restore local state.
+        # but the prompt tensor views are dropped from the wire payload unless the
+        # client asked for them back (return_prompt_tokens). Null all prompt tensor
+        # views around super(), then restore the request's local state.
         prompt_len = len(self.prompt_tokens) if self.prompt_tokens is not None else None
-        drop_prompt = self.prompt_tokens is not None and not getattr(
-            self.sampling_params, "return_prompt_tokens", False
+        drop_prompt = not getattr(self.sampling_params, "return_prompt_tokens", False) and any(
+            tensor is not None
+            for tensor in (
+                self.prompt_tokens,
+                self.compact_prompt_tokens,
+                self.remaining_prompt_tokens,
+            )
         )
         saved_prompt_tokens = self.prompt_tokens
+        saved_compact_prompt_tokens = self.compact_prompt_tokens
         saved_remaining_prompt_tokens = self.remaining_prompt_tokens
         try:
             if drop_prompt:
                 self.prompt_tokens = None
+                self.compact_prompt_tokens = None
                 self.remaining_prompt_tokens = None
 
             obj = super().serialize()
@@ -832,6 +838,7 @@ class DynamicInferenceRequest(InferenceRequest):
         finally:
             if drop_prompt:
                 self.prompt_tokens = saved_prompt_tokens
+                self.compact_prompt_tokens = saved_compact_prompt_tokens
                 self.remaining_prompt_tokens = saved_remaining_prompt_tokens
             nvtx_range_pop("DynamicInferenceRequest.serialize")
 
