@@ -164,14 +164,15 @@ def test_batch_invariant_real_nixl_handoff(length):
             if not source:
                 metadata, state = packet
                 if length == 17:
-                    with pytest.raises(NotImplementedError, match="log probabilities"):
-                        engine.add_request_with_kv_handoff(
-                            909,
-                            tokens,
-                            _params(4, return_log_probs=True),
-                            metadata["kv_meta"],
-                            metadata["block_ids"],
-                        )
+                    for scores in ({"return_log_probs": True}, {"top_n_logprobs": 2}):
+                        with pytest.raises(NotImplementedError, match="log probabilities"):
+                            engine.add_request_with_kv_handoff(
+                                909,
+                                tokens,
+                                _params(4, **scores),
+                                metadata["kv_meta"],
+                                metadata["block_ids"],
+                            )
                 future = engine.add_request_with_kv_handoff(
                     101, tokens, _params(4), metadata["kv_meta"], metadata["block_ids"]
                 )
