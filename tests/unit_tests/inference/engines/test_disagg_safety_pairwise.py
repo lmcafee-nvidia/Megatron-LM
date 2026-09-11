@@ -185,4 +185,6 @@ def test_nonpersist_suspend_rejects_owned_source_state(
             assert observed_destination == (1, 0, True, True, (expected_tokens, 0, 0))
             assert guard[:2] == ([None, None], ("RuntimeError", _PIN_ERROR))
             assert guard[2:] == (True, True, True, 0, "RUNNING", True)
+            if not source:
+                del release
             del pending, future
