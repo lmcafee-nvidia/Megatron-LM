@@ -354,113 +354,114 @@ async def test_live_routing_cold_history_and_media_epoch(mode):
         context = zmq.Context()
         comm = AsyncZMQCommunicator(context, process_group=None)
         try:
-            weights = hashlib.sha256()
-            for parameter in engine.controller.inference_wrapped_model.model.parameters():
-                weights.update(parameter.detach().cpu().view(torch.uint8).numpy().tobytes())
-            digests = [None, None]
-            torch.distributed.all_gather_object(digests, weights.hexdigest())
-            assert len(set(digests)) == 1, "cross-owner model weights differ"
-            address = await engine.start_listening_to_data_parallel_coordinator()
-            prompt = bi.target_prompt(17 if media else 258)
-            if media:
-                prompt[3] = vlm.MEDIA_TOKEN
-            payload = engine._bi_wire_media if media else None
-            await _sync(comm)
-            if rank == 0:
-                client = InferenceClient(
-                    address,
-                    deserialize=True,
-                    block_size_tokens=engine.context.block_size_tokens,
-                    prefix_caching_coordinator_policy=policy,
-                )
-                client.start(connect_timeout_seconds=10)
-            with pytest.MonkeyPatch.context() as patch:
-                patch.setattr(bi, "TARGET", 0)
-                baseline = bi.ForwardWitness(engine, patch)
-                if rank == 0:
-                    reference = await client.add_request(
-                        prompt, _params(), multi_modal_data=payload
-                    )
-                await _sync(comm)
-            owner = await _sync(comm, rank if baseline.steps else -1)
-            assert owner == 0
-            if rank == owner:
-                baseline.assert_active(version)
-                assert {s["physical"] for s in baseline.steps if s["decode"]} == {64}
-            for step in baseline.steps:
-                for key in ("positions", "tokens", "logits"):
-                    step[key] = step[key].cpu()
-            baseline_steps = [None, None]
-            torch.distributed.all_gather_object(baseline_steps, baseline.steps)
-            if rank == 0:
-                client.pause_engines()
-            await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), 30)
-            if mode == "ttl":
-                await asyncio.sleep(0.1)
-            with pytest.MonkeyPatch.context() as patch:
-                patch.setattr(bi, "TARGET", 2)
-                witness = bi.ForwardWitness(engine, patch)
-                admitted = []
-                original = engine.add_request
-
-                def observe(request_id, *args, **kwargs):
-                    result = original(request_id, *args, **kwargs)
-                    admitted.append(request_id)
-                    return result
-
-                patch.setattr(engine, "add_request", observe)
-                if rank == 0:
-                    trigger = client.add_request([23] * (17 if media else 258), _params())
-                while await _sync(comm, len(admitted)) < 1:
-                    await asyncio.sleep(0.01)
-                if rank == 0:
-                    target = client.add_request(prompt, _params(), multi_modal_data=payload)
-                while await _sync(comm, int(2 in admitted)) < 1:
-                    await asyncio.sleep(0.01)
-                target_owner = await _sync(comm, rank if 2 in admitted else -1)
-                assert target_owner == (owner if media else owner ^ 1), (mode, admitted)
-                if rank == owner and not media:
-                    assert engine.context.kv_block_allocator.get_total_used() > 0
-                if rank == 0:
-                    neighbors = [client.add_request([23], _params()) for _ in range(128)]
-                while await _sync(comm, -len(admitted)) != -65:
-                    await asyncio.sleep(0.01)
-                assert len(admitted) == 65
+            async with asyncio.timeout(180):
+                weights = hashlib.sha256()
+                for parameter in engine.controller.inference_wrapped_model.model.parameters():
+                    weights.update(parameter.detach().cpu().view(torch.uint8).numpy().tobytes())
+                digests = [None, None]
+                torch.distributed.all_gather_object(digests, weights.hexdigest())
+                assert len(set(digests)) == 1, "cross-owner model weights differ"
+                address = await engine.start_listening_to_data_parallel_coordinator()
+                prompt = bi.target_prompt(17 if media else 258)
                 if media:
-                    before = len(engine._bi_media_evidence)
-                    if rank == 0:
-                        client.set_generation_epoch(1)
-                    while engine._generation_epoch != 1:
-                        await asyncio.sleep(0.01)
-                    if rank == owner:
-                        assert before == 1
-                        assert len(engine._bi_media_evidence) == 1 + (mode == "media-fresh")
+                    prompt[3] = vlm.MEDIA_TOKEN
+                payload = engine._bi_wire_media if media else None
                 await _sync(comm)
                 if rank == 0:
-                    client.unpause_engines()
-                    results = await asyncio.wait_for(
-                        asyncio.gather(target, trigger, *neighbors), 60
+                    client = InferenceClient(
+                        address,
+                        deserialize=True,
+                        block_size_tokens=engine.context.block_size_tokens,
+                        prefix_caching_coordinator_policy=policy,
                     )
-                    assert results[0].generated_tokens == reference.generated_tokens
-                    if media:
-                        assert [tuple(x) for x in results[0].policy_epoch] == [(0, 1)]
-                await _sync(comm)
-            if rank == target_owner:
-                witness.assert_active(version)
-                for step in witness.steps:
+                    client.start(connect_timeout_seconds=10)
+                with pytest.MonkeyPatch.context() as patch:
+                    patch.setattr(bi, "TARGET", 0)
+                    baseline = bi.ForwardWitness(engine, patch)
+                    if rank == 0:
+                        reference = await client.add_request(
+                            prompt, _params(), multi_modal_data=payload
+                        )
+                    await _sync(comm)
+                owner = await _sync(comm, rank if baseline.steps else -1)
+                assert owner == 0
+                if rank == owner:
+                    baseline.assert_active(version)
+                    assert {s["physical"] for s in baseline.steps if s["decode"]} == {64}
+                for step in baseline.steps:
                     for key in ("positions", "tokens", "logits"):
                         step[key] = step[key].cpu()
-                assert any(s["physical"] == 128 and s["requests"] == 65 for s in witness.steps)
-                assert min(int(s["positions"].min()) for s in witness.steps) == 0
-                bi.assert_same_target(
-                    (None, SimpleNamespace(steps=baseline_steps[owner])),
-                    (None, witness),
-                    require_trajectory=False,
-                )
-                if media:
-                    assert len(engine._bi_decoder_inputs) == 2
-                    projected = engine._bi_media_evidence[0]["projected"].squeeze(1)
-                    for embeddings, mask in engine._bi_decoder_inputs:
-                        vlm._assert_projected(projected, embeddings[mask >= 0])
+                baseline_steps = [None, None]
+                torch.distributed.all_gather_object(baseline_steps, baseline.steps)
+                if rank == 0:
+                    client.pause_engines()
+                await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), 30)
+                if mode == "ttl":
+                    await asyncio.sleep(0.1)
+                with pytest.MonkeyPatch.context() as patch:
+                    patch.setattr(bi, "TARGET", 2)
+                    witness = bi.ForwardWitness(engine, patch)
+                    admitted = []
+                    original = engine.add_request
+
+                    def observe(request_id, *args, **kwargs):
+                        result = original(request_id, *args, **kwargs)
+                        admitted.append(request_id)
+                        return result
+
+                    patch.setattr(engine, "add_request", observe)
+                    if rank == 0:
+                        trigger = client.add_request([23] * (17 if media else 258), _params())
+                    while await _sync(comm, len(admitted)) < 1:
+                        await asyncio.sleep(0.01)
+                    if rank == 0:
+                        target = client.add_request(prompt, _params(), multi_modal_data=payload)
+                    while await _sync(comm, int(2 in admitted)) < 1:
+                        await asyncio.sleep(0.01)
+                    target_owner = await _sync(comm, rank if 2 in admitted else -1)
+                    assert target_owner == (owner if media else owner ^ 1), (mode, admitted)
+                    if rank == owner and not media:
+                        assert engine.context.kv_block_allocator.get_total_used() > 0
+                    if rank == 0:
+                        neighbors = [client.add_request([23], _params()) for _ in range(128)]
+                    while await _sync(comm, -len(admitted)) != -65:
+                        await asyncio.sleep(0.01)
+                    assert len(admitted) == 65
+                    if media:
+                        before = len(engine._bi_media_evidence)
+                        if rank == 0:
+                            client.set_generation_epoch(1)
+                        while engine._generation_epoch != 1:
+                            await asyncio.sleep(0.01)
+                        if rank == owner:
+                            assert before == 1
+                            assert len(engine._bi_media_evidence) == 1 + (mode == "media-fresh")
+                    await _sync(comm)
+                    if rank == 0:
+                        client.unpause_engines()
+                        results = await asyncio.wait_for(
+                            asyncio.gather(target, trigger, *neighbors), 60
+                        )
+                        assert results[0].generated_tokens == reference.generated_tokens
+                        if media:
+                            assert [tuple(x) for x in results[0].policy_epoch] == [(0, 1)]
+                    await _sync(comm)
+                if rank == target_owner:
+                    witness.assert_active(version)
+                    for step in witness.steps:
+                        for key in ("positions", "tokens", "logits"):
+                            step[key] = step[key].cpu()
+                    assert any(s["physical"] == 128 and s["requests"] == 65 for s in witness.steps)
+                    assert min(int(s["positions"].min()) for s in witness.steps) == 0
+                    bi.assert_same_target(
+                        (None, SimpleNamespace(steps=baseline_steps[owner])),
+                        (None, witness),
+                        require_trajectory=False,
+                    )
+                    if media:
+                        assert len(engine._bi_decoder_inputs) == 2
+                        projected = engine._bi_media_evidence[0]["projected"].squeeze(1)
+                        for embeddings, mask in engine._bi_decoder_inputs:
+                            vlm._assert_projected(projected, embeddings[mask >= 0])
         finally:
             await _shutdown(engine, client, address, comm, context, rank)
