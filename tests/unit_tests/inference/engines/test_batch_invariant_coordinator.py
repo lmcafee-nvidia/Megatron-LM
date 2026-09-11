@@ -59,7 +59,7 @@ def _stream_result(messages):
     result = finals[0]
     streamed = [token for partial in partials for token in partial["new_tokens"]]
     assert streamed == result.generated_tokens[:4] and len(result.generated_tokens) == 6
-    assert result.prompt_tokens is None and result.prompt_length == 257
+    assert result.prompt_tokens is None and result.prompt_length == 258
     assert result.generated_text == " ".join(map(str, result.generated_tokens))
     return result
 
@@ -97,7 +97,9 @@ async def test_live_coordinator_batch_invariance_and_output_contracts(policy):
         test_communicator = AsyncZMQCommunicator(sync_context, process_group=None)
         try:
             address = await engine.start_listening_to_data_parallel_coordinator()
-            prompt = bi.target_prompt(257)
+            # Prefix matching must leave at least two computed tokens;257 would
+            # deliberately back off the256-token cache hit to zero skipped tokens.
+            prompt = bi.target_prompt(258)
             await _sync(test_communicator)
             if rank == 0:
                 client = InferenceClient(
