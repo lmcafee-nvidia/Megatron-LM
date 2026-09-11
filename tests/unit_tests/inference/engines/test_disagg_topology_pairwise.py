@@ -58,6 +58,7 @@ def implementation_witness(model):
     """Observe real target layers and inference-optimized TP collectives."""
     events = {"layers": [], "gathers": [], "scatters": []}
     layer_types = {
+        "MambaMixer",
         "ColumnParallelLinear",
         "RowParallelLinear",
         "InferenceLayerNormColumnParallelLinear",
@@ -278,6 +279,7 @@ def test_real_model_heterogeneous_handoff(tmp_path, case):
                 decode_engine.zmq_sockets = []
                 decode_engine._setup_handoff_completion_tracking(hostname="127.0.0.1")
                 pending = future = None
+                mixer_seen = True
                 if rank in chosen_decode:
                     future = _enqueue_decode_handoff(decode_engine, handoff, tokens, sampling())
                     pending = decode_engine._pending_kv_imports[0]
@@ -316,6 +318,8 @@ def test_real_model_heterogeneous_handoff(tmp_path, case):
                     assert actual.generated_tokens == expected
                     assert witness.steps and all(not step[2] for step in witness.steps)
                     assert witness.steps[0][0] == len(tokens)
+                    if model_provider == "hybrid":
+                        mixer_seen = any(name == "MambaMixer" for name, _ in native["layers"])
                     if transformer_impl == "local":
                         assert any(name == "ColumnParallelLinear" for name, _ in native["layers"])
                     elif transformer_impl == "inference_optimized":
@@ -337,6 +341,7 @@ def test_real_model_heterogeneous_handoff(tmp_path, case):
                 for socket in decode_engine.zmq_sockets:
                     socket.close(linger=0)
                 decode_engine.zmq_context.term()
+                assert all(gather(mixer_seen, control))
     finally:
         dist.destroy_process_group(control)
         Utils.destroy_model_parallel()
