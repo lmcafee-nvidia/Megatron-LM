@@ -226,7 +226,9 @@ async def test_routed_bos_stop_after_metadata_compaction(monkeypatch, keep, skip
         top_n_logprobs=3,
         detokenize_stop_sequence=keep,
     )
-    async with routed_model(monkeypatch, sampling_backend="torch", hidden_size=128) as h:
+    async with routed_model(
+        monkeypatch, hidden_size=128, materialize_only_last_token_logits=False
+    ) as h:
         h.tokenizer.bos = 3
         direct = await h.direct([3, 4, 5], params)
         params.stop_words = [h.tokenizer.detokenize(direct["generated_tokens"][:2])]
@@ -259,7 +261,7 @@ async def test_routed_bos_stop_after_metadata_compaction(monkeypatch, keep, skip
         (short, filler, target), owners = payload[0]
         first, other, last = (result["request_id"] for result in (short, filler, target))
         assert owners[first] == owners[last] != owners[other]
-        assert target["status"] == "COMPLETED" and target["prompt_tokens"] == [3, 4, 5]
+        assert target["status"] == "COMPLETED" and target["prompt_tokens"][1] == [3, 4, 5]
         assert target["generated_tokens"] == direct["generated_tokens"][:2] * keep
         for key in ("generated_log_probs", "generated_top_n_logprobs"):
             assert len(target[key]) == 2 * keep
