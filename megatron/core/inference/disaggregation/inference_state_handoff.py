@@ -365,7 +365,7 @@ class InferenceStateHandoffMixin:
                 )
         self._kv_transfer_role = role
         backend_cls = construct_kv_transfer_backend_class(backend)
-        self._kv_transfer_backend = backend_cls.name
+        self._kv_transfer_backend = backend
 
         # Prefill output blocks stay pinned until the peer finishes reading
         # them. Decode requests consume imports but do not produce another
