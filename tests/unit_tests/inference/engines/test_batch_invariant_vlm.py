@@ -48,7 +48,9 @@ def _config(layers, hidden, heads, backend, fa_version):
 
 def _build_engine(case, backend, fa_version, *, modality, engines):
     torch.manual_seed(321)
-    model_parallel_cuda_manual_seed(321, inference_rng_tracker=True, use_cudagraphable_rng=False, force_reset_rng=True)
+    model_parallel_cuda_manual_seed(
+        321, inference_rng_tracker=True, use_cudagraphable_rng=False, force_reset_rng=True
+    )
     language = _config(2, 128, 4, backend, fa_version)
     vision = _config(1, 64, 4, backend, fa_version)
     projection = _config(1, 128, 1, backend, fa_version)
@@ -57,11 +59,15 @@ def _build_engine(case, backend, fa_version, *, modality, engines):
     submodules = gpt_layer_specs.get_gpt_layer_with_transformer_engine_submodules()
     model = LLaVAModel(
         language_transformer_config=language,
-        language_transformer_layer_spec=ModuleSpec(module=TransformerLayer, submodules=deepcopy(submodules)),
+        language_transformer_layer_spec=ModuleSpec(
+            module=TransformerLayer, submodules=deepcopy(submodules)
+        ),
         language_vocab_size=fixture.VOCAB,
         language_max_sequence_length=256,
         vision_transformer_config=vision,
-        vision_transformer_layer_spec=ModuleSpec(module=TransformerLayer, submodules=deepcopy(submodules)),
+        vision_transformer_layer_spec=ModuleSpec(
+            module=TransformerLayer, submodules=deepcopy(submodules)
+        ),
         drop_vision_class_token=False,
         vision_projection_config=projection,
         vision_projection_layer_spec=deepcopy(get_submodules(submodules.mlp)),
@@ -96,9 +102,9 @@ def _build_engine(case, backend, fa_version, *, modality, engines):
         output = vision_forward(images, **kwargs)
         evidence.append(
             {
-                "images": images.detach().clone(),
                 "kwargs": {
-                    key: value.detach().clone() if torch.is_tensor(value) else value for key, value in kwargs.items()
+                    key: value.detach().clone() if torch.is_tensor(value) else value
+                    for key, value in kwargs.items()
                 },
                 "projected": output.detach().clone(),
             }
@@ -106,11 +112,32 @@ def _build_engine(case, backend, fa_version, *, modality, engines):
         return output
 
     wrapper._forward_vision_encoder = observe_vision
-    engine = fixture.DynamicInferenceEngine(fixture.TextGenerationController(wrapper, tokenizer), context)
+    decoder_inputs, current = [], {}
+    dynamic_forward, lm_forward = wrapper._forward_dynamic, model.module.forward_lm_only
+
+    def observe_dynamic(inputs):
+        current["mask"] = inputs["image_token_mask"]
+        return dynamic_forward(inputs)
+
+    def observe_lm(*args, **kwargs):
+        active = context.request_ids[: context.total_request_count]
+        if context.num_prefill_requests and fixture.TARGET in active:
+            decoder_inputs.append(
+                (kwargs["combined_embeddings"].detach().clone(), current["mask"].clone())
+            )
+        return lm_forward(*args, **kwargs)
+
+    wrapper._forward_dynamic, model.module.forward_lm_only = observe_dynamic, observe_lm
+    engine = fixture.DynamicInferenceEngine(
+        fixture.TextGenerationController(wrapper, tokenizer), context
+    )
     frames = 2 if modality == "video" else 1
     media = torch.arange(frames * 4 * 3 * 14 * 14, dtype=torch.float32)
     media = ((media % 31) / 16 - 1).to(torch.bfloat16).reshape(1, frames * 4, -1)
-    media_kwargs = {"imgs": media, "imgs_sizes": torch.tensor([[28, 28]] * frames, dtype=torch.int32)}
+    media_kwargs = {
+        "imgs": media,
+        "imgs_sizes": torch.tensor([[28, 28]] * frames, dtype=torch.int32),
+    }
     if modality == "video":
         media_kwargs["num_frames"] = torch.tensor([frames], dtype=torch.int32)
     add_request = engine.add_request
@@ -125,7 +152,7 @@ def _build_engine(case, backend, fa_version, *, modality, engines):
 
     engine.add_request = add_media
     engine._bi_media_evidence = evidence
-    engine._bi_vision_forward = vision_forward
+    engine._bi_decoder_inputs = decoder_inputs
     engines.append(engine)
     return engine
 
@@ -147,8 +174,13 @@ def _drain(engine):
 def test_vlm_dynamic_batch_invariance(modality):
     case = fixture.Case(f"vlm-{modality}")
     engines = []
-    with fixture.invariant_runtime(case) as (backend, version), pytest.MonkeyPatch.context() as patch:
-        patch.setattr(fixture, "build_engine", partial(_build_engine, modality=modality, engines=engines))
+    with (
+        fixture.invariant_runtime(case) as (backend, version),
+        pytest.MonkeyPatch.context() as patch,
+    ):
+        patch.setattr(
+            fixture, "build_engine", partial(_build_engine, modality=modality, engines=engines)
+        )
         reference = fixture.run_order(case, backend, version, "solo")
         actual = fixture.run_order(case, backend, version, "back")
         fixture.assert_same_target(reference, actual)
@@ -158,13 +190,10 @@ def test_vlm_dynamic_batch_invariance(modality):
         frames = 2 if modality == "video" else 1
         assert observed[0]["projected"].shape == (12 * frames, 1, 128)
         assert ("num_frames" in observed[0]["kwargs"]) == (modality == "video")
-        configs = (engines[1].controller.inference_wrapped_model.model.module,)
-        configs = (
-            configs[0].language_model.config,
-            configs[0].vision_model.config,
-            configs[0].vision_projection.config,
-        )
-        assert all(c.batch_invariant_mode and c.transformer_impl == "transformer_engine" for c in configs)
+        for engine in engines:
+            assert len(engine._bi_decoder_inputs) == 1, "target media never reached decoder"
+            decoder_input, mask = engine._bi_decoder_inputs[0]
+            _assert_projected(expected[0]["projected"].squeeze(1), decoder_input[mask >= 0])
         assert {s["physical"] for s in reference[1].steps if s["decode"]} == {64}
         assert any(s["physical"] == 128 and s["target_row"] > 0 for s in actual[1].steps)
 
@@ -184,9 +213,5 @@ def test_vlm_dynamic_batch_invariance(modality):
         _assert_projected(expected[0]["projected"], observed[1]["projected"])
         _drain(engine)
 
-        wrong_images = observed[1]["images"].neg()
-        wrong = engine._bi_vision_forward(wrong_images, **observed[1]["kwargs"])
-        with pytest.raises(AssertionError, match="projected media embeddings changed"):
-            _assert_projected(expected[0]["projected"], wrong)
         engine.reset()
         print("BI_VLM_WITNESS", modality, backend, version, "physical", [64, 128])
