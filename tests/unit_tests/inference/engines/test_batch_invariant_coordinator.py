@@ -443,7 +443,7 @@ async def test_live_routing_cold_history_and_media_epoch(mode):
                     )
                     assert results[0].generated_tokens == reference.generated_tokens
                     if media:
-                        assert results[0].policy_epoch == [(0, 1)]
+                        assert [tuple(x) for x in results[0].policy_epoch] == [(0, 1)]
                 await _sync(comm)
             if rank == target_owner:
                 witness.assert_active(version)
