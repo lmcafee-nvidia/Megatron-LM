@@ -128,7 +128,8 @@ def test_disagg_real_engine_parity(mixer, rope, transport_world, backend, length
             elif source and chunked:
                 neighbor = engine.add_request(102, neighbor_tokens, sampling(16))
                 engine.step_modern()
-                assert not neighbor.done() and engine.context.is_decode_only()
+                assert engine.context.request_ids[0] == 102 and not neighbor.done()
+                assert not engine.context.request_in_prefill_status_tensor[0].item()
             metadata = state = None
             if source:
                 request = run_to_completion(
