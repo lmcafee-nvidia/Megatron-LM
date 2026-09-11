@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Dict
 
 import torch
 
+from megatron.core.inference.config import KVCacheManagementMode
 from megatron.core.inference.disaggregation.decode_admission import (
     additional_decode_blocks,
     admit_prefilled_decode,
@@ -33,12 +34,14 @@ from megatron.core.inference.disaggregation.utils import (
     drop_transfer_prefix_blocks,
     transfer_block_count,
 )
+from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.inference_request import (
     DynamicInferenceEvent,
     DynamicInferenceEventType,
     Status,
     compute_block_hashes_batched,
 )
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.utils import get_pg_rank, get_pg_size
 
 if TYPE_CHECKING:
@@ -79,6 +82,74 @@ class InferenceStateHandoffMixin:
         self._handoff_completion_notifications: dict[int, bool] = {}  # Request ID -> failed.
         self._pending_kv_pushes: list = []
         self._kv_transfer_role: str | None = None
+        self._kv_transfer_backend: str | None = None
+
+    def suspend(self) -> None:
+        """Reject destructive suspend while a handoff still owns source state."""
+
+        if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
+            return
+        if self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST and (
+            self._pinned_handoff_blocks or self._pinned_handoff_ssm_slots
+        ):
+            raise RuntimeError(
+                "Cannot suspend while handoff state remains pinned; wait for RELEASE_KV"
+            )
+        if self._handoff_storage_is_replaced() and (
+            self._deferred_kv_handoffs
+            or self._pending_kv_imports
+            or self._quarantined_kv_imports
+            or self._pending_kv_pushes
+        ):
+            raise RuntimeError(
+                "Cannot suspend while handoff transfers or admissions remain pending"
+            )
+        super().suspend()
+        if self._kv_transfer_role is not None and self._handoff_storage_is_replaced():
+            # The coordinator sets this after suspend returns; keep failures
+            # non-runnable even if native deregistration prevents that return.
+            if self.state != EngineState.SUSPENDED:
+                self.state = EngineState.SUSPENDING
+            self._retire_handoff_agents()
+
+    def _handoff_storage_is_replaced(self) -> bool:
+        """Select nonstatic recompute, excluding retained-pointer modes."""
+        return (
+            self.context.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE
+            and not self.context.static_kv_memory_pointers
+            and not self.unified_memory_level
+        )
+
+    def _retire_handoff_agents(self) -> None:
+        """Invalidate descriptors, then release only successfully retired owners."""
+        self._kv_peer_metas = None
+        self._pp_kv_peer_metas = None
+        self._pp_ssm_peer_metas = None
+        for agent in [self._kv_transfer_agent, *self._ssm_transfer_agents.values()]:
+            close = getattr(agent, "close", None)
+            if close is not None:
+                close(strict=True)
+        # On failure all references remain, including the registration whose
+        # close failed. Retrying can safely skip already-closed registrations.
+        self._kv_transfer_agent = None
+        self._ssm_transfer_agents.clear()
+
+    def _reinitialize_handoff_after_resume(self) -> None:
+        """Rebind replacing storage before graphs, admission, or loop wakeup."""
+        if self._kv_transfer_role is None or not self._handoff_storage_is_replaced():
+            return
+        try:
+            self._retire_handoff_agents()
+            self.setup_kv_transfer(self._kv_transfer_role, self._kv_transfer_backend)
+        except Exception:
+            # setup keeps new registrations reachable as it constructs the
+            # local KV/SSM set. Failed cleanup must retain their buffer owners.
+            try:
+                self._retire_handoff_agents()
+            except Exception:  # noqa: BLE001 - preserve the initiating failure
+                logging.exception("Retaining handoff registrations after failed resume cleanup")
+            InferenceMode.unset_active()
+            raise
 
     def _setup_handoff_completion_tracking(self, hostname: str | None = None) -> None:
         """Create the CPU path used to aggregate model-parallel transfer completion."""
@@ -188,6 +259,79 @@ class InferenceStateHandoffMixin:
             )
         self._handoff_completion_notifications.clear()
 
+    def _cancel_kv_handoff(self, request_id: int) -> None:
+        """Cancel an unadmitted decode handoff without reclaiming live destinations."""
+
+        matched = False
+        sampling_params = None
+        deferred = deque()
+        while self._deferred_kv_handoffs:
+            handoff = self._deferred_kv_handoffs.popleft()
+            if handoff.request_id == request_id:
+                matched = True
+                sampling_params = handoff.sampling_params
+                if not handoff.future.done():
+                    handoff.future.cancel()
+            else:
+                deferred.append(handoff)
+        self._deferred_kv_handoffs = deferred
+
+        pending_imports = deque()
+        while self._pending_kv_imports:
+            pending = self._pending_kv_imports.popleft()
+            if pending.request_id == request_id:
+                matched = True
+                sampling_params = pending.sampling_params
+                if not pending.future.done():
+                    pending.future.cancel()
+                # The transfer may still write these destinations. Remove the
+                # request from admission now, but retain its storage until all
+                # handles have reached a terminal state.
+                self._quarantined_kv_imports.append(pending)
+            else:
+                pending_imports.append(pending)
+        self._pending_kv_imports = pending_imports
+        self._handoff_completion_notifications.pop(request_id, None)
+        self._reap_quarantined_kv_imports()
+        if matched:
+            self._publish_failed_kv_handoff(request_id, sampling_params, asyncio.CancelledError())
+
+    def _publish_failed_kv_handoff(
+        self, request_id: int, sampling_params: SamplingParams | None, error: BaseException
+    ) -> None:
+        """Publish an unadmitted handoff failure without retaining a batch entry."""
+
+        if request_id not in self.requests and self.use_coordinator and self.is_mp_coordinator:
+            self._fail_submission(request_id, sampling_params, error)
+            # An empty decode batch may never run ordinary failed-request cleanup.
+            failed_entry = self.requests.pop(request_id)
+            failed_request_id = self.failed_request_ids.pop()
+            assert failed_request_id == request_id
+            assert failed_entry.future.done()
+
+    def _reap_quarantined_kv_imports(self) -> int:
+        """Release canceled/failed import destinations after transfers settle."""
+
+        remaining = []
+        reaped = 0
+        for pending in self._quarantined_kv_imports:
+            settled = False
+            if pending.destinations_safe:
+                handles = self._pending_transfer_handles(pending)
+                try:
+                    settled = all(handle.poll() for handle in handles)
+                except Exception:
+                    # A failed poll cannot establish that every writer stopped.
+                    # Keep background progress nonblocking; reset drains errors.
+                    settled = False
+            if settled:
+                self._release_pending_kv_import(pending)
+                reaped += 1
+            else:
+                remaining.append(pending)
+        self._quarantined_kv_imports = remaining
+        return reaped
+
     def schedule_waiting_requests(self) -> None:
         """Reject prompt scheduling on a dedicated disaggregated decode engine.
 
@@ -225,6 +369,7 @@ class InferenceStateHandoffMixin:
                 )
         self._kv_transfer_role = role
         backend_cls = construct_kv_transfer_backend_class(backend)
+        self._kv_transfer_backend = backend
 
         # Prefill output blocks stay pinned until the peer finishes reading
         # them. Decode requests consume imports but do not produce another
@@ -1143,6 +1288,7 @@ class InferenceStateHandoffMixin:
         Side: decode engine; pull and push transport paths.
         """
 
+        self._reap_quarantined_kv_imports()
         self._drain_deferred_kv_handoffs()
         if not self._pending_kv_imports:
             return 0
@@ -1194,6 +1340,7 @@ class InferenceStateHandoffMixin:
                     )
                 if not pending.future.done():
                     pending.future.set_exception(exc)
+                self._publish_failed_kv_handoff(pending.request_id, pending.sampling_params, exc)
                 logging.exception("DISAGG_DECODE_PULL_FAILED request_id=%d", pending.request_id)
                 if failed:
                     continue
