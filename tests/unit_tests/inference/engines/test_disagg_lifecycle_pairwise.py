@@ -24,6 +24,7 @@ from tests.unit_tests.inference.engines.disagg_test_utils import (
     assert_released,
     collocated_reference,
     decode_peer_meta,
+    deferred_pulls,
     disagg_config,
     exchange,
     prompt,
@@ -69,12 +70,7 @@ def deliver_abort(engine, request_id):
 def drain_deferred_without_posting(engine):
     """Reserve a queued import before posting its matched production receive."""
 
-    begin = engine._kv_transfer_agent.begin_pull_blocks
-
-    def defer(*args, **kwargs):
-        return _DeferredNcclPull(begin, args, kwargs)
-
-    with mock.patch.object(engine._kv_transfer_agent, "begin_pull_blocks", side_effect=defer):
+    with deferred_pulls(engine):
         return engine._drain_deferred_kv_handoffs()
 
 
