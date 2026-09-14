@@ -218,7 +218,7 @@ def test_mamba_dynamic_batch_invariance(case):
     engines = []
     with bi.invariant_runtime(case) as (backend, version), pytest.MonkeyPatch.context() as patch:
         patch.setattr(
-            fixture,
+            bi,
             "build_engine",
             partial(_build_model_engine, mamba=True, engines=engines, patch=patch),
         )
@@ -267,7 +267,7 @@ def test_mtp_dynamic_batch_invariance(depth, graph_mode):
     engines = []
     with bi.invariant_runtime(case) as (backend, version), pytest.MonkeyPatch.context() as patch:
         patch.setattr(
-            fixture,
+            bi,
             "build_engine",
             partial(_build_model_engine, mamba=False, engines=engines, patch=patch),
         )
