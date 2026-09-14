@@ -160,7 +160,7 @@ def test_vlm_dynamic_batch_invariance(modality):
     engines = []
     with bi.invariant_runtime(case) as (backend, version), pytest.MonkeyPatch.context() as patch:
         patch.setattr(
-            fixture, "build_engine", partial(_build_engine, modality=modality, engines=engines)
+            bi, "build_engine", partial(_build_engine, modality=modality, engines=engines)
         )
         reference = bi.run_order(case, backend, version, "solo")
         actual = bi.run_order(case, backend, version, "back")
