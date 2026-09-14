@@ -1105,6 +1105,7 @@ class Attention(MegatronModule, ABC):
                     causal=True,
                     window_size=window_size,
                     num_splits=0 if not self.batch_invariant_mode else 1,
+                    return_lse=need_lse,
                 )
             elif use_fa3:
                 # TODO(ksanthanam): Replace with call to flash_attn_varlen_func once
@@ -1240,6 +1241,7 @@ class Attention(MegatronModule, ABC):
                         causal=True,
                         window_size=window_size,
                         num_splits=0 if not self.batch_invariant_mode else 1,
+                        return_lse=need_lse,
                     )
                     if need_lse:
                         # output_total: (B*S, H, D); softmax_lse: (H, B*S)
