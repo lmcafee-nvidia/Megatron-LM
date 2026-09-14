@@ -8,8 +8,10 @@ the interpreter starts. Required capability failures are not successful skips.
 """
 
 import pytest
+import torch
 
 from megatron.core.inference.config import AsyncScheduleMode, CudaGraphSizingDistribution
+from tests.unit_tests.inference.engines import batch_invariant_test_utils as bi
 from tests.unit_tests.inference.engines.batch_invariant_test_utils import (
     Case,
     assert_same_target,
@@ -17,8 +19,20 @@ from tests.unit_tests.inference.engines.batch_invariant_test_utils import (
     run_order,
 )
 
+MLA_CASE = Case(
+    "mla",
+    model=dict(
+        multi_latent_attention=True,
+        cache_mla_latents=True,
+        num_attention_heads=64,
+        qk_layernorm=True,
+    ),
+    context={"block_size_tokens": 64},
+)
+
 DENSE_CASES = [
     Case("dense"),
+    MLA_CASE,
     Case("async", context={"async_sched_mode": AsyncScheduleMode.ASYNC}),
     Case("local", model={"transformer_impl": "local"}),
     Case("optimized", model={"transformer_impl": "inference_optimized", "add_bias_linear": False}),
@@ -44,6 +58,10 @@ DENSE_CASES = [
         sampling={"return_log_probs": False},
         prompt_length=273,
         warm_prefix=True,
+    ),
+    Case(
+        "sink",
+        model={"window_size": (8, 0), "window_attn_skip_freq": 1, "softmax_type": "off-by-one"},
     ),
     Case("decode-graph", context={"num_cuda_graphs": 4, "max_tokens": 128}),
     Case(
@@ -102,6 +120,49 @@ def test_dense_dynamic_feature_batch_invariance(case):
         print("BI_WITNESS", case.name, backend, version, "decode_shapes", ref_decode, wide_decode)
 
 
+@pytest.mark.parametrize("backend", ["torch", "flashinfer"])
+@pytest.mark.parametrize(
+    "filters", [dict(top_k=7, top_p=0.0), dict(top_k=0, top_p=0.8)], ids=["top-k", "top-p"]
+)
+@pytest.mark.parametrize("mode", ["raw_logprobs", "processed_logprobs"])
+@pytest.mark.parametrize("offset_by_dp", [False, True])
+def test_sampling_fixed_history_batch_invariance(backend, filters, mode, offset_by_dp):
+    case = Case("sampling", context={"sampling_backend": backend, "logprobs_mode": mode})
+    case.context["offset_sampling_seed_by_dp_rank"] = offset_by_dp
+    # Stop the target after one real sample. No stochastic sampled token enters
+    # a subsequent target forward, so solo and co-batched histories are identical.
+    params = dict(num_tokens_to_generate=1, temperature=0.7, skip_prompt_log_probs=True, **filters)
+    with invariant_runtime(case) as (gemm, version):
+        reference = run_order(case, gemm, version, "solo", sampling=params)
+        actual = run_order(case, gemm, version, "back", sampling=params)
+        assert_same_target(reference, actual, require_trajectory=False)
+        ref_samples, samples = reference[1].sample_steps, actual[1].sample_steps
+        assert len(ref_samples) == len(samples) == 1
+        expected, observed = ref_samples[0], samples[0]
+        assert observed["sampler"] == (
+            "TorchSampling" if backend == "torch" else "FlashInferSampling"
+        )
+        assert observed["requests"] == 65 and not any(observed["filters"])
+        assert torch.equal(expected["logits"], observed["logits"])
+        assert torch.equal(expected["log_probs"], observed["log_probs"])
+        assert {s["physical"] for s in reference[1].steps} == {64}
+        assert any(s["physical"] == 128 and s["requests"] == 65 for s in actual[1].steps)
+        # TP=PP=1 in this case, so WORLD rank is the actual DP rank.
+        seed = 333 + (torch.distributed.get_rank() if offset_by_dp else 0)
+        for result, sample in ((reference, expected), (actual, observed)):
+            assert result[1].engine.controller._sampling._rng.initial_seed() == seed
+            assert len(result[0].generated_tokens) == 1
+            token = result[0].generated_tokens[0]
+            assert token == sample["token"]
+            assert torch.isfinite(
+                sample["log_probs"][token]
+            ), "sampled outside the actual distribution"
+            assert len(result[0].generated_log_probs) == 1
+        print(
+            "BI_SAMPLING_WITNESS", backend, filters, mode, observed["requests"], observed["filters"]
+        )
+
+
 @pytest.mark.parametrize(
     "case",
     [Case("tp2-sp", tp=2, sp=True), Case("pp2", pp=2), Case("tp2-pp2-sp", tp=2, pp=2, sp=True)],
@@ -115,3 +176,32 @@ def test_parallel_batch_invariance(case):
         assert any(
             s["decode"] and s["physical"] == 128 and s["requests"] == 65 for s in actual[1].steps
         )
+
+
+def test_mla_split_device_first_prefill():
+    with invariant_runtime(MLA_CASE) as (backend, version):
+        assert version == 3
+        engine = bi.build_engine(MLA_CASE, backend, version)
+        model = engine.controller.inference_wrapped_model.model
+        assert model.config.use_cpu_initialization
+        sources = [
+            (layer, layer.linear_kv_up_proj)
+            for layer in model.modules()
+            if isinstance(layer, bi.MLASelfAttention)
+        ]
+        assert len(sources) == 2 and all(source.weight.is_cuda for _, source in sources)
+        engine.add_request(
+            bi.TARGET,
+            bi.target_prompt(MLA_CASE.prompt_length),
+            bi.SamplingParams(num_tokens_to_generate=1, top_k=1, termination_id=-1),
+        )
+        records = engine.step_modern()["finished_request_records"]
+        assert len(records) == 1 and not engine.has_unfinished_requests()
+        for layer, source in sources:
+            assert not hasattr(layer, "linear_kv_up_proj")
+            norm, linear = layer.kv_layernorm, layer.linear_kv_up_proj_linear
+            pairs = [(norm.weight, source.layer_norm_weight), (linear.weight, source.weight)]
+            for actual, expected in pairs:
+                assert actual.device == expected.device == source.weight.device
+                assert actual.dtype == expected.dtype == bi.torch.bfloat16
+                assert bi.torch.equal(actual, expected)

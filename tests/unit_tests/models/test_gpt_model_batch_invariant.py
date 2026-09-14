@@ -433,6 +433,7 @@ class TestGPTModelBatchInvariant:
             controller = TextGenerationController(wrapper, tokenizer)
             engine = DynamicInferenceEngine(controller=controller, context=ctx)
             allocator = ctx.kv_block_allocator
+            ctx.memory_buffer[1, :, : allocator.pool_size - 1] = float("nan")
 
             finished_by_id = {}
             max_paused_blocks = 0
@@ -449,6 +450,9 @@ class TestGPTModelBatchInvariant:
                     max_paused_blocks = max(max_paused_blocks, allocator.get_paused_used())
                     for record in result["finished_request_records"]:
                         req = record.merge(engine.controller.tokenizer)
+                        assert torch.isfinite(
+                            torch.tensor(req.prompt_log_probs + req.generated_log_probs)
+                        ).all()
                         finished_by_id[req.request_id] = req
 
             assert not engine.has_unfinished_requests(), "engine did not drain"

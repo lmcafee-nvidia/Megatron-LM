@@ -557,6 +557,19 @@ class Attention(MegatronModule, ABC):
             self.config, vp_stage=None, pp_rank=get_pg_rank(self.pg_collection.pp)
         )
 
+    def _use_mla_absorption(self, inference_context) -> bool:
+        """Keep BI MLA arithmetic independent of neighboring prefill requests.
+
+        BI retains latent KV storage but uses the existing expanded attention
+        route for every batch, foregoing absorbed decode's memory/compute savings.
+        """
+        return bool(
+            getattr(self.config, "cache_mla_latents", False)
+            and inference_context is not None
+            and inference_context.is_decode_only()
+            and not self.batch_invariant_mode
+        )
+
     def _adjust_key_value_for_inference(
         self,
         inference_context: BaseInferenceContext,
@@ -725,15 +738,14 @@ class Attention(MegatronModule, ABC):
                 self.layer_number - pp_layer_offset, key, value
             )
 
-            if (
-                getattr(self.config, "cache_mla_latents", None)
-                and not inference_context.is_decode_only()
+            if getattr(self.config, "cache_mla_latents", None) and not self._use_mla_absorption(
+                inference_context
             ):
-                # Doing unabsorbed MLA Attention with cached mla latents (prefill/mixed mode)
+                # Expand cached latents for prefill/mixed batches, or all BI batches.
                 kv_cache, _, block_table = inference_context.key_value_cache(
                     self.layer_number - pp_layer_offset
                 )
-                # Uncompress the KV cache for prefill/mixed mode
+                # Uncompress the KV cache for the unabsorbed attention route.
                 key, value = self.uncompress_kv_from_cache(kv_cache)
             else:
                 # Read key/value *pointer* tensors from cache.
@@ -1105,6 +1117,7 @@ class Attention(MegatronModule, ABC):
                     causal=True,
                     window_size=window_size,
                     num_splits=0 if not self.batch_invariant_mode else 1,
+                    return_lse=need_lse,
                 )
             elif use_fa3:
                 # TODO(ksanthanam): Replace with call to flash_attn_varlen_func once
@@ -1240,6 +1253,7 @@ class Attention(MegatronModule, ABC):
                         causal=True,
                         window_size=window_size,
                         num_splits=0 if not self.batch_invariant_mode else 1,
+                        return_lse=need_lse,
                     )
                     if need_lse:
                         # output_total: (B*S, H, D); softmax_lse: (H, B*S)
