@@ -1,20 +1,31 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Target-owned batch invariance across executed dynamic-inference features.
 
-Run backend/version groups in separate torch.distributed.run invocations using
-MCORE_BI_TEST_BACKEND and MCORE_BI_TEST_FA_VERSION; never switch a live backend.
-The te_native invocation additionally sets CUBLASLT_WORKSPACE_SIZE=0 before
-the interpreter starts. Required capability failures are not successful skips.
+Run backend/version groups in fresh torch.distributed.run processes using
+MCORE_BI_TEST_BACKEND and MCORE_BI_TEST_FA_VERSION. Start te_native with
+CUBLASLT_WORKSPACE_SIZE=0; missing required capabilities must fail, not skip.
 """
 
 import pytest
 
 from megatron.core.inference.config import AsyncScheduleMode, CudaGraphSizingDistribution
+from tests.unit_tests.inference.engines import batch_invariant_test_utils as bi
 from tests.unit_tests.inference.engines.batch_invariant_test_utils import (
     Case,
     assert_same_target,
     invariant_runtime,
     run_order,
+)
+
+MLA_CASE = Case(
+    "mla",
+    model=dict(
+        multi_latent_attention=True,
+        cache_mla_latents=True,
+        num_attention_heads=64,
+        qk_layernorm=True,
+    ),
+    context={"block_size_tokens": 64},
 )
 
 DENSE_CASES = [
@@ -115,3 +126,24 @@ def test_parallel_batch_invariance(case):
         assert any(
             s["decode"] and s["physical"] == 128 and s["requests"] == 65 for s in actual[1].steps
         )
+
+
+def test_mla_split_device_first_prefill():
+    with invariant_runtime(MLA_CASE) as (backend, version):
+        engine = bi.build_engine(MLA_CASE, backend, version)
+        model = engine.controller.inference_wrapped_model.model
+        assert version == 3 and model.config.use_cpu_initialization
+        layers = [layer for layer in model.modules() if isinstance(layer, bi.MLASelfAttention)]
+        sources = [layer.linear_kv_up_proj for layer in layers]
+        assert len(sources) == 2 and all(source.weight.is_cuda for source in sources)
+        params = bi.SamplingParams(num_tokens_to_generate=1, top_k=1, termination_id=-1)
+        engine.add_request(bi.TARGET, bi.target_prompt(MLA_CASE.prompt_length), params)
+        records = engine.step_modern()["finished_request_records"]
+        assert len(records) == 1 and not engine.has_unfinished_requests()
+        for layer, source in zip(layers, sources):
+            norm, linear = layer.kv_layernorm, layer.linear_kv_up_proj_linear
+            pairs = [(norm.weight, source.layer_norm_weight), (linear.weight, source.weight)]
+            for actual, expected in pairs:
+                assert actual.device == expected.device == source.weight.device
+                assert actual.dtype == expected.dtype == bi.torch.bfloat16
+                assert bi.torch.equal(actual, expected)
