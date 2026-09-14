@@ -11,6 +11,7 @@ import torch
 from transformer_engine.pytorch.module import linear as te_linear
 from transformer_engine.pytorch.tensor import QuantizedTensorStorage
 
+from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -40,6 +41,19 @@ def _config(recipe, **overrides):
     )
     options.update(overrides)
     return TransformerConfig(**options)
+
+
+@pytest.mark.parametrize("fp8", ["e4m3", "hybrid"])
+def test_dense_tensorwise_fp8_admission(fp8):
+    for recipe in ("tensorwise", Fp8Recipe.tensorwise):
+        with pytest.raises(AssertionError, match="activation scaling depends on neighboring"):
+            _config(recipe, fp8=fp8)
+    assert not _config("tensorwise", fp8=fp8, batch_invariant_mode=False).batch_invariant_mode
+    assert _config("tensorwise", fp8=None).fp8 is None
+    for recipe in ("delayed", "mxfp8", "blockwise", "custom"):
+        assert (
+            _config(recipe, fp8=fp8, fp8_quantizer_factory="builtins.object").fp8_recipe == recipe
+        )
 
 
 @pytest.mark.parametrize("recipe", ["mxfp8", "delayed", "blockwise"])
