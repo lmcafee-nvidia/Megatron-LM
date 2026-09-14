@@ -1340,6 +1340,7 @@ class InferenceStateHandoffMixin:
                     )
                 if not pending.future.done():
                     pending.future.set_exception(exc)
+                self._publish_failed_kv_handoff(pending.request_id, pending.sampling_params, exc)
                 logging.exception("DISAGG_DECODE_PULL_FAILED request_id=%d", pending.request_id)
                 if failed:
                     continue
