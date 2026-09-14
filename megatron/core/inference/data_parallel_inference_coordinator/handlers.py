@@ -141,6 +141,7 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     coordinator.next_request_id += 1
     coordinator.request_id_to_client_id[request_id] = sender_identity
     coordinator.request_id_to_client_request_id[request_id] = client_request_id
+    coordinator.request_id_to_sampling_params[request_id] = sampling_params
     coordinator.client_request_to_request_id[(sender_identity, client_request_id)] = request_id
 
     # Rebuilding the metadata frame is cheap: it holds neither prompt tokens nor
@@ -263,6 +264,7 @@ def handle_submit_request_with_kv(coordinator, sender_identity, metadata, bodies
     coordinator.next_request_id += 1
     coordinator.request_id_to_client_id[request_id] = sender_identity
     coordinator.request_id_to_client_request_id[request_id] = client_request_id
+    coordinator.request_id_to_sampling_params[request_id] = sampling_params
     coordinator.client_request_to_request_id[(sender_identity, client_request_id)] = request_id
 
     # Rebuilding the metadata frame is cheap: it holds no prompt tokens.
@@ -387,17 +389,10 @@ def handle_engine_reply(coordinator, sender_identity, metadata, bodies):
         logging.warning("Coordinator: ENGINE_REPLY from removed engine %r", sender_identity)
 
     for (fid, needs_detokenize), body in zip(metadata[1], bodies):
-        client_identity = coordinator.request_id_to_client_id[fid]
-        client_request_id = coordinator.request_id_to_client_request_id[fid]
-        del coordinator.request_id_to_client_id[fid]
-        del coordinator.request_id_to_client_request_id[fid]
-        del coordinator.client_request_to_request_id[(client_identity, client_request_id)]
-        assigned_rank = coordinator.request_id_to_rank.pop(fid, None)
-        if assigned_rank is not None:
-            idx = coordinator.identity_to_rank_index.get(assigned_rank)
-            if idx is not None:
-                assert coordinator._pending_counts[idx] >= 1
-                coordinator._pending_counts[idx] -= 1
+        if fid not in coordinator.request_id_to_client_id:
+            logging.warning("Coordinator: ignoring late reply for retired request %d", fid)
+            continue
+        client_identity, client_request_id, _ = coordinator._cleanup_request(fid)
 
         if needs_detokenize:
             # Detokenizing writes generated_text into the reply, so this one has
@@ -433,8 +428,13 @@ def handle_engine_reply_partial(coordinator, sender_identity, metadata, bodies):
         logging.warning("Coordinator: ENGINE_REPLY_PARTIAL from removed engine %r", sender_identity)
         return
     for request_id, body in zip(metadata[1], bodies):
-        client_identity = coordinator.request_id_to_client_id[request_id]
-        client_request_id = coordinator.request_id_to_client_request_id[request_id]
+        client_identity = coordinator.request_id_to_client_id.get(request_id)
+        client_request_id = coordinator.request_id_to_client_request_id.get(request_id)
+        if client_identity is None or client_request_id is None:
+            logging.warning(
+                "Coordinator: ignoring late partial reply for retired request %d", request_id
+            )
+            continue
         # Partial tokens are detokenized incrementally by the client-facing
         # streaming layer, so the body is always forwarded untouched.
         coordinator._send_to_client(
