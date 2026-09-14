@@ -370,6 +370,18 @@ class DataParallelInferenceCoordinator:
                 return False
             raise
 
+    def _send_to_client(self, identity, frames):
+        """Send frames to a client without letting a closed peer stop the event loop."""
+        try:
+            self.router_socket.send_multipart([identity, *frames])
+            return True
+        except zmq.error.ZMQError as error:
+            if error.errno == zmq.EHOSTUNREACH:
+                self.known_clients.discard(identity)
+                logging.warning("Coordinator: client %r is unreachable", identity)
+                return False
+            raise
+
     def _broadcast_to_engines(self, payload):
         """Send a deserialized payload to every connected data parallel rank."""
         serialized = msgpack.packb(payload, use_bin_type=True)
