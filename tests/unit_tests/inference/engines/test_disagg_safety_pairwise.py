@@ -36,16 +36,17 @@ def _error(call):
         pytest.param("hybrid", "nixl", id="ssm-nixl"),
     ],
 )
+@pytest.mark.parametrize("resuming", ["prefill", "decode", "both"])
 @pytest.mark.parametrize("stop_keep", [None, False, True], ids=["eos", "stop-strip", "stop-keep"])
 @torch.inference_mode()
 @mock.patch.object(GPTModel, "forward", autospec=True, side_effect=GPTModel.forward)
 @mock.patch.object(MambaMixer, "forward", autospec=True, side_effect=MambaMixer.forward)
 def test_nonpersist_suspend_rejects_owned_source_state(
-    mixer, gpt, transport_world, model, backend, stop_keep
+    mixer, gpt, transport_world, model, backend, stop_keep, resuming
 ):
     """Owned KV/SSM publications reject suspend before its first mutation."""
     _exercise_owned_source_state(
-        mixer, gpt, transport_world, model, backend, stop_keep, resuming=None, cycles=1
+        mixer, gpt, transport_world, model, backend, stop_keep, resuming=resuming, cycles=2
     )
 
 

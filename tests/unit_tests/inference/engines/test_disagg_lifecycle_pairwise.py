@@ -14,7 +14,7 @@ import torch.distributed as dist
 import zmq
 
 from megatron.core.inference.config import KVCacheManagementMode, PrefixCachingEvictionPolicy
-from megatron.core.inference.engines.dynamic_engine import EngineState
+from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, EngineState
 from megatron.core.inference.headers import Headers
 from tests.unit_tests.inference.engines.disagg_test_utils import (
     ForwardWitness,
@@ -34,6 +34,28 @@ from tests.unit_tests.inference.engines.disagg_test_utils import (
 )
 from tests.unit_tests.inference.engines.test_disagg_pairwise import transport_world  # noqa: F401
 from tests.unit_tests.test_utilities import Utils
+
+
+def _suspend_observation(engine):
+    def owners():
+        return tuple(
+            tuple(map(id, getattr(engine, name)))
+            for name in ("_deferred_kv_handoffs", "_pending_kv_imports", "_quarantined_kv_imports")
+        )
+
+    before, error = owners(), None
+    with mock.patch.object(DynamicInferenceEngine, "suspend") as base:
+        try:
+            engine.suspend()
+        except RuntimeError as caught:
+            error = str(caught)
+    return error, base.call_count, owners() == before, engine.state == EngineState.RUNNING
+
+
+def _expected_suspend(mode):
+    if mode == KVCacheManagementMode.RECOMPUTE:
+        return "Cannot suspend while handoff transfers or admissions remain pending", 0, True, True
+    return None, 1, True, True
 
 
 def deliver_abort(engine, request_id):
@@ -159,6 +181,7 @@ def test_abort_capacity_queued_handoff_resolves_without_transfer(mode):
             assert not engine.requests and not engine._pending_kv_imports
             assert [item.request_id for item in engine._deferred_kv_handoffs] == [101]
             try:
+                suspend_state = _suspend_observation(engine)
                 assert not future.done()
                 with ForwardWitness(engine) as witness:
                     reply = deliver_abort(engine, 101)
@@ -178,6 +201,7 @@ def test_abort_capacity_queued_handoff_resolves_without_transfer(mode):
                 assert metadata == [Headers.ENGINE_REPLY.value, [[101, False]]]
                 assert body["request_id"] == 101 and body["status"] == "FAILED"
                 assert deliver_abort(engine, 101) is None
+                assert suspend_state == _expected_suspend(mode)
             finally:
                 allocator.release_memory_blocks(held)
                 engine._reset_pending_kv_imports()
@@ -230,8 +254,9 @@ def test_abort_inflight_handoff_quarantines_until_real_nccl_settles(transport_wo
             peer_meta = None
         peer_meta = exchange(peer_meta, transport_world)
 
-        witness = None
+        witness, suspend_states = None, []
         if not source:
+            suspend_states.append(_suspend_observation(engine))
             assert not future.done()
             with ForwardWitness(engine) as witness:
                 reply = deliver_abort(engine, 101)
@@ -242,6 +267,7 @@ def test_abort_inflight_handoff_quarantines_until_real_nccl_settles(transport_wo
                 torch.ones_like(owned_blocks, dtype=torch.int32),
             )
             assert reply is not None
+            suspend_states.append(_suspend_observation(engine))
         dist.barrier(group=transport_world)
 
         if source:
@@ -269,6 +295,8 @@ def test_abort_inflight_handoff_quarantines_until_real_nccl_settles(transport_wo
             assert engine._poll_pending_kv_imports() == 0
             assert not witness.steps and not engine._handoff_completion_notifications
         assert_released(engine)
+        states = exchange(suspend_states if not source else None, transport_world)
+        assert (states if source else suspend_states) == [_expected_suspend(mode)] * 2
 
 
 @torch.inference_mode()
