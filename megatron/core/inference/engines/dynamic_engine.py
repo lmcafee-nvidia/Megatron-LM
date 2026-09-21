@@ -2257,7 +2257,8 @@ class DynamicInferenceEngine(AbstractEngine):
         finished_handoff_ssm_slots: Optional[Dict[int, int]] = None,
         finished_handoff_decode_tokens: Optional[Dict[int, list[int]]] = None,
         process_request_ids: Optional[set[int]] = None,
-    ) -> Tuple[List[int], List[DynamicInferenceRequest], Dict[int, int]]:
+        record_step_latency: bool = False,
+    ) -> Tuple[List[int], List[DynamicInferenceRequest], Dict[int, Tuple[int, int]]]:
         """
         Apply sampled output and assemble results while request storage is valid.
 
@@ -2282,15 +2283,16 @@ class DynamicInferenceEngine(AbstractEngine):
             finished_handoff_decode_tokens: First sampled token and optional MTP proposals
                 needed to resume directly from imported prefill state on decode.
             process_request_ids: Requests to process in this phase, or None for the full batch.
+            record_step_latency: Reserve this step's latency entries before stop-word trimming.
 
         Returns:
-            Active request IDs, completed requests, and emitted token counts
-            for the later step-latency update.
+            Active request IDs, completed requests, and latency-entry starting
+            offsets with pre-trim token counts for the later timing update.
         """
         active_request_ids: list[int] = []
         finished_request_ids = set(finished_request_ids.tolist())
         finished_requests: list[DynamicInferenceRequest] = []
-        emitted_token_counts = {}
+        tpot_updates = {}
 
         log_probs_iter = log_probs if log_probs else repeat(None)
         block_allocator = self.context.kv_block_allocator
@@ -2416,7 +2418,11 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.ttft = (
                             first_token_event.timestamp - request.event_add_engine.timestamp
                         )
-                    emitted_token_counts[request_id] = len(tokens)
+                    if record_step_latency and tokens:
+                        # Reserve entries now so stop-word trimming sees the original
+                        # token-aligned layout. Fill the measured latency before publication.
+                        tpot_updates[request_id] = (len(request.tpot), len(tokens))
+                        request.tpot.extend([0.0] * len(tokens))
 
                 # Check for stop words (after token is appended).
                 # With speculative decoding, a stop word may end before the last
@@ -2618,38 +2624,45 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # Merge only after the final token's scores and metadata have been applied.
             if finished_entry is not None:
-                finished_requests.append(finished_entry.record.merge())
+                finished = finished_entry.record.merge()
+                if request_id in tpot_updates:
+                    start, count = tpot_updates[request_id]
+                    tpot_updates[request_id] = (
+                        len(finished.tpot) - len(request.tpot) + start,
+                        count,
+                    )
+                finished_requests.append(finished)
 
-        return active_request_ids, finished_requests, emitted_token_counts
+        return active_request_ids, finished_requests, tpot_updates
 
     def _finalize_finished_requests(
         self,
-        completed_requests: Dict[int, Tuple[DynamicInferenceRequest, int]],
+        completed_requests: Dict[int, Tuple[DynamicInferenceRequest, Optional[Tuple[int, int]]]],
         context_state: Dict,
+        record_step_latency: bool,
         **output,
     ) -> None:
         """Finalize only completed rows before their context storage is released.
 
         Args:
-            completed_requests: Step-owned results and token counts filled by this callback.
+            completed_requests: Step-owned results and pending latency entries.
             context_state: Metadata describing the consumed forward.
+            record_step_latency: Whether this step will have a measured latency.
             **output: Sampled tokens, scores, finished IDs, and retained handoff state.
         """
         finished_ids = set(output["finished_request_ids"].tolist())
         if not finished_ids:
             return
-        _, finished, token_counts = self._process_request_outputs(
+        _, finished, tpot_updates = self._process_request_outputs(
             **output,
             consumed_chunked_prefill_request_id=context_state["chunked_prefill_request_id"],
             pre_fwd_active_token_count=context_state["active_token_count"],
             pre_fwd_step_count=context_state["step_count"],
             process_request_ids=finished_ids,
+            record_step_latency=record_step_latency,
         )
         for request in finished:
-            completed_requests[request.request_id] = (
-                request,
-                token_counts.get(request.request_id, 0),
-            )
+            completed_requests[request.request_id] = (request, tpot_updates.get(request.request_id))
 
     def post_process_requests(
         self,
@@ -2668,7 +2681,9 @@ class DynamicInferenceEngine(AbstractEngine):
         finished_handoff_block_ids: Optional[Dict[int, list[int]]] = None,
         finished_handoff_ssm_slots: Optional[Dict[int, int]] = None,
         finished_handoff_decode_tokens: Optional[Dict[int, list[int]]] = None,
-        completed_requests: Optional[Dict[int, Tuple[DynamicInferenceRequest, int]]] = None,
+        completed_requests: Optional[
+            Dict[int, Tuple[DynamicInferenceRequest, Optional[Tuple[int, int]]]]
+        ] = None,
     ) -> Tuple[List[int], List[DynamicInferenceRequest]]:
         """Process survivors and publish completed results after a controller step.
 
@@ -2689,7 +2704,7 @@ class DynamicInferenceEngine(AbstractEngine):
             finished_handoff_ssm_slots: Detached handoff SSM slots.
             finished_handoff_decode_tokens: Tokens for resuming the handed-off request.
             completed_requests: Results assembled by the pre-release callback and
-                their emitted token counts. Futures are published here, not in the callback.
+                pending latency entries. Futures are published here, not in the callback.
 
         Returns:
             Active request IDs and completed requests.
@@ -2703,7 +2718,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Completed rows were already processed before lifecycle cleanup.
         completed_requests = completed_requests or {}
-        active_request_ids, finished_requests, token_counts = self._process_request_outputs(
+        active_request_ids, finished_requests, tpot_updates = self._process_request_outputs(
             request_ids,
             finished_request_ids,
             sample,
@@ -2722,23 +2737,24 @@ class DynamicInferenceEngine(AbstractEngine):
                 if completed_requests
                 else None
             ),
+            record_step_latency=step_time > 0,
         )
-        for request_id, (request, count) in completed_requests.items():
+        for request_id, (request, timing_update) in completed_requests.items():
             finished_requests.append(request)
-            token_counts[request_id] = count
+            if timing_update is not None:
+                tpot_updates[request_id] = timing_update
         finished_by_id = {request.request_id: request for request in finished_requests}
         finished_requests = [finished_by_id[request_id] for request_id in finished_ids]
 
         # Timing is only known after controller execution; preserve sparse TPOT samples.
-        if step_time > 0:
-            for request_id, count in token_counts.items():
-                if count:
-                    request = (
-                        finished_by_id[request_id]
-                        if request_id in finished_by_id
-                        else self.get_request(request_id)
-                    )
-                    request.tpot.extend([step_time / count] * count)
+        for request_id, (start, count) in tpot_updates.items():
+            request = (
+                finished_by_id[request_id]
+                if request_id in finished_by_id
+                else self.get_request(request_id)
+            )
+            retained = max(0, len(request.tpot) - start)
+            request.tpot[start:] = [step_time / count] * retained if step_time > 0 else []
         for request in finished_requests:
             self._complete_request(self.requests.pop(request.request_id), request)
 
@@ -3488,7 +3504,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
         completed_requests = {}
         controller_kwargs["finalize_requests"] = functools.partial(
-            self._finalize_finished_requests, completed_requests, pre_step_context_state
+            self._finalize_finished_requests,
+            completed_requests,
+            pre_step_context_state,
+            will_log_this_step,
         )
         if will_log_this_step:
             self.step_start_event.record()

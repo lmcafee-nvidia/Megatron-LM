@@ -27,8 +27,9 @@ from tests.unit_tests.inference.text_generation_controllers.test_text_generation
 @pytest.mark.parametrize("path", ["legacy", "no_overlap", "overlap"])
 @pytest.mark.parametrize("mtp", [False, True])
 @pytest.mark.parametrize("prefix_caching", [False, True])
+@pytest.mark.parametrize("trim_stop", [False, True])
 async def test_finalization_precedes_reuse_but_publication_waits_for_bookkeeping(
-    path, mtp, prefix_caching
+    path, mtp, prefix_caching, trim_stop
 ):
     """A finishes while B reuses its blocks; A's complete result remains intact."""
     context = _make_async_sched_context(total_request_count=2)
@@ -60,6 +61,7 @@ async def test_finalization_precedes_reuse_but_publication_waits_for_bookkeeping
             prompt_tokens=torch.tensor([3, 4]),
             generated_tokens=[token],
             generated_log_probs=[-0.8],
+            tpot=[0.8],
             sampling_params=SamplingParams(
                 num_tokens_to_generate=8,
                 termination_id=1,
@@ -69,6 +71,8 @@ async def test_finalization_precedes_reuse_but_publication_waits_for_bookkeeping
             ),
         )
         request.add_event_add_engine()
+        if trim_stop and request_id == 10:
+            request.stop_word_ids = [[1]]
         engine.requests[request_id] = SimpleNamespace(
             record=DynamicInferenceRequestRecord.from_request(request),
             future=asyncio.get_running_loop().create_future(),
@@ -101,6 +105,7 @@ async def test_finalization_precedes_reuse_but_publication_waits_for_bookkeeping
         engine._finalize_finished_requests,
         completed,
         {"chunked_prefill_request_id": -1, "active_token_count": 2, "step_count": 3},
+        True,
     )
 
     def reuse_finished_blocks(*args):
@@ -108,7 +113,7 @@ async def test_finalization_precedes_reuse_but_publication_waits_for_bookkeeping
         assert not future.done()
         assert engine.get_request(11).generated_tokens == [9]
         np.testing.assert_array_equal(
-            completed[10][0].routing_indices, expected_routing[: 2 + score_count]
+            completed[10][0].routing_indices, expected_routing[: 2 + score_count - int(trim_stop)]
         )
         allocator.release_memory_blocks(blocks[:2])
         reused = allocator.allocate_memory_blocks(2).clone()
@@ -159,11 +164,13 @@ async def test_finalization_precedes_reuse_but_publication_waits_for_bookkeeping
     )
     assert active == [11]
     assert future.result() is finished[0]
-    assert finished[0].generated_tokens == ([8, 6, 1] if mtp else [8, 1])
-    assert len(finished[0].generated_log_probs) == 1 + score_count
-    assert len(finished[0].generated_top_n_logprobs) == score_count
-    assert finished[0].tpot == [0.25 / score_count] * score_count
+    expected_tokens = [8, 6, 1] if mtp else [8, 1]
+    kept = score_count - int(trim_stop)
+    assert finished[0].generated_tokens == (expected_tokens[:-1] if trim_stop else expected_tokens)
+    assert len(finished[0].generated_log_probs) == 1 + kept
+    assert len(finished[0].generated_top_n_logprobs) == kept
+    assert finished[0].tpot == [0.8] + [0.25 / score_count] * kept
     assert engine.get_request(11).generated_tokens == ([9, 7, 2] if mtp else [9, 2])
     assert engine.finished_request_count == 1
     assert engine._spec_steps == int(mtp)
-    np.testing.assert_array_equal(finished[0].routing_indices, expected_routing[: 2 + score_count])
+    np.testing.assert_array_equal(finished[0].routing_indices, expected_routing[: 2 + kept])
