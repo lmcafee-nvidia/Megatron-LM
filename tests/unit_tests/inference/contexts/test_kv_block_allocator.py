@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -12,6 +13,31 @@ POOL_SIZE = 10
 PAUSED_LIMIT = 2
 MAX_REQUESTS = 8
 MAX_BLOCKS_PER_REQ = 4
+
+
+@pytest.mark.parametrize("cleanup", ["reuse", "reset"])
+def test_finished_routing_snapshot_survives_block_cleanup(cleanup):
+    """A completed request retains its own routes after the block changes owners."""
+    context = _make_context()
+    context.block_size_tokens = 2
+    allocator = KVBlockAllocator(context, pool_size=3, paused_limit=0)
+    blocks = allocator.allocate_memory_blocks(1).clone()
+    block_id = blocks.item()
+    expected = np.array([[[1]], [[2]]], dtype=np.int32)
+    allocator.store_block_routing(block_id, np.arange(2), expected)
+    snapshot = {block_id: allocator.get_block_routing(block_id)}
+
+    if cleanup == "reuse":
+        allocator.release_memory_blocks(blocks)
+        assert allocator.allocate_memory_blocks(1).item() == block_id
+        allocator.store_block_routing(block_id, np.arange(2), expected + 10)
+    else:
+        allocator.reset()
+
+    np.testing.assert_array_equal(
+        allocator.reconstruct_routing_from_blocks([block_id], 2, prefetched_blocks=snapshot),
+        expected,
+    )
 
 
 def _make_context(

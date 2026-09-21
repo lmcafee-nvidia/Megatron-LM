@@ -313,6 +313,9 @@ def _make_async_sched_context(total_request_count=2, paused_request_count=0):
         request_kv_length_offsets=torch.full((metadata_len,), 2, dtype=torch.int32),
     )
     context.is_decode_only = mock.Mock(side_effect=lambda: context.num_prefill_requests == 0)
+    context.kv_block_allocator.get_block_routing = (
+        lambda block_id: context.kv_block_allocator.block_routing.get(block_id)
+    )
     context.get_committed_kv_block_counts = lambda rows: (
         DynamicInferenceContext.get_committed_kv_block_counts(context, rows)
     )
@@ -1413,7 +1416,11 @@ def test_finished_routing_blocks_drop_the_speculative_reserve(reserve_blocks):
     drops `moe_topk_indices` from the response.
     """
     context = _make_async_sched_context(total_request_count=2)
-    context.kv_block_allocator = SimpleNamespace(block_routing=True, enable_handoff_pinning=False)
+    context.kv_block_allocator = SimpleNamespace(
+        block_routing=True,
+        enable_handoff_pinning=False,
+        get_block_routing=mock.Mock(return_value=None),
+    )
     context.request_to_kv_block_ids = torch.tensor(
         [[10, 11] + [-1] * (reserve_blocks - 1), list(range(12, 13 + reserve_blocks))],
         dtype=torch.int32,
@@ -1546,6 +1553,7 @@ def test_async_sched_step_overlap_order():
             finished_handoff_ssm_slots={},
             finished_handoff_decode_tokens={},
             finished_routing_block_ids={},
+            finished_routing_block_snapshots={},
         )
     )
 
@@ -1677,6 +1685,7 @@ def test_async_sched_step_yields_after_resolution_outside_inference_mode():
             finished_handoff_ssm_slots={},
             finished_handoff_decode_tokens={},
             finished_routing_block_ids={},
+            finished_routing_block_snapshots={},
         )
     )
     observed = []
@@ -1823,6 +1832,7 @@ def test_async_sched_no_overlap_updates_before_admission(
         finished_handoff_ssm_slots={},
         finished_handoff_decode_tokens={},
         finished_routing_block_ids={},
+        finished_routing_block_snapshots={},
     )
     input_ids = torch.empty(1, dtype=torch.int64)
     position_ids = torch.empty(1, dtype=torch.int64)
@@ -1931,6 +1941,7 @@ def test_async_sched_no_overlap_finishes_with_matching_ep_base_forward():
         finished_handoff_ssm_slots={},
         finished_handoff_decode_tokens={},
         finished_routing_block_ids={},
+        finished_routing_block_snapshots={},
     )
     controller._run_async_sched_sample = mock.Mock(return_value=sample_result)
     controller._synchronize_async_sched_event = mock.Mock()
@@ -1985,6 +1996,7 @@ def test_async_sched_mtp_overlap_step_order():
         finished_handoff_ssm_slots={},
         finished_handoff_decode_tokens={},
         finished_routing_block_ids={},
+        finished_routing_block_snapshots={},
     )
     input_ids = torch.empty(9, dtype=torch.int64)
     position_ids = torch.empty(9, dtype=torch.int64)
