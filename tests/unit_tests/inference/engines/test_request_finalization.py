@@ -26,14 +26,20 @@ from tests.unit_tests.inference.text_generation_controllers.test_text_generation
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["legacy", "no_overlap", "overlap"])
 @pytest.mark.parametrize("mtp", [False, True])
-async def test_finalization_precedes_reuse_but_publication_waits_for_bookkeeping(path, mtp):
+@pytest.mark.parametrize("prefix_caching", [False, True])
+async def test_finalization_precedes_reuse_but_publication_waits_for_bookkeeping(
+    path, mtp, prefix_caching
+):
     """A finishes while B reuses its blocks; A's complete result remains intact."""
     context = _make_async_sched_context(total_request_count=2)
+    context.num_decode_requests = 2
     context.request_metadata["termination_id"] = torch.tensor([1, 99])
     context.active_request_metadata["termination_id"] = torch.tensor([1, 99])
     context.chunked_prefill_request_id = -1
     context.remove_vlm_request_data = mock.Mock()
-    allocator = KVBlockAllocator(context, pool_size=8, paused_limit=0)
+    allocator = KVBlockAllocator(
+        context, pool_size=8, paused_limit=0, enable_prefix_caching=prefix_caching
+    )
     blocks = allocator.allocate_memory_blocks(4).clone()
     context.kv_block_allocator = allocator
     context.request_to_kv_block_ids = blocks.reshape(2, 2)
