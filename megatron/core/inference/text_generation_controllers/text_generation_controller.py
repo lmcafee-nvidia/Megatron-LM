@@ -243,6 +243,7 @@ class _AsyncScheduleRequestResult:
     finished_handoff_ssm_slots: Dict[int, int] = field(default_factory=dict)
     finished_handoff_decode_tokens: Dict[int, List[int]] = field(default_factory=dict)
     finished_routing_block_ids: Dict[int, List[int]] = field(default_factory=dict)
+    finished_routing_block_snapshots: Dict[int, np.ndarray] = field(default_factory=dict)
 
 
 @dataclass
@@ -1801,19 +1802,23 @@ class TextGenerationController(MTPControllerMixin):
 
         return finished_block_ids, finished_ssm_slots, decode_tokens_by_request
 
-    def _snapshot_finished_routing_block_ids(self, finished_idxs: Tensor) -> Dict[int, List[int]]:
+    def _snapshot_finished_routing_blocks(
+        self, finished_idxs: Tensor
+    ) -> Tuple[Dict[int, List[int]], Dict[int, np.ndarray]]:
         """Snapshot block lists before finished requests release them.
 
         Args:
             finished_idxs (Tensor): Context rows for requests finishing this step.
 
         Returns:
-            Dict[int, List[int]]: Finished request IDs mapped to their KV-block IDs.
+            Finished request block lists and retained routing arrays. Retaining
+            the arrays prevents block reuse or reset from losing finished output.
         """
         context = self.inference_wrapped_model.inference_context
         finished_routing_block_ids = {}
+        finished_routing_block_snapshots = {}
         if not context.kv_block_allocator.block_routing:
-            return finished_routing_block_ids
+            return finished_routing_block_ids, finished_routing_block_snapshots
 
         for finished_idx in finished_idxs.tolist():
             request_id = int(context.request_ids[finished_idx].item())
@@ -1823,7 +1828,11 @@ class TextGenerationController(MTPControllerMixin):
             valid_blocks = blocks[blocks >= 0].tolist()
             if valid_blocks:
                 finished_routing_block_ids[request_id] = valid_blocks
-        return finished_routing_block_ids
+                for block_id in valid_blocks:
+                    routing = context.kv_block_allocator.get_block_routing(block_id)
+                    if routing is not None:
+                        finished_routing_block_snapshots[block_id] = routing
+        return finished_routing_block_ids, finished_routing_block_snapshots
 
     def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
@@ -1881,7 +1890,9 @@ class TextGenerationController(MTPControllerMixin):
 
         # Save block IDs for finished requests before update_requests releases them.
         # Needed for per-block routing reconstruction in the engine.
-        finished_routing_block_ids = self._snapshot_finished_routing_block_ids(finished_idxs)
+        finished_routing_block_ids, finished_routing_block_snapshots = (
+            self._snapshot_finished_routing_blocks(finished_idxs)
+        )
 
         # Retain finished prefill blocks before request cleanup releases them;
         # the handoff path owns this reference until the decode transfer completes.
@@ -1911,6 +1922,7 @@ class TextGenerationController(MTPControllerMixin):
             # D2H sync when the engine later calls sample.tolist().
             "sample": sampled_tokens_cpu,
             "finished_routing_block_ids": finished_routing_block_ids,
+            "finished_routing_block_snapshots": finished_routing_block_snapshots,
             "finished_handoff_block_ids": finished_handoff_block_ids,
             "finished_handoff_ssm_slots": finished_handoff_ssm_slots,
             "finished_handoff_decode_tokens": finished_handoff_decode_tokens,
@@ -2783,7 +2795,9 @@ class TextGenerationController(MTPControllerMixin):
         finished_idxs = (
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
         )
-        finished_routing_block_ids = self._snapshot_finished_routing_block_ids(finished_idxs)
+        finished_routing_block_ids, finished_routing_block_snapshots = (
+            self._snapshot_finished_routing_blocks(finished_idxs)
+        )
         finished_handoff_block_ids, finished_handoff_ssm_slots, finished_handoff_decode_tokens = (
             self._collect_finished_handoff_state(
                 finished_idxs, sampled_tokens_cpu, sample_result.sampled_mtp_tokens_cpu_view
@@ -2811,6 +2825,7 @@ class TextGenerationController(MTPControllerMixin):
             finished_handoff_ssm_slots=finished_handoff_ssm_slots,
             finished_handoff_decode_tokens=finished_handoff_decode_tokens,
             finished_routing_block_ids=finished_routing_block_ids,
+            finished_routing_block_snapshots=finished_routing_block_snapshots,
         )
 
     def _run_async_sched_update_requests(
@@ -2841,7 +2856,9 @@ class TextGenerationController(MTPControllerMixin):
         finished_idxs = (
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
         )
-        finished_routing_block_ids = self._snapshot_finished_routing_block_ids(finished_idxs)
+        finished_routing_block_ids, finished_routing_block_snapshots = (
+            self._snapshot_finished_routing_blocks(finished_idxs)
+        )
 
         finished_idxs = (
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
@@ -2877,6 +2894,7 @@ class TextGenerationController(MTPControllerMixin):
             finished_handoff_ssm_slots=finished_handoff_ssm_slots,
             finished_handoff_decode_tokens=finished_handoff_decode_tokens,
             finished_routing_block_ids=finished_routing_block_ids,
+            finished_routing_block_snapshots=finished_routing_block_snapshots,
         )
 
     def _build_async_sched_step_result(
@@ -2918,6 +2936,7 @@ class TextGenerationController(MTPControllerMixin):
                 "finished_request_ids": request_result.finished_request_ids,
                 "sample": request_result.sampled_tokens_cpu,
                 "finished_routing_block_ids": request_result.finished_routing_block_ids,
+                "finished_routing_block_snapshots": request_result.finished_routing_block_snapshots,
                 "finished_handoff_block_ids": request_result.finished_handoff_block_ids,
                 "finished_handoff_ssm_slots": request_result.finished_handoff_ssm_slots,
                 "finished_handoff_decode_tokens": request_result.finished_handoff_decode_tokens,

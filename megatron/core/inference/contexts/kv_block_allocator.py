@@ -689,7 +689,10 @@ class KVBlockAllocator:
             offset += count
 
     def reconstruct_routing_from_blocks(
-        self, block_ids: list[int], total_routing_tokens: int
+        self,
+        block_ids: list[int],
+        total_routing_tokens: int,
+        prefetched_blocks: Optional[Dict[int, np.ndarray]] = None,
     ) -> Optional[np.ndarray]:
         """Reconstruct routing indices from per-block storage.
 
@@ -701,6 +704,8 @@ class KVBlockAllocator:
             total_routing_tokens: Expected number of routing tokens
                 (total_tokens - 1, since the last generated token has no
                 forward-pass routing).
+            prefetched_blocks: Routing arrays retained before lifecycle cleanup.
+                Missing entries fall back to the allocator's live block storage.
 
         Returns:
             ndarray [total_routing_tokens, num_layers, topk] or None if any
@@ -711,7 +716,9 @@ class KVBlockAllocator:
         tokens_collected = 0
 
         for bid in block_ids:
-            routing = self.get_block_routing(bid)
+            routing = None if prefetched_blocks is None else prefetched_blocks.get(bid)
+            if routing is None:
+                routing = self.get_block_routing(bid)
             if routing is None:
                 return None  # Missing routing data for this block
             remaining = total_routing_tokens - tokens_collected
