@@ -342,7 +342,11 @@ def test_async_forward_routes_one_controller_iteration(
         ]
     )
     assert finalize_requests.func == engine._finalize_finished_requests
-    assert finalize_requests.args == ({}, context_state, False)
+    assert finalize_requests.args == (
+        {},
+        {key: value for key, value in context_state.items() if key != "kv_stats"},
+        False,
+    )
     if output is not None:
         assert finalize_requests.args[0] is output["completed_requests"]
     if mode == AsyncScheduleMode.LEGACY:
