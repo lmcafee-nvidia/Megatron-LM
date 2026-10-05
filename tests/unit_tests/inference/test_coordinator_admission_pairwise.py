@@ -10,11 +10,10 @@ pytestmark = [pytest.mark.internal, pytest.mark.asyncio]
 
 
 async def test_rejected_admission_retires_before_healthy(monkeypatch):
-    prompt, params = list(range(4, 20)), greedy_params()
+    prompt, params, bad = list(range(4, 20)), greedy_params(), 0
     async with routed_model(monkeypatch, max_sequence_length=256) as h:
         direct = await h.direct(prompt, params)
         await h.start()
-        bad = 0
         if h.rank == 0:
             client, events = h.clients[0], h.service.events
             failed = await wait_for(client.add_request([4] * 257, params), 60)
@@ -33,8 +32,9 @@ async def test_rejected_admission_retires_before_healthy(monkeypatch):
         h.assert_retired()
         if h.rank == 0:
             final = await wait_for(client.add_request(prompt, params), 60)
-            for key in ("status", "generated_tokens", "generated_text"):
+            for key in ("status", "generated_tokens"):
                 bad |= final[key] != direct[key]
+            bad |= final["generated_text"] != h.tokenizer.detokenize(direct["generated_tokens"])
             submits = [e["after"] for e in events if e["header"] == Headers.SUBMIT_REQUEST]
             bad |= submits[-1] != {final["request_id"]: owner}
             replies = [
