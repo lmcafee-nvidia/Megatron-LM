@@ -5013,8 +5013,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 )
             return selected_log_probs, log_probs
 
-        # Prefill sampling metadata maps real tokens, never padded model rows.
-        logits_squeezed = logits_squeezed[: self.active_token_count].float()
+        logits_squeezed = logits_squeezed.float()
         active_slice = slice(self.paused_request_count, self.total_request_count)
         active_query_lengths_cpu = self.request_query_lengths[active_slice]
         active_query_lengths_gpu = self.gpu_view.request_query_lengths[:n_active]
