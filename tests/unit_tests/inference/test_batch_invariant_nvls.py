@@ -1,8 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Real NVLS EP4 participation; use a fresh collective/backend interpreter.
-
-Native TE requires CUBLASLT_WORKSPACE_SIZE=0 before interpreter startup.
-"""
+"""Real EP4 NVLS invariance; each collective/backend needs a fresh interpreter."""
 
 import os
 
