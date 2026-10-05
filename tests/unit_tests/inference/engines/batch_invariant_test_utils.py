@@ -133,7 +133,6 @@ def invariant_runtime(case):
 
 
 def model_defaults(backend, fa_version):
-    """Common identical model settings; architecture-specific options stay local."""
     return dict(
         use_cpu_initialization=True,
         hidden_dropout=0.0,

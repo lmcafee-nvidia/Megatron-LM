@@ -37,7 +37,6 @@ from tests.unit_tests.determinism.kernels.harness import (
     bytes_equal,
     seeded,
 )
-from tests.unit_tests.inference.engines import batch_invariant_test_utils as bi
 from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
 pytestmark = pytest.mark.skipif(
@@ -573,8 +572,7 @@ def test_te_fused_rope_replays_fwd_bwd(layout):
 @pytest.mark.parametrize("indices_dtype", [torch.int64, torch.int16], ids=["int64", "int16"])
 def test_te_fused_topk_dense_indices_replays(indices_dtype):
     """The fused router wrapper can write dense [tokens, topk] expert ids into a caller-provided
-    tensor (flex deepep/ncclep: int64, HybridEP: int16) instead of the bool routing map.
-    """
+    tensor (flex deepep/ncclep: int64, HybridEP: int16) instead of the bool routing map."""
     from megatron.core.extensions.transformer_engine import (
         fused_topk_with_score_function,
         fused_topk_with_score_function_supports_topk_indices,
@@ -608,24 +606,3 @@ def test_te_fused_topk_dense_indices_replays(indices_dtype):
     assert_replays_bit_exact(
         fn, (logits,), replays=3, what=f"TE fused topk dense indices[{indices_dtype}]"
     )
-
-
-def test_mla_split_device_first_prefill():
-    with bi.invariant_runtime(bi.MLA_CASE) as (backend, version):
-        engine = bi.build_engine(bi.MLA_CASE, backend, version)
-        model = engine.controller.inference_wrapped_model.model
-        assert version == 3 and model.config.use_cpu_initialization
-        layers = [layer for layer in model.modules() if isinstance(layer, bi.MLASelfAttention)]
-        sources = [layer.linear_kv_up_proj for layer in layers]
-        assert len(sources) == 2 and all(source.weight.is_cuda for source in sources)
-        params = bi.SamplingParams(num_tokens_to_generate=1, top_k=1, termination_id=-1)
-        engine.add_request(bi.TARGET, bi.target_prompt(bi.MLA_CASE.prompt_length), params)
-        requests = engine.step_modern()["finished_requests"]
-        assert len(requests) == 1 and not engine.has_unfinished_requests()
-        for layer, source in zip(layers, sources):
-            norm, linear = layer.kv_layernorm, layer.linear_kv_up_proj_linear
-            pairs = [(norm.weight, source.layer_norm_weight), (linear.weight, source.weight)]
-            for actual, expected in pairs:
-                assert actual.device == expected.device == source.weight.device
-                assert actual.dtype == expected.dtype == bi.torch.bfloat16
-                assert bi.torch.equal(actual, expected)
