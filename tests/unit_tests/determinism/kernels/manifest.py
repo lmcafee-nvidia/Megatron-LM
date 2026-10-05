@@ -151,7 +151,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="attention_kernels_and_dispatch",
         sources=("megatron/core/transformer/attention.py",),
-        tests=(K + "test_fused_activations.py", K + "test_runtime_cp_attention.py"),
+        tests=(
+            K + "test_fused_activations.py",
+            K + "test_runtime_cp_attention.py"
+            "tests/unit_tests/inference/engines/test_batch_invariant_pairwise.py",
+        ),
         kind="dispatch",
         notes="Attention._apply_output_gate is replayed in test_fused_activations.py. "
         "Packed SelfAttention dispatch through RoPE and TE attention is replayed with runtime "
@@ -436,7 +440,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/ssm/gated_delta_net/gdn.py",
             "megatron/core/ssm/gated_delta_net/gdn2.py",
         ),
-        tests=(K + "test_ssm_kernels.py", K + "test_gated_norm.py", C + "test_hybrid_model.py"),
+        tests=(
+            K + "test_ssm_kernels.py",
+            K + "test_gated_norm.py",
+            C + "test_hybrid_model.py",
+        ),
         kind="torch.compile",
         notes="deterministic_mode selects torch_chunk_gated_delta_rule over FLA (recorded non-deterministic).",
     ),
@@ -548,8 +556,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="mtp_speculative_decoding_kernels",
-        sources=("megatron/core/inference/text_generation_controllers/mtp_utils_triton.py",),
-        tests=("tests/unit_tests/inference/text_generation_controllers/test_mtp_utils.py",),
+        sources=(
+            "megatron/core/inference/text_generation_controllers/mtp_utils_triton.py",
+        ),
+        tests=(
+            "tests/unit_tests/inference/text_generation_controllers/test_mtp_utils.py",
+        ),
         kind="triton",
         training_path=False,
         notes="Integer bookkeeping and state copies checked for exact equality against the torch reference.",
@@ -590,7 +602,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="nvshmem_chunked_copy",
-        sources=("megatron/core/resharding/nvshmem_copy_service/kernels/chunked_kernel.cu",),
+        sources=(
+            "megatron/core/resharding/nvshmem_copy_service/kernels/chunked_kernel.cu",
+        ),
         kind="cuda-ext",
         training_path=False,
         exempt_reason="Byte copy for refit; needs NVSHMEM and a multi-GPU RL environment.",
