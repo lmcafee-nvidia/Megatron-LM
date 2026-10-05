@@ -27,6 +27,7 @@ from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, check_fp8_supp
 
 from megatron.core import parallel_state
 from megatron.core.inference.config import AsyncScheduleMode, PrefixCachingEvictionPolicy
+from megatron.core.inference.contexts.mtp_metadata import MTPForwardMode
 from megatron.core.inference.inference_request import DynamicInferenceEventType
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.transformer.attention import HAVE_FA3, HAVE_FA4
@@ -220,9 +221,17 @@ def _install_mtp_witnesses(env, case: _Case, runtime: Counter) -> _MTPWitness:
 
             def observed_layer_forward(*args, _real=real_layer_forward, **kwargs):
                 request_ids = tuple(_active_request_ids(context))
+                committing = (
+                    context.enable_mtp_kv_cache
+                    and context.mtp_metadata.forward_mode is MTPForwardMode.COMMIT
+                )
                 result = _real(*args, **kwargs)
-                witness.layer_request_ids.append(request_ids)
-                runtime["real-mtp-layer-forward"] += 1
+                if committing:
+                    assert kwargs["inference_context"] is context and request_ids
+                    runtime["real-mtp-kv-commit"] += 1
+                else:
+                    witness.layer_request_ids.append(request_ids)
+                    runtime["real-mtp-layer-forward"] += 1
                 return result
 
             layer.forward_single_position = observed_layer_forward
@@ -731,6 +740,7 @@ def _assert_mtp_active(session: _Session, case: _Case) -> None:
     assert runtime["real-base-forward"] > 0
     if parallel_state.is_pipeline_last_stage():
         assert runtime["real-mtp-forward"] > 0
+        assert bool(runtime["real-mtp-kv-commit"]) is case.repeated
         assert runtime["real-mtp-layer-forward"] == runtime["real-mtp-forward"]
         assert runtime["mtp-position-id-forwards"] == runtime["real-mtp-forward"]
         assert session.witness.layer_request_ids == session.witness.proposal_request_ids
