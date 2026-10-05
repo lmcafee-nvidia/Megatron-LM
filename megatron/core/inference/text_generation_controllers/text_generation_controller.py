@@ -4,6 +4,7 @@ import asyncio
 import concurrent
 import copy
 import functools
+import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, OrderedDict, Tuple, Union
@@ -22,15 +23,25 @@ from megatron.core.inference.communication_utils import (
 )
 from megatron.core.inference.config import AsyncScheduleMode
 from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
+from megatron.core.inference.contexts.kv_block_allocator import (
+    PendingPromptLogprobsRow,
+    PromptLogprobsKey,
+    PromptLogprobsReservation,
+)
 from megatron.core.inference.contexts.static_context import StaticInferenceContext
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.text_generation_controllers.mtp_controller_mixin import (
+    MTPControllerMixin,
+)
 from megatron.core.inference.utils import (
     InferenceMode,
+    detokenize_tokens,
     get_attention_mask,
+    model_eos_token_ids,
     set_decode_expert_padding,
     set_moe_metadata_sync,
 )
@@ -41,7 +52,6 @@ from megatron.core.transformer.moe.router_replay import RouterReplay, RouterRepl
 from megatron.core.transformer.moe.router_trace import get_moe_router_tracer
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
 from megatron.core.utils import (
-    accepts_parameter,
     get_asyncio_loop,
     get_model_config,
     get_pg_size,
@@ -61,9 +71,6 @@ except ImportError:
 
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.sampling import FlashInferSampling, Sampling, TorchSampling
-from megatron.core.inference.text_generation_controllers.mtp_inference_mixin import (
-    MTPInferenceMixin,
-)
 from megatron.core.inference.text_generation_controllers.mtp_utils_pytorch import rewind_kv_cache
 from megatron.core.inference.text_generation_controllers.mtp_utils_triton import (
     mamba_state_selective_copy,
@@ -208,8 +215,43 @@ class _AsyncScheduleLogProbsTransfer:
     gpu_result: _AsyncScheduleLogProbsGPUResult
 
 
+@dataclass(frozen=True)
+class _PromptLogprobsBlockWrite:
+    """Rows that will fill one sidecar after asynchronous score transfer."""
+
+    logical_block_index: int
+    reservation: PromptLogprobsReservation
+    target_positions: np.ndarray
+    result_row_indices: np.ndarray
+
+
+@dataclass
+class _PromptLogprobsRequestWrite:
+    """Deferred sidecar writes for one request in the consumed batch."""
+
+    active_index: int
+    request_id: int
+    key: PromptLogprobsKey
+    prompt_row_count: int
+    block_writes: List[_PromptLogprobsBlockWrite]
+    publication_only_reservations: List[PromptLogprobsReservation]
+    update: Dict[str, Any]
+    pending_row: Optional[PendingPromptLogprobsRow] = None
+
+
+@dataclass
+class _PromptLogprobsWritePlan:
+    """Stable prompt-sidecar targets captured before request bookkeeping."""
+
+    request_writes: List[_PromptLogprobsRequestWrite] = field(default_factory=list)
+    updates: Dict[int, Dict[str, Any]] = field(default_factory=dict)
+    latest_reservations: Dict[int, PromptLogprobsReservation] = field(
+        default_factory=dict, repr=False
+    )
+
+
 # pylint: disable=line-too-long
-class TextGenerationController(MTPInferenceMixin):
+class TextGenerationController(MTPControllerMixin):
     """The text generation controller (the main sampling loop)
 
     This class tokenizes the input, runs inference, samples from logits, and detokenizes the output.
@@ -220,11 +262,17 @@ class TextGenerationController(MTPInferenceMixin):
         tokenizer (_type_): Tokenizer used for tokenizing and detokenizing the prompts
     """
 
+    # Model-declared EOS ids beyond the per-request `termination_id`, in two forms:
+    # this set for scalar `in` checks, `extra_eos_token_id_tensor` (a cached view of
+    # it) for batched `torch.isin`. Empty => the model declares a single eos.
+    extra_eos_token_id_set: frozenset = frozenset()
+
     def __init__(self, inference_wrapped_model: AbstractModelInferenceWrapper, tokenizer):
         self.inference_wrapped_model = inference_wrapped_model
         self.model_config = self.inference_wrapped_model.model.config
         inference_config = self.inference_wrapped_model.inference_context.config
         self.tokenizer = tokenizer
+        self.extra_eos_token_id_set = self._build_extra_eos_token_id_set(tokenizer)
         self.num_speculative_tokens = inference_config.num_speculative_tokens
 
         pg_collection = inference_config.pg_collection
@@ -244,6 +292,23 @@ class TextGenerationController(MTPInferenceMixin):
             self.vocab_size = unwrapped_model.language_model.vocab_size
         else:
             self.vocab_size = unwrapped_model.vocab_size
+
+        if getattr(self.inference_wrapped_model.inference_context, "enable_mtp_kv_cache", False):
+            language_model = (
+                unwrapped_model.language_model
+                if isinstance(unwrapped_model, LLaVAModel)
+                else unwrapped_model
+            )
+            if language_model.position_embedding_type != "none":
+                raise ValueError(
+                    "MTP KV caching requires position_embedding_type='none'; positional "
+                    "embeddings are not supported."
+                )
+            if language_model.config.multi_latent_attention:
+                # MLA constructs its own RoPE/YaRN, independently of the model's position type.
+                raise ValueError(
+                    "MTP KV caching does not support MLA's rotary position embeddings."
+                )
 
         # Build and seed sampling RNG. Optionally offset by DP rank so each rank gets a
         # unique generation seed (avoids identical samples when the same prompt is
@@ -361,6 +426,64 @@ class TextGenerationController(MTPInferenceMixin):
 
         self._init_mtp_sampling_tensors()
 
+    def _build_extra_eos_token_id_set(self, tokenizer) -> frozenset:
+        """Build the model-level EOS token-id set used for termination.
+
+        Honors `generation_config.eos_token_id` (which HF may declare as a LIST, e.g.
+        `[2, 11]`) in addition to the tokenizer's single `eod`. The generation_config is
+        read off the tokenizer if present (HF tokenizers attach it; other tokenizers
+        won't).
+
+        Returns empty when there is at most one eos id: the per-request `termination_id`
+        already covers that case, so behavior is unchanged and a client that deliberately
+        narrowed `termination_id` is not silently widened back to `tokenizer.eod`.
+        """
+        ids = model_eos_token_ids(tokenizer)
+        result = ids if len(ids) > 1 else frozenset()
+        is_rank0 = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
+        if is_rank0:
+            eod = getattr(tokenizer, "eod", None)
+            gen_cfg = getattr(tokenizer, "generation_config", None)
+            gen_cfg_eos = gen_cfg.get("eos_token_id") if isinstance(gen_cfg, dict) else None
+            logging.info(
+                "Inference termination EOS ids: tokenizer.eod=%s, "
+                "generation_config.eos_token_id=%s -> eos set=%s (multi-eos active=%s)",
+                eod,
+                gen_cfg_eos,
+                sorted(ids),
+                bool(result),
+            )
+        return result
+
+    @functools.cached_property
+    def extra_eos_token_id_tensor(self) -> Optional[Tensor]:
+        """`extra_eos_token_id_set` as a CPU tensor, to match `sampled_tokens_cpu`.
+
+        None when the set is empty, the signal the per-step checks use to skip `isin`.
+        """
+        if not self.extra_eos_token_id_set:
+            return None
+        return torch.tensor(sorted(self.extra_eos_token_id_set), dtype=torch.long)
+
+    def terminating_token_ids(self, termination_id: Optional[int]) -> frozenset:
+        """Token ids that end generation for a request with this `termination_id`.
+
+        The CPU-side counterpart of the `extra_eos_token_id_tensor` check, for the
+        termination sites that work on Python ints rather than a batched tensor:
+        the engine's mid-speculative-block scan and the disaggregated handoff
+        admission check. Returns an empty set when termination is disabled
+        (`ignore_eos`, i.e. `termination_id` of -1 or None).
+
+        Args:
+            termination_id (Optional[int]): The request's own termination id.
+
+        Returns:
+            frozenset: Terminating token ids, empty when termination is disabled.
+        """
+        if termination_id is None or termination_id < 0:
+            return frozenset()
+        return self.extra_eos_token_id_set | {termination_id}
+
     @staticmethod
     def tokenize_prompt(tokenizer, prompt: str, add_BOS: bool = False) -> List[int]:
         """Utility to tokenize the input prompts.
@@ -406,14 +529,9 @@ class TextGenerationController(MTPInferenceMixin):
         Returns:
             str: The detokenized string.
         """
-        if remove_EOD and getattr(tokenizer, "eod", None) is not None:
-            while tokens and tokens[-1] == tokenizer.eod:
-                tokens = tokens[:-1]
-
-        if accepts_parameter(tokenizer.detokenize, "skip_special_tokens"):
-            return tokenizer.detokenize(tokens, skip_special_tokens=skip_special_tokens)
-        else:
-            return tokenizer.detokenize(tokens)
+        return detokenize_tokens(
+            tokenizer, tokens, remove_EOD=remove_EOD, skip_special_tokens=skip_special_tokens
+        )
 
     def detokenize_generations(
         self,
@@ -836,21 +954,6 @@ class TextGenerationController(MTPInferenceMixin):
         else:
             self._all_logits_cuda = logits
 
-    def _replace_partial_prefill_sample_with_prompt_token(self) -> None:
-        """Use the known next prompt token for a partial chunk's selected logprob."""
-        context = self.inference_wrapped_model.inference_context
-        if context.chunked_prefill_request_id == -1:
-            return
-
-        context_idx = context.get_index_of_chunked_prefill_request(safe=True)
-        if context_idx == -1:
-            return
-        active_idx = context_idx - context.paused_request_count
-        active_request_count = context.total_request_count - context.paused_request_count
-        assert 0 <= active_idx < active_request_count
-        assert active_idx == active_request_count - 1
-        self._sampled_tokens_cuda[active_idx].copy_(context.chunked_prefill_next_prompt_token)
-
     def _rewind_kv_cache(self, accepted_counts_cpu: Optional[Tensor] = None) -> tuple:
         """Update the KV cache bookkeeping for speculative decoding.
 
@@ -889,6 +992,7 @@ class TextGenerationController(MTPInferenceMixin):
             num_speculative_tokens=self.num_speculative_tokens,
             block_size_tokens=context.block_size_tokens,
             num_active_requests=active_request_count,
+            keep_extra_blocks=context.enable_mtp_kv_cache,
         )
 
         # Mamba speculative rewind stays on GPU because it mutates GPU-resident
@@ -1106,6 +1210,21 @@ class TextGenerationController(MTPInferenceMixin):
             no_top_p=no_top_p,
             output=self._sampled_tokens_cuda[:n],
         )
+
+    def _replace_partial_prefill_sample_with_prompt_token(self) -> None:
+        """Use the known next prompt token for a partial chunk's selected logprob."""
+        context = self.inference_wrapped_model.inference_context
+        if context.chunked_prefill_request_id == -1:
+            return
+
+        context_idx = context.get_index_of_chunked_prefill_request(safe=True)
+        if context_idx == -1:
+            return
+        active_idx = context_idx - context.paused_request_count
+        active_request_count = context.total_request_count - context.paused_request_count
+        assert 0 <= active_idx < active_request_count
+        assert active_idx == active_request_count - 1
+        self._sampled_tokens_cuda[active_idx].copy_(context.chunked_prefill_next_prompt_token)
 
     def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
         """Perform bookkeeping necessary to compute log probs for dynamic batching.
@@ -1523,40 +1642,206 @@ class TextGenerationController(MTPInferenceMixin):
         if not log_probs:
             return {}
 
+        plan = self._reserve_prompt_logprob_sidecars([len(rows) for rows in log_probs])
+        self._fill_prompt_logprob_sidecars(
+            plan, log_probs, top_n_logprobs, publish_unregistered=True
+        )
+        return plan.updates
+
+    def _reserve_prompt_logprob_sidecars(
+        self, row_counts: Optional[List[int]]
+    ) -> _PromptLogprobsWritePlan:
+        """Snapshot lazy sidecar destinations before request bookkeeping mutates them."""
+        plan = _PromptLogprobsWritePlan()
+        if row_counts is None:
+            return plan
+
         context = self.inference_wrapped_model.inference_context
         if not context.enable_prefix_caching:
-            return {}
+            return plan
         allocator = context.kv_block_allocator
         active_slice = slice(context.paused_request_count, context.total_request_count)
         query_lengths = context.request_query_lengths[active_slice].tolist()
+        if len(row_counts) != len(query_lengths):
+            raise RuntimeError(
+                f"received {len(row_counts)} prompt-score row counts for "
+                f"{len(query_lengths)} active requests"
+            )
         source_positions = context.token_to_position_in_request[: context.active_token_count].split(
             query_lengths
         )
         request_ids = context.request_ids[active_slice].tolist()
         prefill_status = context.request_in_prefill_status_tensor[active_slice].tolist()
-        updates: Dict[int, Dict[str, Any]] = {}
         block_size = context.block_size_tokens
 
-        for active_idx, (request_id, is_prefill, positions, request_log_probs) in enumerate(
-            zip(request_ids, prefill_status, source_positions, log_probs)
+        for active_idx, (request_id, is_prefill, positions, row_count) in enumerate(
+            zip(request_ids, prefill_status, source_positions, row_counts)
         ):
             key = context.prompt_logprobs_cache_keys.get(request_id)
             if not is_prefill or key is None:
                 continue
 
+            row_count = int(row_count)
             is_partial_prefill = request_id == context.chunked_prefill_request_id
-            prompt_row_count = (
-                len(request_log_probs) if is_partial_prefill else max(len(request_log_probs) - 1, 0)
-            )
+            prompt_row_count = row_count if is_partial_prefill else max(row_count - 1, 0)
             stored_row_count = prompt_row_count - 1 if is_partial_prefill else prompt_row_count
             assert stored_row_count >= 0
-            prompt_positions = positions[:stored_row_count].cpu().numpy().astype(np.int64) + 1
-            selected = np.asarray(request_log_probs[:prompt_row_count], dtype=np.float32)
+            prompt_positions = (
+                positions[:stored_row_count].cpu().numpy().astype(np.int64, copy=True) + 1
+            )
 
-            if key.top_n > 0 and prompt_row_count > 0:
+            pending_row = None
+            if is_partial_prefill:
+                assert prompt_row_count > 0
+                assert prompt_row_count == len(positions)
+                pending_row = PendingPromptLogprobsRow()
+
+            request_block_ids = context.request_to_kv_block_ids[
+                context.paused_request_count + active_idx
+            ]
+            valid_block_ids = request_block_ids[request_block_ids >= 0].tolist()
+            block_hashes = context.prompt_logprobs_block_hashes.get(request_id, ())
+            block_refs = dict(context.prompt_logprobs_matched_refs.get(request_id, {}))
+            block_writes = []
+            publication_only_reservations = []
+            request_reservations = {}
+
+            def reserve_block(logical_block_index: int) -> PromptLogprobsReservation:
+                """Reserve one current request block and chain same-block plan writes."""
+                block_id = valid_block_ids[logical_block_index]
+                expected_hash = (
+                    block_hashes[logical_block_index]
+                    if logical_block_index < len(block_hashes)
+                    else None
+                )
+                reservation = allocator.reserve_prompt_logprobs(
+                    logical_block_index=logical_block_index,
+                    block_id=block_id,
+                    key=key,
+                    expected_block_hash=expected_hash,
+                    block=block_refs.get(logical_block_index),
+                    expected_predecessor=plan.latest_reservations.get(block_id),
+                )
+                plan.latest_reservations[block_id] = reservation
+                request_reservations[logical_block_index] = reservation
+                if reservation.block is not None:
+                    block_refs[logical_block_index] = reservation.block
+                return reservation
+
+            for logical_block_index in np.unique(prompt_positions // block_size):
+                logical_block_index = int(logical_block_index)
+                row_mask = prompt_positions // block_size == logical_block_index
+                local_positions = (prompt_positions[row_mask] % block_size).astype(np.int32)
+                assert logical_block_index < len(valid_block_ids)
+                reservation = reserve_block(logical_block_index)
+                block_writes.append(
+                    _PromptLogprobsBlockWrite(
+                        logical_block_index=logical_block_index,
+                        reservation=reservation,
+                        target_positions=local_positions,
+                        result_row_indices=np.flatnonzero(row_mask).astype(np.int64),
+                    )
+                )
+
+            if pending_row is not None:
+                pending_target_position = int(positions[-1]) + 1
+                pending_logical_block_index, pending_local_position = divmod(
+                    pending_target_position, block_size
+                )
+                if pending_logical_block_index < len(valid_block_ids):
+                    reservation = request_reservations.get(pending_logical_block_index)
+                    if reservation is None:
+                        reservation = reserve_block(pending_logical_block_index)
+                    pending_row.bind(allocator, reservation, pending_local_position)
+
+            # A later request can reuse every row in a retained sidecar and
+            # therefore have no score rows to write for that block. It must
+            # still participate in the plan's publication order when an
+            # earlier reservation can replace the allocator's current entry.
+            for logical_block_index, block_ref in sorted(block_refs.items()):
+                if logical_block_index in request_reservations:
+                    continue
+                if logical_block_index >= len(block_hashes):
+                    continue
+                block_id = valid_block_ids[logical_block_index]
+                prior_reservation = plan.latest_reservations.get(block_id)
+                if (
+                    allocator.block_prompt_logprobs.get(block_id) is block_ref
+                    and prior_reservation is None
+                ):
+                    continue
+                publication_only_reservations.append(reserve_block(logical_block_index))
+
+            final_prefill = not is_partial_prefill
+            if final_prefill:
+                prompt_token_count = int(positions[-1]) + 1
+                if prompt_token_count > 1:
+                    expected_block_count = (prompt_token_count + block_size - 1) // block_size
+                    planned_blocks = set(block_refs).union(
+                        write.logical_block_index for write in block_writes
+                    )
+                    assert set(range(expected_block_count)).issubset(planned_blocks)
+
+            update = {
+                "blocks": block_refs,
+                "prompt_row_count": prompt_row_count,
+                "complete": final_prefill,
+                "pending_row": pending_row,
+                "filled": False,
+            }
+            plan.updates[request_id] = update
+            plan.request_writes.append(
+                _PromptLogprobsRequestWrite(
+                    active_index=active_idx,
+                    request_id=request_id,
+                    key=key,
+                    prompt_row_count=prompt_row_count,
+                    block_writes=block_writes,
+                    publication_only_reservations=publication_only_reservations,
+                    update=update,
+                    pending_row=pending_row,
+                )
+            )
+            if final_prefill:
+                # Decode and later checkpoint segments must not keep collecting
+                # rows under this request ID. The engine owns the captured refs.
+                context.prompt_logprobs_cache_keys.pop(request_id, None)
+                context.prompt_logprobs_block_hashes.pop(request_id, None)
+                context.prompt_logprobs_matched_refs.pop(request_id, None)
+
+        return plan
+
+    def _fill_prompt_logprob_sidecars(
+        self,
+        plan: _PromptLogprobsWritePlan,
+        log_probs: Optional[List[List[float]]],
+        top_n_logprobs: Optional[Dict[int, List[Tuple[Tensor, Tensor]]]],
+        *,
+        publish_unregistered: bool = False,
+    ) -> None:
+        """Fill stable reservations after copied score data becomes available."""
+        if not plan.request_writes:
+            return
+        if log_probs is None:
+            raise RuntimeError("missing copied prompt logprobs for reserved sidecars")
+
+        allocator = self.inference_wrapped_model.inference_context.kv_block_allocator
+        for request_write in plan.request_writes:
+            active_idx = request_write.active_index
+            prompt_row_count = request_write.prompt_row_count
+            request_log_probs = log_probs[active_idx]
+            selected = np.asarray(request_log_probs[:prompt_row_count], dtype=np.float32)
+            if selected.shape != (prompt_row_count,):
+                raise RuntimeError(
+                    f"request {request_write.request_id} has {selected.size} copied prompt scores; "
+                    f"expected {prompt_row_count}"
+                )
+
+            if request_write.key.top_n > 0 and prompt_row_count > 0:
                 if top_n_logprobs is None or active_idx not in top_n_logprobs:
                     raise RuntimeError(
-                        f"missing top-{key.top_n} prompt logprobs for request {request_id}"
+                        f"missing top-{request_write.key.top_n} prompt logprobs for "
+                        f"request {request_write.request_id}"
                     )
                 prompt_top_n = top_n_logprobs[active_idx][:prompt_row_count]
                 top_values = np.stack([values.cpu().numpy() for values, _ in prompt_top_n]).astype(
@@ -1569,76 +1854,37 @@ class TextGenerationController(MTPInferenceMixin):
                 top_values = None
                 top_ids = None
 
-            stored_selected = selected[:stored_row_count]
-            stored_top_values = top_values[:stored_row_count] if top_values is not None else None
-            stored_top_ids = top_ids[:stored_row_count] if top_ids is not None else None
+            for block_write in request_write.block_writes:
+                row_indices = block_write.result_row_indices
+                block_ref = allocator.fill_prompt_logprobs_reservation(
+                    block_write.reservation,
+                    target_positions=block_write.target_positions,
+                    selected_logprobs=selected[row_indices],
+                    top_n_logprobs=(top_values[row_indices] if top_values is not None else None),
+                    top_n_token_ids=(top_ids[row_indices] if top_ids is not None else None),
+                    publish_unregistered=publish_unregistered,
+                )
+                request_write.update["blocks"][block_write.logical_block_index] = block_ref
 
-            pending_row = None
-            if is_partial_prefill:
-                assert prompt_row_count > 0
-                pending_row = (
+            if request_write.pending_row is not None:
+                request_write.pending_row.fill(
                     selected[-1:],
                     top_values[-1:] if top_values is not None else None,
                     top_ids[-1:] if top_ids is not None else None,
                 )
+                if request_write.pending_row.block is not None:
+                    logical_block_index = request_write.pending_row.logical_block_index
+                    assert logical_block_index is not None
+                    request_write.update["blocks"][
+                        logical_block_index
+                    ] = request_write.pending_row.block
 
-            request_block_ids = context.request_to_kv_block_ids[
-                context.paused_request_count + active_idx
-            ]
-            valid_block_ids = request_block_ids[request_block_ids >= 0].tolist()
-            block_hashes = context.prompt_logprobs_block_hashes.get(request_id, ())
-            block_refs = dict(context.prompt_logprobs_matched_refs.get(request_id, {}))
-
-            for logical_block_index in np.unique(prompt_positions // block_size):
-                logical_block_index = int(logical_block_index)
-                row_mask = prompt_positions // block_size == logical_block_index
-                local_positions = (prompt_positions[row_mask] % block_size).astype(np.int32)
-                assert logical_block_index < len(valid_block_ids)
-                block_id = valid_block_ids[logical_block_index]
-                expected_hash = (
-                    block_hashes[logical_block_index]
-                    if logical_block_index < len(block_hashes)
-                    else None
+            for reservation in request_write.publication_only_reservations:
+                allocator.publish_prompt_logprobs_reservation(
+                    reservation, publish_unregistered=publish_unregistered
                 )
-                block_ref = block_refs.get(logical_block_index)
-                block_ref = allocator.store_prompt_logprobs(
-                    logical_block_index=logical_block_index,
-                    block_id=block_id,
-                    key=key,
-                    target_positions=local_positions,
-                    selected_logprobs=stored_selected[row_mask],
-                    top_n_logprobs=(
-                        stored_top_values[row_mask] if stored_top_values is not None else None
-                    ),
-                    top_n_token_ids=(
-                        stored_top_ids[row_mask] if stored_top_ids is not None else None
-                    ),
-                    expected_block_hash=expected_hash,
-                    block=block_ref,
-                )
-                block_refs[logical_block_index] = block_ref
 
-            final_prefill = not is_partial_prefill
-            if final_prefill:
-                prompt_token_count = int(positions[-1]) + 1
-                if prompt_token_count > 1:
-                    expected_block_count = (prompt_token_count + block_size - 1) // block_size
-                    assert set(range(expected_block_count)).issubset(block_refs)
-
-            updates[request_id] = {
-                "blocks": block_refs,
-                "prompt_row_count": prompt_row_count,
-                "complete": final_prefill,
-                "pending_row": pending_row,
-            }
-            if final_prefill:
-                # Decode and later checkpoint segments must not keep collecting
-                # rows under this request ID. The engine owns the captured refs.
-                context.prompt_logprobs_cache_keys.pop(request_id, None)
-                context.prompt_logprobs_block_hashes.pop(request_id, None)
-                context.prompt_logprobs_matched_refs.pop(request_id, None)
-
-        return updates
+            request_write.update["filled"] = True
 
     def _run_dummy_base_forward(self, input_ids: Tensor, position_ids: Tensor) -> None:
         """Run the base-model portion of an expert-parallel dummy step.
@@ -1758,7 +2004,10 @@ class TextGenerationController(MTPInferenceMixin):
 
         for finished_idx in finished_idxs.tolist():
             request_id = int(context.request_ids[finished_idx].item())
-            blocks = context.request_to_kv_block_ids[finished_idx]
+            # Only token-bearing blocks belong to the transferred prompt. Draft lookahead
+            # stays owned by this context until normal request cleanup releases it.
+            committed_blocks = int(context.get_committed_kv_block_counts(finished_idx).item())
+            blocks = context.request_to_kv_block_ids[finished_idx, :committed_blocks]
             valid_blocks = [int(block) for block in blocks.tolist() if block != -1]
             if valid_blocks:
                 finished_block_ids[request_id] = valid_blocks
@@ -1824,10 +2073,21 @@ class TextGenerationController(MTPInferenceMixin):
         # Request finished if termination_id or length >= max_sequence_length.
         # Both operands are CPU: sampled_tokens_cpu was D2H'd above, and
         # active_request_metadata is CPU-pinned.
-        active_request_mask = (
-            sampled_tokens_cpu
-            != context.active_request_metadata["termination_id"][:active_request_count]
-        ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
+        termination_ids = context.active_request_metadata["termination_id"][:active_request_count]
+        termination_enabled = termination_ids >= 0
+        termination_hit = termination_enabled & (sampled_tokens_cpu == termination_ids)
+        # Also terminate on any of the model's declared EOS tokens. The per-request
+        # `termination_id` is a single id (default `tokenizer.eod`), but a model may
+        # declare several (`generation_config.eos_token_id` list, e.g. [2, 11]).
+        # Gated by `termination_enabled` so `ignore_eos` (termination_id == -1) still
+        # never stops. The tensor is None when the model declares a single eos.
+        if self.extra_eos_token_id_tensor is not None:
+            termination_hit |= termination_enabled & torch.isin(
+                sampled_tokens_cpu, self.extra_eos_token_id_tensor
+            )
+        active_request_mask = (~termination_hit).byte() & torch.less(
+            active_sequence_lengths, max_sequence_lengths
+        ).byte()
 
         # Apply stop words detected during the previous engine bookkeeping step.
         self._apply_stop_word_finished_ids(active_request_ids, active_request_mask)
@@ -1849,7 +2109,9 @@ class TextGenerationController(MTPInferenceMixin):
         if context.kv_block_allocator.block_routing and finished_idxs.numel() > 0:
             for fidx in finished_idxs.tolist():
                 req_id = int(context.request_ids[fidx].item())
-                blocks = context.request_to_kv_block_ids[fidx]
+                # Draft-only lookahead has no main-model routing to reconstruct.
+                committed_blocks = int(context.get_committed_kv_block_counts(fidx).item())
+                blocks = context.request_to_kv_block_ids[fidx, :committed_blocks]
                 valid = blocks[blocks >= 0].tolist()
                 if valid:
                     finished_routing_block_ids[req_id] = valid
@@ -2080,9 +2342,20 @@ class TextGenerationController(MTPInferenceMixin):
         active_request_ids = context.request_ids[active_request_slice].long()
 
         max_sequence_lengths = context.get_max_sequence_lengths()
-        active_request_mask = (
-            sampled_tokens_cpu != context.request_metadata["termination_id"][active_request_slice]
-        ).byte() & torch.less(resolved_sequence_lengths, max_sequence_lengths).byte()
+        # Mirror the synchronous path's termination check. A plain `!=` against the
+        # single per-request termination_id misses the model's other declared eos
+        # tokens (generation_config.eos_token_id may be a list, e.g. [2, 11]), which
+        # is why async-scheduled runs generated straight through `</s>`.
+        termination_ids = context.request_metadata["termination_id"][active_request_slice]
+        termination_enabled = termination_ids >= 0
+        termination_hit = termination_enabled & (sampled_tokens_cpu == termination_ids)
+        if self.extra_eos_token_id_tensor is not None:
+            termination_hit |= termination_enabled & torch.isin(
+                sampled_tokens_cpu, self.extra_eos_token_id_tensor
+            )
+        active_request_mask = (~termination_hit).byte() & torch.less(
+            resolved_sequence_lengths, max_sequence_lengths
+        ).byte()
 
         self._apply_stop_word_finished_ids(active_request_ids, active_request_mask)
 
@@ -2783,25 +3056,15 @@ class TextGenerationController(MTPInferenceMixin):
 
                 log_probs_gpu_result = self._run_async_sched_log_probs(sample_result)
                 log_probs_transfer = self._copy_async_sched_log_probs_to_cpu(log_probs_gpu_result)
+                row_counts = (
+                    log_probs_transfer.row_counts
+                    if log_probs_transfer is not None and context.enable_prefix_caching
+                    else None
+                )
+                prompt_logprob_plan = self._reserve_prompt_logprob_sidecars(row_counts)
+                prompt_logprob_updates = prompt_logprob_plan.updates
 
                 self._synchronize_async_sched_event(sample_result.sample_cpu_ready_event)
-
-                # Prefill sidecars must be sealed while the consumed request
-                # block table still owns its physical blocks. No-overlap is the
-                # only async path that can consume prefill work.
-                if log_probs_transfer is not None:
-                    self._synchronize_async_sched_event(log_probs_transfer.cpu_ready_event)
-                log_probs, top_n_logprobs = self._materialize_async_sched_log_probs(
-                    log_probs_transfer,
-                    (
-                        sample_result.accepted_counts_cpu_view
-                        if self.num_speculative_tokens > 0
-                        else None
-                    ),
-                )
-                prompt_logprob_updates = self._store_prompt_logprob_sidecars(
-                    log_probs, top_n_logprobs
-                )
 
                 # -------------------------------------------------------------------------
                 # Update
@@ -2836,6 +3099,22 @@ class TextGenerationController(MTPInferenceMixin):
                     self._synchronize_async_sched_event(bookkeeping_done_event)
             elif had_pending_forward and self.model_config.expert_model_parallel_size > 1:
                 self._run_dummy_async_sched_base_step()
+
+        if had_pending_forward:
+            # The reservations above own every mutable row/block identity needed
+            # by sidecar storage, so score D2H can overlap update, admission, and
+            # the successor forward without writing onto recycled KV storage.
+            if log_probs_transfer is not None:
+                self._synchronize_async_sched_event(log_probs_transfer.cpu_ready_event)
+            log_probs, top_n_logprobs = self._materialize_async_sched_log_probs(
+                log_probs_transfer,
+                (
+                    sample_result.accepted_counts_cpu_view
+                    if self.num_speculative_tokens > 0
+                    else None
+                ),
+            )
+            self._fill_prompt_logprob_sidecars(prompt_logprob_plan, log_probs, top_n_logprobs)
 
         decode_only = DecodeOnly(consumed=consumed_decode_only, launched=launched_decode_only)
         if not had_pending_forward:
@@ -3120,6 +3399,8 @@ class TextGenerationController(MTPInferenceMixin):
                 # Phase 2: Rewind KV cache for rejected tokens.
                 nvtx_range_push("mtp-spec-decoding/rewind-kv-cache")
                 blocks_to_release, remove_mask = self._rewind_kv_cache()
+                # No separate MTP rewind: the draft loop re-derives its start from the (rewound)
+                # main KV offsets, so rejected drafts are naturally overwritten next step.
                 nvtx_range_pop("mtp-spec-decoding/rewind-kv-cache")
 
                 # Disable MoE padding for MTP computation, unless CUDA graphs
