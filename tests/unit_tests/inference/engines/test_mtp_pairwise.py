@@ -146,8 +146,8 @@ def _config(case: _Case, *, mtp_active: bool) -> _DynamicEngineTestConfig:
     }
     values.update(case.config)
     if values.get("model_provider", "gpt") == "gpt":
-        # MTP supports RoPE, but not the separate FlashInfer fused-RoPE path.
-        values["position_embedding_type"] = "rope"
+        # Cached repeated heads require no positions; separate heads still exercise RoPE.
+        values["position_embedding_type"] = "none" if case.repeated else "rope"
         values["use_flashinfer_fused_rope"] = False
     return _DynamicEngineTestConfig(**values)
 
@@ -587,7 +587,8 @@ def _build_env(case: _Case, *, mtp_active: bool):
     env = _DynamicEngineTestBase._build_test_env(_config(case, mtp_active=mtp_active))
     model = env.engine.controller.inference_wrapped_model.model
     if case.config.get("model_provider", "gpt") == "gpt":
-        assert model.position_embedding_type == "rope"
+        assert model.position_embedding_type == ("none" if case.repeated else "rope")
+        assert env.engine.context.enable_mtp_kv_cache is (case.repeated and mtp_active)
         assert not env.engine.context.use_flashinfer_fused_rope
     tokenizer = env.engine.controller.tokenizer
     tokenizer.bos = None
@@ -758,8 +759,8 @@ def _run_mtp_pair(case: _Case) -> tuple[_Session, _Session]:
     ordinary_model = ordinary_env.engine.controller.inference_wrapped_model.model
     mtp_model = mtp_env.engine.controller.inference_wrapped_model.model
     if case.config.get("model_provider", "gpt") == "gpt":
-        assert ordinary_model.position_embedding_type == "rope"
-        assert mtp_model.position_embedding_type == "rope"
+        assert ordinary_model.position_embedding_type == ("none" if case.repeated else "rope")
+        assert mtp_model.position_embedding_type == ordinary_model.position_embedding_type
         assert not ordinary_env.engine.context.use_flashinfer_fused_rope
         assert not mtp_env.engine.context.use_flashinfer_fused_rope
     assert mtp_env.engine.controller.num_mtp_depths == case.depth
