@@ -206,7 +206,7 @@ async def test_routed_media_affinity_uses_real_cached_embeddings(
             future = h.engine.add_request(10001, prompt, copy.deepcopy(params), **media)
             while h.engine.has_unfinished_requests():
                 await h.engine.async_step()
-            references.append(list((await future).merge().generated_tokens))
+            references.append(list((await future).generated_tokens))
             h.engine.reset()
         admissions.clear()
         await h.start()
@@ -266,7 +266,9 @@ async def test_routed_media_affinity_uses_real_cached_embeddings(
             )
             assert repeat_route[1] == expected_repeat_owner
             assert different_route[1] == text_route[1]
-            route_info = [(rid, coordinator.identity_to_rank_index[owner]) for rid, owner in routes]
+            route_info = [
+                (rid, coordinator.identity_to_rank_index[owner]) for rid, owner in routes
+            ]
         await h.barrier()
         route_payload = [route_info if h.rank == 0 else None]
         torch.distributed.broadcast_object_list(route_payload, src=0)
