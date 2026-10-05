@@ -253,7 +253,6 @@ class ForwardWitness:
                     mla=[],
                     sinks=[],
                     gemms=[],
-                    rope=[],
                     neighbor_queries={
                         rid: int(ctx.request_query_lengths[idxs[0]])
                         for rid in (201, 202)
@@ -265,7 +264,7 @@ class ForwardWitness:
                 )
             elif dummy:
                 self.current = dict(
-                    physical=input_ids.shape[1], attention=[], gemms=[], rope=[], sinks=[], mla=[]
+                    physical=input_ids.shape[1], attention=[], gemms=[], sinks=[], mla=[]
                 )
             try:
                 result = original(input_ids, position_ids)
@@ -315,8 +314,6 @@ class ForwardWitness:
                         assert result[0].shape[1:] == (64, 64, 192)
                         assert result[1].shape[1:] == (64, 64, 128)
                         record[kind].append((tuple(args[1].shape), tuple(result[0].shape)))
-                    elif kind == "rope":
-                        record[kind].append((name, int(kwargs["positions"].numel())))
                     else:
                         tensors = [x for x in args if isinstance(x, torch.Tensor)]
                         record[kind].append((name, tuple(tensors[0].shape) if tensors else ()))
@@ -376,7 +373,7 @@ class ForwardWitness:
             result = capture_begin(graph, *args, **kwargs)
             self.capturing = graph
             ctx._bi_capturing_graph = graph
-            self.captures[graph] = dict(attention=[], gemms=[], rope=[], sinks=[], mla=[])
+            self.captures[graph] = dict(attention=[], gemms=[], sinks=[], mla=[])
             return result
 
         patch.setattr(torch.cuda.CUDAGraph, "capture_begin", graph_begin)
