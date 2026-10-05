@@ -37,10 +37,12 @@ from tests.unit_tests.determinism.kernels.harness import (
     bytes_equal,
     seeded,
 )
+from tests.unit_tests.inference.engines import batch_invariant_test_utils as bi
 from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
 pytestmark = pytest.mark.skipif(
-    not (torch.cuda.is_available() and HAVE_TE), reason="needs a GPU and Transformer Engine"
+    not (torch.cuda.is_available() and HAVE_TE),
+    reason="needs a GPU and Transformer Engine",
 )
 
 if HAVE_TE:
@@ -55,7 +57,9 @@ if HAVE_TE:
     )
 
 HIDDEN, FFN, TOKENS = 2048, 8192, 8192
-_IS_BLACKWELL = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
+_IS_BLACKWELL = (
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
+)
 
 
 def _config(**overrides):
@@ -98,7 +102,12 @@ class TestTEWrappers:
             is_expert=False,
         ).cuda()
         x = torch.randn(
-            TOKENS // 2, 2, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True
+            TOKENS // 2,
+            2,
+            HIDDEN,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
         )
         assert_module_replays_bit_exact(
             module, (x,), replays=3, contention=True, what="TEColumnParallelLinear"
@@ -110,7 +119,9 @@ class TestTEWrappers:
     @pytest.mark.parametrize(
         "k,n", [(256, 512), (2048, 1536), (768, 2048), (2688, 1856), (1856, 2688)]
     )
-    def test_device_metadata_batch_invariant_training(self, monkeypatch, quantized, k, n):
+    def test_device_metadata_batch_invariant_training(
+        self, monkeypatch, quantized, k, n
+    ):
         """Exercise actual grouped TN/NN/NT dispatch, co-batches, and graph replay."""
         import transformer_engine.pytorch as te
         from transformer_engine.common.recipe import MXFP8BlockScaling
@@ -133,7 +144,9 @@ class TestTEWrappers:
             calls.add(kwargs.get("layout", "TN"))
             return original_mm(*args, **kwargs)
 
-        monkeypatch.setattr(grouped_linear, "general_grouped_gemm_for_grouped_tensor", counted_mm)
+        monkeypatch.setattr(
+            grouped_linear, "general_grouped_gemm_for_grouped_tensor", counted_mm
+        )
         seeded()
         config = _config(
             moe_use_grouped_tensor=True,
@@ -184,7 +197,8 @@ class TestTEWrappers:
             torch.testing.assert_close(actual, baseline, atol=0, rtol=0)
             assert torch.isfinite(x.grad).all()
             assert all(
-                p.grad is not None and torch.isfinite(p.grad).all() for p in module.parameters()
+                p.grad is not None and torch.isfinite(p.grad).all()
+                for p in module.parameters()
             )
             module.zero_grad(set_to_none=True)
             return actual
@@ -193,8 +207,12 @@ class TestTEWrappers:
             check(module, [256, 256, 256, 256], 0, single_token=True)
             check(module, [512, 256, 0, 768], 73)
             check(module, [1024, 2048, 256, 0], 17)
-            sample = torch.randn(2048, k, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-            splits = torch.tensor([512, 512, 512, 512], device="cuda", dtype=torch.int64)
+            sample = torch.randn(
+                2048, k, device="cuda", dtype=torch.bfloat16, requires_grad=True
+            )
+            splits = torch.tensor(
+                [512, 512, 512, 512], device="cuda", dtype=torch.int64
+            )
             with get_fp8_context(config, 0):
                 assert_module_replays_bit_exact(
                     module,
@@ -246,10 +264,13 @@ class TestTEWrappers:
 
     @pytest.mark.parametrize("normalization", ["LayerNorm", "RMSNorm"])
     @pytest.mark.parametrize("zero_centered_gamma", [False, True])
-    def test_te_layernorm_column_parallel_linear_replays(self, normalization, zero_centered_gamma):
+    def test_te_layernorm_column_parallel_linear_replays(
+        self, normalization, zero_centered_gamma
+    ):
         seeded()
         config = _config(
-            normalization=normalization, layernorm_zero_centered_gamma=zero_centered_gamma
+            normalization=normalization,
+            layernorm_zero_centered_gamma=zero_centered_gamma,
         )
         module = TELayerNormColumnParallelLinear(
             HIDDEN,
@@ -262,7 +283,9 @@ class TestTEWrappers:
             is_expert=False,
         ).cuda()
         # 16k rows stress the cross-row dgamma/dbeta reduction of the norm backward.
-        x = torch.randn(TOKENS, 2, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        x = torch.randn(
+            TOKENS, 2, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
         assert_module_replays_bit_exact(
             module,
             (x,),
@@ -275,29 +298,45 @@ class TestTEWrappers:
     def test_te_norm_replays(self, normalization):
         seeded()
         module = TENorm(_config(normalization=normalization), HIDDEN, eps=1e-5).cuda()
-        x = torch.randn(TOKENS, 2, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        x = torch.randn(
+            TOKENS, 2, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
         assert_module_replays_bit_exact(
             module, (x,), replays=3, contention=True, what=f"TENorm[{normalization}]"
         )
 
-    @pytest.mark.skipif(TEFusedMLP is None, reason="TE operation-based MLP is unavailable")
+    @pytest.mark.skipif(
+        TEFusedMLP is None, reason="TE operation-based MLP is unavailable"
+    )
     @pytest.mark.parametrize("hash_threshold", [None, 0])
     def test_te_fused_mlp_builder_replays(self, hash_threshold):
         seeded()
         module = TEFusedMLP.as_mlp_submodule(
             submodules=MLPSubmodules(
-                linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
+                linear_fc1=TELayerNormColumnParallelLinear,
+                linear_fc2=TERowParallelLinear,
             ),
             config=_config(normalization="RMSNorm", gradient_accumulation_fusion=False),
-            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"]),
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=["tp"]
+            ),
             is_mtp_layer=False,
             hash_moe_layer_threshold=hash_threshold,
         ).cuda()
         x = torch.randn(
-            TOKENS // 2, 2, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True
+            TOKENS // 2,
+            2,
+            HIDDEN,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
         )
         assert_module_replays_bit_exact(
-            module, (x,), replays=3, contention=True, what=f"TEFusedMLP[hash={hash_threshold}]"
+            module,
+            (x,),
+            replays=3,
+            contention=True,
+            what=f"TEFusedMLP[hash={hash_threshold}]",
         )
 
     def test_te_grouped_linear_replays_on_uneven_splits(self):
@@ -315,7 +354,11 @@ class TestTEWrappers:
         ).cuda()
         m_splits = [4096, 13, 0, 2048, 1, 8191, 33, 1999]
         x = torch.randn(
-            sum(m_splits), HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True
+            sum(m_splits),
+            HIDDEN,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
         )
         assert_module_replays_bit_exact(
             module, (x, m_splits), replays=3, contention=True, what="TEGroupedLinear"
@@ -323,18 +366,35 @@ class TestTEWrappers:
 
     @pytest.mark.internal
     @pytest.mark.launch_on_gb200
-    @pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 parameter storage needs Blackwell")
+    @pytest.mark.skipif(
+        not _IS_BLACKWELL, reason="MXFP8 parameter storage needs Blackwell"
+    )
     @pytest.mark.parametrize(
         ("recipe_storage", "global_recipe", "transformer_impl", "middle_uses_mxfp8"),
         [
             ({}, Fp8Recipe.mxfp8, "inference_optimized", True),
-            ({"inherit_model_init_context": True}, Fp8Recipe.mxfp8, "inference_optimized", True),
+            (
+                {"inherit_model_init_context": True},
+                Fp8Recipe.mxfp8,
+                "inference_optimized",
+                True,
+            ),
             ({"fp8_param": False}, Fp8Recipe.mxfp8, "inference_optimized", False),
-            ({"inherit_model_init_context": False}, Fp8Recipe.mxfp8, "inference_optimized", False),
+            (
+                {"inherit_model_init_context": False},
+                Fp8Recipe.mxfp8,
+                "inference_optimized",
+                False,
+            ),
             ({"fp4_param": False}, Fp8Recipe.mxfp8, "inference_optimized", False),
             ({}, Fp8Recipe.tensorwise, "inference_optimized", False),
             ({}, Fp8Recipe.mxfp8, "transformer_engine", False),
-            ({"inherit_model_init_context": True}, Fp8Recipe.mxfp8, "transformer_engine", True),
+            (
+                {"inherit_model_init_context": True},
+                Fp8Recipe.mxfp8,
+                "transformer_engine",
+                True,
+            ),
         ],
         ids=[
             "automatic-inheritance",
@@ -351,7 +411,10 @@ class TestTEWrappers:
         self, recipe_storage, global_recipe, transformer_impl, middle_uses_mxfp8
     ):
         """Only inference inherits MXFP8 storage automatically; explicit choices win."""
-        training_recipe = {"fp8_quantization_recipe": "mxfp8", "override_quantized_autocast": True}
+        training_recipe = {
+            "fp8_quantization_recipe": "mxfp8",
+            "override_quantized_autocast": True,
+        }
         training_recipe.update(recipe_storage)
         recipe = RecipeConfig.from_config_dict(
             {
@@ -483,16 +546,27 @@ class TestTEWrappers:
         )
         config = _config()
         module = TEDotProductAttention(
-            config, layer_number=1, attn_mask_type=AttnMaskType.causal, attention_type="self"
+            config,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type="self",
         ).cuda()
         s, b, h, hkv, d = 4096, 2, 16, 4, 128
-        q = torch.randn(s, b, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        k = torch.randn(s, b, hkv, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        v = torch.randn(s, b, hkv, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        q = torch.randn(
+            s, b, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        k = torch.randn(
+            s, b, hkv, d, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        v = torch.randn(
+            s, b, hkv, d, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
 
         cp_group = parallel_state.get_context_parallel_group()
         assert cp_group.size() == 1
-        runtime_cp1 = PackedSeqParams(qkv_format="sbhd", cp_group=cp_group, local_cp_size=1)
+        runtime_cp1 = PackedSeqParams(
+            qkv_format="sbhd", cp_group=cp_group, local_cp_size=1
+        )
         assert module.cp_group is None
         reference = None
 
@@ -503,7 +577,12 @@ class TestTEWrappers:
 
                 def fn(q, k, v):
                     output = module(
-                        q, k, v, None, AttnMaskType.causal, packed_seq_params=packed_seq_params
+                        q,
+                        k,
+                        v,
+                        None,
+                        AttnMaskType.causal,
+                        packed_seq_params=packed_seq_params,
                     )
                     assert module.cp_group is None
                     return output
@@ -538,7 +617,9 @@ class TestTEWrappers:
 @pytest.mark.parametrize("layout", ["sbhd", "thd"])
 def test_te_fused_rope_replays_fwd_bwd(layout):
     from megatron.core.models.common.embeddings import rope_utils
-    from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+    from megatron.core.models.common.embeddings.rotary_pos_embedding import (
+        RotaryEmbedding,
+    )
 
     if (
         rope_utils.fused_apply_rotary_pos_emb is None
@@ -552,14 +633,22 @@ def test_te_fused_rope_replays_fwd_bwd(layout):
         s, b, h, d = 4096, 2, 32, 128
         freqs = RotaryEmbedding(kv_channels=d, rotary_percent=1.0)(s)
         if layout == "sbhd":
-            t = torch.randn(s, b, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            t = torch.randn(
+                s, b, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True
+            )
             cu_seqlens = None
         else:
-            t = torch.randn(s, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-            cu_seqlens = torch.tensor([0, 1000, 1500, 2048, 4096], dtype=torch.int32, device="cuda")
+            t = torch.randn(
+                s, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True
+            )
+            cu_seqlens = torch.tensor(
+                [0, 1000, 1500, 2048, 4096], dtype=torch.int32, device="cuda"
+            )
 
         def fn(t):
-            return rope_utils.apply_rotary_pos_emb(t, freqs, config, cu_seqlens=cu_seqlens)
+            return rope_utils.apply_rotary_pos_emb(
+                t, freqs, config, cu_seqlens=cu_seqlens
+            )
 
         assert_replays_bit_exact(fn, (t,), replays=3, what=f"TE fused RoPE[{layout}]")
     finally:
@@ -569,10 +658,13 @@ def test_te_fused_rope_replays_fwd_bwd(layout):
 # --- fused top-k router with dense indices ------------------------------------------------------
 
 
-@pytest.mark.parametrize("indices_dtype", [torch.int64, torch.int16], ids=["int64", "int16"])
+@pytest.mark.parametrize(
+    "indices_dtype", [torch.int64, torch.int16], ids=["int64", "int16"]
+)
 def test_te_fused_topk_dense_indices_replays(indices_dtype):
     """The fused router wrapper can write dense [tokens, topk] expert ids into a caller-provided
-    tensor (flex deepep/ncclep: int64, HybridEP: int16) instead of the bool routing map."""
+    tensor (flex deepep/ncclep: int64, HybridEP: int16) instead of the bool routing map.
+    """
     from megatron.core.extensions.transformer_engine import (
         fused_topk_with_score_function,
         fused_topk_with_score_function_supports_topk_indices,
@@ -600,9 +692,40 @@ def test_te_fused_topk_dense_indices_replays(indices_dtype):
             expert_bias=expert_bias,
             topk_indices=topk_indices,
         )
-        assert routing_map.dtype == indices_dtype and routing_map.shape == (num_tokens, topk)
+        assert routing_map.dtype == indices_dtype and routing_map.shape == (
+            num_tokens,
+            topk,
+        )
         return probs, routing_map
 
     assert_replays_bit_exact(
         fn, (logits,), replays=3, what=f"TE fused topk dense indices[{indices_dtype}]"
     )
+
+
+def test_mla_split_device_first_prefill():
+    with bi.invariant_runtime(bi.MLA_CASE) as (backend, version):
+        engine = bi.build_engine(bi.MLA_CASE, backend, version)
+        model = engine.controller.inference_wrapped_model.model
+        assert version == 3 and model.config.use_cpu_initialization
+        layers = [
+            layer for layer in model.modules() if isinstance(layer, bi.MLASelfAttention)
+        ]
+        sources = [layer.linear_kv_up_proj for layer in layers]
+        assert len(sources) == 2 and all(source.weight.is_cuda for source in sources)
+        params = bi.SamplingParams(num_tokens_to_generate=1, top_k=1, termination_id=-1)
+        engine.add_request(
+            bi.TARGET, bi.target_prompt(bi.MLA_CASE.prompt_length), params
+        )
+        requests = engine.step_modern()["finished_requests"]
+        assert len(requests) == 1 and not engine.has_unfinished_requests()
+        for layer, source in zip(layers, sources):
+            norm, linear = layer.kv_layernorm, layer.linear_kv_up_proj_linear
+            pairs = [
+                (norm.weight, source.layer_norm_weight),
+                (linear.weight, source.weight),
+            ]
+            for actual, expected in pairs:
+                assert actual.device == expected.device == source.weight.device
+                assert actual.dtype == expected.dtype == bi.torch.bfloat16
+                assert bi.torch.equal(actual, expected)

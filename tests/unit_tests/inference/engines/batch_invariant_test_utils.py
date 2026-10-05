@@ -35,9 +35,14 @@ from megatron.core.transformer import attention
 from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik
 from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
-from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
+from megatron.core.transformer.moe.token_dispatcher_inference import (
+    NVLSAllGatherVDispatcher,
+)
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention
-from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
+from megatron.core.transformer.transformer_config import (
+    MLATransformerConfig,
+    TransformerConfig,
+)
 from tests.unit_tests.inference.test_data_parallel_inference_coordinator import (
     DummyTokenizer as _DummyTokenizer,
 )
@@ -77,13 +82,27 @@ class Case:
     sp: bool = False
 
 
+MLA_CASE = Case(
+    "mla",
+    model=dict(
+        multi_latent_attention=True,
+        cache_mla_latents=True,
+        num_attention_heads=64,
+        qk_layernorm=True,
+    ),
+    context={"block_size_tokens": 64},
+)
+
+
 @contextmanager
 def invariant_runtime(case):
     """Pin process-global mode; launch each selected backend in a fresh process."""
     backend = os.environ.get("MCORE_BI_TEST_BACKEND", "triton")
     fa_version = int(os.environ.get("MCORE_BI_TEST_FA_VERSION", "3"))
     assert backend in ("triton", "te_native", "deepgemm")
-    assert not bik.is_batch_invariant_mode_enabled(), "inherited a live backend from another test"
+    assert (
+        not bik.is_batch_invariant_mode_enabled()
+    ), "inherited a live backend from another test"
     if backend == "te_native":
         assert (
             os.environ.get("CUBLASLT_WORKSPACE_SIZE") == "0"
@@ -92,7 +111,10 @@ def invariant_runtime(case):
     assert attention.HAVE_FA3 if fa_version == 3 else attention.HAVE_FA4
     assert bik.te_supports_batch_invariant_attention()
     # Another test module can change these class attributes during collection.
-    rounders = DynamicInferenceContext.TOKEN_ROUNDER, DynamicInferenceContext.REQUEST_ROUNDER
+    rounders = (
+        DynamicInferenceContext.TOKEN_ROUNDER,
+        DynamicInferenceContext.REQUEST_ROUNDER,
+    )
     DynamicInferenceContext.TOKEN_ROUNDER = 64
     DynamicInferenceContext.REQUEST_ROUNDER = 4
     # Each fresh backend must activate before distributed CUDA initialization or model/GEMM use.
@@ -114,7 +136,10 @@ def invariant_runtime(case):
             SymmetricMemoryManager.destroy()
         InferenceMode.unset_active()
         bik.disable_batch_invariant_mode()
-        DynamicInferenceContext.TOKEN_ROUNDER, DynamicInferenceContext.REQUEST_ROUNDER = rounders
+        (
+            DynamicInferenceContext.TOKEN_ROUNDER,
+            DynamicInferenceContext.REQUEST_ROUNDER,
+        ) = rounders
         gc.collect()
         torch.cuda.empty_cache()
         Utils.destroy_model_parallel()
@@ -144,7 +169,10 @@ def build_engine(case, backend, fa_version):
     """Build the same tiny, real model for every ordering of a case."""
     torch.manual_seed(321)
     model_parallel_cuda_manual_seed(
-        321, inference_rng_tracker=True, use_cudagraphable_rng=False, force_reset_rng=True
+        321,
+        inference_rng_tracker=True,
+        use_cudagraphable_rng=False,
+        force_reset_rng=True,
     )
     graphed = case.context.get("num_cuda_graphs") is not None
     model_options = dict(
@@ -163,14 +191,18 @@ def build_engine(case, backend, fa_version):
     )
     model_options.update(case.model)
     cfg = (
-        MLATransformerConfig if model_options.get("multi_latent_attention") else TransformerConfig
+        MLATransformerConfig
+        if model_options.get("multi_latent_attention")
+        else TransformerConfig
     )(**model_options)
     factories = {
         "transformer_engine": get_gpt_layer_with_transformer_engine_spec,
         "local": get_gpt_layer_local_spec,
         "inference_optimized": get_gpt_layer_with_inference_spec,
     }
-    spec_options = {"normalization": cfg.normalization} if cfg.transformer_impl == "local" else {}
+    spec_options = (
+        {"normalization": cfg.normalization} if cfg.transformer_impl == "local" else {}
+    )
     spec_options["num_experts"] = cfg.num_moe_experts
     if cfg.multi_latent_attention:
         spec_options.update(multi_latent_attention=True, qk_layernorm=cfg.qk_layernorm)
@@ -256,7 +288,11 @@ class ForwardWitness:
                     neighbor_queries={
                         rid: int(ctx.request_query_lengths[idxs[0]])
                         for rid in (201, 202)
-                        if (idxs := (ctx.request_ids[: ctx.total_request_count] == rid).nonzero())
+                        if (
+                            idxs := (
+                                ctx.request_ids[: ctx.total_request_count] == rid
+                            ).nonzero()
+                        )
                         .flatten()
                         .numel()
                     },
@@ -264,7 +300,11 @@ class ForwardWitness:
                 )
             elif dummy:
                 self.current = dict(
-                    physical=input_ids.shape[1], attention=[], gemms=[], sinks=[], mla=[]
+                    physical=input_ids.shape[1],
+                    attention=[],
+                    gemms=[],
+                    sinks=[],
+                    mla=[],
                 )
             try:
                 result = original(input_ids, position_ids)
@@ -273,12 +313,14 @@ class ForwardWitness:
                 elif self.current is not None:
                     getattr(engine, "_bi_after_forward", lambda: None)()
                     if ctx.config.materialize_only_last_token_logits:
-                        mapped = ctx.active_logit_idxs[: ctx.num_last_token_logits].long()
+                        mapped = ctx.active_logit_idxs[
+                            : ctx.num_last_token_logits
+                        ].long()
                         selected = torch.isin(mapped, rows.to(mapped.device))
                         rows = mapped[selected]
-                        logits = controller._all_logits_cuda[0, : ctx.num_last_token_logits][
-                            selected.to("cuda")
-                        ]
+                        logits = controller._all_logits_cuda[
+                            0, : ctx.num_last_token_logits
+                        ][selected.to("cuda")]
                         self.current["positions"] = position_ids[0, rows].clone()
                         self.current["tokens"] = input_ids[0, rows].clone()
                     else:
@@ -308,15 +350,21 @@ class ForwardWitness:
                     if kind == "attention":
                         record[kind].append((name, kwargs.get("num_splits")))
                         if self.model_config.multi_latent_attention:
-                            assert (kwargs["q"] if "q" in kwargs else args[0]).shape[-1] == 192
+                            assert (kwargs["q"] if "q" in kwargs else args[0]).shape[
+                                -1
+                            ] == 192
                     elif kind == "mla":
                         assert args[1].shape[1:] == (64, 576)
                         assert result[0].shape[1:] == (64, 64, 192)
                         assert result[1].shape[1:] == (64, 64, 128)
-                        record[kind].append((tuple(args[1].shape), tuple(result[0].shape)))
+                        record[kind].append(
+                            (tuple(args[1].shape), tuple(result[0].shape))
+                        )
                     else:
                         tensors = [x for x in args if isinstance(x, torch.Tensor)]
-                        record[kind].append((name, tuple(tensors[0].shape) if tensors else ()))
+                        record[kind].append(
+                            (name, tuple(tensors[0].shape) if tensors else ())
+                        )
                 return result
 
             # Preserve CustomOpDef's _init_fn signature so production keeps FA3 kwargs such as q.
@@ -324,11 +372,17 @@ class ForwardWitness:
                 call.__signature__ = inspect.signature(fn._init_fn)
             patch.setattr(owner, name, staticmethod(call) if kind == "sinks" else call)
 
-        for name in ("_flash_attn_forward", "flash_attn3_with_kvcache", "flash_attn4_varlen_func"):
+        for name in (
+            "_flash_attn_forward",
+            "flash_attn3_with_kvcache",
+            "flash_attn4_varlen_func",
+        ):
             observe(attention, name, "attention")
         observe(MLASelfAttention, "uncompress_kv_from_cache", "mla")
         for layout in ("varlen", "bshd"):
-            observe(attention.Attention, f"_apply_sink_softmax_correction_{layout}", "sinks")
+            observe(
+                attention.Attention, f"_apply_sink_softmax_correction_{layout}", "sinks"
+            )
         for name in ("matmul_persistent", "_mm_deepgemm"):
             observe(bik, name, "gemms")
         # Native TE binds GEMM locally; the other dense providers use torch.matmul.
@@ -365,7 +419,9 @@ class ForwardWitness:
                 self._active_async_overlap["forwards"] += 1
             return async_forward(*args, **kwargs)
 
-        patch.setattr(controller, "_run_async_sched_step_overlap", observe_async_overlap)
+        patch.setattr(
+            controller, "_run_async_sched_step_overlap", observe_async_overlap
+        )
         patch.setattr(controller, "_run_async_sched_forward", observe_async_forward)
         capture_begin = torch.cuda.CUDAGraph.capture_begin
 
@@ -397,7 +453,9 @@ class ForwardWitness:
         @wraps(sample_kernel)
         def sample(logits, n, context, **kwargs):
             result = sample_kernel(logits, n, context, **kwargs)
-            ids = context.request_ids[context.paused_request_count : context.total_request_count]
+            ids = context.request_ids[
+                context.paused_request_count : context.total_request_count
+            ]
             target_rows = (ids == TARGET).nonzero().flatten()
             if target_rows.numel() and kwargs.get("token_to_request_index") is None:
                 target_row = int(target_rows[0])
@@ -430,9 +488,13 @@ class ForwardWitness:
             else {"flash_attn4_varlen_func"}
         )
         assert all(name in expected and splits == 1 for name, splits in calls), calls
-        assert any(step["gemms"] for step in self.steps), "no real target-containing GEMM call"
+        assert any(
+            step["gemms"] for step in self.steps
+        ), "no real target-containing GEMM call"
         if self.model_config.softmax_type != "vanilla":
-            assert any(s["sinks"] for s in self.steps), "target never executed sink correction"
+            assert any(
+                s["sinks"] for s in self.steps
+            ), "target never executed sink correction"
         if self.model_config.multi_latent_attention:
             assert any(
                 s["decode"] and s["mla"] for s in self.steps
@@ -440,7 +502,9 @@ class ForwardWitness:
         assert all(
             step["physical"] % 64 == 0
             for step in self.steps
-            if not self.engine.num_speculative_tokens or step["graph"] or not step["decode"]
+            if not self.engine.num_speculative_tokens
+            or step["graph"]
+            or not step["decode"]
         )
         if self.engine.context.config.async_sched_mode == AsyncScheduleMode.ASYNC:
             assert any(
@@ -465,7 +529,9 @@ def run_order(case, backend, fa_version, order, *, sampling=None):
             ForwardWitness(engine, construction_patch)
             return create_graphs(engine, *args, **kwargs)
 
-        construction_patch.setattr(DynamicInferenceEngine, "create_cuda_graphs", capture)
+        construction_patch.setattr(
+            DynamicInferenceEngine, "create_cuda_graphs", capture
+        )
         engine = build_engine(case, backend, fa_version)
     params = dict(
         num_tokens_to_generate=6,
@@ -491,7 +557,8 @@ def run_order(case, backend, fa_version, order, *, sampling=None):
             if witness is not None and req.request_id == 201:
                 witness.retirement_events.append(
                     dict(
-                        target_active=TARGET in engine.requests, generated=len(req.generated_tokens)
+                        target_active=TARGET in engine.requests,
+                        generated=len(req.generated_tokens),
                     )
                 )
 
@@ -504,7 +571,9 @@ def run_order(case, backend, fa_version, order, *, sampling=None):
 
     if case.warm_prefix:
         engine.add_request(
-            99, target, SamplingParams(num_tokens_to_generate=1, top_k=1, termination_id=-1)
+            99,
+            target,
+            SamplingParams(num_tokens_to_generate=1, top_k=1, termination_id=-1),
         )
         drain()
         assert engine.context.kv_block_allocator.enable_prefix_caching
@@ -560,10 +629,15 @@ def run_order(case, backend, fa_version, order, *, sampling=None):
             ), "target never replayed a graph with observed captured attention"
         if case.context.get("use_cuda_graphs_for_non_decode_steps"):
             assert any(
-                not s["decode"] and s["graph"] and s["captured_graphs"] for s in witness.steps
+                not s["decode"] and s["graph"] and s["captured_graphs"]
+                for s in witness.steps
             ), "no target nondecode replay with captured attention provenance"
         if case.context.get("enable_chunked_prefill"):
-            chunks = [s for s in witness.steps if int(s["positions"][0]) < case.prompt_length - 1]
+            chunks = [
+                s
+                for s in witness.steps
+                if int(s["positions"][0]) < case.prompt_length - 1
+            ]
             assert len(chunks) >= 2, "target did not execute multiple prefill chunks"
         if case.warm_prefix:
             assert (
@@ -589,17 +663,26 @@ def assert_same_target(reference, actual, *, require_trajectory=True):
             "prompt_top_n_logprobs",
             "generated_top_n_logprobs",
         ):
-            assert getattr(req, field_name, None) == getattr(ref_req, field_name, None), field_name
+            assert getattr(req, field_name, None) == getattr(
+                ref_req, field_name, None
+            ), field_name
     expected = {}
     for step in ref_witness.steps:
-        for pos, token, logits in zip(step["positions"], step["tokens"], step["logits"]):
+        for pos, token, logits in zip(
+            step["positions"], step["tokens"], step["logits"]
+        ):
             key = int(pos), int(token)
             if key in expected:
-                assert torch.equal(expected[key], logits), ("reference repeated position", key)
+                assert torch.equal(expected[key], logits), (
+                    "reference repeated position",
+                    key,
+                )
             expected[key] = logits
     comparisons = 0
     for step in witness.steps:
-        for pos, token, logits in zip(step["positions"], step["tokens"], step["logits"]):
+        for pos, token, logits in zip(
+            step["positions"], step["tokens"], step["logits"]
+        ):
             key = int(pos), int(token)
             assert key in expected, ("target history changed", key)
             assert torch.equal(expected[key], logits), (
