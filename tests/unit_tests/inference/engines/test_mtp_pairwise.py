@@ -229,6 +229,9 @@ def _install_mtp_witnesses(env, case: _Case, runtime: Counter) -> _MTPWitness:
                 if committing:
                     assert kwargs["inference_context"] is context and request_ids
                     runtime["real-mtp-kv-commit"] += 1
+                elif context.enable_mtp_kv_cache and kwargs["inference_context"] is None:
+                    assert context.mtp_metadata.forward_mode is MTPForwardMode.NONE
+                    runtime["mtp-dummy-commit"] += 1
                 else:
                     witness.layer_request_ids.append(request_ids)
                     runtime["real-mtp-layer-forward"] += 1
@@ -741,6 +744,11 @@ def _assert_mtp_active(session: _Session, case: _Case) -> None:
     if parallel_state.is_pipeline_last_stage():
         assert runtime["real-mtp-forward"] > 0
         assert bool(runtime["real-mtp-kv-commit"]) is case.repeated
+        if case.repeated:
+            assert (
+                runtime["real-mtp-kv-commit"] + runtime["mtp-dummy-commit"]
+                == runtime["mtp-serial-steps"]
+            )
         assert runtime["real-mtp-layer-forward"] == runtime["real-mtp-forward"]
         assert runtime["mtp-position-id-forwards"] == runtime["real-mtp-forward"]
         assert session.witness.layer_request_ids == session.witness.proposal_request_ids
