@@ -870,8 +870,7 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
                     int(engine._spec_tokens_accepted_per_pos.sum()) - accepted_before
                 )
 
-            for record in result["finished_request_records"]:
-                request = record.merge()
+            for request in result["finished_requests"]:
                 finished[request.request_id] = request
 
             target = live_request(_TARGET_ID)
