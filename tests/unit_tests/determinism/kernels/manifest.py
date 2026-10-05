@@ -302,7 +302,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="moe_utils",
         sources=("megatron/core/transformer/moe/moe_utils.py",),
-        tests=(K + "test_moe_kernels.py",),
+        tests=(
+            K + "test_moe_kernels.py",
+            "tests/unit_tests/inference/test_batch_invariant_nvls.py",
+        ),
         kind="torch-op",
         notes="permute/unpermute (index_add_ vs scatter_add_), routing (index_put_ vs scatter), sort_chunks, aux loss, "
         "router gating GEMM, TE fused permutation/router kernels.",
@@ -436,7 +439,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/ssm/gated_delta_net/gdn.py",
             "megatron/core/ssm/gated_delta_net/gdn2.py",
         ),
-        tests=(K + "test_ssm_kernels.py", K + "test_gated_norm.py", C + "test_hybrid_model.py"),
+        tests=(
+            K + "test_ssm_kernels.py",
+            K + "test_gated_norm.py",
+            C + "test_hybrid_model.py",
+        ),
         kind="torch.compile",
         notes="deterministic_mode selects torch_chunk_gated_delta_rule over FLA (recorded non-deterministic).",
     ),
@@ -548,8 +555,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="mtp_speculative_decoding_kernels",
-        sources=("megatron/core/inference/text_generation_controllers/mtp_utils_triton.py",),
-        tests=("tests/unit_tests/inference/text_generation_controllers/test_mtp_utils.py",),
+        sources=(
+            "megatron/core/inference/text_generation_controllers/mtp_utils_triton.py",
+        ),
+        tests=(
+            "tests/unit_tests/inference/text_generation_controllers/test_mtp_utils.py",
+        ),
         kind="triton",
         training_path=False,
         notes="Integer bookkeeping and state copies checked for exact equality against the torch reference.",
@@ -590,7 +601,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="nvshmem_chunked_copy",
-        sources=("megatron/core/resharding/nvshmem_copy_service/kernels/chunked_kernel.cu",),
+        sources=(
+            "megatron/core/resharding/nvshmem_copy_service/kernels/chunked_kernel.cu",
+        ),
         kind="cuda-ext",
         training_path=False,
         exempt_reason="Byte copy for refit; needs NVSHMEM and a multi-GPU RL environment.",
