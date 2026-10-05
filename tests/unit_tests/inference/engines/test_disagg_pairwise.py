@@ -155,8 +155,6 @@ def test_disagg_real_engine_parity(mixer, rope, transport_world, backend, length
                     mixed_offsets = {step[0] for step in witness.steps if 102 in step[3]}
                     assert len(mixed_offsets) >= 3
                     assert all(102 in step[3] for step in witness.steps)
-                with pytest.raises(RuntimeError, match="handoff state remains pinned"):
-                    engine.reset()
             transferred = exchange((metadata, state) if source else None, transport_world)
             if not source:
                 metadata, state = transferred
@@ -213,6 +211,9 @@ def test_disagg_real_engine_parity(mixer, rope, transport_world, backend, length
             if source:
                 engine._poll_pending_kv_pushes()
                 assert not engine._pending_kv_pushes
+                assert not engine.requests
+                with pytest.raises(RuntimeError, match="handoff state remains pinned"):
+                    engine.reset()
                 engine.release_handoff_blocks(101)
                 engine.release_handoff_blocks(101)
                 assert_released(engine)
