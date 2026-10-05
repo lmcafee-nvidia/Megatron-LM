@@ -146,7 +146,7 @@ class RoutedModel:
         while self.engine.has_unfinished_requests():
             await self.engine.async_step()
         result = msgpack.unpackb(
-            msgpack.packb((await future).merge().serialize(), use_bin_type=True), raw=False
+            msgpack.packb((await future).serialize(), use_bin_type=True), raw=False
         )
         self.engine.reset()
         return result
