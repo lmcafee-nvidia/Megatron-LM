@@ -1,8 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Real dense precision contracts; fresh native-TE/workspace-zero processes.
-
-Tensorwise FP8 and NVFP4 admission are negative; real MXFP8 requires Blackwell.
-"""
+"""Native TE/workspace-zero dense precision; MXFP8 requires Blackwell."""
 
 import os
 
