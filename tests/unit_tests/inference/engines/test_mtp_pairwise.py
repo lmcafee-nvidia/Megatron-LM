@@ -26,9 +26,9 @@ import torch
 from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, check_fp8_support
 
 from megatron.core import parallel_state
+from megatron.core.fusions import fused_layer_norm
 from megatron.core.inference.config import AsyncScheduleMode, PrefixCachingEvictionPolicy
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.models import backends as model_backends
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_layer_specs,
     get_gpt_mtp_block_spec,
@@ -820,15 +820,15 @@ class TestMTPPairwise(_DynamicEngineTestBase):
         assert treatment.witness.raw_depths and set(treatment.witness.raw_depths) == {0}
 
     @torch.inference_mode()
-    def test_local_rmsnorm_is_explicit_and_matches_ordinary(self):
+    def test_local_rmsnorm_is_explicit_and_matches_ordinary(self, monkeypatch):
         """Local MTP selects RMSNorm independent of an earlier factory side effect."""
 
         class WrongNorm:
             pass
 
-        original_norm = model_backends.LNImpl
-        try:
-            model_backends.LNImpl = WrongNorm
+        with monkeypatch.context() as norm_patch:
+            norm_patch.setattr(fused_layer_norm, "HAVE_FUSED_LAYER_NORM", True)
+            norm_patch.setattr(fused_layer_norm, "FusedLayerNorm", WrongNorm)
             config = TransformerConfig(
                 num_layers=1,
                 hidden_size=32,
@@ -839,7 +839,6 @@ class TestMTPPairwise(_DynamicEngineTestBase):
             )
             layer_spec = get_gpt_decoder_layer_specs(config, use_transformer_engine=False)[-1]
             assert layer_spec.submodules.input_layernorm is WrappedTorchNorm
-            model_backends.LNImpl = WrongNorm
             mtp_spec = get_gpt_mtp_block_spec(config, layer_spec, use_transformer_engine=False)
             assert mtp_spec.layer_specs[0].submodules.enorm is WrappedTorchNorm
 
@@ -851,8 +850,6 @@ class TestMTPPairwise(_DynamicEngineTestBase):
                     config={"normalization": "RMSNorm"},
                 )
             )
-        finally:
-            model_backends.LNImpl = original_norm
 
     @torch.inference_mode()
     def test_separate_depth_three_all_accept(self):
