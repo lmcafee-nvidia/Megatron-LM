@@ -1,11 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Target-owned MoE invariance across real NVLS rank/token participation.
-
-Run each MCORE_BI_TEST_COLLECTIVE=ordered/multimem selection in a fresh EP4
-interpreter. Native TE additionally requires CUBLASLT_WORKSPACE_SIZE=0 before
-interpreter startup. These layer tests complement, not replace, dynamic GPT
-and existing NVLS graph tests.
-"""
+"""Real EP4 NVLS invariance; each collective/backend needs a fresh interpreter."""
 
 import os
 
