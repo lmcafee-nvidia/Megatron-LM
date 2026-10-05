@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest import mock
 
@@ -38,10 +39,10 @@ def _make_postprocess_engine(request, num_speculative_tokens=2, track_generated_
         kv_block_allocator=SimpleNamespace(pool_size=8, pool_avail=8, enable_prefix_caching=False),
         remove_vlm_request_data=mock.Mock(),
     )
-    engine.controller = SimpleNamespace(
-        tokenizer=SimpleNamespace(detokenize=lambda token_ids: str(token_ids[0]))
-    )
-    engine.requests = {request.request_id: RequestEntry(record=record, future=mock.Mock())}
+    engine.controller = TextGenerationController.__new__(TextGenerationController)
+    engine.controller.tokenizer = SimpleNamespace(detokenize=lambda token_ids: str(token_ids[0]))
+    engine.controller.extra_eos_token_id_set = frozenset({98})
+    engine.requests = {request.request_id: RequestEntry(record=record, future=Future())}
     engine.finished_request_count = 0
     engine.evicted_request_count = 0
     engine.track_generated_token_events = track_generated_token_events
@@ -84,25 +85,26 @@ def _top_n_rows(token_ids):
     return [(torch.tensor([-0.1, -1.1]), torch.tensor([token, token + 1])) for token in token_ids]
 
 
-def test_terminal_position_uses_accepted_prefix_then_replacement():
-    """Accepted EOS wins, while rejected proposal IDs are never terminal."""
-    positions = TextGenerationController._get_step_termination_token_positions(
-        sampled_tokens_cpu=torch.tensor([41, 42, 99, 44]),
-        accepted_tokens_cpu=torch.tensor([[99, 99, -1], [30, 99, 32], [30, 31, -1], [99, -1, -1]]),
-        termination_ids=torch.tensor([99, 99, 99, -1]),
-    )
-
-    # Row 0 terminates at the first accepted draft, row 1 at the second, and
-    # row 2 at its replacement. Row 3 has EOS disabled even though a draft is 99.
-    assert positions.device.type == "cpu"
-    assert positions.tolist() == [0, 1, 2, -1]
-
-    rejected_eos = TextGenerationController._get_step_termination_token_positions(
-        sampled_tokens_cpu=torch.tensor([7]),
-        accepted_tokens_cpu=torch.tensor([[-1, -1]]),
-        termination_ids=torch.tensor([99]),
-    )
-    assert rejected_eos.tolist() == [-1]
+@pytest.mark.parametrize(
+    ("accepted", "sample", "termination_id", "expected"),
+    [
+        ([99, 99, -1], 41, 99, 0),
+        ([30, 99, 32], 42, 99, 1),
+        ([30, 31, -1], 99, 99, 2),
+        ([99, -1, -1], 44, -1, None),
+        ([-1, -1], 7, 99, None),
+        ([30, 98], 41, 99, 1),
+    ],
+)
+def test_terminal_position_uses_accepted_prefix_then_replacement(
+    accepted, sample, termination_id, expected
+):
+    """Use current multi-EOS policy over accepted drafts followed by the replacement."""
+    request = _make_decode_request()
+    request.sampling_params.termination_id = termination_id
+    engine = _make_postprocess_engine(request)
+    tokens = [token for token in accepted if token != -1] + [sample]
+    assert engine._find_mid_block_eos(request, tokens) == expected
 
 
 @pytest.mark.parametrize(
@@ -153,9 +155,8 @@ def test_stop_boundary_output_is_aligned_for_keep_and_strip(keep_stop):
         def __add__(self, other):
             raise AssertionError("stop matching copied the complete generated history")
 
-    history = NoFullHistoryCopy([0] * 100 + [20])
-    assert DynamicInferenceEngine._find_step_stop_match(history, [20, 20], [[20, 20]]) == (0, 2)
     request = _make_decode_request(keep_stop=keep_stop)
+    request.generated_tokens = NoFullHistoryCopy(request.generated_tokens)
     request.stop_word_ids = [[20, 20]]
     engine = _make_postprocess_engine(
         request, num_speculative_tokens=3, track_generated_token_events=True
@@ -170,7 +171,6 @@ def test_stop_boundary_output_is_aligned_for_keep_and_strip(keep_stop):
         accepted_tokens=torch.tensor([[20, 20, 20]]),
         log_probs=[[-0.2, -0.3, -0.4, -0.5]],
         consumed_chunked_prefill_request_id=-1,
-        termination_token_positions=torch.tensor([-1]),
         top_n_logprobs={0: _top_n_rows([20, 20, 20, 20])},
     )
 
@@ -218,7 +218,6 @@ def test_eos_wins_same_endpoint_stop_and_keeps_all_metadata_aligned():
         accepted_tokens=torch.tensor([[19, 20]]),
         log_probs=[[-0.2, -0.3, -0.4]],
         consumed_chunked_prefill_request_id=-1,
-        termination_token_positions=torch.tensor([1]),
         top_n_logprobs={0: _top_n_rows([19, 20, 21])},
     )
 
@@ -289,7 +288,6 @@ def test_chunked_prefill_provisional_sample_is_not_output_or_metric_data():
         accepted_tokens=None,
         log_probs=None,
         consumed_chunked_prefill_request_id=request.request_id,
-        termination_token_positions=torch.tensor([0]),
     )
 
     assert active_ids == [request.request_id]
@@ -386,34 +384,40 @@ class TestMtpAcceptedEosLifecycle(DynamicInferenceEngineTestBase):
         real_mtp = model.compute_mtp_single_step
 
         def deterministic_mtp(
-            hidden_states, next_token_ids, position_ids, depth, eager=False, cache_key=None
+            hidden_states,
+            next_token_ids,
+            position_ids,
+            depth,
+            eager=False,
+            cache_key=None,
+            mtp_inference_context=None,
         ):
             hidden_states, logits = real_mtp(
-                hidden_states, next_token_ids, position_ids, depth, eager=eager, cache_key=cache_key
+                hidden_states,
+                next_token_ids,
+                position_ids,
+                depth,
+                eager=eager,
+                cache_key=cache_key,
+                mtp_inference_context=mtp_inference_context,
             )
             witness["mtp_depths"].add(int(depth))
             logits.fill_(-100.0)
             logits[..., eos_token if depth == 0 else trailing_draft] = 100.0
             return hidden_states, logits
 
-        real_terminal_positions = controller._get_step_termination_token_positions
+        real_find_eos = engine._find_mid_block_eos
 
-        def witnessed_terminal_positions(samples, accepted, termination_ids):
-            positions = real_terminal_positions(samples, accepted, termination_ids)
-            assert positions.device.type == "cpu"
-            if accepted is not None:
-                accepted_counts = (accepted != -1).reshape(accepted.size(0), -1).sum(dim=1)
-                witness["accepted_eos_rows"] += int(
-                    ((positions >= 0) & (positions < accepted_counts)).sum().item()
-                )
-                witness["accepted_eos_with_suffix_rows"] += int(
-                    ((positions >= 0) & (positions + 1 < accepted_counts)).sum().item()
-                )
-            return positions
+        def witnessed_eos(request, tokens):
+            position = real_find_eos(request, tokens)
+            if position is not None:
+                witness["accepted_eos_rows"] += int(position < len(tokens) - 1)
+                witness["accepted_eos_with_suffix_rows"] += int(position + 1 < len(tokens) - 1)
+            return position
 
         model.forward = deterministic_forward
         model.compute_mtp_single_step = deterministic_mtp
-        controller._get_step_termination_token_positions = witnessed_terminal_positions
+        engine._find_mid_block_eos = witnessed_eos
 
         for request_id in range(3):
             engine._add_request(
@@ -435,12 +439,11 @@ class TestMtpAcceptedEosLifecycle(DynamicInferenceEngineTestBase):
         for _ in range(20):
             if not engine.has_unfinished_requests():
                 break
-            records.extend(engine.step_modern()["finished_request_records"])
+            records.extend(engine.step_modern()["finished_requests"])
         assert not engine.has_unfinished_requests(), "engine did not converge"
 
         finished = {}
-        for record in records:
-            request = record.merge()
+        for request in records:
             finished[request.request_id] = request
         assert set(finished) == {0, 1, 2}
         eos_request = finished[1]
