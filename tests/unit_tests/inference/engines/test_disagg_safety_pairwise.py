@@ -36,16 +36,17 @@ def _error(call):
         pytest.param("hybrid", "nixl", id="ssm-nixl"),
     ],
 )
+@pytest.mark.parametrize("resuming", ["prefill", "decode", "both"])
 @pytest.mark.parametrize("stop_keep", [None, False, True], ids=["eos", "stop-strip", "stop-keep"])
 @torch.inference_mode()
 @mock.patch.object(GPTModel, "forward", autospec=True, side_effect=GPTModel.forward)
 @mock.patch.object(MambaMixer, "forward", autospec=True, side_effect=MambaMixer.forward)
 def test_nonpersist_suspend_rejects_owned_source_state(
-    mixer, gpt, transport_world, model, backend, stop_keep
+    mixer, gpt, transport_world, model, backend, stop_keep, resuming
 ):
     """Owned KV/SSM publications reject suspend before its first mutation."""
     _exercise_owned_source_state(
-        mixer, gpt, transport_world, model, backend, stop_keep, resuming=None, cycles=1
+        mixer, gpt, transport_world, model, backend, stop_keep, resuming=resuming, cycles=2
     )
 
 
@@ -133,10 +134,12 @@ def _exercise_owned_source_state(
                 engine, metadata, tokens, params, transport_world
             )
 
-            destination_release = None
+            destination_release = import_error = None
             if not source:
                 assert pending.sampling_params.num_tokens_to_generate == 7
-                dtu.assert_import_equal(engine, pending, state, len(tokens))
+                import_error = _error(
+                    lambda: dtu.assert_import_equal(engine, pending, state, len(tokens))
+                )
                 owned = pending.local_blocks + pending.continuation_blocks
                 refs_before = engine.context.kv_block_allocator.block_ref_counts[owned].clone()
                 with mock.patch.object(
@@ -184,6 +187,9 @@ def _exercise_owned_source_state(
             assert not engine._pending_kv_pushes and not engine._handoff_completion_notifications
             dtu.assert_released(engine)
             peer_release = dtu.exchange((source_release, destination_release), transport_world)
+            # Report comparison failure only after both peers complete normal release.
+            peer_error = dtu.exchange(import_error, transport_world)
+            assert import_error is None and peer_error is None, (import_error, peer_error)
             observed_source = source_release if source else peer_release[0]
             observed_destination = destination_release if not source else peer_release[1]
             assert publication[0] and all(ref > 0 for ref in publication[1])
