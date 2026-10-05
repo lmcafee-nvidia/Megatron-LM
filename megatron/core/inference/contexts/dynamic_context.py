@@ -4403,7 +4403,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         if active_request_count == 0:
             self.request_to_kv_block_ids.fill_(-1)
             self.total_request_count = 0
-            self.reset_mamba_state()
+            # Finished request slots were freed above. Detached handoff/import
+            # slots remain owned outside the batch until their explicit release.
             return finished_request_ids, survivor_idxs
 
         dst_idxs = torch.arange(active_request_count, device='cpu')
@@ -4536,8 +4537,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.total_request_count = 0
             self.active_token_count = 0
 
-            # Reset Mamba state.
-            self.reset_mamba_state()
+            # Request cleanup already returned bound Mamba slots and attention
+            # reset cleared varlen metadata. Do not free detached handoff slots.
             return
 
         # 3. Concatenate the paused tokens to the active tokens if present.
