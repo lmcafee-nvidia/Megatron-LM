@@ -643,7 +643,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/multi_latent_attention.py",
             "megatron/core/transformer/experimental_attention_variant/absorbed_mla.py",
         ),
-        tests=(K + "test_fused_triton_kernels.py", K + "test_te_wrappers.py"),
+        tests=(
+            K + "test_fused_triton_kernels.py",
+            K + "test_te_wrappers.py"
+            "tests/unit_tests/inference/engines/test_batch_invariant_pairwise.py",
+        ),
         kind="dispatch",
         notes="Calls the Triton MLA YaRN RoPE kernels (fused_apply_mla_rope_for_q / _kv, replayed in "
         "test_fused_triton_kernels.py) and TE fused RoPE (test_te_wrappers.py). The TE "
