@@ -599,9 +599,7 @@ def split_te_layernorm_column_parallel_linear(
     out_features = fused_layer.out_features * fused_layer.tp_size
 
     # Create the norm layer
-    norm_layer = TENorm(config=config, hidden_size=in_features, eps=fused_layer.eps).to(
-        device=fused_layer.weight.device
-    )
+    norm_layer = TENorm(config=config, hidden_size=in_features, eps=fused_layer.eps)
 
     with torch.no_grad():
         # Copy layer norm weight
@@ -624,7 +622,7 @@ def split_te_layernorm_column_parallel_linear(
         is_expert=False,
         tp_comm_buffer_name=fused_layer.ub_name,
         tp_group=tp_group or fused_layer.tp_group,
-    ).to(device=fused_layer.weight.device)
+    )
 
     with torch.no_grad():
         # Copy weight
