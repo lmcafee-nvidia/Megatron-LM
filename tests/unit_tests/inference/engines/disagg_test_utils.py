@@ -98,8 +98,7 @@ def real_engine(config, *, role=None, backend="nccl", weights=None):
 def run_to_completion(engine, future, *, limit=256):
     for _ in range(limit):
         if future.done():
-            result = future.result()
-            request = result.merge()
+            request = future.result()
             assert request.status == Status.COMPLETED
             return request
         engine.step_modern()
