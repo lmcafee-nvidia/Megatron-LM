@@ -101,7 +101,7 @@ def _build_engine(case, backend, fa_version, *, modality, engines, wire=False):
     dynamic_forward, lm_forward = wrapper._forward_dynamic, model.module.forward_lm_only
 
     def observe_dynamic(inputs):
-        current["mask"] = inputs["image_token_mask"]
+        current["mask"] = inputs.get("image_token_mask")  # Text-only decode has no media mask.
         return dynamic_forward(inputs)
 
     def observe_lm(*args, **kwargs):
