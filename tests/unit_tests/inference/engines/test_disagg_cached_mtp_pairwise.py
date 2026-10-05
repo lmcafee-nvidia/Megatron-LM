@@ -27,13 +27,16 @@ from tests.unit_tests.inference.engines.disagg_test_utils import (
 from tests.unit_tests.inference.engines.test_disagg_pairwise import transport_world  # noqa: F401
 
 
-@pytest.mark.parametrize("mode", ["cached-prefix", "mtp-depth-two"])
+@pytest.mark.parametrize("mode", ["cached-prefix", "mtp-depth-two", "mtp-kv-depth-two"])
 @torch.inference_mode()
 def test_cached_prefix_and_mtp_handoff(transport_world, mode):
     cached = mode == "cached-prefix"
     depth = 0 if cached else 2
+    mtp_kv = mode == "mtp-kv-depth-two"
     config = disagg_config(
-        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU, num_speculative_tokens=depth
+        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
+        num_speculative_tokens=depth,
+        mtp_use_repeated_layer=mtp_kv,
     )
     tokens = prompt(33 if cached else 31)
     weights, expected = collocated_reference(config, tokens, sampling(7))
@@ -44,11 +47,12 @@ def test_cached_prefix_and_mtp_handoff(transport_world, mode):
         backend="nixl" if cached else "nccl",
         weights=weights,
     ) as engine:
-        inner_calls = [0] * depth
+        assert engine.context.enable_mtp_kv_cache == mtp_kv
+        inner_calls = [0] * (1 if mtp_kv else depth)
         hooks = []
         if depth:
             model = engine.controller.inference_wrapped_model.model
-            assert len(model.mtp.layers) == depth
+            assert len(model.mtp.layers) == len(inner_calls)
             for index, layer in enumerate(model.mtp.layers):
 
                 def record_inner(module, args, output, index=index):
@@ -66,6 +70,11 @@ def test_cached_prefix_and_mtp_handoff(transport_world, mode):
                 assert request.generated_tokens == expected[:1]
                 metadata, state = snapshot_source(engine, request)
                 assert len(metadata["kv_meta"]["resume_tokens"]) == depth + 1
+                if mtp_kv:
+                    slot = engine.context.mtp_kv_layer_slot
+                    assert metadata["kv_meta"]["num_layers_global"] == slot + 1
+                    plane = state["kv"][:, slot].flatten(1, 2)[:, : len(tokens)]
+                    assert torch.isfinite(plane).all() and plane.count_nonzero() > 0
             peer = exchange((metadata, state) if source else None, transport_world)
             if not source:
                 metadata, state = peer
@@ -88,6 +97,8 @@ def test_cached_prefix_and_mtp_handoff(transport_world, mode):
                         assert len(imported_blocks) == 1, "Only the uncached tail should transfer"
                         assert pending.local_blocks[:2] == previously_imported_prefix
                     assert_import_equal(engine, pending, state, len(tokens))
+                    if mtp_kv:
+                        assert state["kv"].shape[1] == engine.context.mtp_kv_layer_slot + 1
                     if iteration == 0:
                         value = engine.context.memory_buffer[0, 0, pending.local_blocks[0], 0, 0, 0]
                         saved = value.clone()
@@ -124,6 +135,8 @@ def test_cached_prefix_and_mtp_handoff(transport_world, mode):
                 dist.barrier(group=transport_world)
             if depth:
                 assert all(inner_calls), "Every inner MTP layer must execute for the handoff target"
+                if mtp_kv:
+                    assert inner_calls[0] >= depth, "Shared MTP head must execute every draft depth"
             if source:
                 engine._poll_pending_kv_pushes()
                 engine.release_handoff_blocks(101)
