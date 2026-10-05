@@ -306,9 +306,9 @@ def _install_mtp_witnesses(env, case: _Case, runtime: Counter) -> _MTPWitness:
         mtp_module = None
         real_broadcast = None
         if controller.model_is_pipeline_parallel:
-            from megatron.core.inference.text_generation_controllers import mtp_inference_mixin
+            from megatron.core.inference.text_generation_controllers import mtp_controller_mixin
 
-            mtp_module = mtp_inference_mixin
+            mtp_module = mtp_controller_mixin
             real_broadcast = mtp_module.broadcast_from_last_pipeline_stage
 
             def observed_mtp_broadcast(*broadcast_args, **broadcast_kwargs):
@@ -354,12 +354,24 @@ def _install_mtp_witnesses(env, case: _Case, runtime: Counter) -> _MTPWitness:
         repeated_call_index = 0
 
         def observed_mtp(
-            hidden_states, next_token_ids, position_ids, depth=None, eager=False, cache_key=None
+            hidden_states,
+            next_token_ids,
+            position_ids,
+            depth=None,
+            eager=False,
+            cache_key=None,
+            mtp_inference_context=None,
         ):
             nonlocal repeated_call_index
             layer_calls_before = len(witness.layer_request_ids)
             hidden_states, logits = real_mtp(
-                hidden_states, next_token_ids, position_ids, depth, eager=eager, cache_key=cache_key
+                hidden_states,
+                next_token_ids,
+                position_ids,
+                depth,
+                eager=eager,
+                cache_key=cache_key,
+                mtp_inference_context=mtp_inference_context,
             )
             logical_depth = int(depth) if depth is not None else repeated_call_index % case.depth
             repeated_call_index += 1
@@ -577,8 +589,7 @@ def _run_session(
     for step in range(256):
         result = engine.step_modern()
         runtime["engine-steps"] += 1
-        for record in result["finished_request_records"]:
-            request = record.merge()
+        for request in result["finished_requests"]:
             finished[request.request_id] = request
         if (
             suspended
