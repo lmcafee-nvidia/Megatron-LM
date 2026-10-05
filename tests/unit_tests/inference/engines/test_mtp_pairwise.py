@@ -871,30 +871,33 @@ class TestMTPPairwise(_DynamicEngineTestBase):
         assert set(treatment.witness.logical_depths) == {0, 1, 2}
         assert all(value > 0 for value in treatment.accepted)
 
+    @pytest.mark.parametrize("repeated", [False, True], ids=["separate", "cached-repeated"])
     @torch.inference_mode()
-    def test_repeated_depth_three_request_local_acceptance_and_block_rewind(self):
-        """One repeated layer drives request-local accept/partial/reject rewinds."""
+    def test_depth_three_request_local_acceptance_and_block_rewind(self, repeated):
+        """Reject across a block boundary, retaining only cached lookahead ownership."""
         case = _Case(
             name="repeated-depth3-heterogeneous",
             depth=3,
             pattern="heterogeneous",
-            repeated=True,
+            repeated=repeated,
             prompt_lengths=(254, 254, 254),
             output_lengths=(9, 9, 9),
             config={"context_max_tokens": 1024},
         )
         _, treatment = _run_mtp_pair(case)
-        assert set(treatment.witness.raw_depths) == {None}
+        assert set(treatment.witness.raw_depths) == ({None} if repeated else {0, 1, 2})
         assert set(treatment.witness.logical_depths) == {0, 1, 2}
         assert {0: 3, 1: 1, 2: 0} in treatment.witness.acceptance_batches
         assert all(count == 3 for count in treatment.witness.accepted_by_request[0])
         assert all(count == 1 for count in treatment.witness.accepted_by_request[1])
         assert all(count == 0 for count in treatment.witness.accepted_by_request[2])
-        assert treatment.runtime["rewind-released-blocks"] > 0
-        assert any(
-            before_blocks > after_blocks
-            for _, _, before_blocks, after_blocks in treatment.witness.rewinds[2]
-        )
+        rewinds = treatment.witness.rewinds[2]
+        assert (treatment.runtime["rewind-released-blocks"] == 0) is repeated
+        assert any(before < after for before, after, _, _ in rewinds)
+        if repeated:
+            assert all(before == after for _, _, before, after in rewinds)
+        else:
+            assert any(before > after for _, _, before, after in rewinds)
 
     @torch.inference_mode()
     def test_mtp_lru_prefix_cache_pressure_matches_cache_off(self):
