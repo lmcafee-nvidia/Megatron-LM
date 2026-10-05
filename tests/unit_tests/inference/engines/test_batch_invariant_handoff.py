@@ -54,7 +54,7 @@ def _load_canonical(engine, expected):
 def _run(engine, future, limit=128):
     for _ in range(limit):
         if future.done():
-            return future.result().merge()
+            return future.result()
         engine.step_modern()
     raise AssertionError("request did not finish within the real-engine step bound")
 
