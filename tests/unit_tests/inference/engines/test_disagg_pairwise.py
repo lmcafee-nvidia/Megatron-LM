@@ -196,7 +196,7 @@ def test_disagg_real_engine_parity(mixer, rope, transport_world, backend, length
                         assert any(102 in step[3] for step in witness.pending_forwards)
                 else:
                     assert future.done()
-                    result = future.result().merge()
+                    result = future.result()
                     assert not witness.steps
                 assert result.generated_tokens == expected
                 assert result.sampling_params.num_tokens_to_generate == count
