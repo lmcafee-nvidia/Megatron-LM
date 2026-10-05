@@ -68,7 +68,6 @@ def test_dense_fp8_target_batch_invariance(monkeypatch, recipe):
         torch.manual_seed(321)
         model_parallel_cuda_manual_seed(321, inference_rng_tracker=True, force_reset_rng=True)
         config = _config(recipe)
-        # Use the production MCore TE adapter, FP8 context, quantization, and GEMM.
         layer = (
             TEColumnParallelLinear(
                 input_size=128,
