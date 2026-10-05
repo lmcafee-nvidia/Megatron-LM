@@ -3,6 +3,9 @@
 """Real allocator/backpressure and message-level disaggregation regressions."""
 
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
+from unittest import mock
 
 import msgpack
 import pytest
@@ -15,6 +18,7 @@ from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.headers import Headers
 from tests.unit_tests.inference.engines.disagg_test_utils import (
     ForwardWitness,
+    _enqueue_decode_handoff,
     assert_import_equal,
     assert_released,
     collocated_reference,
@@ -29,6 +33,7 @@ from tests.unit_tests.inference.engines.disagg_test_utils import (
     snapshot_source,
 )
 from tests.unit_tests.inference.engines.test_disagg_pairwise import transport_world  # noqa: F401
+from tests.unit_tests.test_utilities import Utils
 
 
 def deliver_abort(engine, request_id):
@@ -131,6 +136,138 @@ def test_real_handoff_capacity_fifo(transport_world, policy):
             engine.release_handoff_blocks(101)
         else:
             allocator.release_memory_blocks(held[3:])
+        assert_released(engine)
+
+
+@pytest.mark.parametrize("mode", [KVCacheManagementMode.PERSIST, KVCacheManagementMode.RECOMPUTE])
+@torch.inference_mode()
+def test_abort_capacity_queued_handoff_resolves_without_transfer(mode):
+    """A delivered ABORT must reach handoffs not yet present in engine.requests.
+
+    This is a focused negative/lifecycle regression, not positive transfer credit.
+    """
+    Utils.initialize_model_parallel()
+    try:
+        config = disagg_config(kv_cache_management_mode=mode, static_kv_memory_pointers=False)
+        with real_engine(config, role="decode") as engine:
+            allocator = engine.context.kv_block_allocator
+            held = allocator.allocate_memory_blocks(allocator.pool_avail).clone()
+            params = sampling(detokenize_generations=False)
+            future = engine.add_request_with_kv_handoff(
+                101, prompt(33), params, {"resume_tokens": [9]}, [1, 2, 3]
+            )
+            assert not engine.requests and not engine._pending_kv_imports
+            assert [item.request_id for item in engine._deferred_kv_handoffs] == [101]
+            try:
+                assert not future.done()
+                with ForwardWitness(engine) as witness:
+                    reply = deliver_abort(engine, 101)
+                # Assert while capacity is still exhausted, before teardown can
+                # cancel anything or release the independently held blocks.
+                resolved = future.cancelled()
+                retired = not engine._deferred_kv_handoffs and not engine._pending_kv_imports
+                assert not witness.steps
+                assert torch.equal(allocator.block_ref_counts[held], torch.ones_like(held))
+                assert resolved, "Delivered ABORT left a capacity-queued handoff future unresolved"
+                assert retired, "Aborted handoff remained eligible for a later real transfer"
+                assert not (
+                    engine.requests or engine.failed_request_ids or engine.local_metadata_ledger
+                )
+                assert reply is not None, "Delivered ABORT did not publish a terminal ENGINE_REPLY"
+                metadata, body = [msgpack.unpackb(frame, raw=False) for frame in reply]
+                assert metadata == [Headers.ENGINE_REPLY.value, [[101, False]]]
+                assert body["request_id"] == 101 and body["status"] == "FAILED"
+                assert deliver_abort(engine, 101) is None
+            finally:
+                allocator.release_memory_blocks(held)
+                engine._reset_pending_kv_imports()
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("mode", [KVCacheManagementMode.PERSIST, KVCacheManagementMode.RECOMPUTE])
+@torch.inference_mode()
+def test_abort_inflight_handoff_quarantines_until_real_nccl_settles(transport_world, mode):
+    tokens = prompt(33)
+    source = dist.get_rank() % 2 == 0
+    config = disagg_config(kv_cache_management_mode=mode, static_kv_memory_pointers=False)
+    with real_engine(config, role="prefill" if source else "decode") as engine:
+        metadata = state = None
+        if source:
+            result = run_to_completion(
+                engine, engine.add_request(101, tokens, sampling(1, do_kv_handoff=True))
+            )
+            metadata, state = snapshot_source(engine, result)
+        peer = exchange((metadata, state) if source else None, transport_world)
+        if not source:
+            metadata, state = peer
+
+        pending = future = owned_blocks = None
+        if not source:
+            future = _enqueue_decode_handoff(engine, metadata, tokens, sampling())
+            pending = engine._pending_kv_imports[0]
+            owned_blocks = torch.tensor(
+                pending.local_blocks + pending.continuation_blocks, dtype=torch.int64
+            )
+            peer_meta = decode_peer_meta(engine, pending)
+            receive_started = Event()
+            batch = dist.batch_isend_irecv
+
+            def receive(ops):
+                assert ops and all(op.op is dist.irecv for op in ops)
+                receive_started.set()
+                return batch(ops)
+
+            def post_receive():
+                torch.cuda.set_device(dist.get_rank())
+                with mock.patch.object(dist, "batch_isend_irecv", side_effect=receive):
+                    return pending.handle._start()
+
+            receive_poster = ThreadPoolExecutor(max_workers=1)
+            receive_post = receive_poster.submit(post_receive)
+            assert receive_started.wait(timeout=5) and not receive_post.done()
+        else:
+            peer_meta = None
+        peer_meta = exchange(peer_meta, transport_world)
+
+        witness = None
+        if not source:
+            assert not future.done()
+            with ForwardWitness(engine) as witness:
+                reply = deliver_abort(engine, 101)
+            assert future.cancelled() and not engine._pending_kv_imports
+            assert engine._quarantined_kv_imports == [pending]
+            assert torch.equal(
+                engine.context.kv_block_allocator.block_ref_counts[owned_blocks],
+                torch.ones_like(owned_blocks, dtype=torch.int32),
+            )
+            assert reply is not None
+        dist.barrier(group=transport_world)
+
+        if source:
+            engine.push_handoff_kv(101, [peer_meta])
+            handles = engine._pending_kv_pushes[0][1]
+            blocks = engine._pinned_handoff_blocks[101]
+            assert (engine.context.kv_block_allocator.block_ref_counts[blocks] > 0).all()
+        else:
+            assert receive_post.result(timeout=30) is pending.handle.real_handle
+            receive_poster.shutdown()
+            handles = engine._pending_transfer_handles(pending)
+        for handle in handles:
+            handle.wait()
+            assert handle.poll()
+
+        if source:
+            assert engine._poll_pending_kv_pushes() == 1
+            engine.release_handoff_blocks(101)
+            engine.release_handoff_blocks(101)
+        else:
+            assert_import_equal(engine, pending, state, len(tokens))
+            assert engine._poll_pending_kv_imports() == 0
+            assert not engine._quarantined_kv_imports
+            assert (engine.context.kv_block_allocator.block_ref_counts[owned_blocks] == 0).all()
+            assert engine._poll_pending_kv_imports() == 0
+            assert not witness.steps and not engine._handoff_completion_notifications
         assert_released(engine)
 
 
