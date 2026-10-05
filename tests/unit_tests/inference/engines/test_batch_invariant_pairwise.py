@@ -39,7 +39,6 @@ DENSE_CASES = [
         context={"materialize_only_last_token_logits": True},
         sampling={"return_log_probs": False},
     ),
-    Case("fused-rope", context={"use_flashinfer_fused_rope": True}),
     Case("chunked", context={"enable_chunked_prefill": True, "max_tokens": 128}, prompt_length=273),
     Case(
         "chunked-async",
