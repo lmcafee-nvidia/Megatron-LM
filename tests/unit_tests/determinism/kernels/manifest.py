@@ -646,7 +646,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(
             K + "test_fused_triton_kernels.py",
-            K + "test_te_wrappers.py"
+            K + "test_te_wrappers.py",
             "tests/unit_tests/inference/engines/test_batch_invariant_pairwise.py",
         ),
         kind="dispatch",
