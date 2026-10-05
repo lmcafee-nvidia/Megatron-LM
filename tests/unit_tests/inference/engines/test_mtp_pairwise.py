@@ -26,9 +26,15 @@ import torch
 from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, check_fp8_support
 
 from megatron.core import parallel_state
+from megatron.core.fusions import fused_layer_norm
 from megatron.core.inference.config import AsyncScheduleMode, PrefixCachingEvictionPolicy
 from megatron.core.inference.contexts.mtp_metadata import MTPForwardMode
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_layer_specs,
+    get_gpt_mtp_block_spec,
+)
+from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import HAVE_FA3, HAVE_FA4
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
@@ -36,6 +42,7 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     set_batch_invariant_mode,
     te_supports_batch_invariant_attention,
 )
+from megatron.core.transformer.torch_norm import WrappedTorchNorm
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.inference.contexts.test_dynamic_prefix_caching import (
     TestPrefixCacheRealEngineMatrix as _PrefixEngineHarness,
@@ -756,6 +763,14 @@ def _run_mtp_pair(case: _Case) -> tuple[_Session, _Session]:
         assert hasattr(mtp_model, "mtp")
         assert mtp_model.mtp.mtp_use_repeated_layer is case.repeated
         assert len(mtp_model.mtp.layers) == (1 if case.repeated else case.depth)
+        if case.config.get("normalization") == "RMSNorm":
+            for layer in mtp_model.mtp.layers:
+                assert all(
+                    isinstance(getattr(layer, name), torch.nn.RMSNorm)
+                    for name in ("enorm", "hnorm", "final_layernorm")
+                )
+                assert isinstance(layer.mtp_model_layer.input_layernorm, torch.nn.RMSNorm)
+                assert isinstance(layer.mtp_model_layer.pre_mlp_layernorm, torch.nn.RMSNorm)
     else:
         assert not hasattr(mtp_model, "mtp")
 
@@ -822,6 +837,38 @@ class TestMTPPairwise(_DynamicEngineTestBase):
             )
         )
         assert treatment.witness.raw_depths and set(treatment.witness.raw_depths) == {0}
+
+    @torch.inference_mode()
+    def test_local_rmsnorm_is_explicit_and_matches_ordinary(self, monkeypatch):
+        """Local MTP selects RMSNorm independent of an earlier factory side effect."""
+
+        class WrongNorm:
+            pass
+
+        with monkeypatch.context() as norm_patch:
+            norm_patch.setattr(fused_layer_norm, "HAVE_FUSED_LAYER_NORM", True)
+            norm_patch.setattr(fused_layer_norm, "FusedLayerNorm", WrongNorm)
+            config = TransformerConfig(
+                num_layers=1,
+                hidden_size=32,
+                num_attention_heads=4,
+                mtp_num_layers=1,
+                normalization="RMSNorm",
+                transformer_impl="local",
+            )
+            layer_spec = get_gpt_decoder_layer_specs(config, use_transformer_engine=False)[-1]
+            assert layer_spec.submodules.input_layernorm is WrappedTorchNorm
+            mtp_spec = get_gpt_mtp_block_spec(config, layer_spec, use_transformer_engine=False)
+            assert mtp_spec.layer_specs[0].submodules.enorm is WrappedTorchNorm
+
+            _run_mtp_pair(
+                _Case(
+                    name="local-rmsnorm",
+                    depth=1,
+                    pattern="accept",
+                    config={"normalization": "RMSNorm"},
+                )
+            )
 
     @torch.inference_mode()
     def test_separate_depth_three_all_accept(self):
