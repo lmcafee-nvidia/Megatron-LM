@@ -140,7 +140,6 @@ def test_usable_proposal_count_follows_logical_boundary(boundary, accepted_count
             torch.tensor([[20, 21, 22]]),
             None,
             -1,
-            termination_token_positions=torch.tensor([-1]),
         )
         assert request.generated_tokens == [10]
         assert engine._spec_tokens_proposed_per_pos.tolist() == [0, 0, 0]
@@ -252,7 +251,6 @@ def test_length_boundary_trims_tokens_scores_and_proposal_metrics_together():
         accepted_tokens=torch.tensor([[20, 21]]),
         log_probs=[[-0.2, -0.3, -0.4]],
         consumed_chunked_prefill_request_id=-1,
-        termination_token_positions=torch.tensor([-1]),
         top_n_logprobs={0: _top_n_rows([20, 21, 22])},
     )
 
