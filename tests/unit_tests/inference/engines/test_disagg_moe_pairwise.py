@@ -30,7 +30,7 @@ async def finish_live_request(engine, future, control):
         work.wait()
     engine.state = EngineState.STOPPING
     await asyncio.wait_for(asyncio.shield(engine.engine_loop_task), timeout=60)
-    return future.result().merge() if future is not None else None
+    return future.result() if future is not None else None
 
 
 def moe_state(engine):
@@ -200,7 +200,7 @@ def test_real_moe_ep2_handoff(tmp_path, live_loop):
                     target._loop.run_until_complete(finish_live_request(target, future, control))
                 else:
                     for _ in expected:
-                        assert not target.step_modern()["finished_request_records"]
+                        assert not target.step_modern()["finished_requests"]
                 witnesses = topology.gather(
                     (rank, local_calls, local_tokens, local_dummy, tuple(consensus)), control
                 )
