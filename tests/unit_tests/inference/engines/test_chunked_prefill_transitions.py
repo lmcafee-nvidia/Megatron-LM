@@ -130,7 +130,7 @@ class TestChunkedPrefillTransitions(DynamicInferenceEngineTestBase):
     def _assert_partial_primer(env, request, forward_states):
         result = env.engine.step_modern()
         progress = request.finished_chunk_token_count
-        assert result["finished_request_records"] == []
+        assert result["finished_requests"] == []
         assert 0 < progress < len(request.prompt_tokens)
         assert torch.equal(request.remaining_prompt_tokens, request.prompt_tokens[progress:])
         assert env.engine.context.chunked_prefill_request_id == request.request_id
@@ -146,9 +146,9 @@ class TestChunkedPrefillTransitions(DynamicInferenceEngineTestBase):
             if not env.engine.has_unfinished_requests():
                 break
             result = env.engine.step_modern()
-            for record in result["finished_request_records"]:
-                if record[-1].request_id == request_id:
-                    completed = record.merge()
+            for request in result["finished_requests"]:
+                if request.request_id == request_id:
+                    completed = request
         assert not env.engine.has_unfinished_requests()
         assert completed is not None
         assert completed.status == Status.COMPLETED
