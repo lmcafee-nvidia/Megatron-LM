@@ -236,10 +236,10 @@ class TestChunkedPrefillScheduleCharacterization(PrefixCachingTestBase):
         self._queue(engine, request)
 
         one_token_probe = context.check_availability(request, prefill_chunk_length=1)
-        *_, clamped_skip, clamped_compute = context._compute_prefix_match(request, 9)
+        clamped = context._compute_prefix_match(request, 9)
         expanded_probe = context.check_availability(request, prefill_chunk_length=9)
         assert one_token_probe == (True, True, True)
-        assert (clamped_skip, clamped_compute) == (4, 5)
+        assert (clamped.prefix_skip_tokens, clamped.effective_prefill_chunk_length) == (4, 5)
         assert expanded_probe == (True, False, True)
 
         before = self._state(engine, request)
