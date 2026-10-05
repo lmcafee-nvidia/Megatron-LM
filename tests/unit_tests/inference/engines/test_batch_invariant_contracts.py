@@ -36,6 +36,14 @@ def test_batch_invariant_support_boundary(invalid, reason):
         TransformerConfig(**kwargs)
 
 
+def test_batch_invariant_rejects_flashinfer_rope():
+    # Main rejects this numerical path; it is no longer a supported positive pair.
+    case = fixture.Case("fused-rope", context={"use_flashinfer_fused_rope": True})
+    with fixture.invariant_runtime(case) as (backend, version):
+        with pytest.raises(ValueError, match="does not support FlashInfer fused RoPE"):
+            fixture.build_engine(case, backend, version)
+
+
 @pytest.mark.parametrize("output", ["top-n", "skip-prompt", "total-length", "bos"])
 def test_batch_invariant_output_contract(output):
     options = dict(top_n_logprobs=3)
