@@ -495,8 +495,8 @@ def run_order(case, backend, fa_version, order, *, sampling=None):
 
     def step():
         result = engine.step_modern()
-        for record in result["finished_request_records"]:
-            req = record.merge(engine.controller.tokenizer)
+        for req in result["finished_requests"]:
+            req.finalize_text(engine.controller.tokenizer)
             finished[req.request_id] = req
             if witness is not None and req.request_id == 201:
                 witness.retirement_events.append(
