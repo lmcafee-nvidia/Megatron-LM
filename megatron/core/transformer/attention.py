@@ -1302,7 +1302,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                     if need_lse:
                         # FA3 may append kernel metadata after (out, softmax_lse),
                         # while FA2 returns exactly those two values.
-                        output_total, softmax_lse, *_ = kvcache_ret
+                        output_total, softmax_lse = kvcache_ret
                         # output_total: (B, S, H, D); softmax_lse: (B, H, S)
                         output_total = self._apply_sink_softmax_correction_bshd(
                             output_total, softmax_lse, softmax_offset
