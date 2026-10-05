@@ -105,8 +105,9 @@ async def _exercise_all_owners(
     assert sorted(Counter(owners.values()).values()) == [requests_per_client] * harness.dp_size
     await harness.pause()
     for output in outputs:
-        for key in ("status", "generated_tokens", "prompt_tokens", "generated_text"):
+        for key in ("status", "generated_tokens", "prompt_tokens"):
             assert output[key] == direct[key], key
+        assert output["generated_text"] == harness.tokenizer.detokenize(direct["generated_tokens"])
     _assert_every_owner_executed(harness, target, requests_per_client)
     harness.assert_retired()
     return target
@@ -290,8 +291,7 @@ async def test_routed_hybrid_updates_owned_recurrent_state(monkeypatch, mixer):
         ({"fp8": True, "hidden_size": 128}, ("fp8",), ("fp8-quantized-forwards",)),
         (
             {
-                # FI 0.6.6 NeoX D16 corrupts adjacent heads; exercise native D64.
-                "hidden_size": 256,
+                "hidden_size": 256,  # FI 0.6.6 corrupts NeoX D16 heads; use native D64.
                 "position_embedding_type": "rope",
                 "use_flashinfer_fused_rope": True,
             },
