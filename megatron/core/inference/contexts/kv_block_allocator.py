@@ -2,6 +2,7 @@
 
 import heapq
 from collections import deque
+from dataclasses import dataclass, field
 from typing import Callable, Dict, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
@@ -204,6 +205,91 @@ class PromptLogprobsBlock:
         )
 
 
+@dataclass
+class PromptLogprobsReservation:
+    """A lazy sidecar and allocator identity captured before lifecycle mutation."""
+
+    logical_block_index: int
+    block_id: int
+    key: PromptLogprobsKey
+    expected_mapping: Optional[PromptLogprobsBlock]
+    expected_block_hash: Optional[int]
+    expected_predecessor: Optional["PromptLogprobsReservation"] = field(default=None, repr=False)
+    block: Optional[PromptLogprobsBlock] = None
+
+
+@dataclass
+class PendingPromptLogprobsRow:
+    """One prompt-score row whose value and destination may arrive in either order."""
+
+    reservation: Optional[PromptLogprobsReservation] = None
+    local_position: Optional[int] = None
+    selected_logprobs: Optional[np.ndarray] = None
+    top_n_logprobs: Optional[np.ndarray] = None
+    top_n_token_ids: Optional[np.ndarray] = None
+    values_ready: bool = False
+    committed: bool = False
+    _allocator: Optional["KVBlockAllocator"] = field(default=None, repr=False)
+
+    @property
+    def block(self) -> Optional[PromptLogprobsBlock]:
+        """Return the bound sidecar once one exists."""
+        return self.reservation.block if self.reservation is not None else None
+
+    @property
+    def logical_block_index(self) -> Optional[int]:
+        """Return the bound logical block index."""
+        return self.reservation.logical_block_index if self.reservation is not None else None
+
+    def bind(
+        self,
+        allocator: "KVBlockAllocator",
+        reservation: PromptLogprobsReservation,
+        local_position: int,
+    ) -> None:
+        """Bind the row to its next-chunk sidecar without waiting for its value."""
+        if self.reservation is not None:
+            raise RuntimeError("prompt-logprob row already has a destination")
+        self._allocator = allocator
+        self.reservation = reservation
+        self.local_position = int(local_position)
+        self._commit_if_ready()
+
+    def fill(
+        self,
+        selected_logprobs: np.ndarray,
+        top_n_logprobs: Optional[np.ndarray],
+        top_n_token_ids: Optional[np.ndarray],
+    ) -> None:
+        """Supply the copied score values and commit if the destination is bound."""
+        if self.values_ready:
+            raise RuntimeError("prompt-logprob row values are already available")
+        self.selected_logprobs = np.asarray(selected_logprobs)
+        self.top_n_logprobs = None if top_n_logprobs is None else np.asarray(top_n_logprobs)
+        self.top_n_token_ids = None if top_n_token_ids is None else np.asarray(top_n_token_ids)
+        self.values_ready = True
+        self._commit_if_ready()
+
+    def _commit_if_ready(self) -> None:
+        """Store exactly once after both the copied values and destination exist."""
+        if not self.values_ready or self.reservation is None:
+            return
+        if self.committed:
+            raise RuntimeError("prompt-logprob row was committed more than once")
+        assert self._allocator is not None
+        assert self.local_position is not None
+        assert self.selected_logprobs is not None
+        self._allocator.fill_prompt_logprobs_reservation(
+            self.reservation,
+            target_positions=np.asarray([self.local_position], dtype=np.int32),
+            selected_logprobs=self.selected_logprobs,
+            top_n_logprobs=self.top_n_logprobs,
+            top_n_token_ids=self.top_n_token_ids,
+            publish_unregistered=True,
+        )
+        self.committed = True
+
+
 class KVBlockAllocator:
     """Allocator that manages blocks of memory for the KV cache.
 
@@ -263,6 +349,16 @@ class KVBlockAllocator:
 
             # Reference count per block: 0 = cached (evictable), >0 = actively used
             self.block_ref_counts = torch.zeros((self.pool_size,), dtype=torch.int32, device='cpu')
+
+            # Token the block's FINAL MTP draft slot was computed against, or -1 when that slot
+            # holds no draft KV. A block's last draft entry pairs its last hidden with the first
+            # token of the NEXT block, so it is reusable only by a consumer whose next token
+            # matches; the hash alone does not determine it. -1 is the safe default: only the
+            # prefill path that knows the producer's next token records one, so blocks
+            # registered by any other route (a disaggregated import, say) stay uninheritable.
+            self.block_mtp_next_token = torch.full(
+                (self.pool_size,), -1, dtype=torch.int64, device='cpu'
+            )
 
             # LRU timestamps for eviction ordering (higher = more recently used)
             # Only needed in LRU mode; RZ mode evicts immediately on ref_count==0
@@ -500,6 +596,7 @@ class KVBlockAllocator:
             # Reset prefix caching state
             self.kv_hash_to_block_id.clear()
             self.block_ref_counts.fill_(0)
+            self.block_mtp_next_token.fill_(-1)
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.block_timestamps.fill_(0)
                 self.block_parent_id.fill_(-1)
@@ -518,7 +615,7 @@ class KVBlockAllocator:
         block_ids: list[int],
         block_hashes: list[int],
         parent_hashes: Optional[list[int]] = None,
-    ) -> None:
+    ) -> list[int]:
         """Register blocks in the hash-to-block mapping for discovery (batch).
 
         Registration is idempotent: a block that already carries the hash being
@@ -545,9 +642,13 @@ class KVBlockAllocator:
                 length as block_ids); 0 marks a root block with no parent. Used
                 by LRU eviction to avoid evicting a parent before its children.
                 If None, parents default to 0.
+
+        Returns:
+            Newly registered block IDs, in input order. Already registered blocks
+            are excluded so callers can preserve their existing metadata.
         """
         if not block_ids:
-            return
+            return []
         if parent_hashes is not None:
             assert len(parent_hashes) == len(block_ids)
         # Tensor views of the batch, used to index the per-block state arrays.
@@ -575,7 +676,7 @@ class KVBlockAllocator:
             # hash-map update and the child-count bumps all see the same subset.
             keep = torch.nonzero(~already_registered, as_tuple=True)[0]
             if keep.numel() == 0:
-                return
+                return []
             keep_list = keep.tolist()
             block_ids = [block_ids[i] for i in keep_list]
             block_hashes = [block_hashes[i] for i in keep_list]
@@ -613,6 +714,7 @@ class KVBlockAllocator:
                     parent_id_tensor[has_parent],
                     torch.ones(int(has_parent.sum()), dtype=torch.int64),
                 )
+        return block_ids
 
     def add_blocks_deregistered_observer(self, observer: BlocksDeregisteredObserver) -> None:
         """Register a callback invoked when cached blocks are deregistered.
@@ -668,6 +770,7 @@ class KVBlockAllocator:
             self.block_timestamps[block_ids] = 0
         self.block_hashes[block_ids] = -1
         self.block_ref_counts[block_ids] = 0
+        self.block_mtp_next_token[block_ids] = -1
 
         # Return blocks to free pool
         self.block_bag[self.pool_avail : self.pool_avail + num_blocks] = block_ids
@@ -866,24 +969,120 @@ class KVBlockAllocator:
         Only the latest settings variant is discoverable. Existing strong
         references remain valid when a new variant replaces the mapping.
         """
+        reservation = self.reserve_prompt_logprobs(
+            logical_block_index=logical_block_index,
+            block_id=block_id,
+            key=key,
+            expected_block_hash=expected_block_hash,
+            block=block,
+        )
+        entry = self.fill_prompt_logprobs_reservation(
+            reservation,
+            target_positions=target_positions,
+            selected_logprobs=selected_logprobs,
+            top_n_logprobs=top_n_logprobs,
+            top_n_token_ids=top_n_token_ids,
+            publish_unregistered=True,
+        )
+        # This synchronous path does not cross a lifecycle mutation, so the
+        # validated destination is still current even when no hash was supplied.
+        self.block_prompt_logprobs[block_id] = entry
+        return entry
+
+    def reserve_prompt_logprobs(
+        self,
+        logical_block_index: int,
+        block_id: int,
+        key: PromptLogprobsKey,
+        expected_block_hash: Optional[int] = None,
+        block: Optional[PromptLogprobsBlock] = None,
+        expected_predecessor: Optional[PromptLogprobsReservation] = None,
+    ) -> PromptLogprobsReservation:
+        """Capture a sidecar destination without allocating, publishing, or pinning it."""
         logical_block_index = int(logical_block_index)
         if logical_block_index < 0:
             raise ValueError("logical_block_index must be non-negative")
         block_id = self._validate_prompt_logprobs_block_id(block_id)
         self._validate_prompt_logprobs_hash(block_id, expected_block_hash)
+        current = self.block_prompt_logprobs.get(block_id)
+        if expected_predecessor is not None and (
+            expected_predecessor.block_id != block_id
+            or expected_predecessor.expected_mapping is not current
+        ):
+            raise ValueError("prompt-logprob predecessor does not share the reserved identity")
         if block is not None:
             if block.block_id != block_id or not block.matches(logical_block_index, key):
-                raise ValueError("prompt-logprob block reference does not match the store target")
+                raise ValueError("prompt-logprob block reference does not match the reserve target")
             entry = block
+        elif current is not None and current.matches(logical_block_index, key):
+            entry = current
         else:
-            entry = self.block_prompt_logprobs.get(block_id)
-        if entry is None or not entry.matches(logical_block_index, key):
-            entry = PromptLogprobsBlock(
-                self.context.block_size_tokens, logical_block_index, key, block_id
-            )
+            entry = None
+        return PromptLogprobsReservation(
+            logical_block_index=logical_block_index,
+            block_id=block_id,
+            key=key,
+            expected_mapping=current,
+            expected_block_hash=expected_block_hash,
+            expected_predecessor=expected_predecessor,
+            block=entry,
+        )
 
-        self.block_prompt_logprobs[block_id] = entry
+    def fill_prompt_logprobs_reservation(
+        self,
+        reservation: PromptLogprobsReservation,
+        target_positions: np.ndarray,
+        selected_logprobs: np.ndarray,
+        top_n_logprobs: Optional[np.ndarray] = None,
+        top_n_token_ids: Optional[np.ndarray] = None,
+        *,
+        publish_unregistered: bool = False,
+    ) -> PromptLogprobsBlock:
+        """Fill a reserved sidecar and publish it only if its captured identity is still live."""
+        entry = reservation.block
+        if entry is None:
+            entry = PromptLogprobsBlock(
+                self.context.block_size_tokens,
+                reservation.logical_block_index,
+                reservation.key,
+                reservation.block_id,
+            )
+            reservation.block = entry
         entry.store(target_positions, selected_logprobs, top_n_logprobs, top_n_token_ids)
+
+        return self.publish_prompt_logprobs_reservation(
+            reservation, publish_unregistered=publish_unregistered
+        )
+
+    def publish_prompt_logprobs_reservation(
+        self, reservation: PromptLogprobsReservation, *, publish_unregistered: bool = False
+    ) -> PromptLogprobsBlock:
+        """Publish a filled or retained sidecar if its reserved KV identity is still live."""
+        entry = reservation.block
+        if entry is None:
+            raise RuntimeError("cannot publish an unmaterialized prompt-logprob reservation")
+
+        actual_hash = (
+            int(self.block_hashes[reservation.block_id]) if self.enable_prefix_caching else -1
+        )
+        hash_matches = reservation.expected_block_hash is not None and actual_hash == int(
+            reservation.expected_block_hash
+        )
+        if publish_unregistered and actual_hash == -1:
+            hash_matches = True
+        current = self.block_prompt_logprobs.get(reservation.block_id)
+        predecessor_mapping = (
+            reservation.expected_predecessor.block
+            if reservation.expected_predecessor is not None
+            else None
+        )
+        mapping_matches = (
+            current is reservation.expected_mapping
+            or current is entry
+            or (predecessor_mapping is not None and current is predecessor_mapping)
+        )
+        if hash_matches and mapping_matches:
+            self.block_prompt_logprobs[reservation.block_id] = entry
         return entry
 
     def get_prompt_logprobs_block(
