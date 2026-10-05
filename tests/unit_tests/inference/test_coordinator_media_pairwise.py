@@ -266,9 +266,7 @@ async def test_routed_media_affinity_uses_real_cached_embeddings(
             )
             assert repeat_route[1] == expected_repeat_owner
             assert different_route[1] == text_route[1]
-            route_info = [
-                (rid, coordinator.identity_to_rank_index[owner]) for rid, owner in routes
-            ]
+            route_info = [(rid, coordinator.identity_to_rank_index[owner]) for rid, owner in routes]
         await h.barrier()
         route_payload = [route_info if h.rank == 0 else None]
         torch.distributed.broadcast_object_list(route_payload, src=0)

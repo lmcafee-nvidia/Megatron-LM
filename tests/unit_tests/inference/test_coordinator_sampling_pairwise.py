@@ -190,17 +190,14 @@ async def test_routed_bos_stop_after_metadata_compaction(monkeypatch, keep, skip
         )
         first, other, last = (result["request_id"] for result in (short, filler, target))
         assert owners[first] == owners[last] != owners[other]
-        assert target["status"] == "COMPLETED" and deserialize_tensor(
-            target["prompt_tokens"][1]
-        ).tolist() == [3, 4, 5]
+        assert target["status"] == "COMPLETED"
+        assert deserialize_tensor(target["prompt_tokens"][1]).tolist() == [3, 4, 5]
         assert target["generated_tokens"] == direct["generated_tokens"][:2] * keep
         for key in ("generated_log_probs", "generated_top_n_logprobs"):
             assert len(target[key]) == 2 * keep
         assert target["generated_log_probs"] == [
             scores[str(token)]
-            for token, scores in zip(
-                target["generated_tokens"], target["generated_top_n_logprobs"]
-            )
+            for token, scores in zip(target["generated_tokens"], target["generated_top_n_logprobs"])
         ]
         for key in ("prompt_log_probs", "prompt_top_n_logprobs"):
             assert target[key] == direct[key]
