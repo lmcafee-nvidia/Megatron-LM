@@ -206,7 +206,7 @@ async def test_routed_media_affinity_uses_real_cached_embeddings(
             future = h.engine.add_request(10001, prompt, copy.deepcopy(params), **media)
             while h.engine.has_unfinished_requests():
                 await h.engine.async_step()
-            references.append(list((await future).merge().generated_tokens))
+            references.append(list((await future).generated_tokens))
             h.engine.reset()
         admissions.clear()
         await h.start()

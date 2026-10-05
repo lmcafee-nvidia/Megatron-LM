@@ -2,6 +2,7 @@
 
 """MCore adapter and optimizer integration tests for experimental MFSDP v2."""
 
+import contextlib
 import logging
 import os
 from dataclasses import replace
@@ -10,6 +11,7 @@ import pytest
 import torch
 from torch.distributed.distributed_c10d import _world
 from torch.distributed.tensor import DTensor, Replicate, Shard
+from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
 import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
 from megatron.core.distributed import DistributedDataParallelConfig
@@ -74,6 +76,52 @@ class TestMcoreAdapterDense:
 
     def teardown_method(self):
         _destroy_model_parallel()
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(
+        torch.cuda.get_device_capability()[0] < 10,
+        reason="MXFP8 requires Blackwell-or-newer CUDA hardware.",
+    )
+    def test_mxfp8_parameters(self, distributed_setup):
+        """The MCore adapter preserves MXFP8 parameters when FP8 gather is enabled."""
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            ffn_hidden_size=256,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            fp8="hybrid",
+            fp8_recipe="mxfp8",
+            fp8_param=True,
+        )
+
+        block = TransformerBlock(
+            config=config, spec=get_gpt_layer_with_transformer_engine_spec()
+        ).to(device="cuda", dtype=config.params_dtype)
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+                fp8_param_gather=True,
+            ),
+            module=block,
+            pg_collection=self.pg_collection,
+        )
+        # FSDP installs DTensor shards; check the parameters used for compute.
+        parameters = []
+        for module in model.module.modules():
+            if not isinstance(module, FsdpModule):
+                continue
+            for group in module.parameter_groups:
+                for parameter in group.fsdp_parameters:
+                    parameters.append(parameter.unsharded)
+        assert any(isinstance(p, MXFP8Tensor) for p in parameters)
 
     def test_init_model_with_meta_device_initializes_fsdp_v2_parameters(self):
         """init_model_with_meta_device should materialize FSDP v2 parameters with configured values."""
@@ -350,19 +398,16 @@ class TestMcoreAdapterDense:
         success, _, _ = optimizer.step()
         assert success
 
-    def test_gradient_clipping_reaches_global_norm(self):
-        """MFSDP v2 reports the true global gradient norm and clips the update to it.
+    @pytest.mark.parametrize("use_precision_aware_optimizer", [False, True])
+    def test_gradient_clipping_reaches_global_norm(self, use_precision_aware_optimizer):
+        """MFSDP v2 reports the true global gradient norm and clips the gradients to it.
 
-        Clipping is measured through the optimizer update rather than through
-        parameter.grad after the step. _copy_model_grads_to_main_grads installs a
-        dtype-cast copy of each gradient, clip_grad_norm scales that copy, and
-        step_with_ready_grads restores the original afterwards, so the post-step
-        gradient is unclipped by design. Plain SGD at lr=1.0 makes the weight delta
-        exactly the gradient the optimizer stepped with, which keeps this test on the
-        default FP32-main-weight / BF16-gradient configuration.
+        Main gradients are kept in the main-weight dtype so that clipping is measurable on
+        parameter.grad: _copy_model_grads_to_main_grads otherwise installs a dtype-cast copy
+        for non-precision-aware optimizers, clip_grad_norm scales that copy, and
+        step_with_ready_grads restores the original afterwards.
         """
         clip_grad = 1.0
-        learning_rate = 1.0
         config = TransformerConfig(
             num_layers=2,
             hidden_size=16,
@@ -380,19 +425,21 @@ class TestMcoreAdapterDense:
                 megatron_fsdp_version=2,
                 use_distributed_optimizer=False,
                 data_parallel_sharding_strategy="optim_grads_params",
+                megatron_fsdp_main_grads_dtype=torch.float32,
             ),
             module=_build_block(config),
             pg_collection=self.pg_collection,
         )
         optimizer = get_megatron_optimizer(
             OptimizerConfig(
-                optimizer="sgd",
-                lr=learning_rate,
+                optimizer="adam",
+                lr=1.0e-3,
                 weight_decay=0.0,
                 bf16=True,
                 params_dtype=torch.bfloat16,
                 use_distributed_optimizer=False,
                 clip_grad=clip_grad,
+                use_precision_aware_optimizer=use_precision_aware_optimizer,
             ),
             [model],
         )
@@ -421,20 +468,17 @@ class TestMcoreAdapterDense:
         ]
         assert all(isinstance(parameter.grad, DTensor) for parameter in parameters)
         expected_pre_clip_norm = global_norm([p.grad.to_local() for p in parameters])
-        weights_before = [p.data.to_local().float().clone() for p in parameters]
-
-        success, pre_clip_norm, _ = optimizer.step()
-        updates = [
-            before - parameter.data.to_local().float()
-            for parameter, before in zip(parameters, weights_before)
-        ]
-
-        assert success
-        torch.testing.assert_close(pre_clip_norm.item(), expected_pre_clip_norm)
         assert (
             expected_pre_clip_norm > clip_grad
         ), "Test gradients must exceed the clipping threshold to exercise clipping."
-        torch.testing.assert_close(global_norm(updates), clip_grad, rtol=1e-3, atol=0)
+
+        success, pre_clip_norm, _ = optimizer.step()
+
+        assert success
+        torch.testing.assert_close(pre_clip_norm.item(), expected_pre_clip_norm)
+        torch.testing.assert_close(
+            global_norm([p.grad.to_local() for p in parameters]), clip_grad, rtol=1e-3, atol=0
+        )
 
 
 class TestMcoreAdapterCudaGraph:
@@ -569,7 +613,7 @@ class TestMcoreAdapterCudaGraph:
         cuda_graph_forward_backward = FullCudaGraphWrapper(
             forward_backward, cuda_graph_warmup_steps=1
         )
-        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
+        with torch.profiler.profile() as prof:
             graph_losses = run(graph_model, graph_optimizer, cuda_graph_forward_backward)
 
         graph_launches = sum(event.name == "cudaGraphLaunch" for event in prof.events())
@@ -582,6 +626,12 @@ class TestMcoreAdapterCudaGraph:
                 assert state["exp_avg"].dtype == torch.bfloat16
                 assert state["exp_avg_sq"].dtype == torch.bfloat16
         torch.testing.assert_close(graph_losses, eager_losses, rtol=1e-3, atol=0)
+
+        # The optimizer holds the wrapper as its step attribute. The wrapper saves
+        # the original step method, which keeps a reference to the optimizer it
+        # operates on. Remove the wrapper to break this cycle so the optimizer's
+        # GPU memory can be released when the test returns.
+        del graph_optimizer.step
 
 
 class TestMcoreAdapterExpertParallel:
@@ -776,8 +826,12 @@ class TestMcoreAdapterHybrid:
         )
 
     @staticmethod
-    def _train(config, instances, outer_strategy, steps=3):
+    def _train(config, instances, outer_strategy, steps=3, microbatches=1):
         """Train over the already-initialized DP topology and return per-step losses.
+
+        With ``microbatches`` > 1 each step accumulates gradients, and every microbatch
+        but the last runs inside ``no_sync`` -- which is how MCore's schedules tell a
+        data-parallel wrapper which backward finalizes gradients.
 
         ``instances`` must match what initialize_model_parallel was given: it selects the
         adapter's mesh, while the process groups it maps onto come from the caller.
@@ -812,16 +866,29 @@ class TestMcoreAdapterHybrid:
         losses = []
         for step in range(steps):
             optimizer.zero_grad(set_to_none=True)
-            # Rank-dependent but step-deterministic input, so every configuration
-            # sees the same global batch however the domain is split.
-            hidden = torch.arange(
-                1, config.hidden_size + 1, device="cuda", dtype=torch.bfloat16
-            ).view(1, 1, -1).expand(8, 2, -1) * (torch.distributed.get_rank() + 1 + step)
-            loss = model(hidden_states=hidden, attention_mask=None).float().square().mean()
-            loss.backward()
+            step_losses = []
+            for index in range(microbatches):
+                # Only the last microbatch finalizes gradients, so it runs outside no_sync.
+                sync_context = (
+                    contextlib.nullcontext() if index == microbatches - 1 else model.no_sync()
+                )
+                with sync_context:
+                    # Rank-dependent but step-deterministic input, so every configuration
+                    # sees the same global batch however the domain is split. Microbatches
+                    # differ so that dropping any of them changes the result.
+                    hidden = torch.arange(
+                        1, config.hidden_size + 1, device="cuda", dtype=torch.bfloat16
+                    ).view(1, 1, -1).expand(8, 2, -1) * (
+                        torch.distributed.get_rank() + 1 + step + index
+                    )
+                    loss = model(hidden_states=hidden, attention_mask=None).float().square().mean()
+                    loss.backward()
+                step_losses.append(loss.detach())
             success, _, _ = optimizer.step()
             assert success
-            losses.append(loss.detach())
+            # No update happens until optimizer.step(), so every microbatch in a step sees
+            # the same parameters; averaging them matches what train_step reports.
+            losses.append(torch.stack(step_losses).float().mean())
         return torch.stack(losses)
 
     @pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"], ids=["hsdp", "hfsdp"])
@@ -860,6 +927,26 @@ class TestMcoreAdapterHybrid:
             assert parameter.grad.placements == (expected_outer, Shard(0))
 
     @pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"], ids=["hsdp", "hfsdp"])
+    def test_hybrid_matches_single_instance_accumulating(self, outer_strategy):
+        """Splitting the DP domain must not change the math under gradient accumulation.
+
+        HSDP/HFSDP keep the DP-outer axis Partial between microbatches and reduce it on
+        the last backward, so the adapter has to mark the earlier ones through no_sync.
+        When it does not, every backward finalizes that axis and the accumulation buffer
+        is dropped, leaving only the last microbatch's gradient: the losses then drift
+        away from the single-instance reference within a couple of steps.
+        """
+        config = self._config()
+        Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=1)
+        reference = self._train(config, instances=1, outer_strategy="no_shard", microbatches=2)
+        _destroy_model_parallel()
+
+        Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=2)
+        hybrid = self._train(config, instances=2, outer_strategy=outer_strategy, microbatches=2)
+        assert torch.isfinite(reference).all()
+        torch.testing.assert_close(hybrid, reference, rtol=1e-2, atol=0)
+
+    @pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"], ids=["hsdp", "hfsdp"])
     def test_hybrid_matches_single_instance(self, outer_strategy):
         """Splitting the DP domain must not change the math: same losses as one instance."""
         config = self._config()
@@ -874,12 +961,12 @@ class TestMcoreAdapterHybrid:
         assert torch.isfinite(reference).all()
         torch.testing.assert_close(hybrid, reference, rtol=1e-2, atol=0)
 
-    def test_moe_with_hybrid_dense(self):
-        """Dense parameters go hybrid; experts stay ZeRO-3 over the whole expert-DP domain.
-
-        This is the intended MoE configuration: ZeRO-3 + EP for the large expert weights,
-        and hybrid sharding for the dense ones. The two must end up on different meshes.
-        """
+    @pytest.mark.parametrize("dense_outer_strategy", ["optim", "no_shard"])
+    @pytest.mark.parametrize("expert_outer_strategy", ["optim", "no_shard"])
+    def test_moe_with_independent_hybrid_placements(
+        self, dense_outer_strategy, expert_outer_strategy
+    ):
+        """Dense and expert parameters use different placements on the same hybrid mesh."""
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
         if world_size < 4 or world_size % 4:
             pytest.skip("MoE + hybrid needs a world size divisible by four (EP=2, instances=2).")
@@ -917,7 +1004,8 @@ class TestMcoreAdapterHybrid:
                 use_distributed_optimizer=False,
                 data_parallel_sharding_strategy="optim_grads_params",
                 num_distributed_optimizer_instances=2,
-                outer_dp_sharding_strategy="optim",
+                outer_dp_sharding_strategy=dense_outer_strategy,
+                expert_outer_dp_sharding_strategy=expert_outer_strategy,
             ),
             module=HybridModel(
                 config=config,
@@ -948,12 +1036,27 @@ class TestMcoreAdapterHybrid:
         success, _, _ = optimizer.step()
         assert success
 
-        meshes = {
+        mesh_dim_names = {
             parameter.grad.device_mesh.mesh_dim_names
             for parameter in model.parameters()
             if parameter.grad is not None
         }
-        assert ("dp_outer", "dp_shard") in meshes, f"no hybrid dense mesh in {meshes}"
-        assert ("expert_dp",) in meshes, f"no expert mesh in {meshes}"
-        # Experts must not have acquired an outer axis.
-        assert meshes == {("dp_outer", "dp_shard"), ("expert_dp",)}, meshes
+        assert mesh_dim_names == {("dp_outer", "dp_shard")}
+
+        dense_parameters = []
+        expert_parameters = []
+        for name, parameter in model.named_parameters():
+            if parameter.grad is None:
+                continue
+            # In this model, expert weights live under mlp.experts; router weights are dense.
+            if "experts" in name:
+                expert_parameters.append((name, parameter))
+            else:
+                dense_parameters.append((name, parameter))
+        dense_outer = Replicate() if dense_outer_strategy == "no_shard" else Shard(0)
+        for name, parameter in dense_parameters:
+            assert parameter.grad.placements == (dense_outer, Shard(0)), name
+
+        expert_outer = Replicate() if expert_outer_strategy == "no_shard" else Shard(0)
+        for name, parameter in expert_parameters:
+            assert parameter.grad.placements == (expert_outer, Shard(0)), name
