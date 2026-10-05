@@ -215,8 +215,8 @@ async def test_routed_media_affinity_uses_real_cached_embeddings(
         assert local_ids == [(0, 0), (1, 0)]
         assert outputs[1]["generated_tokens"] == references[0]
         cache_before = {
-            key: embedding.detach().cpu().clone()
-            for key, embedding in h.engine._vision_embedding_cache.items()
+            key: entry.embedding.detach().cpu().clone()
+            for key, entry in h.engine._vision_embedding_cache.items()
         }
         assert set(cache_before) == {row[2] for row in admissions}
         await h.pause()
@@ -227,7 +227,7 @@ async def test_routed_media_affinity_uses_real_cached_embeddings(
         if allow_stale:
             assert set(h.engine._vision_embedding_cache) == set(cache_before)
             assert all(
-                torch.equal(h.engine._vision_embedding_cache[key].cpu(), value)
+                torch.equal(h.engine._vision_embedding_cache[key].embedding.cpu(), value)
                 for key, value in cache_before.items()
             )
         else:
