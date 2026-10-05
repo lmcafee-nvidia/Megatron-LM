@@ -335,7 +335,7 @@ def multimem_reduce_scatter_v(
 
     reduce_f32 = output_tensor.dtype == torch.float32
     _multimem_reduce_scatter_v_kernel[(num_blocks, 1, 1)](
-        output_tensor.data_ptr(),
+        output_tensor,
         symm_mem_hdl.multicast_ptr,
         symm_mem_hdl.signal_pad_ptrs_dev,
         local_tokens=local_tokens,
@@ -745,13 +745,13 @@ def multimem_all_gatherv_3tensor(
     num_blocks = min(per_rank_max_tokens, MAX_NUM_BLOCKS)
 
     _multimem_all_gatherv_3tensor_kernel[(num_blocks, 1, 1)](
-        input_tensor_0.data_ptr(),
+        input_tensor_0,
         symm_mem_hdl_0.multicast_ptr,
         output_byte_offset_0,
-        input_tensor_1.data_ptr(),
+        input_tensor_1,
         symm_mem_hdl_1.multicast_ptr,
         output_byte_offset_1,
-        input_tensor_2.data_ptr(),
+        input_tensor_2,
         symm_mem_hdl_2.multicast_ptr,
         output_byte_offset_2,
         symm_mem_hdl_0.signal_pad_ptrs_dev,
