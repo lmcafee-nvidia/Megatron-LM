@@ -87,7 +87,7 @@ async def test_routed_native_model_modes_match_direct(monkeypatch, mode):
             else dict(fp4="e2m1", fp4_recipe="nvfp4")
         )
         # Both direct and routed GEMMs consume the same 128-row physical batch.
-        for name in ("ROUNDER", "TOKEN_ROUNDER", "REQUEST_ROUNDER"):
+        for name in ("TOKEN_ROUNDER", "REQUEST_ROUNDER"):
             monkeypatch.setattr(engines.DynamicInferenceContext, name, 128)
         monkeypatch.setattr(engines, "set_rounder", lambda _: None)
     monkeypatch.setattr(engines, "TransformerConfig", lambda **kw: constructor(**(kw | overrides)))
