@@ -1544,7 +1544,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._discard_prompt_logprob_state(self.requests[req_id])
 
             # Reset the chunked prefill request id
-            self.context.chunked_prefill_request_id = -1
+            self.chunked_prefill_request_id = -1
         else:
             recompute_resident_ids = []
         self.resume_request_ids = [*recompute_resident_ids, *waiting_request_ids]
