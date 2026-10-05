@@ -77,8 +77,8 @@ def handle_connect(coordinator, sender_identity, metadata, bodies):
         return
 
     coordinator.known_clients.add(sender_identity)
-    coordinator._send_to_client(
-        sender_identity, [msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)]
+    coordinator.router_socket.send_multipart(
+        [sender_identity, msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)]
     )
 
 
@@ -418,7 +418,7 @@ def handle_engine_reply(coordinator, sender_identity, metadata, bodies):
         reply_metadata = msgpack.packb(
             [Headers.ENGINE_REPLY.value, client_request_id], use_bin_type=True
         )
-        coordinator._send_to_client(client_identity, [reply_metadata, body])
+        coordinator.router_socket.send_multipart([client_identity, reply_metadata, body])
 
 
 @message_handler(Headers.ENGINE_REPLY_PARTIAL)
@@ -445,14 +445,14 @@ def handle_engine_reply_partial(coordinator, sender_identity, metadata, bodies):
         client_request_id = coordinator.request_id_to_client_request_id[request_id]
         # Partial tokens are detokenized incrementally by the client-facing
         # streaming layer, so the body is always forwarded untouched.
-        coordinator._send_to_client(
-            client_identity,
+        coordinator.router_socket.send_multipart(
             [
+                client_identity,
                 msgpack.packb(
                     [Headers.ENGINE_REPLY_PARTIAL.value, client_request_id], use_bin_type=True
                 ),
                 body,
-            ],
+            ]
         )
 
 
