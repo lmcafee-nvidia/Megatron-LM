@@ -157,7 +157,7 @@ async def _run_coordinator_handoff(
 
             original_capture = engine._capture_handoff_meta
             original_finalize = engine._finalize_kv_handoff_import
-            original_reply = engine._send_request_records_to_coordinator
+            original_reply = engine._send_requests_to_coordinator
             original_submit = engine.add_request_with_kv_handoff
 
             def capture_submission(request_id, *args):
@@ -191,10 +191,10 @@ async def _run_coordinator_handoff(
                 }
                 original_finalize(pending)
 
-            def capture_reply(records):
+            def capture_reply(requests):
                 if role == "decode":
-                    local["terminal"].extend(record.merge().serialize() for record in records)
-                original_reply(records)
+                    local["terminal"].extend(request.serialize() for request in requests)
+                original_reply(requests)
 
             with (
                 RequestForwardWitness(
@@ -205,7 +205,7 @@ async def _run_coordinator_handoff(
                     engine, "_finalize_kv_handoff_import", side_effect=capture_import
                 ),
                 mock.patch.object(
-                    engine, "_send_request_records_to_coordinator", side_effect=capture_reply
+                    engine, "_send_requests_to_coordinator", side_effect=capture_reply
                 ),
                 mock.patch.object(
                     engine, "add_request_with_kv_handoff", side_effect=capture_submission
