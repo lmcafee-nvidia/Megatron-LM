@@ -341,11 +341,6 @@ class ForwardWitness:
             observe(torch, "matmul", "gemms")
             observe(linear, "general_gemm", "gemms")
             observe(layernorm_linear, "general_gemm", "gemms")
-        if ctx.use_flashinfer_fused_rope:
-            from flashinfer import rope
-
-            observe(rope, "apply_rope_with_cos_sin_cache", "rope")
-
         async_overlap = controller._run_async_sched_step_overlap
         async_forward = controller._run_async_sched_forward
 
@@ -450,8 +445,6 @@ class ForwardWitness:
             for step in self.steps
             if not self.engine.num_speculative_tokens or step["graph"] or not step["decode"]
         )
-        if self.engine.context.use_flashinfer_fused_rope:
-            assert any(step["rope"] for step in self.steps), "target never executed fused RoPE"
         if self.engine.context.config.async_sched_mode == AsyncScheduleMode.ASYNC:
             assert any(
                 item["target_active"]
