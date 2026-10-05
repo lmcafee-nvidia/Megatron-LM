@@ -499,10 +499,10 @@ class MultiLatentAttention(Attention):
                     cu_kv_lengths,
                     kv_lengths,
                     block_table,
-                    self._use_mla_absorption(inference_context),
+                    inference_context.is_decode_only(),
                 )
                 # Only rearrange if not in absorption mode (Flash MLA handles format correctly)
-                if not self._use_mla_absorption(inference_context):
+                if not inference_context.is_decode_only():
                     core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
                 needs_output_trim = need_v_pad
             forced = [
@@ -515,7 +515,7 @@ class MultiLatentAttention(Attention):
             )
 
         # We are doing absorption with cache mla latents and decode mode.
-        if self._use_mla_absorption(inference_context):
+        if self.cache_mla_latents and inference_context.is_decode_only():
             # core_attn_out = self.self.up_v_layer(core_attn_out)
             core_attn_out = torch.einsum("sbhc,hdc->sbhd", core_attn_out, self.up_v_weight)
             core_attn_out = core_attn_out.contiguous()
@@ -915,7 +915,11 @@ class MLASelfAttention(MultiLatentAttention):
 
             # Flag for whether to use absorption. We only use absorption
             # when caching the latents and in decode-only mode
-            use_absorption = self._use_mla_absorption(inference_context)
+            use_absorption = (
+                self.config.cache_mla_latents
+                and inference_context
+                and inference_context.is_decode_only()
+            )
             # Compute query components. Multiply by up k if absorbing
             q_content = (
                 torch.einsum("sbhd,hdk->sbhk", q_no_pe, self.up_k_weight)
