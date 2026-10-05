@@ -409,7 +409,7 @@ async def test_small_neox_rope_matches_complex_rotation(mocker, head, rotary, in
     query[:, :, 1].add_(0.5)
     changed, _ = apply(context, query, key, cache, config)
     assert torch.equal(changed[:, :, 0], outputs[0][:, :, 0])
-    assert native.call_count == (0 if head == 16 and not interleaved else 2)
+    assert native.call_count == 2  # Native-only validation control, including D16 NeoX.
 
 
 async def test_routed_d16_neox_rope_preserves_model_output(monkeypatch):
