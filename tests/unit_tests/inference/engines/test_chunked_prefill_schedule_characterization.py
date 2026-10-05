@@ -256,6 +256,26 @@ class TestChunkedPrefillScheduleCharacterization(PrefixCachingTestBase):
         assert (admitted["finished"], admitted["remaining"]) == (13, 7)
         assert (admitted["cache_hits"], admitted["skipped"]) == (1, 8)
 
+    def test_hash_conflict_yields_to_a_chunked_queue_head(self):
+        context = self._context(max_tokens=20, max_requests=3, prefix=True)
+        engine = self._engine(context)
+        first = self._request(context, 1, 8)
+        conflict = self._request(context, 2, 8)
+        chunked = self._request(context, 3, 16, offset=1000)
+        for request in (first, conflict, chunked):
+            self._queue(engine, request)
+
+        engine.schedule_chunked_prefill()
+        state = self._state(engine, chunked)
+        assert state["queue"] == [3, 2] and state["chunked_id"] == 3
+        assert state["active_ids"] == [1, 3] and state["query_lengths"] == [8, 12]
+        assert state["kv_offsets"] == [0, 0] and state["active_tokens"] == 20
+        assert (state["finished"], state["remaining"]) == (12, 4)
+        assert engine.get_prefix_coordination_metrics() == {"waits": 1}
+        assert (
+            conflict.finished_chunk_token_count == 0 and len(conflict.remaining_prompt_tokens) == 8
+        )
+
     def test_first_chunk_snaps_to_cuda_graph_boundary(self):
         context = self._context(max_tokens=10, prefix=False)
         engine = self._engine(context)
