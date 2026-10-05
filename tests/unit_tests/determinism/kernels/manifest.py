@@ -153,7 +153,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/transformer/attention.py",),
         tests=(
             K + "test_fused_activations.py",
-            K + "test_runtime_cp_attention.py"
+            K + "test_runtime_cp_attention.py",
             "tests/unit_tests/inference/engines/test_batch_invariant_pairwise.py",
         ),
         kind="dispatch",
@@ -642,7 +642,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(
             K + "test_fused_triton_kernels.py",
-            K + "test_te_wrappers.py"
+            K + "test_te_wrappers.py",
             "tests/unit_tests/inference/engines/test_batch_invariant_pairwise.py",
         ),
         kind="dispatch",
