@@ -8,10 +8,7 @@ CUBLASLT_WORKSPACE_SIZE=0; missing required capabilities must fail, not skip.
 
 import pytest
 
-from megatron.core.inference.config import (
-    AsyncScheduleMode,
-    CudaGraphSizingDistribution,
-)
+from megatron.core.inference.config import AsyncScheduleMode, CudaGraphSizingDistribution
 from tests.unit_tests.inference.engines.batch_invariant_test_utils import (
     Case,
     assert_same_target,
@@ -23,20 +20,13 @@ DENSE_CASES = [
     Case("dense"),
     Case("async", context={"async_sched_mode": AsyncScheduleMode.ASYNC}),
     Case("local", model={"transformer_impl": "local"}),
-    Case(
-        "optimized",
-        model={"transformer_impl": "inference_optimized", "add_bias_linear": False},
-    ),
+    Case("optimized", model={"transformer_impl": "inference_optimized", "add_bias_linear": False}),
     Case(
         "last-logits",
         context={"materialize_only_last_token_logits": True},
         sampling={"return_log_probs": False},
     ),
-    Case(
-        "chunked",
-        context={"enable_chunked_prefill": True, "max_tokens": 128},
-        prompt_length=273,
-    ),
+    Case("chunked", context={"enable_chunked_prefill": True, "max_tokens": 128}, prompt_length=273),
     Case(
         "chunked-async",
         context={
@@ -95,9 +85,7 @@ def test_dense_dynamic_feature_batch_invariance(case):
         # Witness target movement and changed decode shape during execution with live neighbors.
         assert any(step["target_row"] > 0 for step in contrasts)
         ref_decode = {s["physical"] for s in reference[1].steps if s["decode"]}
-        wide_decode = {
-            s["physical"] for s in contrasts if s["decode"] and s["requests"] > 64
-        }
+        wide_decode = {s["physical"] for s in contrasts if s["decode"] and s["requests"] > 64}
         assert ref_decode == {64}, ref_decode
         assert 128 in wide_decode, wide_decode
         assert any(
@@ -109,24 +97,12 @@ def test_dense_dynamic_feature_batch_invariance(case):
         )
         if case.prompt_length == 17:
             assert any(not s["decode"] and s["physical"] == 128 for s in contrasts)
-        print(
-            "BI_WITNESS",
-            case.name,
-            backend,
-            version,
-            "decode_shapes",
-            ref_decode,
-            wide_decode,
-        )
+        print("BI_WITNESS", case.name, backend, version, "decode_shapes", ref_decode, wide_decode)
 
 
 @pytest.mark.parametrize(
     "case",
-    [
-        Case("tp2-sp", tp=2, sp=True),
-        Case("pp2", pp=2),
-        Case("tp2-pp2-sp", tp=2, pp=2, sp=True),
-    ],
+    [Case("tp2-sp", tp=2, sp=True), Case("pp2", pp=2), Case("tp2-pp2-sp", tp=2, pp=2, sp=True)],
     ids=lambda case: case.name,
 )
 def test_parallel_batch_invariance(case):
@@ -135,6 +111,5 @@ def test_parallel_batch_invariance(case):
         actual = run_order(case, backend, version, "back")
         assert_same_target(reference, actual)
         assert any(
-            s["decode"] and s["physical"] == 128 and s["requests"] == 65
-            for s in actual[1].steps
+            s["decode"] and s["physical"] == 128 and s["requests"] == 65 for s in actual[1].steps
         )
