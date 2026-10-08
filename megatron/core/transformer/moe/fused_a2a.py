@@ -3,7 +3,8 @@
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
 
-from typing import Optional
+import inspect
+from typing import Callable, Optional
 
 from megatron.core.utils import internal_api
 
@@ -267,12 +268,29 @@ else:
     set_deepep_num_sms = None
 
 
+def _has_parameter(function: Callable, parameter: str) -> bool:
+    """Return whether a callable exposes a named parameter."""
+    try:
+        return parameter in inspect.signature(function).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 try:
     from deep_ep import HybridEPBuffer
 
     HAVE_HYBRIDEP = True
+    # HybridEP accepts dense [num_tokens, topk] expert ids (topk_idx) when its config carries a
+    # topk field; older builds only take the bool [num_tokens, num_experts] routing map.
+    try:
+        import hybrid_ep_cpp
+
+        HAVE_HYBRIDEP_DENSE_ROUTING = hasattr(hybrid_ep_cpp.HybridEpConfigInstance(), "topk")
+    except (ImportError, AttributeError, TypeError, ValueError):
+        HAVE_HYBRIDEP_DENSE_ROUTING = False
 except ImportError:
     HAVE_HYBRIDEP = False
+    HAVE_HYBRIDEP_DENSE_ROUTING = False
 
 _hybrid_ep_buffer = None
 
@@ -375,16 +393,16 @@ class HybridEPDispatch(torch.autograd.Function):
         num_permuted_tokens=None,
         pad_multiple=None,
         num_sms_preprocessing_api=108,
+        topk_idx=None,
+        num_of_experts=None,
     ):
         '''
         Forward pass of fused dispatch of the HybridEP backend
         '''
         if fused or num_blocks_permute is not None or num_blocks_unpermute is not None:
-            import inspect
             import warnings
 
-            sig = inspect.signature(HybridEPBuffer.dispatch_with_permute)
-            if 'fuse_permute_dispatch' not in sig.parameters:
+            if not _has_parameter(HybridEPBuffer.dispatch_with_permute, 'fuse_permute_dispatch'):
                 warnings.warn(
                     "Current DeepEP version does not support fused permute dispatch or "
                     "num_blocks_permute/num_blocks_unpermute. Falling back to unfused "
@@ -414,7 +432,16 @@ class HybridEPDispatch(torch.autograd.Function):
         # If we provide the num_permuted_tokens, we do not need to use sync to
         # wait for the data in pinned memory ready
         non_blocking = num_permuted_tokens is not None
-        # Process the dispatch
+        use_dense = topk_idx is not None and HAVE_HYBRIDEP_DENSE_ROUTING
+        if use_dense:
+            assert num_of_experts is not None, "num_of_experts is required for dense routing"
+            dispatch_kwargs = {"topk_idx": topk_idx, "num_of_experts": num_of_experts}
+        else:
+            assert (
+                routing_map is not None
+            ), "routing_map is required when dense HybridEP routing is unavailable"
+            dispatch_kwargs = {"routing_map": routing_map}
+
         (
             dispatched_hidden,
             dispatched_probs,
@@ -423,7 +450,6 @@ class HybridEPDispatch(torch.autograd.Function):
             handle,
         ) = _hybrid_ep_buffer.dispatch_with_permute(
             hidden=x,
-            routing_map=routing_map,
             probs=probs,
             scaling_factor=None,
             num_of_experts_per_rank=num_local_experts,
@@ -431,6 +457,7 @@ class HybridEPDispatch(torch.autograd.Function):
             num_permuted_tokens=num_permuted_tokens,
             non_blocking=non_blocking,
             **({"fuse_permute_dispatch": fused} if fused else {}),
+            **dispatch_kwargs,
         )
 
         ctx.handle = handle
@@ -461,6 +488,8 @@ class HybridEPDispatch(torch.autograd.Function):
             combined_hidden,
             None,
             combined_probs,
+            None,
+            None,
             None,
             None,
             None,
@@ -531,6 +560,8 @@ if HAVE_HYBRIDEP:
         num_permuted_tokens=None,
         pad_multiple=None,
         num_sms_preprocessing_api=108,
+        topk_idx=None,
+        num_of_experts=None,
     ):
         '''
         Perform fused dispatch for "permute + dispatch a2a + permute" using the
@@ -564,6 +595,10 @@ if HAVE_HYBRIDEP:
                 is performed.
             num_sms_preprocessing_api (int):
                 Number of SMs used by the preprocessing (metadata scan) kernel.
+            topk_idx (torch.Tensor, optional):
+                Dense top-k expert indices with shape [num_tokens, topk].
+            num_of_experts (int, optional):
+                Total number of experts. Required when topk_idx is provided.
         '''
         return HybridEPDispatch.apply(
             x,
@@ -579,6 +614,8 @@ if HAVE_HYBRIDEP:
             num_permuted_tokens,
             pad_multiple,
             num_sms_preprocessing_api,
+            topk_idx,
+            num_of_experts,
         )
 
     @internal_api
@@ -620,6 +657,7 @@ def ensure_nccl_ep_bootstrapped(
     max_tokens_per_rank,
     recv_capacity_per_rank,
     hidden_dim,
+    num_topk,
     num_sms=0,
     zero_copy=False,
 ):
@@ -635,9 +673,13 @@ def ensure_nccl_ep_bootstrapped(
         num_experts (int): Total experts across ``ep_group`` (global, not per-rank).
         max_tokens_per_rank (int): Upper bound on local input tokens per forward. Must be
             even (NCCL EP requires ``num_tokens_per_rank * inner_dim % 4 == 0``).
-        recv_capacity_per_rank (int): Per-rank receive-buffer capacity in tokens. Must be
-            ``>= max_tokens_per_rank``; runtime overflow hard-traps (no soft drop).
+        recv_capacity_per_rank (int, optional): Per-rank receive-buffer capacity in tokens. Must
+            be ``>= max_tokens_per_rank``. ``None`` selects eager mode, where TE sizes the
+            receive buffer per step from the actual received-token count.
         hidden_dim (int): Token hidden size.
+        num_topk (int): Per-token top-k over ``ep_group``; sizes NCCL EP's internal buffers.
+            This is the same TP-scaled top-k used for the receive-capacity budget, not the
+            raw ``moe_router_topk``.
         num_sms (int): SM cap passed to TE as ``max_num_sms`` (0 lets TE/NCCL choose).
     """
     if not HAVE_TE_EP:
@@ -645,7 +687,7 @@ def ensure_nccl_ep_bootstrapped(
             "transformer_engine.pytorch.ep is unavailable. The 'ncclep' flex dispatcher backend "
             "requires a TransformerEngine build with NCCL EP support (NVTE_BUILD_WITH_NCCL_EP=1)."
         )
-    if te_ep._BOOTSTRAPPED:  # reuse TE's own one-time guard; no parallel state to drift
+    if is_nccl_ep_bootstrapped():  # reuse TE's own one-time guard; no parallel state to drift
         return
     te_ep.ep_bootstrap(
         ep_group,
@@ -653,9 +695,20 @@ def ensure_nccl_ep_bootstrapped(
         max_tokens_per_rank=max_tokens_per_rank,
         recv_capacity_per_rank=recv_capacity_per_rank,
         hidden_dim=hidden_dim,
+        num_topk=num_topk,
         max_num_sms=num_sms,
         zero_copy=zero_copy,
+        drop_on_overflow=recv_capacity_per_rank is not None,
     )
+
+
+def is_nccl_ep_bootstrapped() -> bool:
+    """Whether TE's process-wide NCCL EP context is live. is_ep_bootstrapped is TE 3321."""
+    if not HAVE_TE_EP:
+        return False
+    if hasattr(te_ep, "is_ep_bootstrapped"):
+        return te_ep.is_ep_bootstrapped()
+    return te_ep._BOOTSTRAPPED
 
 
 def nccl_ep_finalize():
@@ -670,6 +723,17 @@ def nccl_ep_finalize():
 
 if HAVE_TE_EP:
 
+    def alloc_ep_symm_buffer(shape, dtype, ep_group):
+        """Allocate one persistent NCCL symm-mem buffer (per-buffer collective rendezvous). mcore's
+        zero-copy buffers are all persistent and non-pool; the symm mem-pool is used only by TE for
+        the per-call recv buffers it recycles."""
+        return te_ep.symm_mem_alloc(shape, dtype, ep_group)
+
+    # Whether this TE build supports quantized EP dispatch/combine payloads.
+    _TE_EP_BUFFER_HAS_QUANT_RECIPE = (
+        "dispatch_fwd_quant_recipe" in inspect.signature(te_ep.EpBuffer).parameters
+    )
+
     def new_nccl_ep_buffer(
         top_k,
         max_tokens_per_rank,
@@ -677,12 +741,31 @@ if HAVE_TE_EP:
         hidden_dim,
         num_local_experts,
         alignment=0,
+        dispatch_fwd_quant_recipe=None,
+        combine_bwd_quant_recipe=None,
     ):
         """Build a fresh TE EpBuffer for one dispatch/combine pair.
 
-        The buffer owns handle_mem (the routing table dispatch writes and combine reads) and
-        the receive buffers; a new one is built per dispatch and dropped after combine.
+        The buffer owns handle_mem (the routing table dispatch writes and combine reads); a new one
+        is built per dispatch and dropped after combine. Payload symm buffers are not owned here —
+        they are caller-supplied to dispatch/combine or allocated on the fly by TE.
+
+        dispatch_fwd_quant_recipe / combine_bwd_quant_recipe (TE Recipe, optional): quantize the
+        dispatch forward payload / combine backward gradient over the wire,
+        the corresponding output is returned as a per-expert GroupedTensor.
         """
+        quant_kwargs = {}
+        if dispatch_fwd_quant_recipe is not None or combine_bwd_quant_recipe is not None:
+            if not _TE_EP_BUFFER_HAS_QUANT_RECIPE:
+                raise RuntimeError(
+                    "Quantized NCCL EP dispatch/combine payloads require a TransformerEngine "
+                    "build with EpBuffer quant-recipe support "
+                    "(dispatch_fwd_quant_recipe / combine_bwd_quant_recipe)."
+                )
+            quant_kwargs = dict(
+                dispatch_fwd_quant_recipe=dispatch_fwd_quant_recipe,
+                combine_bwd_quant_recipe=combine_bwd_quant_recipe,
+            )
         return te_ep.EpBuffer(
             top_k=top_k,
             max_tokens_per_rank=max_tokens_per_rank,
@@ -690,9 +773,12 @@ if HAVE_TE_EP:
             hidden_dim=hidden_dim,
             num_local_experts=num_local_experts,
             alignment=alignment,
+            **quant_kwargs,
         )
 
-    def nccl_ep_dispatch(buffer, tokens, topk_idx, topk_weights):
+    def nccl_ep_dispatch(
+        buffer, tokens, topk_idx, topk_weights, recv_tokens=None, recv_topk_weights=None
+    ):
         """Autograd-aware prepare + dispatch via TransformerEngine NCCL EP.
 
         Args:
@@ -702,41 +788,56 @@ if HAVE_TE_EP:
             topk_idx (torch.Tensor): ``int64`` ``[num_local_tokens, top_k]`` global expert
                 ids per token.
             topk_weights (torch.Tensor): ``float32`` ``[num_local_tokens, top_k]`` weights.
+            recv_tokens, recv_topk_weights (torch.Tensor, optional): caller-owned symm dispatch
+                recv buffers (fp8 zero-copy). Left None, TE allocates them (bf16 zero-copy: symm
+                mem-pool; normal: plain).
 
         Returns:
             tuple: ``(recv_tokens, tokens_per_expert, dispatched_probs)``:
-              * ``recv_tokens``: packed received tokens ``[recv_capacity_per_rank, hidden]``,
-                grouped by local expert (no separate compaction step).
-              * ``tokens_per_expert``: ``int32`` ``[num_local_experts]`` device tensor of
+              * ``recv_tokens``: packed received tokens ``[recv_rows, hidden]``, grouped by local
+                expert (no separate compaction step). ``recv_rows`` is
+                ``recv_capacity_per_rank``, or this step's received-token count in eager mode.
+              * ``tokens_per_expert``: ``int64`` ``[num_local_experts]`` device tensor of
                 received counts per local expert (feeds grouped GEMM as group sizes;
                 alignment-padded, == actual when ``alignment=0``).
-              * ``dispatched_probs``: ``float32`` ``[recv_capacity_per_rank]`` per-slot
+              * ``dispatched_probs``: ``float32`` ``[recv_rows]`` per-slot
                 weights; apply them in the expert MLP (combine is called unweighted).
 
             ``tokens_per_expert`` is non-differentiable.
         """
         recv_tokens, dispatched_probs, tokens_per_expert = te_ep.ep_dispatch(
-            buffer, tokens, topk_idx, topk_weights
+            buffer,
+            tokens,
+            topk_idx,
+            topk_weights,
+            recv_tokens=recv_tokens,
+            recv_topk_weights=recv_topk_weights,
         )
         return recv_tokens, tokens_per_expert, dispatched_probs
 
-    def nccl_ep_combine(buffer, expert_out, num_local_tokens=None):
+    def nccl_ep_combine(buffer, expert_out, num_local_tokens=None, grad_out=None):
         """Autograd-aware combine via TransformerEngine NCCL EP (no scatter step).
 
         Args:
             buffer (te_ep.EpBuffer): The TE EP buffer for this combine.
-            expert_out (torch.Tensor): Expert outputs ``[recv_capacity_per_rank, hidden]``,
-                already weighted.
+            expert_out (torch.Tensor): Expert outputs ``[recv_rows, hidden]`` (the row count
+                ``nccl_ep_dispatch`` returned), already weighted.
             num_local_tokens (int): Rows of the result (local token count for this
                 forward). When None, TE uses ``buffer.max_tokens_per_rank``.
+            grad_out (torch.Tensor, optional): caller-owned symm buffer the backward scatters the
+                expert_out grad into (zero-copy). Left None, TE allocates it (bf16: symm mem-pool;
+                normal: plain).
 
         Returns:
             torch.Tensor: ``[num_local_tokens, hidden]`` combined output, in local token
             order.
         """
-        return te_ep.ep_combine(buffer, expert_out, num_local_tokens=num_local_tokens)
+        return te_ep.ep_combine(
+            buffer, expert_out, num_local_tokens=num_local_tokens, grad_out=grad_out
+        )
 
 else:
+    alloc_ep_symm_buffer = None
     new_nccl_ep_buffer = None
     nccl_ep_dispatch = None
     nccl_ep_combine = None
