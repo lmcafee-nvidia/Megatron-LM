@@ -78,12 +78,19 @@ def get_model_and_buffers(
     # Wrap with DistributedDataParallel, and get underlying buffer.
     # Use dummy TransformerConfig with mostly default values. Avoid divide-by-zero
     # errors for num_attention_heads and num_layers.
-    # Pre-compute parameter layouts for the distributed optimizer.
+    # Pre-compute parameter layouts for the distributed optimizer. Size the layout by the group
+    # the optimizer shards over, which is the intra-instance group when there are several
+    # optimizer instances. This is the same group DDP hands to the buffer below.
     full_param_layout = None
     if use_distributed_optimizer:
         all_params = [p for p in model.parameters() if p.requires_grad]
         full_param_layout = DistributedOptimizer.compute_full_param_layout(
-            all_params, bucket_size, parallel_state.get_data_parallel_world_size(), ddp_config
+            all_params,
+            bucket_size,
+            parallel_state.get_data_parallel_world_size(
+                with_context_parallel=True, partial_data_parallel=True
+            ),
+            ddp_config,
         )
     model = DistributedDataParallel(
         TransformerConfig(num_attention_heads=1, num_layers=1),
@@ -421,7 +428,7 @@ def test_start_param_sync_dp_size_1():
     """When dp_size == 1 (e.g., expt_dp_size == 1), start_param_sync should set
     param_gather_dispatched=True and return immediately without launching any
     all-gather collective."""
-    world_size = torch.distributed.get_world_size()
+    world_size = Utils.world_size
     Utils.initialize_model_parallel(tensor_model_parallel_size=world_size)
 
     ddp_config = DistributedDataParallelConfig(
@@ -793,9 +800,6 @@ class TestNVFP4IndexMaps:
                 'megatron.core.distributed.param_and_grad_buffer.modify_nvfp4_rowwise_storage'
             ),
             mock.patch('torch.cuda.current_device', return_value='cpu'),
-            mock.patch(
-                'megatron.core.distributed.param_and_grad_buffer.log_on_each_pipeline_stage'
-            ),
         ):
             buffer = _ParamAndGradBuffer(
                 ddp_config=ddp_config,
@@ -1016,7 +1020,12 @@ def test_expert_parallel_params_get_separate_buffers(use_distributed_optimizer: 
     if use_distributed_optimizer:
         all_params = [p for p in model.parameters() if p.requires_grad]
         full_param_layout = DistributedOptimizer.compute_full_param_layout(
-            all_params, bucket_size, parallel_state.get_data_parallel_world_size(), ddp_config
+            all_params,
+            bucket_size,
+            parallel_state.get_data_parallel_world_size(
+                with_context_parallel=True, partial_data_parallel=True
+            ),
+            ddp_config,
         )
 
     ddp_model = DistributedDataParallel(
