@@ -156,7 +156,7 @@ def admit_model_group(engine, failed=False):
     if tracker.is_coordinator:
         deadline = time.monotonic() + 10
         while (not notifications or tracker._reports) and time.monotonic() < deadline:
-            notifications.extend(tracker.drain_completed())
+            notifications.extend(engine._drain_handoff_completion_notifications())
         assert notifications == [(101, failed)]
         assert not tracker._reports
     src_rank = dist.get_process_group_ranks(engine.pg_collection.mp)[0]
