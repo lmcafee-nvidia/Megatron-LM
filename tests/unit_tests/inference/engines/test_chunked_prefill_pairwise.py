@@ -48,6 +48,7 @@ from tests.unit_tests.inference.contexts.test_dynamic_prefix_caching import (
 from tests.unit_tests.inference.engines.test_dynamic_engine import (
     DynamicEngineTestConfig as _DynamicEngineTestConfig,
 )
+from tests.unit_tests.inference.engines.test_dynamic_engine import reset_rounder as _reset_rounder
 from tests.unit_tests.inference.engines.test_dynamic_engine import set_rounder as _set_rounder
 from tests.unit_tests.inference.engines.test_dynamic_engine import (
     skip_if_mamba_sequence_packing_not_available,
@@ -1158,5 +1159,5 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
                 )
         finally:
             _cleanup()
-            _set_rounder(64)
+            _reset_rounder()
             Utils.destroy_model_parallel()
