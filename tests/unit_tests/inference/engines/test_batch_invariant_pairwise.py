@@ -1,15 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Target-owned batch invariance across executed dynamic-inference features.
-
-Run backend/version groups in fresh torch.distributed.run processes using
-MCORE_BI_TEST_BACKEND and MCORE_BI_TEST_FA_VERSION. Start te_native with
-CUBLASLT_WORKSPACE_SIZE=0; missing required capabilities must fail, not skip.
-"""
+"""Target-owned batch invariance; launch each backend/version in a fresh torchrun."""
 
 import pytest
 
 from megatron.core.inference.config import AsyncScheduleMode, CudaGraphSizingDistribution
 from tests.unit_tests.inference.engines.batch_invariant_test_utils import (
+    MLA_CASE,
     Case,
     assert_same_target,
     invariant_runtime,
@@ -18,6 +14,7 @@ from tests.unit_tests.inference.engines.batch_invariant_test_utils import (
 
 DENSE_CASES = [
     Case("dense"),
+    MLA_CASE,
     Case("async", context={"async_sched_mode": AsyncScheduleMode.ASYNC}),
     Case("local", model={"transformer_impl": "local"}),
     Case("optimized", model={"transformer_impl": "inference_optimized", "add_bias_linear": False}),
