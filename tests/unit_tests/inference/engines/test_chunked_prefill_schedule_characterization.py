@@ -157,14 +157,12 @@ class TestChunkedPrefillScheduleCharacterization(PrefixCachingTestBase):
         request = self._request(context, 1, 16)
         self._queue(engine, request)
 
-        history = []
         for step in range(steps):
             engine.schedule_chunked_prefill()
-            history.append(self._state(engine, request))
             if step + 1 < steps:
                 self._consume_step(context)
 
-        state = history[-1]
+        state = self._state(engine, request)
         remaining, finished, chunked_id, queue, query, offset, blocks = expected
         assert state["remaining"] == remaining, phase
         assert state["finished"] == finished and state["chunked_id"] == chunked_id
@@ -256,18 +254,42 @@ class TestChunkedPrefillScheduleCharacterization(PrefixCachingTestBase):
         assert (admitted["finished"], admitted["remaining"]) == (13, 7)
         assert (admitted["cache_hits"], admitted["skipped"]) == (1, 8)
 
-    def test_first_chunk_snaps_to_cuda_graph_boundary(self):
-        context = self._context(max_tokens=10, prefix=False)
+    @pytest.mark.parametrize(
+        ("max_tokens", "length", "graph_tokens", "cached_blocks", "query", "offset", "blocks"),
+        [
+            pytest.param(10, 20, 6, 0, 6, 0, 2, id="first-chunk-graph-boundary"),
+            pytest.param(6, 20, 4, 2, 4, 8, 3, id="prefix-skip-excluded-from-graph-snap"),
+            pytest.param(6, 7, 6, 0, 5, 0, 2, id="graph-snap-avoids-one-token-tail"),
+        ],
+    )
+    def test_first_chunk_graph_boundaries(
+        self, max_tokens, length, graph_tokens, cached_blocks, query, offset, blocks
+    ):
+        context = self._context(max_tokens=max_tokens, prefix=bool(cached_blocks))
         engine = self._engine(context)
-        self._set_graph(engine, 6)
-        request = self._request(context, 1, 20)
+        self._set_graph(engine, graph_tokens)
+        request = self._request(context, 1, length)
+        if cached_blocks:
+            self._prime_prefix(context, request, cached_blocks)
         self._queue(engine, request)
 
         engine.schedule_chunked_prefill()
         state = self._state(engine, request)
-        assert state["query_lengths"] == [6] and state["kv_offsets"] == [0]
-        assert (state["finished"], state["remaining"], state["chunked_id"]) == (6, 14, 1)
-        assert request.cg_wait_iters == 0 and state["block_counts"] == [2]
+        assert state["query_lengths"] == [query] and state["kv_offsets"] == [offset]
+        assert (state["finished"], state["remaining"]) == (query + offset, length - query - offset)
+        assert state["active_tokens"] == query and state["chunked_id"] == 1
+        assert state["block_counts"] == [blocks] and state["queue"] == [1]
+        assert request.cg_wait_iters == 0
+        if cached_blocks:
+            assert (state["computed"], state["skipped"], state["cached_tokens"]) == (
+                query,
+                offset,
+                offset,
+            )
+        if length == graph_tokens + 1:
+            assert (
+                state["query_lengths"][0] < context.cuda_graph_batch_dimensions_list[0].token_count
+            )
 
     def test_continuation_bypasses_cuda_graph_wait(self):
         context = self._context(max_tokens=10, prefix=False)
@@ -286,61 +308,31 @@ class TestChunkedPrefillScheduleCharacterization(PrefixCachingTestBase):
         assert (state["finished"], state["remaining"], state["chunked_id"]) == (16, 4, 1)
         assert request.cg_wait_iters == 7
 
-    def test_prefix_skip_is_excluded_from_cuda_graph_snap(self):
-        context = self._context(max_tokens=6, prefix=True)
-        engine = self._engine(context)
-        self._set_graph(engine, 4)
-        request = self._request(context, 1, 20)
-        self._prime_prefix(context, request, 2)
-        self._queue(engine, request)
-
-        engine.schedule_chunked_prefill()
-        state = self._state(engine, request)
-        assert state["query_lengths"] == [4] and state["kv_offsets"] == [8]
-        assert (state["finished"], state["remaining"]) == (12, 8)
-        assert (state["computed"], state["skipped"], state["cached_tokens"]) == (4, 8, 8)
-        assert state["active_tokens"] == 4 and state["chunked_id"] == 1
-
-    def test_batch_invariant_mamba_uses_model_alignment_not_gdp(self):
-        context = self._context(max_tokens=13, prefix=False, mamba=True, batch_invariant=True)
-        engine = self._engine(context)
-        request = self._request(context, 1, 25)
-        self._queue(engine, request)
-
-        engine.schedule_chunked_prefill()
-        state = self._state(engine, request)
-        assert context.gdp_num_householder == 0 and context.ssm_chunk_alignment == 4
-        assert state["query_lengths"] == [12] and state["kv_offsets"] == [0]
-        assert (state["finished"], state["remaining"]) == (12, 13)
-        assert state["finished"] % context.ssm_chunk_alignment == 0
-        assert context.mamba_metadata.request_to_mamba_state_idx[0].item() >= 0
-
-    def test_hybrid_prefix_chunk_ends_on_kv_block_boundary(self):
-        context = self._context(max_tokens=13, prefix=True, mamba=True, mamba_cache=True)
-        engine = self._engine(context)
-        request = self._request(context, 1, 30)
-        self._queue(engine, request)
-
-        engine.schedule_chunked_prefill()
-        state = self._state(engine, request)
-        assert state["query_lengths"] == [8] and state["kv_offsets"] == [0]
-        assert (state["finished"], state["remaining"]) == (8, 22)
-        assert state["finished"] % context.block_size_tokens == 0
-        assert context.mamba_metadata.request_to_mamba_state_idx[0].item() >= 0
-        assert context.mamba_slot_allocator._eos_cache_block_id_cpu[0].item() == (
-            context.request_last_kv_block_id[0].item()
+    @pytest.mark.parametrize(
+        ("prefix", "length", "query"),
+        [
+            pytest.param(False, 25, 12, id="batch-invariant-model-alignment-not-gdp"),
+            pytest.param(True, 30, 8, id="hybrid-prefix-kv-block-boundary"),
+        ],
+    )
+    def test_mamba_first_chunk_alignment(self, prefix, length, query):
+        context = self._context(
+            max_tokens=13, prefix=prefix, mamba=True, batch_invariant=not prefix, mamba_cache=prefix
         )
-
-    def test_cuda_graph_snap_then_avoids_one_token_tail(self):
-        context = self._context(max_tokens=6, prefix=False)
         engine = self._engine(context)
-        self._set_graph(engine, 6)
-        request = self._request(context, 1, 7)
+        request = self._request(context, 1, length)
         self._queue(engine, request)
 
         engine.schedule_chunked_prefill()
         state = self._state(engine, request)
-        assert state["query_lengths"] == [5] and state["kv_offsets"] == [0]
-        assert (state["finished"], state["remaining"], state["chunked_id"]) == (5, 2, 1)
-        assert state["query_lengths"][0] < context.cuda_graph_batch_dimensions_list[0].token_count
-        assert state["block_counts"] == [2] and state["queue"] == [1]
+        assert state["query_lengths"] == [query] and state["kv_offsets"] == [0]
+        assert (state["finished"], state["remaining"]) == (query, length - query)
+        assert context.mamba_metadata.request_to_mamba_state_idx[0].item() >= 0
+        if prefix:
+            assert state["finished"] % context.block_size_tokens == 0
+            assert context.mamba_slot_allocator._eos_cache_block_id_cpu[0].item() == (
+                context.request_last_kv_block_id[0].item()
+            )
+        else:
+            assert context.gdp_num_householder == 0 and context.ssm_chunk_alignment == 4
+            assert state["finished"] % context.ssm_chunk_alignment == 0
