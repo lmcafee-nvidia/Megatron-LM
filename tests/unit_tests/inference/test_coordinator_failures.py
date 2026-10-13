@@ -62,7 +62,7 @@ class _CoordinatorRuntime(CoordinatorThread):
             if socket.poll(5000) & zmq.POLLIN:
                 socket.recv_multipart()
                 socket.send(msgpack.packb([Headers.SHUTDOWN.value], use_bin_type=True))
-            socket.close(linger=0)
+            socket.close(linger=100)
             context.term()
         self.monitor.close(linger=0)
         self.thread.join(timeout=5.0)
