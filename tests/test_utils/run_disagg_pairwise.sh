@@ -9,7 +9,7 @@ LOG_DIR=$4
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
 case "$BUCKET" in
-    tests/unit_tests/inference/engines/test_disagg_coordinator_pairwise.py) RANKS=4 ;;
+    tests/unit_tests/inference/engines/test_disagg_coordinator_pairwise.py|tests/unit_tests/inference/engines/test_disagg_safety_pairwise.py) RANKS=4 ;;
     tests/unit_tests/inference/test_disagg_transfer_pairwise.py) RANKS=6 ;;
     *) echo "Unsupported disaggregation bucket: $BUCKET" >&2; exit 1 ;;
 esac
