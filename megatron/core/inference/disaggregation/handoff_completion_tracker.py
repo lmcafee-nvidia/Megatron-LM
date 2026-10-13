@@ -60,18 +60,29 @@ class HandoffCompletionTracker:
             return
         self._socket.send(struct.pack(self._REPORT_FORMAT, request_id, self.rank, failed))
 
-    def drain_completed(self) -> list[tuple[int, bool]]:
+    def discard(self, request_id: int) -> None:
+        """Retire bookkeeping independently of the transfer's storage lifetime."""
+        self._reports.pop(request_id, None)
+        self._failure_notified.discard(request_id)
+
+    def drain_completed(self, active_request_ids: set[int] | None = None) -> list[tuple[int, bool]]:
         """Return requests that failed or completed on every model-parallel rank."""
 
         if not self.is_coordinator:
             return []
+        # Admission owns the live request set. Filtering against it prevents
+        # late reports from resurrecting canceled entries without tombstones.
+        if active_request_ids is not None:
+            for request_id in self._reports.keys() - active_request_ids:
+                self.discard(request_id)
         if self._socket is not None:
             while True:
                 try:
                     request_id, rank, failed = struct.unpack(
                         self._REPORT_FORMAT, self._socket.recv(flags=zmq.NOBLOCK)
                     )
-                    self._record(request_id, rank, failed)
+                    if active_request_ids is None or request_id in active_request_ids:
+                        self._record(request_id, rank, failed)
                 except zmq.Again:
                     break
 

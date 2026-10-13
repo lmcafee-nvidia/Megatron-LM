@@ -96,7 +96,9 @@ class InferenceStateHandoffMixin:
 
         if self._handoff_completion_tracker is None:
             return []
-        return self._handoff_completion_tracker.drain_completed()
+        active_request_ids = {handoff.request_id for handoff in self._deferred_kv_handoffs}
+        active_request_ids.update(pending.request_id for pending in self._pending_kv_imports)
+        return self._handoff_completion_tracker.drain_completed(active_request_ids)
 
     def _record_handoff_completion_notification(self, request_id: int, failed: bool) -> None:
         """Record the coordinator's shared admission decision on every MP rank.
@@ -221,6 +223,8 @@ class InferenceStateHandoffMixin:
                 pending_imports.append(pending)
         self._pending_kv_imports = pending_imports
         self._handoff_completion_notifications.pop(request_id, None)
+        if self._handoff_completion_tracker is not None:
+            self._handoff_completion_tracker.discard(request_id)
         self._reap_quarantined_kv_imports()
         if matched:
             self._publish_failed_kv_handoff(request_id, sampling_params, asyncio.CancelledError())
