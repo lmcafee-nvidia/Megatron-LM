@@ -48,6 +48,7 @@ from tests.unit_tests.inference.contexts.test_dynamic_prefix_caching import (
 from tests.unit_tests.inference.engines.test_dynamic_engine import (
     DynamicEngineTestConfig as _DynamicEngineTestConfig,
 )
+from tests.unit_tests.inference.engines.test_dynamic_engine import reset_rounder as _reset_rounder
 from tests.unit_tests.inference.engines.test_dynamic_engine import set_rounder as _set_rounder
 from tests.unit_tests.inference.engines.test_dynamic_engine import (
     skip_if_mamba_sequence_packing_not_available,
@@ -107,7 +108,8 @@ def _owned_scenario(
         signals=signals,
         prerequisite=prerequisite,
         parity=inherited.parity if parity is None else parity,
-        atol=inherited.atol if atol is None else atol,
+        # Chunking changes BF16 batch shapes; allow a few rounding units in scores.
+        atol=max(inherited.atol, 5.0e-3) if atol is None else atol,
     )
 
 
@@ -202,6 +204,8 @@ _CASES = (
                 "ssm_mixer": "gdp",
             },
             signals=("chunked", "gdp", "hybrid", "prefix-hit"),
+            # Use the prefix-cache oracle's absolute bound for recurrent cache scores.
+            atol=5.0e-2,
         ),
         prefix_flow="lru",
         chunk_counters=("gdp-prefills", "mamba-restores"),
@@ -231,7 +235,7 @@ _CASES = (
         _owned_scenario(
             "processed-skip-prompt-logprobs",
             "processed-hidden-flashinfer",
-            config={"sampling_backend": "flashinfer"},
+            config={"sampling_backend": "flashinfer", "materialize_only_last_token_logits": True},
             sampling=(
                 {
                     "return_log_probs": True,
@@ -457,7 +461,7 @@ def _install_consumed_chunk_observer(engine, consumed_chunk_ids: list[int]) -> N
 
 
 def _install_sequence_parallel_gather_witness(env, runtime: Counter) -> None:
-    """Observe the frozen-weight SP all-gather used by inference linear layers."""
+    """Observe the SP all-gather in the grad-accumulation linear path."""
     from megatron.core.tensor_parallel import layers as tp_layers
 
     model = env.engine.controller.inference_wrapped_model.model
@@ -567,7 +571,11 @@ def _tokens(length: int, offset: int = 0) -> torch.Tensor:
 
 
 def _config(case: _ChunkCase, chunked: bool) -> _DynamicEngineTestConfig:
-    config = dict(case.scenario.config)
+    config = {
+        "return_log_probs": True,
+        "materialize_only_last_token_logits": False,
+        **case.scenario.config,
+    }
     config.update(
         num_requests=0,
         min_prompt_length=1,
@@ -902,6 +910,19 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
         assert engine.context.total_request_count == 0
         assert engine.context.active_token_count == 0
         requests = [finished[request_id] for request_id in sorted(finished)]
+        for request in requests:
+            # Check both runs before snapshot/parity can turn missing scores into [].
+            assert request.generated_tokens
+            if request.sampling_params.return_log_probs:
+                assert request.generated_log_probs is not None
+                assert len(request.generated_log_probs) == len(request.generated_tokens)
+                if request.sampling_params.skip_prompt_log_probs:
+                    assert not request.prompt_log_probs
+                else:
+                    assert request.prompt_log_probs is not None
+                    assert len(request.prompt_log_probs) == len(request.prompt_tokens) - 1 > 0
+            else:
+                assert not request.prompt_log_probs and not request.generated_log_probs
         if case.name == "tp2-pp2-sp-dp2":
             assert not engine.context.config.offset_sampling_seed_by_dp_rank
             payload = torch.tensor(
@@ -1145,5 +1166,5 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
                 )
         finally:
             _cleanup()
-            _set_rounder(64)
+            _reset_rounder()
             Utils.destroy_model_parallel()
