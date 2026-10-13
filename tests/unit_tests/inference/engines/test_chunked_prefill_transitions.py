@@ -278,17 +278,8 @@ class TestChunkedPrefillTransitions(DynamicInferenceEngineTestBase):
         ] == [progress, 2 * progress]
 
     @torch.inference_mode()
-    def test_mid_partial_recompute_resets_and_matches_uninterrupted(self):
-        """RECOMPUTE restarts the prompt, then reaches the uninterrupted result."""
-        baseline_env, baseline_request, _ = self._build_chunked_env(
-            KVCacheManagementMode.RECOMPUTE, AsyncScheduleMode.ASYNC
-        )
-        baseline = self._finish_request(baseline_env, baseline_request.request_id)
-        baseline_tokens = list(baseline.generated_tokens)
-        del baseline, baseline_request, baseline_env
-        gc.collect()
-        torch.cuda.empty_cache()
-
+    def test_mid_partial_recompute_resets_and_completes(self):
+        """RECOMPUTE restarts the prompt, then emits the fixed model's three tokens."""
         env, request, forward_states = self._build_chunked_env(
             KVCacheManagementMode.RECOMPUTE, AsyncScheduleMode.ASYNC
         )
@@ -301,7 +292,7 @@ class TestChunkedPrefillTransitions(DynamicInferenceEngineTestBase):
         assert "chunked_prefill_request_id" not in vars(env.engine)
         env.engine.resume()
         completed = self._finish_request(env, request.request_id)
-        assert completed.generated_tokens == baseline_tokens
+        assert completed.generated_tokens == [_OUTPUT_TOKEN] * 3
         partial_progress = [
             state["partial_progress"]
             for state in forward_states
