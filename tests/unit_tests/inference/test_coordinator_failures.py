@@ -176,7 +176,7 @@ async def test_engine_disconnect_fails_owned_request_and_ignores_late_reply(coor
         for future in futures:
             future.add_done_callback(resolved.append)
         server_request_ids = [engine.receive_request(), engine.receive_request()]
-        await _eventually(lambda: len(coordinator.request_id_to_rank) == 2, "unowned requests")
+        await _eventually(lambda: runtime.processed[Headers.SUBMIT_REQUEST] == 2, "not admitted")
         assert set(coordinator.request_id_to_rank.values()) == {engine.identity}
         assert coordinator._pending_counts.tolist() == [2]
         coordinator.request_id_to_sampling_params[server_request_ids[0]]["streaming_interval"] = 0
