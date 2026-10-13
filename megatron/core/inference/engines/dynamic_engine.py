@@ -3863,6 +3863,15 @@ class DynamicInferenceEngine(AbstractEngine):
                         can_schedule = False
                         break
 
+                # A bypass must finish prefill now. Starting a partial request would
+                # keep it at the queue head after the earlier prefix conflict clears.
+                if (
+                    prefix_caching_enabled
+                    and pending_request_ids
+                    and prefill_chunk_length < remaining_len
+                ):
+                    break
+
                 request_available, tokens_available, kv_available = self.context.check_availability(
                     req, prefill_chunk_length
                 )
