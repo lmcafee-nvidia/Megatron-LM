@@ -3,6 +3,7 @@
 import asyncio
 import threading
 from collections import Counter
+from unittest.mock import patch
 
 import msgpack
 import pytest
@@ -62,7 +63,7 @@ class _CoordinatorRuntime(CoordinatorThread):
             if socket.poll(5000) & zmq.POLLIN:
                 socket.recv_multipart()
                 socket.send(msgpack.packb([Headers.SHUTDOWN.value], use_bin_type=True))
-            socket.close(linger=0)
+            socket.close(linger=100)
             context.term()
         self.monitor.close(linger=0)
         self.thread.join(timeout=5.0)
@@ -100,25 +101,21 @@ class _EnginePeer:
     def disconnect(self):
         self.socket.send(msgpack.packb([Headers.DISCONNECT.value], use_bin_type=True))
 
-    def send_partial(self, request_id):
-        metadata = msgpack.packb(
-            [Headers.ENGINE_REPLY_PARTIAL.value, [request_id]], use_bin_type=True
+    def send_reply(self, request_id, *, partial=False):
+        header = Headers.ENGINE_REPLY_PARTIAL if partial else Headers.ENGINE_REPLY
+        request_ids = [request_id] if partial else [[request_id, False]]
+        body = (
+            {"request_id": request_id, "new_tokens": [1]}
+            if partial
+            else DynamicInferenceRequest(
+                request_id=request_id,
+                prompt_tokens=torch.empty(0, dtype=torch.int64),
+                sampling_params=SamplingParams(detokenize_generations=False),
+                status=Status.COMPLETED,
+            ).serialize()
         )
-        body = msgpack.packb({"request_id": request_id, "new_tokens": [1]}, use_bin_type=True)
-        self.socket.send_multipart([metadata, body])
-
-    def send_final(self, request_id):
-        metadata = msgpack.packb(
-            [Headers.ENGINE_REPLY.value, [[request_id, False]]], use_bin_type=True
-        )
-        completed_request = DynamicInferenceRequest(
-            request_id=request_id,
-            prompt_tokens=torch.empty(0, dtype=torch.int64),
-            sampling_params=SamplingParams(detokenize_generations=False),
-            status=Status.COMPLETED,
-        )
-        body = msgpack.packb(completed_request.serialize(), use_bin_type=True)
-        self.socket.send_multipart([metadata, body])
+        metadata = msgpack.packb([header.value, request_ids], use_bin_type=True)
+        self.socket.send_multipart([metadata, msgpack.packb(body, use_bin_type=True)])
 
     def close(self):
         self.socket.close(linger=0)
@@ -154,15 +151,19 @@ def _assert_reply(reply, status=Status.FAILED):
         assert [event["type"] for event in reply["events"]].count("FAIL") == 1
 
 
-def _assert_no_requests(coordinator):
-    for field in ("client_id", "client_request_id", "rank", "sampling_params"):
-        assert not getattr(coordinator, f"request_id_to_{field}", {}), field
-    assert coordinator.client_request_to_request_id == {}
+def test_send_to_client_reraises_other_errors(coordinator_runtime):
+    coordinator = coordinator_runtime.coordinator
+    error = zmq.ZMQError(zmq.EINVAL)
+    with patch.object(coordinator.router_socket, "send_multipart", side_effect=error):
+        with pytest.raises(zmq.ZMQError) as caught:
+            coordinator._send_to_client(b"client", [b"reply"])
+    assert caught.value is error
 
 
 @pytest.mark.asyncio
 async def test_engine_disconnect_fails_owned_request_and_ignores_late_reply(coordinator_runtime):
     runtime = coordinator_runtime
+    coordinator = runtime.coordinator
     engine = _EnginePeer(runtime.address, b"removed-engine")
     first_client, second_client = [_start_client(runtime) for _ in range(2)]
     try:
@@ -175,24 +176,26 @@ async def test_engine_disconnect_fails_owned_request_and_ignores_late_reply(coor
         for future in futures:
             future.add_done_callback(resolved.append)
         server_request_ids = [engine.receive_request(), engine.receive_request()]
-        await _eventually(
-            lambda: len(runtime.coordinator.request_id_to_rank) == 2, "unowned requests"
-        )
-        assert set(runtime.coordinator.request_id_to_rank.values()) == {engine.identity}
-        assert runtime.coordinator._pending_counts.tolist() == [2]
+        await _eventually(lambda: runtime.processed[Headers.SUBMIT_REQUEST] == 2, "not admitted")
+        assert set(coordinator.request_id_to_rank.values()) == {engine.identity}
+        assert coordinator._pending_counts.tolist() == [2]
+        coordinator.request_id_to_sampling_params[server_request_ids[0]]["streaming_interval"] = 0
         engine.disconnect()
         replies = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
+        by_id = {reply["request_id"]: reply for reply in replies}
+        assert by_id[server_request_ids[0]]["sampling_params"] == SamplingParams().serialize()
+        assert by_id[server_request_ids[1]]["sampling_params"]["num_tokens_to_generate"] == 1
         for reply in replies:
             _assert_reply(reply)
         assert {reply["request_id"] for reply in replies} == set(server_request_ids)
         await _eventually(
-            lambda: engine.identity not in runtime.coordinator.identities_of_data_parallel_ranks,
+            lambda: engine.identity not in coordinator.identities_of_data_parallel_ranks,
             "engine was not removed",
         )
-        _assert_no_requests(runtime.coordinator)
-        assert runtime.coordinator._pending_counts.size == 0
+        runtime.assert_requests_retired()
+        assert coordinator._pending_counts.size == 0
         for server_request_id in server_request_ids:
-            engine.send_final(server_request_id)
+            engine.send_reply(server_request_id)
         await _eventually(
             lambda: runtime.processed[Headers.ENGINE_REPLY] == len(server_request_ids),
             "late finals were not processed",
@@ -204,12 +207,12 @@ async def test_engine_disconnect_fails_owned_request_and_ignores_late_reply(coor
         await runtime.wait_for_engine(engine)
         for client in (first_client, second_client):
             barrier = client.add_request([9], SamplingParams(num_tokens_to_generate=1))
-            engine.send_final(engine.receive_request())
+            engine.send_reply(engine.receive_request())
             _assert_reply(await asyncio.wait_for(barrier, 5.0), Status.COMPLETED)
             assert not client.listener_task.done()
         assert first_client.socket.replies == second_client.socket.replies == {0: 1, 1: 1}
-        _assert_no_requests(runtime.coordinator)
-        assert runtime.coordinator._pending_counts.tolist() == [0]
+        runtime.assert_requests_retired()
+        assert coordinator._pending_counts.tolist() == [0]
     finally:
         first_client.stop()
         second_client.stop()
@@ -246,17 +249,16 @@ async def test_no_engines_fails_submission_but_keeps_loop_alive(coordinator_runt
             _assert_reply(reply)
         assert Counter(resolved) == Counter([old, future])
         assert client.socket.replies == {0: 1, 1: 1}
-        _assert_no_requests(runtime.coordinator)
-        runtime.assert_healthy()
+        runtime.assert_requests_retired()
         engine = _EnginePeer(runtime.address, b"replacement-engine")
         await runtime.wait_for_engine(engine)
         future = client.add_request([3, 4], SamplingParams(num_tokens_to_generate=1))
         server_request_id = engine.receive_request()
-        engine.send_final(server_request_id)
+        engine.send_reply(server_request_id)
         reply = await asyncio.wait_for(future, timeout=5.0)
         _assert_reply(reply, Status.COMPLETED)
         assert client.socket.replies == {0: 1, 1: 1, 2: 1}
-        _assert_no_requests(runtime.coordinator)
+        runtime.assert_requests_retired()
     finally:
         client.stop()
         if engine is not None:
@@ -284,12 +286,9 @@ async def test_closed_client_delivery_does_not_disrupt_live_client(coordinator_r
         closed_client.stop()
         closed = True
         await runtime.wait_for_disconnect()
-        if delivery == "partial":
-            engine.send_partial(closed_request_id)
-        else:
-            engine.send_final(closed_request_id)
+        engine.send_reply(closed_request_id, partial=delivery == "partial")
         # Same-peer FIFO makes this live reply a barrier after the failed delivery.
-        engine.send_final(live_request_id)
+        engine.send_reply(live_request_id)
         reply = await asyncio.wait_for(live_future, timeout=5.0)
         assert reply["status"] == Status.COMPLETED.name
         runtime.assert_healthy()
@@ -297,12 +296,12 @@ async def test_closed_client_delivery_does_not_disrupt_live_client(coordinator_r
         assert live_client.socket.replies == {0: 1}
         if delivery == "partial":
             # A later final still owns cleanup even though its client is gone.
-            engine.send_final(closed_request_id)
+            engine.send_reply(closed_request_id)
             await _eventually(
                 lambda: not runtime.coordinator.request_id_to_client_id,
                 "closed client request was not cleaned up",
             )
-        _assert_no_requests(runtime.coordinator)
+        runtime.assert_requests_retired()
         assert runtime.coordinator._pending_counts.tolist() == [0]
         assert closed_stream.finished
     finally:
