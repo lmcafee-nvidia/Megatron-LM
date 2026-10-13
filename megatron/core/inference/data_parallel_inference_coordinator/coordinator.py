@@ -421,11 +421,18 @@ class DataParallelInferenceCoordinator:
         serialized_sampling_params = (
             sampling_params if sampling_params is not None else stored_sampling_params
         )
-        params = (
-            serialized_sampling_params
-            if isinstance(serialized_sampling_params, SamplingParams)
-            else SamplingParams.deserialize(serialized_sampling_params or {})
-        )
+        try:
+            params = (
+                serialized_sampling_params
+                if isinstance(serialized_sampling_params, SamplingParams)
+                else SamplingParams.deserialize(serialized_sampling_params or {})
+            )
+        except (AssertionError, TypeError, ValueError):
+            # Invalid saved parameters must not prevent a terminal failure reply.
+            logging.warning(
+                "Coordinator: invalid sampling parameters for failed request %d", request_id
+            )
+            params = SamplingParams()
         failed_request = DynamicInferenceRequest(
             request_id=request_id,
             prompt_tokens=torch.empty(0, dtype=torch.int64),

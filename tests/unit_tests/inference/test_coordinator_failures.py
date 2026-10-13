@@ -163,6 +163,7 @@ def test_send_to_client_reraises_other_errors(coordinator_runtime):
 @pytest.mark.asyncio
 async def test_engine_disconnect_fails_owned_request_and_ignores_late_reply(coordinator_runtime):
     runtime = coordinator_runtime
+    coordinator = runtime.coordinator
     engine = _EnginePeer(runtime.address, b"removed-engine")
     first_client, second_client = [_start_client(runtime) for _ in range(2)]
     try:
@@ -175,22 +176,24 @@ async def test_engine_disconnect_fails_owned_request_and_ignores_late_reply(coor
         for future in futures:
             future.add_done_callback(resolved.append)
         server_request_ids = [engine.receive_request(), engine.receive_request()]
-        await _eventually(
-            lambda: len(runtime.coordinator.request_id_to_rank) == 2, "unowned requests"
-        )
-        assert set(runtime.coordinator.request_id_to_rank.values()) == {engine.identity}
-        assert runtime.coordinator._pending_counts.tolist() == [2]
+        await _eventually(lambda: len(coordinator.request_id_to_rank) == 2, "unowned requests")
+        assert set(coordinator.request_id_to_rank.values()) == {engine.identity}
+        assert coordinator._pending_counts.tolist() == [2]
+        coordinator.request_id_to_sampling_params[server_request_ids[0]]["streaming_interval"] = 0
         engine.disconnect()
         replies = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
+        by_id = {reply["request_id"]: reply for reply in replies}
+        assert by_id[server_request_ids[0]]["sampling_params"] == SamplingParams().serialize()
+        assert by_id[server_request_ids[1]]["sampling_params"]["num_tokens_to_generate"] == 1
         for reply in replies:
             _assert_reply(reply)
         assert {reply["request_id"] for reply in replies} == set(server_request_ids)
         await _eventually(
-            lambda: engine.identity not in runtime.coordinator.identities_of_data_parallel_ranks,
+            lambda: engine.identity not in coordinator.identities_of_data_parallel_ranks,
             "engine was not removed",
         )
         runtime.assert_requests_retired()
-        assert runtime.coordinator._pending_counts.size == 0
+        assert coordinator._pending_counts.size == 0
         for server_request_id in server_request_ids:
             engine.send_reply(server_request_id)
         await _eventually(
@@ -209,7 +212,7 @@ async def test_engine_disconnect_fails_owned_request_and_ignores_late_reply(coor
             assert not client.listener_task.done()
         assert first_client.socket.replies == second_client.socket.replies == {0: 1, 1: 1}
         runtime.assert_requests_retired()
-        assert runtime.coordinator._pending_counts.tolist() == [0]
+        assert coordinator._pending_counts.tolist() == [0]
     finally:
         first_client.stop()
         second_client.stop()
