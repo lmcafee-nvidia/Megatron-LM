@@ -454,7 +454,7 @@ def _install_consumed_chunk_observer(engine, consumed_chunk_ids: list[int]) -> N
 
 
 def _install_sequence_parallel_gather_witness(env, runtime: Counter) -> None:
-    """Observe the frozen-weight SP all-gather used by inference linear layers."""
+    """Observe the SP all-gather in the grad-accumulation linear path."""
     from megatron.core.tensor_parallel import layers as tp_layers
 
     model = env.engine.controller.inference_wrapped_model.model
