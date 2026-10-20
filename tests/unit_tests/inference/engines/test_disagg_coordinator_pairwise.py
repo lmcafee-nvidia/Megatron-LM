@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Real coordinator-native prefill-to-decode handoff coverage."""
+"""Real public-client prefill-to-decode handoff coverage."""
 
 import asyncio
 from copy import copy
@@ -13,7 +13,7 @@ import torch.distributed as dist
 
 from megatron.core.inference.config import AsyncScheduleMode
 from megatron.core.inference.engines.dynamic_engine import EngineState
-from megatron.core.inference.inference_client import InferenceClient
+from megatron.core.inference.inference_client import InferenceClient, InferenceRequestError
 from tests.unit_tests.inference.engines.disagg_test_utils import (
     ForwardWitness,
     assert_released,
@@ -211,6 +211,12 @@ async def _run_coordinator_handoff(
                 mock.patch.object(
                     engine, "add_request_with_kv_handoff", side_effect=capture_submission
                 ),
+                mock.patch.object(
+                    engine, "_notify_request_error", wraps=engine._notify_request_error
+                ) as error_notice,
+                mock.patch.object(
+                    engine, "_notify_request_aborted", wraps=engine._notify_request_aborted
+                ) as abort_notice,
             ):
                 # The shared tiny-engine factory uses an unpicklable lambda tokenizer.
                 # This token-ID-only flow disables coordinator detokenization.
@@ -323,10 +329,10 @@ async def _run_coordinator_handoff(
                         assert aborted_future.cancelled()
                     if rank == 1:
                         await _wait_for(
-                            lambda: not engine._deferred_kv_handoffs and local["terminal"]
+                            lambda: not engine._deferred_kv_handoffs and abort_notice.called
                         )
                     if rank == 0:
-                        # Only a terminal reply routed back through the coordinator clears
+                        # Only the acknowledgment routed back through the coordinator clears
                         # this set; local Future cancellation alone cannot satisfy it.
                         await _wait_for(lambda: aborted_id not in decode_client.aborted_request_ids)
                         assert source_id in engine._pinned_handoff_blocks
@@ -364,8 +370,11 @@ async def _run_coordinator_handoff(
                     if native_failure:
                         # Healthy public progress is the ordering boundary. Snapshot before
                         # stop() cancels unresolved futures; assert only after clean shutdown.
+                        failure = failed_public.exception() if failed_public.done() else None
                         local["public_failure"] = (
-                            failed_public.result() if failed_public.done() else None
+                            isinstance(failure, InferenceRequestError),
+                            str(failure),
+                            getattr(failure, "source_safe", False),
                         )
                         local["client_clean"] = not any(
                             (
@@ -399,6 +408,14 @@ async def _run_coordinator_handoff(
                     "imported": local["imported"],
                     "transfer": local["transfer"],
                     "terminal": local["terminal"],
+                    "errors": [
+                        (call.args[0], str(call.args[1]), call.kwargs["source_safe"])
+                        for call in error_notice.call_args_list
+                    ],
+                    "aborts": [
+                        (call.args[0], call.kwargs["source_safe"])
+                        for call in abort_notice.call_args_list
+                    ],
                     "client_result": client_result,
                     "native": local.get("native"),
                     "failure_clean": local.get("failure_clean"),
@@ -413,11 +430,10 @@ async def _run_coordinator_handoff(
                     assert gathered[1]["native"][0] > 0
                     assert gathered[1]["native"][1:] == (0, "nixlNotFoundError")
                     assert gathered[1]["failure_clean"]
-                    failure = gathered[0]["public_failure"]
-                    assert (
-                        failure is not None
-                    ), "native import failed without a public terminal reply"
-                    assert (failure["request_id"], failure["status"]) == (0, "FAILED")
+                    assert len(gathered[1]["errors"]) == 1
+                    request_id, reason, source_safe = gathered[1]["errors"][0]
+                    assert (request_id, source_safe) == (0, True)
+                    assert gathered[0]["public_failure"] == (True, reason, True)
                     assert gathered[0]["client_clean"]
 
                 source_owners = [item for item in gathered if item["source"] is not None]
@@ -446,7 +462,14 @@ async def _run_coordinator_handoff(
                     assert [
                         (reply["request_id"], reply["status"])
                         for reply in terminal_owners[0]["terminal"]
-                    ] == [(0, "FAILED"), (1, "COMPLETED")]
+                    ] == [(1, "COMPLETED")]
+                assert all(
+                    not item["errors"] and not item["aborts"]
+                    for item in gathered
+                    if item["rank"] != 1
+                )
+                assert gathered[1]["aborts"] == ([(0, True)] if abort_deferred else [])
+                assert bool(gathered[1]["errors"]) == native_failure
                 source_kv = source_owners[0]["source"]
                 imported_kv = decode_owners[0]["imported"]
                 corrupted = imported_kv.clone()
