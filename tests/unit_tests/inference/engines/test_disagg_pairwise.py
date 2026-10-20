@@ -136,7 +136,7 @@ def test_disagg_real_engine_parity(mixer, rope, transport_world, backend, length
                     admit_import(engine)
                     neighbor = seeded
                     engine.step_modern()
-                    assert engine.controller._async_sched_logits.is_valid
+                    assert engine.controller._async_sched_forward.is_valid
             elif source and chunked:
                 neighbor = engine.add_request(102, neighbor_tokens, sampling(16))
                 engine.step_modern()
@@ -179,7 +179,7 @@ def test_disagg_real_engine_parity(mixer, rope, transport_world, backend, length
                     assert not engine.context.total_request_count
                     admit_import(engine)
                 else:
-                    assert engine.controller._async_sched_logits.is_valid
+                    assert engine.controller._async_sched_forward.is_valid
                     assert engine.context.total_request_count == 1
                     assert engine._poll_pending_kv_imports() == 1
                     engine.step_modern()  # Resolve neighbor before normal import admission.
