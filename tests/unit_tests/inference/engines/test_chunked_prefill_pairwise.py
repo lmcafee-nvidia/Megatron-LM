@@ -731,8 +731,15 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
             if case.name == "mamba-batch-invariant"
             else nullcontext()
         )
-        with manager:
-            return cls._run_session_impl(case, chunked=chunked, stop_tokens=stop_tokens)
+        deterministic = torch.are_deterministic_algorithms_enabled()
+        try:
+            torch.use_deterministic_algorithms(
+                deterministic or case.name == "mamba-batch-invariant"
+            )
+            with manager:
+                return cls._run_session_impl(case, chunked=chunked, stop_tokens=stop_tokens)
+        finally:
+            torch.use_deterministic_algorithms(deterministic)
 
     @classmethod
     def _run_session_impl(
