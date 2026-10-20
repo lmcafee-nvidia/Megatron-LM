@@ -8,7 +8,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from megatron.core.inference.disaggregation.engine import DisaggDynamicInferenceEngine
+from megatron.core.inference.disaggregation.engine import StateHandoffDynamicInferenceEngine
 from megatron.core.inference.sampling_params import SamplingParams
 from tests.unit_tests.inference.engines import batch_invariant_test_utils as fixture
 
@@ -24,9 +24,9 @@ def _exchange(value, group):
 
 
 def _build(case, backend, version):
-    with mock.patch.object(fixture, "DynamicInferenceEngine", DisaggDynamicInferenceEngine):
+    with mock.patch.object(fixture, "DynamicInferenceEngine", StateHandoffDynamicInferenceEngine):
         engine = fixture.build_engine(case, backend, version)
-    assert isinstance(engine, DisaggDynamicInferenceEngine)
+    assert isinstance(engine, StateHandoffDynamicInferenceEngine)
     return engine
 
 
@@ -125,7 +125,8 @@ def test_batch_invariant_real_nixl_handoff(length):
         engine = _build(case, backend, version)
         _load_canonical(engine, weights)
         role = "prefill" if source else "decode"
-        engine.setup_kv_transfer(role, backend="nixl")
+        engine.context.config.kv_transport_backend = "nixl"
+        engine.setup_kv_transfer(role)
         agent = engine._kv_transfer_agent
         assert agent._memory_buffer.data_ptr() == engine.context.memory_buffer.data_ptr()
         assert agent._memory_buffer.is_cuda
