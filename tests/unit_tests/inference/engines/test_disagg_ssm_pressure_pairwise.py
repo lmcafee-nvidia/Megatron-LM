@@ -68,7 +68,7 @@ def test_ssm_slot_pressure_defers_real_handoffs(mixer, transport_world, monkeypa
                     None if source else du.decode_peer_meta(engine, pending), transport_world
                 )
                 if source:
-                    engine.push_handoff_kv(rid, [peer])
+                    du.push_handoff(engine, rid, [peer])
                     handles = engine._pending_kv_pushes[-1][1]
                 else:
                     handles = engine._pending_transfer_handles(pending)
