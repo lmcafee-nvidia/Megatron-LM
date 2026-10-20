@@ -356,7 +356,7 @@ class ForwardWitness:
         async def observe_async_overlap():
             record = dict(
                 target_active=target_is_active(),
-                pending=controller._async_sched_logits.is_valid,
+                pending=controller._async_sched_forward.is_valid,
                 forwards=0,
                 returned_previous=False,
             )
