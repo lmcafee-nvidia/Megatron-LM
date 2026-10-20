@@ -146,7 +146,7 @@ def admit_model_group(engine, failed=False):
     engine._report_completed_kv_imports()
     tracker = engine._handoff_completion_tracker
     if tracker.world_size == 1:
-        assert engine._handoff_completion_notifications == {101: False}
+        assert engine._handoff_completion_notifications == {101: (False, True)}
         assert engine._admit_pending_kv_imports() == 1
         return
     # All participants have locally waited for the real transfer before entering
@@ -157,13 +157,13 @@ def admit_model_group(engine, failed=False):
         deadline = time.monotonic() + 10
         while (not notifications or tracker._reports) and time.monotonic() < deadline:
             notifications.extend(tracker.drain_completed())
-        assert notifications == [(101, failed)]
+        assert notifications == [(101, failed, True)]
         assert not tracker._reports
     src_rank = dist.get_process_group_ranks(engine.pg_collection.mp)[0]
     payload = [notifications]
     dist.broadcast_object_list(payload, src=src_rank, group=engine.pg_collection.mp)
-    for request_id, failed in payload[0]:
-        engine._record_handoff_completion_notification(request_id, failed)
+    for request_id, failed, source_safe in payload[0]:
+        engine._record_handoff_completion_notification(request_id, failed, source_safe)
     assert engine._admit_pending_kv_imports() == int(not failed)
     assert not engine._pending_kv_imports
     assert not engine.waiting_request_ids
@@ -234,7 +234,8 @@ def test_real_model_heterogeneous_handoff(tmp_path, case):
                 source_engine, source_engine.add_request(101, tokens, sampling())
             )
             expected = list(reference.generated_tokens)
-            source_engine.setup_kv_transfer("prefill", backend=backend)
+            source_engine.context.config.kv_transport_backend = backend
+            source_engine.setup_kv_transfer("prefill")
             with ForwardWitness(source_engine) as source_witness:
                 request = run_to_completion(
                     source_engine,
