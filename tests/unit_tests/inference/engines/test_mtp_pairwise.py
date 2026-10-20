@@ -223,16 +223,18 @@ def _install_mtp_witnesses(env, case: _Case, runtime: Counter) -> _MTPWitness:
 
             def observed_layer_forward(*args, _real=real_layer_forward, **kwargs):
                 request_ids = tuple(_active_request_ids(context))
+                mtp = context.mtp_metadata
                 committing = (
-                    context.enable_mtp_kv_cache
-                    and context.mtp_metadata.forward_mode is MTPForwardMode.COMMIT
+                    context.enable_mtp_kv_cache and mtp.forward_mode is MTPForwardMode.COMMIT
                 )
                 result = _real(*args, **kwargs)
                 if committing:
                     assert kwargs["inference_context"] is context and request_ids
                     runtime["real-mtp-kv-commit"] += 1
-                elif context.enable_mtp_kv_cache and kwargs["inference_context"] is None:
-                    assert context.mtp_metadata.forward_mode is MTPForwardMode.NONE
+                elif context.enable_mtp_kv_cache and not runtime["mtp-proposal-inflight"]:
+                    assert kwargs["inference_context"] is context
+                    assert mtp.forward_mode is MTPForwardMode.DRAFT
+                    assert (mtp.active_block_table == mtp.dummy_block_idx).all()
                     runtime["mtp-dummy-commit"] += 1
                 else:
                     witness.layer_request_ids.append(request_ids)
@@ -384,6 +386,7 @@ def _install_mtp_witnesses(env, case: _Case, runtime: Counter) -> _MTPWitness:
         ):
             nonlocal repeated_call_index
             layer_calls_before = len(witness.layer_request_ids)
+            runtime["mtp-proposal-inflight"] += 1
             hidden_states, logits = real_mtp(
                 hidden_states,
                 next_token_ids,
@@ -393,6 +396,7 @@ def _install_mtp_witnesses(env, case: _Case, runtime: Counter) -> _MTPWitness:
                 cache_key=cache_key,
                 mtp_inference_context=mtp_inference_context,
             )
+            runtime["mtp-proposal-inflight"] -= 1
             logical_depth = int(depth) if depth is not None else repeated_call_index % case.depth
             repeated_call_index += 1
             request_ids = _active_request_ids(context)
