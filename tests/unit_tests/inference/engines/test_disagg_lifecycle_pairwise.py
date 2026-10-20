@@ -28,6 +28,7 @@ from tests.unit_tests.inference.engines.disagg_test_utils import (
     disagg_config,
     exchange,
     prompt,
+    push_handoff,
     real_engine,
     run_to_completion,
     sampling,
@@ -118,9 +119,11 @@ def test_real_handoff_capacity_fifo(transport_world, policy):
                 assert len(engine._pending_kv_imports) == 1
                 pending = engine._pending_kv_imports[0]
                 assert pending.request_id == rid
+                cached = 2 if index and policy == PrefixCachingEvictionPolicy.LRU else 0
+                assert pending.cached_prefix_block_count == cached
             peer = exchange(None if source else decode_peer_meta(engine, pending), transport_world)
             if source:
-                engine.push_handoff_kv(101, [peer])
+                push_handoff(engine, 101, [peer])
             handles = (
                 [handle for _, group in engine._pending_kv_pushes for handle in group]
                 if source
