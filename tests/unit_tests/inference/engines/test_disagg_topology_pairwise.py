@@ -23,6 +23,7 @@ from tests.unit_tests.inference.engines.disagg_test_utils import (
     decode_peer_meta,
     disagg_config,
     prompt,
+    push_handoff,
     real_engine,
     run_to_completion,
     sampling,
@@ -318,7 +319,7 @@ def test_real_model_heterogeneous_handoff(tmp_path, case):
                     control,
                 )
                 if backend == "nccl" and rank in chosen_source:
-                    source_engine.push_handoff_kv(101, [peers[index] for index in chosen_decode])
+                    push_handoff(source_engine, 101, [peers[index] for index in chosen_decode])
                     for _, handles in source_engine._pending_kv_pushes:
                         for handle in handles:
                             handle.wait()

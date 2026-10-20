@@ -134,7 +134,7 @@ def test_real_moe_ep2_handoff(tmp_path, live_loop):
                     dtu.decode_peer_meta(target, pending) if pending is not None else None, control
                 )
                 if rank == source_group[0]:
-                    source.push_handoff_kv(101, [peers[member] for member in consumers])
+                    dtu.push_handoff(source, 101, [peers[member] for member in consumers])
                     for handle in source._pending_kv_pushes[0][1]:
                         handle.wait()
                     assert source._poll_pending_kv_pushes() == 1
