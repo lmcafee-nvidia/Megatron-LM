@@ -287,7 +287,7 @@ class TestChunkedPrefillTransitions(DynamicInferenceEngineTestBase):
         env.engine.suspend()
         assert request.finished_chunk_token_count == 0
         assert torch.equal(request.remaining_prompt_tokens, request.prompt_tokens)
-        assert not env.engine.controller._async_sched_logits.is_valid
+        assert not env.engine.controller._async_sched_forward.is_valid
         assert env.engine.context.chunked_prefill_request_id == -1
         assert "chunked_prefill_request_id" not in vars(env.engine)
         env.engine.resume()
