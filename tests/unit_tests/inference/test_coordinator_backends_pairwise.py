@@ -40,10 +40,8 @@ async def test_routed_dense_backends_match_direct(monkeypatch, backend, version,
             monkeypatch.setattr(attention, symbol, observed)
 
     monkeypatch.setattr(features, "_instrument_scenario_runtime", instrument_native)
-    options = dict(
-        transformer_impl="inference_optimized" if version is None else "local",
-        flash_attention_version=version or 3,
-    )
+    options = dict(flash_attention_version=version or 3)
+    options["transformer_impl"] = "inference_optimized" if version is None else "local"
     if version == 2:
         options.update(context_block_size_tokens=256, context_max_tokens=256)
     if version == 4:
