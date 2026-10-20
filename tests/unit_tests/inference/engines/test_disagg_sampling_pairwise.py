@@ -133,8 +133,8 @@ def test_handoff_stochastic_fixed_history(transport_world, backend, filters):
 @pytest.mark.parametrize("skip_prompt", [False, True])
 @pytest.mark.parametrize("score_fields", [{"return_log_probs": True}, {"top_n_logprobs": 2}])
 @torch.inference_mode()
-def test_handoff_rejects_all_public_scores_before_transfer(skip_prompt, score_fields):
-    """Guard coverage only: skipped prompt scores do not enable score suffixes."""
+def test_handoff_rejects_unsupported_or_missing_scores_before_transfer(skip_prompt, score_fields):
+    """Reject unsupported scores or a missing carried first-token score."""
     Utils.initialize_model_parallel()
     try:
         with real_engine(disagg_config(), role="decode") as engine:
@@ -143,9 +143,13 @@ def test_handoff_rejects_all_public_scores_before_transfer(skip_prompt, score_fi
             )
             allocator = engine.context.kv_block_allocator
             before = allocator.pool_avail
-            with pytest.raises(
-                NotImplementedError, match="prompt or first-token log probabilities"
-            ):
+            if score_fields.get("top_n_logprobs"):
+                error, message = NotImplementedError, "top-token log probabilities"
+            elif skip_prompt:
+                error, message = ValueError, "first-token log probability count"
+            else:
+                error, message = NotImplementedError, "prompt log probabilities"
+            with pytest.raises(error, match=message):
                 engine.add_request_with_kv_handoff(
                     101, prompt(33), params, {"resume_tokens": [9]}, [1, 2, 3]
                 )
