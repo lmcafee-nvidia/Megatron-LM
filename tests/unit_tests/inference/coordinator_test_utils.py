@@ -14,6 +14,7 @@ from megatron.core.inference.config import (
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
+from megatron.core.inference.disaggregation.handoff_ownership import HandoffOwnership
 
 
 def make_coordinator_direct(
@@ -52,6 +53,7 @@ def make_coordinator_direct(
     coordinator = object.__new__(DataParallelInferenceCoordinator)
     coordinator.request_id_to_rank = {}
     coordinator.request_id_to_sampling_params = {}
+    coordinator.handoff_ownership = HandoffOwnership()
     coordinator.tokenizer = tokenizer
     coordinator.data_parallel_size = data_parallel_size
     coordinator.block_size_tokens = block_size_tokens
