@@ -64,7 +64,9 @@ def real_engine(config, *, role=None, backend="nccl", weights=None):
     version = config.flash_attention_version
     config_factory = partial(dynamic_tests.TransformerConfig, flash_attention_version=version)
     with (
-        mock.patch.object(dynamic_tests, "DynamicInferenceEngine", StateHandoffDynamicInferenceEngine),
+        mock.patch.object(
+            dynamic_tests, "DynamicInferenceEngine", StateHandoffDynamicInferenceEngine
+        ),
         mock.patch.object(dynamic_tests, "TransformerConfig", config_factory),
     ):
         engine = DynamicInferenceEngineTestBase._build_test_env(config).engine
