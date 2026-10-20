@@ -293,6 +293,7 @@ async def routed_model(monkeypatch, *, coordinator_options=None, engine_factory=
         context_block_size_tokens=16,
         context_buffer_size_gb=0.02,
         transformer_impl="transformer_engine",
+        flash_attention_version=3,
     )
     settings.update(overrides)
     config = engine_tests.DynamicEngineTestConfig(**settings)

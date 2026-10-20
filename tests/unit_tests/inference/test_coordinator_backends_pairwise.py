@@ -21,8 +21,6 @@ from tests.unit_tests.inference.engines import test_dynamic_engine as engines
     ],
 )
 async def test_routed_dense_backends_match_direct(monkeypatch, backend, version, symbols):
-    constructor = partial(engines.TransformerConfig, flash_attention_version=version or 3)
-    monkeypatch.setattr(engines, "TransformerConfig", constructor)
     build = engines.DynamicInferenceEngineTestBase._build_test_env
     routed = partial(features.routed_model, engine_factory=lambda config: build(config).engine)
     monkeypatch.setattr(features, "routed_model", routed)
@@ -42,7 +40,8 @@ async def test_routed_dense_backends_match_direct(monkeypatch, backend, version,
             monkeypatch.setattr(attention, symbol, observed)
 
     monkeypatch.setattr(features, "_instrument_scenario_runtime", instrument_native)
-    options = {"transformer_impl": "inference_optimized" if version is None else "local"}
+    options = dict(flash_attention_version=version or 3)
+    options["transformer_impl"] = "inference_optimized" if version is None else "local"
     if version == 2:
         options.update(context_block_size_tokens=256, context_max_tokens=256)
     if version == 4:
