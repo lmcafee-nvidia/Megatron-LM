@@ -95,20 +95,21 @@ def invariant_runtime(case):
     rounders = DynamicInferenceContext.TOKEN_ROUNDER, DynamicInferenceContext.REQUEST_ROUNDER
     DynamicInferenceContext.TOKEN_ROUNDER = 64
     DynamicInferenceContext.REQUEST_ROUNDER = 4
-    # Each fresh backend must activate before distributed CUDA initialization or model/GEMM use.
+    deterministic = torch.are_deterministic_algorithms_enabled()
     bik.enable_batch_invariant_mode(backend=backend, collective="ordered")
     try:
+        torch.use_deterministic_algorithms(deterministic or case.name.startswith("mamba"))
         Utils.initialize_model_parallel(
             case.tp,
             case.pp,
             expert_model_parallel_size=case.model.get("expert_model_parallel_size", 1),
         )
         with pytest.MonkeyPatch.context() as patch:
-            patch.setenv("NVTE_FUSED_ATTN", "0")
-            patch.setenv("NVTE_FLASH_ATTN", "1")
-            patch.setenv("NVTE_UNFUSED_ATTN", "0")
+            for name, value in (("FLASH_ATTN", "1"), ("FUSED_ATTN", "0"), ("UNFUSED_ATTN", "0")):
+                patch.setenv("NVTE_" + name, value)
             yield backend, fa_version
     finally:
+        torch.use_deterministic_algorithms(deterministic)
         if case.model.get("expert_model_parallel_size", 1) > 1:
             NVLSAllGatherVDispatcher._delete_buffers()
             SymmetricMemoryManager.destroy()
@@ -474,8 +475,7 @@ def run_order(case, backend, fa_version, order, *, sampling=None):
         return_log_probs=True,
         return_prompt_tokens=True,
     )
-    params.update(case.sampling)
-    params.update(sampling or {})
+    params.update({**case.sampling, **(sampling or {})})
     target_params = SamplingParams(**params)
     depth = case.context.get("num_speculative_tokens", 0)
     short_neighbor_length = depth + 2
