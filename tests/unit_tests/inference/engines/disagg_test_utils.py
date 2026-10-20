@@ -227,13 +227,25 @@ def snapshot_source(engine, request):
 
 
 def decode_peer_meta(engine, pending):
-    metadata = dict(engine._kv_transfer_agent.export_meta(), block_ids=pending.local_blocks)
+    cached = pending.cached_prefix_block_count
+    metadata = dict(
+        engine._kv_transfer_agent.export_meta(),
+        block_ids=pending.local_blocks[cached:],
+        cached_prefix_blocks=cached,
+    )
     if pending.ssm is not None:
         metadata["ssm"] = {
             kind: dict(agent.export_meta(), block_ids=[pending.ssm.live_slot])
             for kind, agent in engine._ssm_transfer_agents.items()
         }
     return metadata
+
+
+def push_handoff(engine, request_id, peers):
+    """Mirror the control plane's agreed cached-prefix count in a real push."""
+    cached = {peer["cached_prefix_blocks"] for peer in peers}
+    assert len(cached) == 1
+    engine.push_handoff_kv(request_id, peers, cached_prefix_blocks=cached.pop())
 
 
 class _DeferredNcclPull:
@@ -319,7 +331,7 @@ def complete_transfer(engine, metadata, tokens, params, control, request_id=101)
         assert pending.request_id == request_id
     peer = exchange(None if is_source else decode_peer_meta(engine, pending), control)
     if is_source and engine._kv_transfer_agent.is_push:
-        engine.push_handoff_kv(request_id, [peer])
+        push_handoff(engine, request_id, [peer])
         assert engine._pending_kv_pushes[-1][0] == request_id
     handles = (
         [handle for _, group in engine._pending_kv_pushes for handle in group]
