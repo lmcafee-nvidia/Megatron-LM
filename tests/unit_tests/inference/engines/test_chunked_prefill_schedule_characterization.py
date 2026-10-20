@@ -224,7 +224,7 @@ class TestChunkedPrefillScheduleCharacterization(PrefixCachingTestBase):
         assert (final["remaining"], final["computed"], final["skipped"]) == (0, 8, 8)
         assert final["cache_hits"] == 1 and final["cached_tokens"] == 8
 
-    def test_minimum_effective_chunk_is_repreviewed_and_deferred(self):
+    def test_cached_single_token_chunk_uses_last_available_token(self):
         context = self._context(max_tokens=5, prefix=True)
         engine = self._engine(context)
         request = self._request(context, 1, 20)
@@ -234,24 +234,17 @@ class TestChunkedPrefillScheduleCharacterization(PrefixCachingTestBase):
         self._queue(engine, request)
 
         one_token_probe = context.check_availability(request, prefill_chunk_length=1)
-        clamped = context._compute_prefix_match(request, 9)
+        matched = context._compute_prefix_match(request, 9)
         expanded_probe = context.check_availability(request, prefill_chunk_length=9)
         assert one_token_probe == (True, True, True)
-        assert (clamped.prefix_skip_tokens, clamped.effective_prefill_chunk_length) == (4, 5)
-        assert expanded_probe == (True, False, True)
+        assert (matched.prefix_skip_tokens, matched.effective_prefill_chunk_length) == (8, 1)
+        assert expanded_probe == (True, True, True)
 
-        before = self._state(engine, request)
-        engine.schedule_chunked_prefill()
-        deferred = self._state(engine, request)
-        assert deferred == before
-        assert deferred["active_ids"] == [9] and deferred["queue"] == [1]
-        assert deferred["remaining"] == 20 and deferred["finished"] == 0
-
-        self._consume_step(context, survive=False)
         engine.schedule_chunked_prefill()
         admitted = self._state(engine, request)
-        assert admitted["query_lengths"] == [5] and admitted["kv_offsets"] == [8]
-        assert (admitted["finished"], admitted["remaining"]) == (13, 7)
+        assert admitted["active_ids"] == [9, 1] and admitted["queue"] == [1]
+        assert admitted["query_lengths"] == [4, 1] and admitted["kv_offsets"] == [0, 8]
+        assert (admitted["finished"], admitted["remaining"]) == (9, 11)
         assert (admitted["cache_hits"], admitted["skipped"]) == (1, 8)
 
     @pytest.mark.parametrize(
@@ -259,7 +252,7 @@ class TestChunkedPrefillScheduleCharacterization(PrefixCachingTestBase):
         [
             pytest.param(10, 20, 6, 0, 6, 0, 2, id="first-chunk-graph-boundary"),
             pytest.param(6, 20, 4, 2, 4, 8, 3, id="prefix-skip-excluded-from-graph-snap"),
-            pytest.param(6, 7, 6, 0, 5, 0, 2, id="graph-snap-avoids-one-token-tail"),
+            pytest.param(6, 7, 6, 0, 6, 0, 2, id="graph-snap-allows-one-token-tail"),
         ],
     )
     def test_first_chunk_graph_boundaries(
@@ -288,7 +281,7 @@ class TestChunkedPrefillScheduleCharacterization(PrefixCachingTestBase):
             )
         if length == graph_tokens + 1:
             assert (
-                state["query_lengths"][0] < context.cuda_graph_batch_dimensions_list[0].token_count
+                state["query_lengths"][0] == context.cuda_graph_batch_dimensions_list[0].token_count
             )
 
     def test_continuation_bypasses_cuda_graph_wait(self):
