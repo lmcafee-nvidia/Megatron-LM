@@ -79,7 +79,8 @@ def test_real_moe_ep2_handoff(tmp_path, live_loop):
                 source, source.add_request(101, tokens, dtu.sampling())
             ).generated_tokens
             assert all(result == expected for result in topology.gather(expected, control))
-            source.setup_kv_transfer("prefill", backend="nccl")
+            source.context.config.kv_transport_backend = "nccl"
+            source.setup_kv_transfer("prefill")
             with dtu.ForwardWitness(source) as source_witness:
                 request = dtu.run_to_completion(
                     source, source.add_request(101, tokens, dtu.sampling(1, do_kv_handoff=True))

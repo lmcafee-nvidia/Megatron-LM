@@ -13,7 +13,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.inference.config import AsyncScheduleMode
-from megatron.core.inference.disaggregation.engine import DisaggDynamicInferenceEngine
+from megatron.core.inference.disaggregation.engine import StateHandoffDynamicInferenceEngine
 from megatron.core.inference.inference_request import Status
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.transformer import attention
@@ -64,7 +64,7 @@ def real_engine(config, *, role=None, backend="nccl", weights=None):
     version = config.flash_attention_version
     config_factory = partial(dynamic_tests.TransformerConfig, flash_attention_version=version)
     with (
-        mock.patch.object(dynamic_tests, "DynamicInferenceEngine", DisaggDynamicInferenceEngine),
+        mock.patch.object(dynamic_tests, "DynamicInferenceEngine", StateHandoffDynamicInferenceEngine),
         mock.patch.object(dynamic_tests, "TransformerConfig", config_factory),
     ):
         engine = DynamicInferenceEngineTestBase._build_test_env(config).engine
@@ -78,7 +78,8 @@ def real_engine(config, *, role=None, backend="nccl", weights=None):
             if torch.is_tensor(value):
                 assert torch.equal(value.cpu(), weights[name]), name
     if role is not None:
-        engine.setup_kv_transfer(role, backend=backend)
+        engine.context.config.kv_transport_backend = backend
+        engine.setup_kv_transfer(role)
     try:
         yield engine
     finally:
@@ -166,7 +167,7 @@ class ForwardWitness:
 
         def forward(*args, **kwargs):
             snapshot = self._snapshot()
-            if snapshot is not None and self.engine.controller._async_sched_logits.is_valid:
+            if snapshot is not None and self.engine.controller._async_sched_forward.is_valid:
                 self.pending_forwards.append(snapshot)
             result = original_forward(*args, **kwargs)
             if snapshot is not None:
@@ -253,6 +254,10 @@ class _DeferredNcclPull:
     def poll(self):
         return self.real_handle is not None and self.real_handle.poll()
 
+    @property
+    def storage_safe(self):
+        return self.real_handle is not None and self.real_handle.storage_safe
+
 
 @contextmanager
 def deferred_pulls(engine):
@@ -262,12 +267,12 @@ def deferred_pulls(engine):
     with ExitStack() as stack:
         for agent in [engine._kv_transfer_agent, *engine._ssm_transfer_agents.values()]:
 
-            def defer(*args, _begin=agent.begin_pull_blocks, **kwargs):
+            def defer(*args, _begin=agent.start_prepared, **kwargs):
                 handle = _DeferredNcclPull(_begin, args, kwargs)
                 deferred.append(handle)
                 return handle
 
-            stack.enter_context(mock.patch.object(agent, "begin_pull_blocks", side_effect=defer))
+            stack.enter_context(mock.patch.object(agent, "start_prepared", side_effect=defer))
         yield deferred
 
 
@@ -282,7 +287,7 @@ def _enqueue_decode_handoff(engine, metadata, tokens, params, request_id=101):
         future = engine.add_request_with_kv_handoff(
             request_id, tokens, params, metadata["kv_meta"], metadata["block_ids"]
         )
-    assert len(deferred) == 1 + len(engine._ssm_transfer_agents)
+    assert len(deferred) == 1  # NCCL batches KV and SSM plans into one real handle.
     return future
 
 
@@ -319,7 +324,9 @@ def complete_transfer(engine, metadata, tokens, params, control, request_id=101)
         if is_source
         else engine._pending_transfer_handles(pending)
     )
-    if engine._kv_transfer_agent.is_push or not is_source:
+    if engine._kv_transfer_agent.is_push:
+        assert len(handles) == 1
+    elif not is_source:
         assert len(handles) == 1 + len(engine._ssm_transfer_agents)
     for handle in handles:
         handle.wait()
