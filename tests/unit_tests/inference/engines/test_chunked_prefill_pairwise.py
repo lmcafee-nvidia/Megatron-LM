@@ -612,6 +612,8 @@ def _build_env(case: _ChunkCase, chunked: bool):
     if case.name == "mamba-batch-invariant":
         _set_rounder(64)
         context = env.engine.context
+        # Keep unused V finite; poisoned-page behavior has its own regression.
+        context.memory_buffer[1].zero_()
         model_config = env.engine.controller.inference_wrapped_model.model.config
         assert context.batch_invariant_mode
         assert not context.enable_prefix_caching
