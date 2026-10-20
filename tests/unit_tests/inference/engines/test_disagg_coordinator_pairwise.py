@@ -160,9 +160,9 @@ async def _run_coordinator_handoff(
             original_reply = engine._send_requests_to_coordinator
             original_submit = engine.add_request_with_kv_handoff
 
-            def capture_submission(request_id, *args):
+            def capture_submission(request_id, *args, **kwargs):
                 if not native_failure or request_id != 0:
-                    return original_submit(request_id, *args)
+                    return original_submit(request_id, *args, **kwargs)
                 agent = engine._kv_transfer_agent._agent
                 with (
                     mock.patch.object(
@@ -170,7 +170,7 @@ async def _run_coordinator_handoff(
                     ) as begin,
                     mock.patch.object(agent, "transfer", wraps=agent.transfer) as post,
                 ):
-                    future = original_submit(request_id, *args)
+                    future = original_submit(request_id, *args, **kwargs)
                 local["failed_future"] = future
                 local["native"] = (begin.call_count, post.call_count)
                 return future
