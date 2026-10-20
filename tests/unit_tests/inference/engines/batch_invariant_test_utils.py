@@ -342,7 +342,7 @@ class ForwardWitness:
         async_forward = controller._run_async_sched_forward
 
         @wraps(async_overlap)
-        async def observe_async_overlap():
+        async def observe_async_overlap(**kwargs):
             record = dict(
                 target_active=target_is_active(),
                 pending=controller._async_sched_forward.is_valid,
@@ -351,7 +351,7 @@ class ForwardWitness:
             )
             self._active_async_overlap = record
             try:
-                result = await async_overlap()
+                result = await async_overlap(**kwargs)
                 record["returned_previous"] = result.output is not None
                 return result
             finally:
