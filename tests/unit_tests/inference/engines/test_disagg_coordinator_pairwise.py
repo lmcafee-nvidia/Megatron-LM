@@ -253,7 +253,7 @@ async def _run_coordinator_handoff(
                     source_id = handoff["request_id"]
                     assert source_id == prefill_result["request_id"]
                     assert len(handoff["block_ids"]) == 3
-                    assert handoff["kv_meta"]["agent_name"] == "prefill-rank0"
+                    assert handoff["kv_meta"]["agent_name"] == engine._kv_transfer_agent.agent_name
                     assert handoff["kv_meta"]["agent_metadata_b64"]
 
                 held = None
