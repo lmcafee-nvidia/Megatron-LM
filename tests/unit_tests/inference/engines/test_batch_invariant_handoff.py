@@ -35,10 +35,9 @@ def _canonical_state(engine):
     for parameter in model.parameters():
         assert parameter.is_cuda
         dist.broadcast(parameter.data, src=0)
-    state = model.state_dict()
     return {
         name: value.detach().cpu().clone() if torch.is_tensor(value) else value
-        for name, value in state.items()
+        for name, value in model.state_dict().items()
     }
 
 
