@@ -156,7 +156,7 @@ def test_send_to_client_reraises_other_errors(coordinator_runtime):
     error = zmq.ZMQError(zmq.EINVAL)
     with patch.object(coordinator.router_socket, "send_multipart", side_effect=error):
         with pytest.raises(zmq.ZMQError) as caught:
-            coordinator._send_to_client(b"client", [b"reply"])
+            coordinator._send_to_client([b"client", b"reply"])
     assert caught.value is error
 
 
