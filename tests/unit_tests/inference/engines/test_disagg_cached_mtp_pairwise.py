@@ -80,9 +80,8 @@ def test_cached_prefix_and_mtp_handoff(transport_world, mode):
                 metadata, state = peer
             for iteration in range(2 if cached else 1):
                 agent = engine._kv_transfer_agent
-                with mock.patch.object(
-                    agent, "begin_pull_blocks", wraps=agent.begin_pull_blocks
-                ) as pull:
+                method = "prepare_pull_blocks" if agent.is_push else "begin_pull_blocks"
+                with mock.patch.object(agent, method, wraps=getattr(agent, method)) as pull:
                     pending, future = complete_transfer(
                         engine, metadata, tokens, sampling(7), transport_world
                     )
