@@ -922,7 +922,6 @@ class DynamicEngineTestConfig:
     fp8: bool = False
     batch_invariant_mode: bool = False
     batch_invariant_backend: str = "te_native"
-    flash_attention_version: Optional[int] = None
     hidden_size: Optional[int] = None
     model_provider: str = "gpt"
     flash_attention_version: Optional[int] = 2
@@ -1253,7 +1252,6 @@ class DynamicInferenceEngineTestBase:
                     AttnBackend.flash if test_config.batch_invariant_mode else AttnBackend.auto
                 ),
                 attention_dropout=0.0 if test_config.batch_invariant_mode else 0.1,
-                flash_attention_version=test_config.flash_attention_version,
                 batch_invariant_mode=test_config.batch_invariant_mode,
                 batch_invariant_backend=test_config.batch_invariant_backend,
                 inference_sampling_seed=test_config.random_seed,
@@ -1364,7 +1362,6 @@ class DynamicInferenceEngineTestBase:
                     AttnBackend.flash if test_config.batch_invariant_mode else AttnBackend.auto
                 ),
                 attention_dropout=0.0 if test_config.batch_invariant_mode else 0.1,
-                flash_attention_version=test_config.flash_attention_version,
                 batch_invariant_mode=test_config.batch_invariant_mode,
                 batch_invariant_backend=test_config.batch_invariant_backend,
                 inference_sampling_seed=test_config.random_seed,
