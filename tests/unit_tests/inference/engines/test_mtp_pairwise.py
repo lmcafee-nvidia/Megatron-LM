@@ -142,6 +142,7 @@ def _config(case: _Case, *, mtp_active: bool) -> _DynamicEngineTestConfig:
         "use_flashinfer_fused_rope": False,
         "async_sched_mode": AsyncScheduleMode.LEGACY,
         "sampling_backend": "torch",
+        "flash_attention_version": 3,
         "top_k": 1,
     }
     values.update(case.config)
