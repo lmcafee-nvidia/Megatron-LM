@@ -573,6 +573,7 @@ def _tokens(length: int, offset: int = 0) -> torch.Tensor:
 def _config(case: _ChunkCase, chunked: bool) -> _DynamicEngineTestConfig:
     config = {
         "return_log_probs": True,
+        "flash_attention_version": 3,
         "materialize_only_last_token_logits": False,
         **case.scenario.config,
     }
