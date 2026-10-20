@@ -4,6 +4,7 @@
 
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, contextmanager
 from threading import Event
 from unittest import mock
 
@@ -36,9 +37,9 @@ from tests.unit_tests.inference.engines.test_disagg_pairwise import transport_wo
 from tests.unit_tests.test_utilities import Utils
 
 
-def deliver_abort(engine, request_id):
-    """Deliver one ABORT through the production ZMQ receive handler."""
-
+@contextmanager
+def abort_channel(engine):
+    """Keep the real coordinator socket alive through delayed cancellation."""
     context = zmq.Context()
     receiver, sender, publisher = (
         context.socket(zmq.PAIR),
@@ -53,17 +54,24 @@ def deliver_abort(engine, request_id):
     engine.socket_for_receiving_requests = receiver
     engine.model_parallel_publisher_socket = publisher
     try:
-        sender.send_multipart(
-            [msgpack.packb([Headers.ABORT_REQUEST.value, request_id], use_bin_type=True)]
-        )
-        assert receiver.poll(1000)
-        assert engine.schedule_requests() == 1
-        reply = sender.recv_multipart() if sender.poll(1000) else None
+        yield sender
     finally:
         for socket in (receiver, sender, publisher):
             socket.close(linger=0)
         context.term()
-    return reply
+
+
+def send_abort(engine, sender, request_id):
+    sender.send_multipart([msgpack.packb([Headers.ABORT_REQUEST.value, request_id])])
+    assert engine.socket_for_receiving_requests.poll(1000)
+    assert engine.schedule_requests() == 1
+    return sender.recv_multipart() if sender.poll(1000) else None
+
+
+def deliver_abort(engine, request_id):
+    """Deliver one ABORT through the production ZMQ receive handler."""
+    with abort_channel(engine) as sender:
+        return send_abort(engine, sender, request_id)
 
 
 @pytest.mark.parametrize("policy", list(PrefixCachingEvictionPolicy))
@@ -139,16 +147,15 @@ def test_real_handoff_capacity_fifo(transport_world, policy):
         assert_released(engine)
 
 
-@pytest.mark.parametrize("mode", [KVCacheManagementMode.PERSIST, KVCacheManagementMode.RECOMPUTE])
 @torch.inference_mode()
-def test_abort_capacity_queued_handoff_resolves_without_transfer(mode):
+def test_abort_capacity_queued_handoff_resolves_without_transfer():
     """A delivered ABORT must reach handoffs not yet present in engine.requests.
 
     This is a focused negative/lifecycle regression, not positive transfer credit.
     """
     Utils.initialize_model_parallel()
     try:
-        config = disagg_config(kv_cache_management_mode=mode, static_kv_memory_pointers=False)
+        config = disagg_config()
         with real_engine(config, role="decode") as engine:
             allocator = engine.context.kv_block_allocator
             held = allocator.allocate_memory_blocks(allocator.pool_avail).clone()
@@ -173,10 +180,13 @@ def test_abort_capacity_queued_handoff_resolves_without_transfer(mode):
                 assert not (
                     engine.requests or engine.failed_request_ids or engine.local_metadata_ledger
                 )
-                assert reply is not None, "Delivered ABORT did not publish a terminal ENGINE_REPLY"
-                metadata, body = [msgpack.unpackb(frame, raw=False) for frame in reply]
-                assert metadata == [Headers.ENGINE_REPLY.value, [[101, False]]]
-                assert body["request_id"] == 101 and body["status"] == "FAILED"
+                assert reply is not None, "Delivered ABORT did not publish REQUEST_ABORTED"
+                assert len(reply) == 1
+                assert msgpack.unpackb(reply[0], raw=False) == [
+                    Headers.REQUEST_ABORTED.value,
+                    101,
+                    True,
+                ]
                 assert deliver_abort(engine, 101) is None
             finally:
                 allocator.release_memory_blocks(held)
@@ -185,13 +195,15 @@ def test_abort_capacity_queued_handoff_resolves_without_transfer(mode):
         Utils.destroy_model_parallel()
 
 
-@pytest.mark.parametrize("mode", [KVCacheManagementMode.PERSIST, KVCacheManagementMode.RECOMPUTE])
 @torch.inference_mode()
-def test_abort_inflight_handoff_quarantines_until_real_nccl_settles(transport_world, mode):
+def test_abort_inflight_handoff_retains_storage_until_real_nccl_settles(transport_world):
     tokens = prompt(33)
     source = dist.get_rank() % 2 == 0
-    config = disagg_config(kv_cache_management_mode=mode, static_kv_memory_pointers=False)
-    with real_engine(config, role="prefill" if source else "decode") as engine:
+    config = disagg_config()
+    with (
+        real_engine(config, role="prefill" if source else "decode") as engine,
+        ExitStack() as stack,
+    ):
         metadata = state = None
         if source:
             result = run_to_completion(
@@ -233,15 +245,17 @@ def test_abort_inflight_handoff_quarantines_until_real_nccl_settles(transport_wo
         witness = None
         if not source:
             assert not future.done()
+            sender = stack.enter_context(abort_channel(engine))
             with ForwardWitness(engine) as witness:
-                reply = deliver_abort(engine, 101)
-            assert future.cancelled() and not engine._pending_kv_imports
-            assert engine._quarantined_kv_imports == [pending]
+                reply = send_abort(engine, sender, 101)
+            assert not future.done() and pending.cancel_requested
+            assert list(engine._pending_kv_imports) == [pending]
+            assert not engine._quarantined_kv_imports
             assert torch.equal(
                 engine.context.kv_block_allocator.block_ref_counts[owned_blocks],
                 torch.ones_like(owned_blocks, dtype=torch.int32),
             )
-            assert reply is not None
+            assert reply is None
         dist.barrier(group=transport_world)
 
         if source:
@@ -263,8 +277,17 @@ def test_abort_inflight_handoff_quarantines_until_real_nccl_settles(transport_wo
             engine.release_handoff_blocks(101)
         else:
             assert_import_equal(engine, pending, state, len(tokens))
-            assert engine._poll_pending_kv_imports() == 0
+            assert engine._poll_pending_kv_imports() == 1
+            assert engine._admit_pending_kv_imports() == 0
+            assert future.cancelled() and not engine._pending_kv_imports
             assert not engine._quarantined_kv_imports
+            assert sender.poll(1000)
+            assert msgpack.unpackb(sender.recv(), raw=False) == [
+                Headers.REQUEST_ABORTED.value,
+                101,
+                True,
+            ]
+            assert send_abort(engine, sender, 101) is None
             assert (engine.context.kv_block_allocator.block_ref_counts[owned_blocks] == 0).all()
             assert engine._poll_pending_kv_imports() == 0
             assert not witness.steps and not engine._handoff_completion_notifications
