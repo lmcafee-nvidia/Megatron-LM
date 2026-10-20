@@ -253,12 +253,12 @@ class TestChunkedPrefillTransitions(DynamicInferenceEngineTestBase):
         context = env.engine.context
         storage_bytes = context.memory_buffer.untyped_storage().nbytes()
         memory_address = context.memory_buffer.data_ptr()
-        assert env.engine.controller._async_sched_logits.is_valid
+        assert env.engine.controller._async_sched_forward.is_valid
         env.engine.suspend()
         assert env.engine.state == EngineState.SUSPENDED
         assert request.finished_chunk_token_count == progress
         assert context.chunked_prefill_request_id == request.request_id
-        assert env.engine.controller._async_sched_logits.is_valid
+        assert env.engine.controller._async_sched_forward.is_valid
         if kv_mode == KVCacheManagementMode.PERSIST:
             assert context.memory_buffer.untyped_storage().nbytes() == storage_bytes
             assert context.memory_buffer.data_ptr() == memory_address
