@@ -104,7 +104,7 @@ async def test_routed_suspend_resumes_active_request(monkeypatch, mode, residenc
             saver.pause.assert_called_once_with(context.TMS_TAG)
         else:
             assert not hasattr(context, "memory_buffer")
-            assert not h.engine.controller._async_sched_logits.is_valid
+            assert not h.engine.controller._async_sched_forward.is_valid
         await h.barrier()
         if h.rank == 0:
             assert h.service.coordinator.request_id_to_rank == route and not future.done()
