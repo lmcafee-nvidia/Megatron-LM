@@ -62,7 +62,8 @@ def test_ssm_slot_pressure_defers_real_handoffs(mixer, transport_world, monkeypa
                     assert engine._drain_deferred_kv_handoffs() == 1
                     pending = engine._pending_kv_imports[0]
                     assert pending.request_id == rid and pending.ssm.live_slot == int(held[0])
-                    assert len(pulls) == 3 * (index + 1)
+                    # One prepared transfer owns KV and both SSM components.
+                    assert len(pulls) == index + 1
                 peer = du.exchange(
                     None if source else du.decode_peer_meta(engine, pending), transport_world
                 )
