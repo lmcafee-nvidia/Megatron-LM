@@ -1,11 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Characterize chunked-prefill scheduling at its stateful boundaries.
-
-These tests intentionally use the real dynamic context, KV allocator, scheduler,
-and lifecycle update.  The only test double absorbs the scheduler's notification;
-no model forward is needed to characterize admission and bookkeeping.
-"""
+"""Exercise real chunked-prefill scheduling, allocation and lifecycle without a model forward."""
 
 from collections import deque
 from concurrent.futures import Future
@@ -353,7 +348,8 @@ class TestChunkedPrefillScheduleCharacterization(PrefixCachingTestBase):
                 state["query_lengths"][0] == context.cuda_graph_batch_dimensions_list[0].token_count
             )
 
-    def test_continuation_bypasses_cuda_graph_wait(self):
+    @pytest.mark.parametrize(("prefills", "query"), [(1, 2), (0, 10)])
+    def test_continuation_uses_graph_or_eager_fallback(self, prefills, query):
         context = self._context(max_tokens=10, prefix=False)
         engine = self._engine(context)
         self._set_graph(engine, 6)
@@ -362,13 +358,15 @@ class TestChunkedPrefillScheduleCharacterization(PrefixCachingTestBase):
         engine.schedule_chunked_prefill()
         self._consume_step(context)
 
-        self._set_graph(engine, 2)
+        context.cuda_graph_batch_dimensions_list = [
+            InferenceBatchDimensions(2, prefills, 1 - prefills)
+        ]
         request.cg_wait_iters = 7
         engine.schedule_chunked_prefill()
         state = self._state(engine, request)
-        assert state["query_lengths"] == [10] and state["kv_offsets"] == [6]
-        assert (state["finished"], state["remaining"], state["chunked_id"]) == (16, 4, 1)
-        assert request.cg_wait_iters == 7
+        assert state["query_lengths"] == [query] and state["kv_offsets"] == [6]
+        assert (state["finished"], state["remaining"]) == (6 + query, 14 - query)
+        assert state["chunked_id"] == 1 and request.cg_wait_iters == 0
 
     @pytest.mark.parametrize(
         ("prefix", "length", "query"),
