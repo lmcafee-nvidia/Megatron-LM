@@ -292,9 +292,9 @@ class TestChunkedPrefillScheduleCharacterization(PrefixCachingTestBase):
         engine.schedule_chunked_prefill()
         resumed = self._state(engine, conflict)
         assert resumed["active_ids"][0] == 2
-        assert resumed["kv_offsets"][0] == context.block_size_tokens
+        assert resumed["kv_offsets"][0] == 7 and resumed["query_lengths"][0] == 1
         assert not conflict.remaining_prompt_tokens.numel()
-        assert conflict.num_cached_tokens == context.block_size_tokens
+        assert conflict.num_cached_tokens == 7
         # Any partial C begins only after B is admitted; drain it with the real lifecycle.
         for _ in range(4):
             if not engine.waiting_request_ids:
