@@ -19,7 +19,7 @@ from tests.unit_tests.inference.contexts.test_dynamic_prefix_caching import Pref
 
 
 class SharingMachine(RuleBasedStateMachine):
-    """Six blocks, two live requests, and three overlapping/divergent prompt families.
+    """Six blocks, two live requests, and prompts on either side of block boundaries.
 
     The driver supplies completion decisions without computing KV contents. Real
     resolve_requests compacts surviving rows; synthetic sampled tokens establish
@@ -28,6 +28,7 @@ class SharingMachine(RuleBasedStateMachine):
     """
 
     capacity = 6
+    prompt_lengths = (1, 31, 32, 33, 63, 64, 65, 95, 96, 97)
     metrics = Counter()
     histories = []
     failures = []
@@ -66,7 +67,10 @@ class SharingMachine(RuleBasedStateMachine):
         self.trace.append(dict(action=action, **details))
         self.metrics[action] += 1
 
-    def _admit(self, family, full_blocks, request, action):
+    def _admit(self, family, num_tokens, request, action):
+        bs = self.ctx.block_size_tokens
+        full_blocks = num_tokens // bs
+        required_blocks = (num_tokens + bs - 1) // bs
         matched = []
         for index in range(full_blocks):
             key = self._key(family, index)
@@ -75,29 +79,49 @@ class SharingMachine(RuleBasedStateMachine):
             matched.append(self.cache[key][0])
         live = self._live_blocks()
         unavailable = live | set(self.held) | set(matched)
-        should_succeed = full_blocks + 1 - len(matched) <= self.capacity - len(unavailable)
-        self._record(action, family=family, full_blocks=full_blocks, expected=should_succeed)
+        should_succeed = required_blocks - len(matched) <= self.capacity - len(unavailable)
+        self._record(action, family=family, num_tokens=num_tokens, expected=should_succeed)
+        # Full cached blocks save their tokens, except the final prompt token:
+        # it must still produce the first output logits, even on an exact hit.
+        computed_positions = [
+            pos for pos in range(num_tokens) if pos // bs >= len(matched) or pos == num_tokens - 1
+        ]
+        skipped_tokens = num_tokens - len(computed_positions)
         # The component's availability query must agree even when matches are already pinned.
         requests_ok, tokens_ok, blocks_ok = self.ctx.check_availability(request)
         assert requests_ok and tokens_ok, 'fixture unexpectedly exhausted request/token capacity'
         assert bool(blocks_ok) == should_succeed, 'availability disagrees with independent capacity'
         row = len(self.active)
+        token_start = self.ctx.active_token_count
         try:
             self.ctx.add_request(request)
         except BlockOverflowError:
             assert not should_succeed, 'admission rejected despite sufficient modeled capacity'
-            self.waiting = (family, full_blocks, request)
+            self.waiting = (family, num_tokens, request)
             self.metrics['rejected_with_prefix' if matched else 'rejected_without_prefix'] += 1
             if self.active:
                 self.metrics['rejected_with_live_request'] += 1
             return
         assert should_succeed, 'admission exceeded modeled capacity'
-        blocks = self.helper._block_ids(self.ctx, row, full_blocks + 1)
+        blocks = self.helper._block_ids(self.ctx, row, required_blocks)
         assert len(set(blocks)) == len(blocks), 'duplicate physical blocks in one request'
         assert blocks[: len(matched)] == matched, 'matched prefix was not retained'
         assert not set(blocks).intersection(self.held + self.reserved.tolist())
         assert not set(blocks[len(matched) :]).intersection(live), 'new blocks alias a live request'
-        assert request.num_cached_tokens == len(matched) * self.ctx.block_size_tokens
+        assert request.num_cached_tokens == skipped_tokens, 'skipped-token accounting mismatch'
+        token_end = self.ctx.active_token_count
+        assert token_end - token_start == len(computed_positions), 'computed-token count mismatch'
+        assert self.ctx.request_query_lengths[row].item() == len(computed_positions)
+        assert self.ctx.request_kv_length_offsets[row].item() == skipped_tokens
+        assert self.ctx.token_to_pos_ids[token_start:token_end].tolist() == computed_positions
+        # Recomputed cached tokens must not overwrite a block another owner can read.
+        expected_writes = [
+            self.alloc.dummy_block_idx if pos // bs < len(matched) else blocks[pos // bs]
+            for pos in computed_positions
+        ]
+        assert (
+            self.ctx.token_to_block_idx[token_start:token_end].tolist() == expected_writes
+        ), 'cached-token write protection mismatch'
         new_ids = set(blocks[len(matched) :])
         before = len(self.cache)
         self.cache = {key: value for key, value in self.cache.items() if value[0] not in new_ids}
@@ -114,6 +138,14 @@ class SharingMachine(RuleBasedStateMachine):
         )
         self.waiting = None
         self.metrics['accepted_with_prefix' if matched else 'accepted_without_prefix'] += 1
+        self.metrics[f'accepted_length_{num_tokens}'] += 1
+        if num_tokens % bs == 0:
+            self.metrics['aligned_admissions'] += 1
+        if len(matched) == required_blocks:
+            self.metrics['fully_cached_aligned_admissions'] += 1
+            self.metrics['cached_token_write_redirects'] += 1
+            if self._raw_free() == 0:
+                self.metrics['fully_cached_with_empty_raw_pool'] += 1
         if len(self.active) == 2:
             self.metrics['two_live_requests'] += 1
         if set(blocks).intersection(live):
@@ -124,15 +156,15 @@ class SharingMachine(RuleBasedStateMachine):
                 self.metrics['successful_retries_with_survivor'] += 1
 
     @precondition(lambda self: len(self.active) < 2)
-    @rule(family=st.integers(0, 2), full_blocks=st.integers(0, 3))
-    def submit(self, family, full_blocks):
+    @rule(family=st.integers(0, 2), num_tokens=st.sampled_from(prompt_lengths))
+    def submit(self, family, num_tokens):
         bs = self.ctx.block_size_tokens
-        tokens = self.helper._prompt(full_blocks * bs + 1, offset=2000 if family == 2 else 0)
+        tokens = self.helper._prompt(num_tokens, offset=2000 if family == 2 else 0)
         if family == 1:
             tokens[bs:] += 1000
         request = self.helper._req(self.ctx, tokens, request_id=self.next_request)
         self.next_request += 1
-        self._admit(family, full_blocks, request, 'submit')
+        self._admit(family, num_tokens, request, 'submit')
 
     @precondition(lambda self: len(self.active) < 2 and self.waiting is not None)
     @rule()
@@ -254,7 +286,7 @@ def test_replay_sharing_history():
         machine.bookkeeping_matches_reference()
         for step in history:
             if step['action'] == 'submit':
-                machine.submit(step['family'], step['full_blocks'])
+                machine.submit(step['family'], step['num_tokens'])
             elif step['action'] == 'finish':
                 machine.finish(step['slot'])
             elif step['action'] in ('reserve', 'unreserve'):
