@@ -3714,7 +3714,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 async def assert_endpoint_stream_matches_final(path, body, *, chat):
                     endpoint_client = endpoint_app.test_client()
                     final_response = await endpoint_client.post(path, json=body)
-                    assert final_response.status_code == 200
+                    assert final_response.status_code == 200, await final_response.get_data(
+                        as_text=True
+                    )
                     final_payload = await final_response.get_json()
                     final_choices = sorted(
                         final_payload["choices"], key=lambda choice: choice["index"]
