@@ -535,6 +535,71 @@ async def test_openai_stream_rejects_clean_termination_without_a_final_record():
     assert "error" in json.loads(records[-1].removeprefix("data: "))
 
 
+@pytest.mark.asyncio
+async def test_short_choice_gets_terminal_before_longer_choice_finishes():
+    short = AsyncStream(request_id=1, cancel=lambda: None)
+    long = AsyncStream(request_id=2, cancel=lambda: None)
+    short.put(
+        {
+            "final": {
+                "prompt_tokens": [9],
+                "generated_tokens": [1],
+                "sampling_params": {"num_tokens_to_generate": 4},
+            }
+        }
+    )
+    short.finish()
+    long.put({"partial": {"request_id": 2, "new_tokens": [2]}})
+    terminal_seen = asyncio.Event()
+    records = []
+
+    async def collect():
+        async for record in openai_stream(
+            [short, long],
+            _Tokenizer(),
+            [_IncrementalDetokenizer(), _IncrementalDetokenizer()],
+            chat=False,
+        ):
+            records.append(record)
+            if record == "data: [DONE]\n\n":
+                continue
+            payload = json.loads(record.removeprefix("data: "))
+            if any(
+                choice["index"] == 0 and choice["finish_reason"] is not None
+                for choice in payload.get("choices", [])
+            ):
+                terminal_seen.set()
+
+    collector = asyncio.create_task(collect())
+    try:
+        await asyncio.wait_for(terminal_seen.wait(), timeout=2)
+        assert not long.finished
+    finally:
+        long.put(
+            {
+                "final": {
+                    "prompt_tokens": [9],
+                    "generated_tokens": [2, 3],
+                    "sampling_params": {"num_tokens_to_generate": 4},
+                }
+            }
+        )
+        long.finish()
+        await collector
+
+    terminal_indices = []
+    for record in records:
+        if record == "data: [DONE]\n\n":
+            continue
+        payload = json.loads(record.removeprefix("data: "))
+        terminal_indices.extend(
+            choice["index"]
+            for choice in payload.get("choices", [])
+            if choice["finish_reason"] is not None
+        )
+    assert terminal_indices == [0, 1]
+
+
 def test_incremental_detokenizer_rejects_unsupported_tokenizer():
     with pytest.raises(
         ValueError, match="Streaming is currently supported only for Hugging Face fast tokenizers"
