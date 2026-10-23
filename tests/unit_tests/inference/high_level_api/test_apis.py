@@ -360,6 +360,12 @@ class TestLifecycleGuards:
         await llm.shutdown()
         await llm.wait_for_shutdown()
 
+        sync_llm = _make_worker_instance(MegatronLLM)
+        sync_llm._shutdown_called = True
+        sync_llm._loop_manager = MagicMock()
+        sync_llm.wait_for_shutdown()
+        sync_llm._loop_manager.run_sync.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_generate_after_shutdown_is_rejected(self):
         sync_llm = _make_worker_instance(MegatronLLM)
@@ -367,12 +373,23 @@ class TestLifecycleGuards:
         sync_llm._shutdown_called = True
         with pytest.raises(RuntimeError, match="shut down"):
             sync_llm.generate("late")
+        for method in ("pause", "unpause", "suspend", "resume"):
+            with pytest.raises(RuntimeError, match="shut down"):
+                getattr(sync_llm, method)()
+        for method in (sync_llm.submit, sync_llm.run_sync):
+            coro = asyncio.sleep(0)
+            with pytest.raises(RuntimeError, match="shut down"):
+                method(coro)
+            coro.close()
 
         async_llm = _make_worker_instance(MegatronAsyncLLM)
         async_llm._is_primary_rank = True
         async_llm._shutdown_called = True
         with pytest.raises(RuntimeError, match="shut down"):
             await async_llm.generate("late")
+        for method in ("pause", "unpause", "suspend", "resume"):
+            with pytest.raises(RuntimeError, match="shut down"):
+                await getattr(async_llm, method)()
 
     def test_bridge_and_serve_raise_in_direct_mode(self, mock_pipeline, fake_model_and_tokenizer):
         model, tok = fake_model_and_tokenizer

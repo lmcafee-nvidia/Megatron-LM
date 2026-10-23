@@ -131,6 +131,7 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         Raises:
             RuntimeError: in direct mode (``use_coordinator=False``).
         """
+        self._assert_not_shutdown()
         self._assert_coordinator()
         assert self._loop_manager is not None
         await self._loop_manager.run_async(self._pause_impl())
@@ -141,6 +142,7 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         Raises:
             RuntimeError: in direct mode (``use_coordinator=False``).
         """
+        self._assert_not_shutdown()
         self._assert_coordinator()
         assert self._loop_manager is not None
         await self._loop_manager.run_async(self._unpause_impl())
@@ -153,6 +155,7 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         Raises:
             RuntimeError: in direct mode (``use_coordinator=False``).
         """
+        self._assert_not_shutdown()
         self._assert_coordinator()
         assert self._loop_manager is not None
         await self._loop_manager.run_async(self._suspend_impl())
@@ -163,6 +166,7 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         Raises:
             RuntimeError: in direct mode (``use_coordinator=False``).
         """
+        self._assert_not_shutdown()
         self._assert_coordinator()
         assert self._loop_manager is not None
         await self._loop_manager.run_async(self._resume_impl())
@@ -260,6 +264,13 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         No-op in direct mode.
         """
         if not self._use_coordinator:
+            return
+        with self._async_shutdown_lock:
+            shutdown_called = self._shutdown_called
+            shutdown_complete_future = self._shutdown_complete_future
+        if shutdown_called:
+            assert shutdown_complete_future is not None
+            await asyncio.shield(asyncio.wrap_future(shutdown_complete_future))
             return
         assert self._loop_manager is not None
         await self._loop_manager.run_async(self._wait_for_shutdown_impl())

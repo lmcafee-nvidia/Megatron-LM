@@ -54,10 +54,11 @@ class HuggingFaceFastIncrementalDetokenizer:
         # `DecodeStream(skip_special_tokens=True)` would drop those markers too.
         self._remove_eos = remove_eos
         self._eos_token_ids = model_eos_token_ids(tokenizer)
-        # The non-streaming path keeps special tokens when the caller explicitly
-        # asks to include the stop sequence. Mirror that policy here.
+        # Mapped special tokens remain filtered when the caller asks to retain
+        # the stop sequence. EOS ids are managed separately so only their
+        # trailing-position policy changes with ``remove_eos``.
         self._skipped_token_ids = (
-            frozenset(huggingface_tokenizer.all_special_ids) if remove_eos else frozenset()
+            frozenset(huggingface_tokenizer.all_special_ids) - self._eos_token_ids
         )
         self._pending_eos_token_ids: list[int] = []
         self._decode_stream = self._new_decode_stream(prompt_token_ids)
@@ -158,6 +159,6 @@ def detokenize_generated_tokens(
         )
     except (ImportError, ValueError):
         return detokenize_tokens(
-            tokenizer, generated_token_ids, remove_EOD=remove_eos, skip_special_tokens=remove_eos
+            tokenizer, generated_token_ids, remove_EOD=remove_eos, skip_special_tokens=True
         )
     return detokenizer.update(generated_token_ids) + detokenizer.finish()

@@ -413,6 +413,7 @@ class _MegatronLLMBase:
             RuntimeError: in direct mode (``use_coordinator=False``), which
                 has no background runtime loop.
         """
+        self._assert_not_shutdown()
         self._assert_coordinator()
         assert self._loop_manager is not None
         return self._loop_manager.submit(coro)
@@ -429,6 +430,7 @@ class _MegatronLLMBase:
             RuntimeError: in direct mode (``use_coordinator=False``), or when
                 called from a coroutine running on the runtime loop itself.
         """
+        self._assert_not_shutdown()
         self._assert_coordinator()
         assert self._loop_manager is not None
         return self._loop_manager.run_sync(coro)

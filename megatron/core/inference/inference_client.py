@@ -535,7 +535,11 @@ class InferenceClient:
     def _submit_request(self, frames: list, request_id: int) -> asyncio.Future:
         """Send a prepared request and register its completion future."""
         self._pending_source_requests.add(request_id)
-        self.socket.send_multipart(frames)
+        try:
+            self.socket.send_multipart(frames)
+        except Exception:  # pylint: disable=broad-except
+            self._pending_source_requests.discard(request_id)
+            raise
         assert request_id not in self.completion_futures
         future = asyncio.get_running_loop().create_future()
         self.completion_futures[request_id] = future
@@ -545,7 +549,11 @@ class InferenceClient:
     def _submit_stream(self, frames: list, request_id: int) -> AsyncStream[dict]:
         """Send a prepared streaming request and register its response stream."""
         self._pending_source_requests.add(request_id)
-        self.socket.send_multipart(frames)
+        try:
+            self.socket.send_multipart(frames)
+        except Exception:  # pylint: disable=broad-except
+            self._pending_source_requests.discard(request_id)
+            raise
         stream = AsyncStream(
             request_id, functools.partial(self.abort_request, request_id), loop=self._loop
         )

@@ -127,6 +127,7 @@ class MegatronLLM(_MegatronLLMBase):
         Raises:
             RuntimeError: in direct mode (``use_coordinator=False``).
         """
+        self._assert_not_shutdown()
         self._assert_coordinator()
         assert self._loop_manager is not None
         self._loop_manager.run_sync(self._pause_impl())
@@ -137,6 +138,7 @@ class MegatronLLM(_MegatronLLMBase):
         Raises:
             RuntimeError: in direct mode (``use_coordinator=False``).
         """
+        self._assert_not_shutdown()
         self._assert_coordinator()
         assert self._loop_manager is not None
         self._loop_manager.run_sync(self._unpause_impl())
@@ -149,6 +151,7 @@ class MegatronLLM(_MegatronLLMBase):
         Raises:
             RuntimeError: in direct mode (``use_coordinator=False``).
         """
+        self._assert_not_shutdown()
         self._assert_coordinator()
         assert self._loop_manager is not None
         self._loop_manager.run_sync(self._suspend_impl())
@@ -159,6 +162,7 @@ class MegatronLLM(_MegatronLLMBase):
         Raises:
             RuntimeError: in direct mode (``use_coordinator=False``).
         """
+        self._assert_not_shutdown()
         self._assert_coordinator()
         assert self._loop_manager is not None
         self._loop_manager.run_sync(self._resume_impl())
@@ -243,6 +247,8 @@ class MegatronLLM(_MegatronLLMBase):
     def wait_for_shutdown(self) -> None:
         """Block until the engine loop terminates. Direct mode no-op."""
         if not self._use_coordinator:
+            return
+        if self._shutdown_called:
             return
         assert self._loop_manager is not None
         self._loop_manager.run_sync(self._wait_for_shutdown_impl())
