@@ -67,10 +67,10 @@ class TorchSampling(Sampling):
         """
         top_p_active = not is_no_op_top_p(top_p)
         assert not (top_k > 0 and top_p_active), "Cannot have top-p and top-k both active"
-        # Clone needed: .div_() and the filters below modify in-place. Upcast before
-        # scaling so low-precision logits do not quantize the temperature division;
-        # sampling and processed scores both promise fp32 probability math.
-        last_token_logits = last_token_logits.float().clone()
+        # A copy is needed because .div_() and the filters below modify in-place.
+        # Upcast while copying so low-precision logits do not quantize the temperature
+        # division; sampling and processed scores both promise fp32 probability math.
+        last_token_logits = last_token_logits.to(dtype=torch.float32, copy=True)
         if temperature != 1.0:
             last_token_logits.div_(max(temperature, MIN_SAMPLING_TEMPERATURE))
         if not is_no_op_top_k(top_k):
