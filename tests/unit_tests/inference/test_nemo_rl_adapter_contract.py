@@ -413,7 +413,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         engine.context = SimpleNamespace(
             block_size_tokens=16, enable_prefix_caching=False, add_vlm_request_data=mock.Mock()
         )
-        engine.vision_embedding_cache_max_bytes = 1 << 30
+        engine.vision_embedding_cache_max_bytes = sys.maxsize
         engine.allow_stale_multimodal_embeddings = False
         engine._vision_embedding_cache = OrderedDict()
         engine._vision_embedding_cache_bytes = 0
@@ -456,6 +456,8 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         direct_token, direct_score = next_token(direct_request)
         adapter_request = build_request(1301, media[0])
         adapter_token, adapter_score = next_token(adapter_request)
+        cache_key = f"consumer-{modality}"
+        assert cache_key in engine._vision_embedding_cache
         assert vision_calls == [modality]
         assert torch.equal(direct_request.image_embeddings, adapter_request.image_embeddings)
         assert (adapter_token, adapter_score) == (direct_token, direct_score)
@@ -472,10 +474,14 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         engine._invalidate_vision_state()
         assert not engine._vision_embedding_cache
         build_request(1302, media[0])
+        assert cache_key in engine._vision_embedding_cache
         assert vision_calls == [modality, modality]
+        stale_embedding = engine._vision_embedding_cache[cache_key].embedding
         engine.allow_stale_multimodal_embeddings = True
         engine._invalidate_vision_state()
-        build_request(1303, media[0])
+        assert engine._vision_embedding_cache[cache_key].embedding is stale_embedding
+        stale_request = build_request(1303, media[0])
+        assert stale_request.image_embeddings is stale_embedding
         assert vision_calls == [modality, modality]
 
     @pytest.mark.internal
