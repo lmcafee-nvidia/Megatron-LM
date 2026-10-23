@@ -36,6 +36,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.resharding.refit import clear_all_caches
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
@@ -323,6 +324,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             num_attention_heads=4,
             use_cpu_initialization=False,
             bf16=True,
+            attention_backend=AttnBackend.local,
         )
         vision_config = TransformerConfig(
             num_layers=1,
@@ -330,6 +332,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             num_attention_heads=2,
             use_cpu_initialization=False,
             bf16=True,
+            attention_backend=AttnBackend.local,
         )
         projection_config = TransformerConfig(
             num_layers=1,
