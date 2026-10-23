@@ -288,6 +288,19 @@ def test_public_validation_rejects_invalid_dtype_and_linear_geometry(monkeypatch
         MXFP8Tensor.from_bf16(
             torch.ones(8, 128, device="cuda", dtype=torch.int32), backend="triton"
         )
+    with pytest.raises(ValueError, match="dimensions must be nonzero"):
+        MXFP8Tensor.from_bf16(
+            torch.empty(0, 128, device="cuda", dtype=torch.bfloat16), backend="triton"
+        )
+    with pytest.raises(ValueError, match="divisible"):
+        MXFP8Tensor.from_bf16(
+            torch.empty(8, 130, device="cuda", dtype=torch.bfloat16), backend="triton"
+        )
+    if HAVE_FLASHINFER:
+        with pytest.raises(TypeError, match="accepts BF16 or FP16"):
+            MXFP8Tensor.from_bf16(
+                torch.randn(8, 128, device="cuda", dtype=torch.float32), backend="flashinfer"
+            )
 
     weight = MXFP8Tensor.from_bf16(
         torch.randn(64, 128, device="cuda", dtype=torch.bfloat16), backend="triton"
@@ -305,6 +318,8 @@ def test_public_validation_rejects_invalid_dtype_and_linear_geometry(monkeypatch
         quantization_utils.mm_mxfp8(
             torch.randn(4, 1, 160, device="cuda", dtype=torch.bfloat16), weight
         )
+    with pytest.raises(TypeError, match="linear input must use"):
+        quantization_utils.mm_mxfp8(torch.ones(4, 1, 128, device="cuda", dtype=torch.int32), weight)
     with pytest.raises(ValueError, match="output buffer"):
         quantization_utils.mm_mxfp8(
             torch.randn(4, 1, 128, device="cuda", dtype=torch.bfloat16),

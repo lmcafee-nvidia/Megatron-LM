@@ -364,6 +364,10 @@ def mm_mxfp8(x: torch.Tensor, weight: MXFP8Tensor, out: torch.Tensor = None):
             f"MXFP8 input and weight must use the same CUDA device, got "
             f"{x.device} and {weight.device}."
         )
+    if x.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise TypeError(f"MXFP8 linear input must use BF16, FP16, or FP32, got {x.dtype}.")
+    if backend == "flashinfer" and x.dtype == torch.float32:
+        raise TypeError("FlashInfer MXFP8 linear input must use BF16 or FP16, not FP32.")
     if x.shape[-1] != weight.shape[-1]:
         raise ValueError(
             f"MXFP8 input hidden size {x.shape[-1]} does not match weight K "

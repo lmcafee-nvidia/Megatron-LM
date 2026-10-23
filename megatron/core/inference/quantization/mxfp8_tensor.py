@@ -248,7 +248,10 @@ class MXFP8Tensor:
             raise TypeError(f"MXFP8 quantization requires BF16, FP16, or FP32, got {x.dtype}.")
         if x.shape[0] == 0 or x.shape[1] == 0:
             raise ValueError(f"MXFP8 input dimensions must be nonzero, got {tuple(x.shape)}.")
-        assert x.shape[-1] % group_size == 0
+        if x.shape[-1] % group_size != 0:
+            raise ValueError(
+                f"MXFP8 K dimension {x.shape[-1]} must be divisible by group size {group_size}."
+            )
         x = x.contiguous()
         if backend == "flashinfer":
             assert HAVE_FLASHINFER, "FlashInfer not available"
