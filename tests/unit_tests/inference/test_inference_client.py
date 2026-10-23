@@ -150,6 +150,22 @@ async def test_inference_client_connect_handshake_rejects_unexpected_reply():
         client._connect_with_inference_coordinator()
 
 
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_failed_submission_releases_source_ownership(streaming):
+    """A request that never reached the socket cannot own remote state."""
+    client, _, fake_socket = _make_client()
+    fake_socket.send_multipart.side_effect = RuntimeError("send failed")
+
+    submit = client.add_request_streaming if streaming else client.add_request
+    with pytest.raises(RuntimeError, match="send failed"):
+        submit("prompt", SamplingParams())
+
+    assert not client._pending_source_requests
+    assert not client.completion_futures
+    assert not client.streams
+    assert not client.request_submission_times
+
+
 async def test_add_request_with_kv_handoff_returns_future():
     """Non-streaming handoffs use the normal final-reply future path."""
     client, _, fake_socket = _make_client()
