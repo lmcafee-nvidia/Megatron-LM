@@ -29,13 +29,14 @@ def _requests(context):
             return_log_probs=True,
             skip_prompt_log_probs=False,
             top_n_logprobs=3,
-            stop_words=["12 13"],
+            # Both sequences end on token 13; the longest simultaneous match wins.
+            stop_words=["12 13", "11 12 13"],
             detokenize_stop_sequence=False,
         ),
         SamplingParams(
-            num_tokens_to_generate=6,
+            num_tokens_to_generate=2,
             termination_id=-1,
-            stop_token_ids=[22],
+            stop_token_ids=[22, 55],
             top_k=1,
             return_log_probs=True,
             skip_prompt_log_probs=True,
@@ -94,6 +95,16 @@ def _install_step_witnesses(env, runtime, step_index, vocab_size):
 
     sampler.sample_kernel = traced_sample
 
+    original_scores = sampler.log_probs_kernel
+
+    def traced_scores(*args, **kwargs):
+        request_ids = tuple(_active_request_ids(context))
+        result = original_scores(*args, **kwargs)
+        runtime[("scores", step_index[0], request_ids)] += 1
+        return result
+
+    sampler.log_probs_kernel = traced_scores
+
     original_compact = engine.controller._compact_async_sched_forward
 
     def traced_compact(survivor_idxs):
@@ -133,9 +144,17 @@ def _assert_scores(request):
 
 class TestSamplingOutputMatrix(RequestLifecyclePairwiseBase):
     @classmethod
-    def _run_mode(cls, mode):
-        config, env = cls._manual_env(async_sched_mode=mode, vocab_size=64)
+    def _run_mode(cls, mode, sampling_backend):
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
+        config, env = cls._manual_env(
+            async_sched_mode=mode,
+            sampling_backend=sampling_backend,
+            logprobs_mode="processed_logprobs",
+            vocab_size=64,
+        )
         engine = env.engine
+        assert engine.controller._sampling_backend == sampling_backend
         requests = _requests(engine.context)
         futures = [engine._add_request(request) for request in requests]
         runtime = Counter()
@@ -157,12 +176,15 @@ class TestSamplingOutputMatrix(RequestLifecyclePairwiseBase):
         _assert_engine_drained(engine, futures, completed, range(3))
         finished = [completed[request_id] for request_id in range(3)]
         assert [request.generated_tokens for request in finished] == [
-            [11],
+            [],
             [21, 22],
             [31, 32, 33, 34],
         ]
         assert [request.finish_reason for request in finished] == ["stop", "stop", "length"]
         assert all(request.status == Status.COMPLETED for request in finished)
+        assert finished[0].stop_word_ids == [[12, 13], [11, 12, 13]]
+        assert finished[1].sampling_params.stop_token_ids == [22, 55]
+        assert finished[1].generated_length == finished[1].sampling_params.num_tokens_to_generate
         assert runtime["middle-finished-with-survivors"] > 0
 
         for request in finished:
@@ -186,7 +208,12 @@ class TestSamplingOutputMatrix(RequestLifecyclePairwiseBase):
             for key in runtime
             if isinstance(key, tuple) and key[0] == "sample" and set(key[2]) == {0, 1, 2}
         }
-        assert model_steps & sample_steps
+        score_steps = {
+            key[1]
+            for key in runtime
+            if isinstance(key, tuple) and key[0] == "scores" and set(key[2]) == {0, 1, 2}
+        }
+        assert model_steps & sample_steps & score_steps
         if mode == AsyncScheduleMode.ASYNC:
             assert runtime[("compact", (0, 2))] > 0
 
@@ -207,11 +234,12 @@ class TestSamplingOutputMatrix(RequestLifecyclePairwiseBase):
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="real dynamic engine requires CUDA")
+    @pytest.mark.parametrize("sampling_backend", ["torch", "flashinfer"])
     @torch.inference_mode()
-    def test_heterogeneous_scores_stops_and_middle_compaction(self):
+    def test_heterogeneous_scores_stops_and_middle_compaction(self, sampling_backend):
         """Legacy and async engines preserve exact tokens, scores, stops, and events."""
-        legacy = self._run_mode(AsyncScheduleMode.LEGACY)
-        asynchronous = self._run_mode(AsyncScheduleMode.ASYNC)
+        legacy = self._run_mode(AsyncScheduleMode.LEGACY, sampling_backend)
+        asynchronous = self._run_mode(AsyncScheduleMode.ASYNC, sampling_backend)
 
         assert asynchronous.keys() == legacy.keys()
         for request_id in legacy:

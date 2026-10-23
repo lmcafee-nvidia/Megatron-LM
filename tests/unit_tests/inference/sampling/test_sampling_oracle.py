@@ -135,6 +135,10 @@ def test_known_logits_match_independent_filter_and_score_oracle(backend, dtype):
         rtol=2.0e-4 if dtype == torch.bfloat16 else 2.0e-5,
         atol=2.0e-4 if dtype == torch.bfloat16 else 2.0e-6,
     )
+    torch.testing.assert_close(actual_raw.exp().sum(1), torch.ones(len(parameters), device="cuda"))
+    torch.testing.assert_close(
+        actual_scores.exp().sum(1), torch.ones(len(parameters), device="cuda"), atol=2.0e-6, rtol=0
+    )
     torch.testing.assert_close(
         expected_raw.exp().sum(1), torch.ones(len(parameters), device="cuda")
     )
