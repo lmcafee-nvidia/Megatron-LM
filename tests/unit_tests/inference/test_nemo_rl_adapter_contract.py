@@ -805,11 +805,17 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         if stresses_chunking:
             assert witness["chunked_prefill_steps"] > 0
             assert engine._prefill_tokens_skipped > 0
-        if (
-            feature_config.get("prefix_caching_eviction_policy")
-            == PrefixCachingEvictionPolicy.REF_ZERO
-        ):
-            assert engine._prefill_tokens_skipped == 0
+        if stresses_prefix:
+            allocator = engine.context.kv_block_allocator
+            assert engine._prefill_tokens_skipped > 0
+            assert not torch.count_nonzero(allocator.block_ref_counts)
+            if (
+                feature_config["prefix_caching_eviction_policy"]
+                == PrefixCachingEvictionPolicy.REF_ZERO
+            ):
+                assert not allocator.kv_hash_to_block_id
+            else:
+                assert allocator.kv_hash_to_block_id
         if feature_config.get("num_cuda_graphs") is not None:
             assert witness["cuda_graph_steps"] > 0
         if feature_config.get("num_speculative_tokens", 0):
