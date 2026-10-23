@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import asyncio
 import builtins
 import json
 from types import SimpleNamespace
