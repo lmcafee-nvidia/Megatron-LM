@@ -1265,6 +1265,7 @@ def test_swap_gated_recurrent_variants_matches_fresh_model(variant: str):
             linear_num_key_heads=4,
             linear_num_value_heads=4,
             experimental_attention_variant="gated_delta_net",
+            linear_attention_freq=[1, 1],
             gdn_kernel_backend="fla",
             activation_func=torch.nn.functional.silu,
             normalization="RMSNorm",
