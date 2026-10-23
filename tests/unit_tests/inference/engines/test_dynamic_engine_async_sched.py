@@ -859,6 +859,22 @@ _ASYNC_PARALLEL_SCENARIOS = (
         signals=("inference-optimized", "moe", "nccl-dispatch", "parallel"),
     ),
     _pair_scenario(
+        "moe-ep2-etp2",
+        "model:moe",
+        "topology:ep",
+        "topology:etp",
+        "interaction:moe-etp-streaming",
+        config={
+            "expert_model_parallel_size": 2,
+            "expert_tensor_parallel_size": 2,
+            "num_moe_experts": 4,
+            "use_moe_layer_spec": True,
+            "transformer_impl": "transformer_engine",
+        },
+        signals=("etp", "moe", "parallel", "transformer-engine"),
+        prerequisite="transformer-engine",
+    ),
+    _pair_scenario(
         "optimized-tp2-sp",
         "interaction:optimized-tp-sp",
         "seed:shared-across-dp",
@@ -900,9 +916,10 @@ _STREAMING_SIGNAL_COUNTERS = {
     "mamba": "module-forward:mamba",
     "mla": "module-forward:mla",
     "mxfp8": "fp8-quantized-forwards",
-    "moe": "nccl-token-dispatches",
+    "moe": "module-forward:moe",
     "nccl-dispatch": "nccl-token-dispatches",
     "parallel": "module-forward:parallel",
+    "etp": "module-forward:parallel",
     "processed-logprobs": "log-probs-kernel",
     "softmax-sink": "sink-correction-calls",
     "swa-all": "swa-kernel-calls",
@@ -2021,6 +2038,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 model_config.tensor_model_parallel_size > 1
                 or model_config.pipeline_model_parallel_size > 1
                 or model_config.expert_model_parallel_size > 1
+                or model_config.expert_tensor_parallel_size > 1
             )
             assert runtime["module-forward:parallel"] > 0
             if model_config.tensor_model_parallel_size > 1:
@@ -2044,11 +2062,13 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 assert runtime["pipeline-logits-broadcasts"] > 0
         if "moe" in signals:
             assert model_config.num_moe_experts is not None
-            assert context._nccl_ep_dispatcher
-            # Inference MoE may dispatch through split execution helpers that
-            # bypass nn.Module forward hooks. The live dispatcher calls below
-            # are the feature-owning runtime boundary.
-            assert runtime["nccl-token-dispatches"] > 0
+            assert context._nccl_ep_dispatcher or context._training_ep_dispatcher
+            assert runtime["module-forward:moe"] > 0
+        if "etp" in signals:
+            assert model_config.expert_tensor_parallel_size > 1
+            assert parallel_state.get_expert_tensor_parallel_world_size() == 2
+            assert runtime["tp-column-partition-forwards"] > 0
+            assert runtime["tp-row-partition-forwards"] > 0
         if "nccl-dispatch" in signals:
             assert model_config.expert_model_parallel_size > 1
             assert model_config.inference_moe_token_dispatcher_type == "nccl"
@@ -2198,7 +2218,7 @@ class TestAsyncSchedulePairwiseParallel(_AsyncPairwiseHarness):
             tensor_model_parallel_size=config.get("tensor_model_parallel_size", 1),
             pipeline_model_parallel_size=config.get("pipeline_model_parallel_size", 1),
             expert_model_parallel_size=config.get("expert_model_parallel_size", 1),
-            expert_tensor_parallel_size=1,
+            expert_tensor_parallel_size=config.get("expert_tensor_parallel_size", 1),
         )
         try:
             assert parallel_state.get_tensor_model_parallel_world_size() == config.get(
@@ -2209,6 +2229,9 @@ class TestAsyncSchedulePairwiseParallel(_AsyncPairwiseHarness):
             )
             assert parallel_state.get_expert_model_parallel_world_size() == config.get(
                 "expert_model_parallel_size", 1
+            )
+            assert parallel_state.get_expert_tensor_parallel_world_size() == config.get(
+                "expert_tensor_parallel_size", 1
             )
             if scenario.name == "tp2-pp2-sp-dp2":
                 assert parallel_state.get_data_parallel_world_size() == 2

@@ -10,7 +10,7 @@ import os
 import random
 import threading
 import types
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -954,6 +954,8 @@ class DynamicEngineTestConfig:
     tensor_model_parallel_size: int = 1
     pipeline_model_parallel_size: int = 1
     expert_model_parallel_size: int = 1
+    expert_tensor_parallel_size: int = 1
+    num_moe_experts: Optional[int] = None
     # EP process groups can also exercise dense models; build MoE layers only
     # when a test explicitly owns that model behavior.
     use_moe_layer_spec: bool = False
@@ -1293,10 +1295,15 @@ class DynamicInferenceEngineTestBase:
                 tensor_model_parallel_size=test_config.tensor_model_parallel_size,
                 pipeline_model_parallel_size=test_config.pipeline_model_parallel_size,
                 expert_model_parallel_size=test_config.expert_model_parallel_size,
+                expert_tensor_parallel_size=test_config.expert_tensor_parallel_size,
                 num_moe_experts=(
-                    None
-                    if test_config.expert_model_parallel_size == 1
-                    else test_config.expert_model_parallel_size
+                    test_config.num_moe_experts
+                    if test_config.num_moe_experts is not None
+                    else (
+                        None
+                        if test_config.expert_model_parallel_size == 1
+                        else test_config.expert_model_parallel_size
+                    )
                 ),
                 sequence_parallel=test_config.sequence_parallel,
                 pipeline_dtype=torch.bfloat16,
@@ -1402,10 +1409,15 @@ class DynamicInferenceEngineTestBase:
                 tensor_model_parallel_size=test_config.tensor_model_parallel_size,
                 pipeline_model_parallel_size=pp_size,
                 expert_model_parallel_size=test_config.expert_model_parallel_size,
+                expert_tensor_parallel_size=test_config.expert_tensor_parallel_size,
                 num_moe_experts=(
-                    None
-                    if test_config.expert_model_parallel_size == 1
-                    else test_config.expert_model_parallel_size
+                    test_config.num_moe_experts
+                    if test_config.num_moe_experts is not None
+                    else (
+                        None
+                        if test_config.expert_model_parallel_size == 1
+                        else test_config.expert_model_parallel_size
+                    )
                 ),
                 sequence_parallel=test_config.sequence_parallel,
                 pipeline_dtype=torch.bfloat16,
@@ -6620,6 +6632,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         )
         env = self._build_test_env(test_config)
         engine = env.engine
+        engine.use_coordinator = True
+        engine.is_mp_coordinator = True
+        engine.socket_for_receiving_requests = mock.MagicMock()
+        streaming_history = {0: [], 1: []}
+        partial_epochs = Counter()
+        current_epoch = [None]
 
         for i in range(2):
             prompt_tokens = torch.randint(
@@ -6634,10 +6652,35 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     request_id=i,
                     prompt_tokens=prompt_tokens,
                     sampling_params=SamplingParams(
-                        num_tokens_to_generate=NUM_TOKENS, termination_id=-1
+                        num_tokens_to_generate=NUM_TOKENS,
+                        termination_id=-1,
+                        streaming=True,
+                        streaming_interval=1,
                     ),
                 )
             )
+
+        def step_and_capture():
+            sent = len(engine.socket_for_receiving_requests.send_multipart.call_args_list)
+            result = engine.step_modern()
+            calls = engine.socket_for_receiving_requests.send_multipart.call_args_list
+            for call in calls[sent:]:
+                frames = call.args[0]
+                if (
+                    msgpack.unpackb(frames[0], raw=False)[0]
+                    != Headers.ENGINE_REPLY_PARTIAL.value
+                ):
+                    continue
+                for frame in frames[1:]:
+                    partial = msgpack.unpackb(frame, raw=False)
+                    request_id = partial["request_id"]
+                    assert request_id in engine.requests
+                    request = engine.get_request(request_id)
+                    if current_epoch[0] is not None:
+                        assert request.policy_epoch[-1][1] == current_epoch[0]
+                        partial_epochs[current_epoch[0]] += 1
+                    streaming_history[request_id].extend(partial["new_tokens"])
+            return result
 
         def set_epoch(epoch):
             """Simulate receiving a SET_GENERATION_EPOCH signal."""
@@ -6669,15 +6712,16 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             }
 
         # Steps without a generation epoch set — no stamps.
-        engine.step_modern()
+        step_and_capture()
         for entry in engine.requests.values():
             assert entry.record[-1].policy_epoch is None
             assert entry.record[-1].kv_cache_epoch is None
 
         # Generation epoch 0: stamps all active requests at their current length.
         set_epoch(0)
+        current_epoch[0] = 0
         for _ in range(2):
-            engine.step_modern()
+            step_and_capture()
 
         for entry in engine.requests.values():
             ps = entry.record[-1].policy_epoch
@@ -6687,8 +6731,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         # Generation epoch 1: boundary at current length, before next step.
         epoch_1_boundaries = capture_epoch_boundaries(1)
         set_epoch(1)
+        current_epoch[0] = 1
         for _ in range(3):
-            engine.step_modern()
+            step_and_capture()
 
         for request_id, entry in engine.requests.items():
             ps = entry.record[-1].policy_epoch
@@ -6711,11 +6756,14 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         # Generation epoch 2: stamp then generate remaining tokens.
         epoch_2_boundaries = capture_epoch_boundaries(2)
         set_epoch(2)
+        current_epoch[0] = 2
 
         finished_requests = []
         while engine.has_unfinished_requests():
-            result = engine.step_modern()
+            result = step_and_capture()
             finished_requests.extend(result["finished_requests"])
+
+        assert set(partial_epochs) == {0, 1, 2}
 
         for finished_request in finished_requests:
             expected_policy_epoch = [
@@ -6730,6 +6778,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 assert finished_request.kv_cache_epoch == [(0, 2)]
             else:
                 assert finished_request.kv_cache_epoch == expected_policy_epoch
+            history = streaming_history[finished_request.request_id]
+            assert history == finished_request.generated_tokens[: len(history)]
+            assert len(history) < len(finished_request.generated_tokens)
 
         # Verify checkpoint clears kv_cache_epoch and preserves policy.
         finished_request = finished_requests[0]
