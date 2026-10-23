@@ -1048,6 +1048,8 @@ class DynamicEngineTestConfig:
     force_build_cuda_graphs: bool = False
     transformer_impl: str = "local"
     inference_moe_token_dispatcher_type: str = "nccl"
+    inference_grouped_gemm_backend: str = "vllm"
+    inference_moe_nvfp4_recipe: Optional[str] = None
     moe_enable_routing_replay: bool = False
     # If False, do not build cuda graphs in the tests, even if
     # num_cuda_graphs is set.
@@ -1322,7 +1324,7 @@ class DynamicInferenceEngineTestBase:
                     else (
                         "fp32"
                         if test_config.transformer_impl == "inference_optimized"
-                        and test_config.expert_model_parallel_size > 1
+                        and test_config.num_moe_experts is not None
                         else None
                     )
                 ),
@@ -1366,12 +1368,14 @@ class DynamicInferenceEngineTestBase:
                 activation_func=(
                     squared_relu
                     if test_config.transformer_impl == "inference_optimized"
-                    and test_config.expert_model_parallel_size > 1
+                    and test_config.num_moe_experts is not None
                     else torch.nn.functional.gelu
                 ),
                 inference_moe_token_dispatcher_type=(
                     test_config.inference_moe_token_dispatcher_type
                 ),
+                inference_grouped_gemm_backend=test_config.inference_grouped_gemm_backend,
+                inference_moe_nvfp4_recipe=test_config.inference_moe_nvfp4_recipe,
                 moe_enable_routing_replay=test_config.moe_enable_routing_replay,
                 normalization=(
                     "RMSNorm"
@@ -3717,16 +3721,26 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     final_response = await endpoint_client.post(path, json=body)
                     assert final_response.status_code == 200
                     final_payload = await final_response.get_json()
-                    final_choice = final_payload["choices"][0]
+                    final_choices = sorted(
+                        final_payload["choices"], key=lambda choice: choice["index"]
+                    )
                     if chat:
-                        final_text = final_choice["message"]["content"]
-                        final_token_ids = final_choice["message"]["generation_token_ids"]
-                        assert len(final_choice["logprobs"]["content"]) == len(final_token_ids)
+                        final_texts = [choice["message"]["content"] for choice in final_choices]
+                        final_token_ids = [
+                            choice["message"]["generation_token_ids"] for choice in final_choices
+                        ]
+                        assert all(
+                            len(choice["logprobs"]["content"]) == len(token_ids)
+                            for choice, token_ids in zip(final_choices, final_token_ids, strict=True)
+                        )
                     else:
-                        final_text = final_choice["text"]
-                        final_token_ids = final_choice["generation_token_ids"]
-                        assert len(final_choice["logprobs"]["token_logprobs"]) == len(
-                            final_token_ids
+                        final_texts = [choice["text"] for choice in final_choices]
+                        final_token_ids = [
+                            choice["generation_token_ids"] for choice in final_choices
+                        ]
+                        assert all(
+                            len(choice["logprobs"]["token_logprobs"]) == len(token_ids)
+                            for choice, token_ids in zip(final_choices, final_token_ids, strict=True)
                         )
 
                     streaming_response = await endpoint_client.post(
@@ -3750,22 +3764,24 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                         json.loads(record.removeprefix("data: "))
                         for record in records[:-1]
                     ]
-                    reconstructed = ""
-                    terminal_choices = []
+                    reconstructed = [""] * len(final_choices)
+                    terminal_choices = [[] for _ in final_choices]
                     for payload in stream_payloads:
                         for choice in payload["choices"]:
+                            index = choice["index"]
                             if choice["finish_reason"] is None:
-                                reconstructed += (
+                                reconstructed[index] += (
                                     choice["delta"].get("content", "")
                                     if chat
                                     else choice["text"]
                                 )
                             else:
-                                terminal_choices.append(choice)
-                    assert reconstructed == final_text
-                    assert len(terminal_choices) == 1
-                    assert terminal_choices[0]["finish_reason"] == "length"
-                    assert terminal_choices[0]["generation_token_ids"] == final_token_ids
+                                terminal_choices[index].append(choice)
+                    assert reconstructed == final_texts
+                    assert all(len(choices) == 1 for choices in terminal_choices)
+                    for index, choices in enumerate(terminal_choices):
+                        assert choices[0]["finish_reason"] == "length"
+                        assert choices[0]["generation_token_ids"] == final_token_ids[index]
                     usage_records = [
                         payload["usage"] for payload in stream_payloads if "usage" in payload
                     ]
@@ -3781,8 +3797,22 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 await assert_endpoint_stream_matches_final(
                     "/v1/completions",
                     {
-                        "prompt": endpoint_prompt,
+                        "prompt": [
+                            endpoint_prompt,
+                            " ".join(f"t{token}" for token in prompts[1]),
+                        ],
                         "max_tokens": 12,
+                        "temperature": 0,
+                        "ignore_eos": True,
+                        "logprobs": 2,
+                    },
+                    chat=False,
+                )
+                await assert_endpoint_stream_matches_final(
+                    "/v1/completions",
+                    {
+                        "prompt": prompts[0],
+                        "max_tokens": 8,
                         "temperature": 0,
                         "ignore_eos": True,
                         "logprobs": 2,
@@ -3799,6 +3829,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                         "logprobs": True,
                         "top_logprobs": 2,
                         "return_tokenized_data": True,
+                        "n": 2,
                     },
                     chat=True,
                 )

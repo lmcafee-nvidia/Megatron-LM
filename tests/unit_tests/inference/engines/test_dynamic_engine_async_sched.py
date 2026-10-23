@@ -769,6 +769,24 @@ _ASYNC_PAIR_SCENARIOS = (
         parity="reproducible",
     ),
     _pair_scenario(
+        "nvfp4-inference-moe",
+        "precision:nvfp4",
+        "implementation:inference-optimized",
+        "model:moe",
+        config={
+            "transformer_impl": "inference_optimized",
+            "hidden_size": 256,
+            "num_moe_experts": 2,
+            "use_moe_layer_spec": True,
+            "inference_grouped_gemm_backend": "flashinfer",
+            "inference_moe_nvfp4_recipe": "per_token",
+        },
+        signals=("inference-optimized", "moe", "nvfp4"),
+        prerequisite="nvfp4",
+        atol=5.0e-2,
+        parity="reproducible",
+    ),
+    _pair_scenario(
         "mla-latent-cache",
         "model:mla",
         "kv:mla-latent-cache",
@@ -916,6 +934,7 @@ _STREAMING_SIGNAL_COUNTERS = {
     "mamba": "module-forward:mamba",
     "mla": "module-forward:mla",
     "mxfp8": "fp8-quantized-forwards",
+    "nvfp4": "nvfp4-kernel-forwards",
     "moe": "module-forward:moe",
     "nccl-dispatch": "nccl-token-dispatches",
     "parallel": "module-forward:parallel",
@@ -955,6 +974,13 @@ def _check_scenario_prerequisite(scenario):
         available, reason = check_fp8_support()
         if not available:
             pytest.skip(reason)
+    elif scenario.prerequisite == "nvfp4":
+        from megatron.core.inference.moe.flashinfer_nvfp4 import HAVE_FLASHINFER_ROUTED_NVFP4
+
+        if torch.cuda.get_device_capability()[0] < 10:
+            pytest.skip("per-token NVFP4 MoE requires Blackwell or newer")
+        if not HAVE_FLASHINFER_ROUTED_NVFP4:
+            pytest.skip("FlashInfer per-token NVFP4 MoE is unavailable")
 
 
 def _sampling_params_for_request(scenario, request_id, prompt_length):
@@ -1427,6 +1453,19 @@ def _instrument_scenario_runtime(env, scenario, runtime):
     for module in model.modules():
         class_name = type(module).__name__
         module_name = type(module).__module__
+        if "nvfp4" in scenario.signals and class_name == "InferenceGroupedMLP":
+            original_flashinfer_forward = module._flashinfer_forward
+
+            def traced_nvfp4_forward(
+                *args, _module=module, _forward=original_flashinfer_forward, **kwargs
+            ):
+                result = _forward(*args, **kwargs)
+                assert _module._nvfp4_weights is not None
+                assert not _module._uses_mxfp8_weights
+                runtime["nvfp4-kernel-forwards"] += 1
+                return result
+
+            module._flashinfer_forward = traced_nvfp4_forward
         if "softmax-sink" in scenario.signals and class_name == "SelfAttention":
             _instrument_attention_runtime(module, runtime)
         if "parallel" in scenario.signals and (
@@ -1973,6 +2012,17 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["fp8-recipe-forwards"] > 0
         if "mxfp8" in signals:
             assert str(model_config.fp8_recipe).lower().endswith("mxfp8")
+        if "nvfp4" in signals:
+            assert model_config.inference_moe_nvfp4_recipe == "per_token"
+            assert (
+                getattr(
+                    model_config.inference_grouped_gemm_backend,
+                    "value",
+                    model_config.inference_grouped_gemm_backend,
+                )
+                == "flashinfer"
+            )
+            assert runtime["nvfp4-kernel-forwards"] > 0
         if "fused-rope" in signals:
             assert context.use_flashinfer_fused_rope
             assert model_config.hidden_size // model_config.num_attention_heads == 64
