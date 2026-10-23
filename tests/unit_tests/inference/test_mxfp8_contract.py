@@ -207,6 +207,7 @@ def test_odd_live_rows_graph_replay_clears_stale_swizzled_scales():
     data_ptr, scale_ptr = data.data_ptr(), scale.data_ptr()
 
     for live_rows in (129, 33, 128, 1, 257):
+        data_before_replay = data.view(torch.uint8).clone()
         n_rows.fill_(live_rows)
         graph.replay()
         expected_data, logical_scale = _reference_quantize(x[:live_rows])
@@ -218,6 +219,7 @@ def test_odd_live_rows_graph_replay_clears_stale_swizzled_scales():
         assert torch.equal(
             scale.view(torch.uint8), _swizzle_scales(expected_logical, storage_rows=rows)
         )
+        assert torch.equal(data[live_rows:].view(torch.uint8), data_before_replay[live_rows:])
         assert (data.data_ptr(), scale.data_ptr()) == (data_ptr, scale_ptr)
 
 
@@ -416,6 +418,8 @@ def test_direct_linear_backend_matches_dequantized_matmul(
     output = _apply_linear(x, weight, SimpleNamespace(), out=output_buffer)
     activation = observed["activation"]
     reference = (_dequantize(activation) @ _dequantize(weight).T).to(torch.bfloat16)
+    bf16_weight = torch.randn(96, 256, device="cuda", dtype=torch.bfloat16) / 4
+    bf16_output = _apply_linear(x, bf16_weight, SimpleNamespace())
 
     assert observed["dispatch"] == dispatch_name
     assert torch.count_nonzero(activation.data.view(torch.uint8)) > 0
@@ -423,6 +427,7 @@ def test_direct_linear_backend_matches_dequantized_matmul(
     assert output.data_ptr() == output_ptr
     assert torch.isnan(output_storage[x.shape[0] :]).all()
     _assert_backend_gemm_close(output.squeeze(1), reference, backend)
+    assert torch.equal(bf16_output, torch.matmul(x, bf16_weight.T))
 
 
 @pytest.mark.launch_on_gb200
