@@ -902,6 +902,7 @@ class _StreamingTransportTokenizer:
     """Pickle-safe tokenizer for the real coordinator transport witness."""
 
     vocab_size = 100
+    bos = None
     eod = 99
 
     def tokenize(self, prompt):
