@@ -498,6 +498,7 @@ def _consume_reply_for_a_completed_request(client):
     # _recv_task pops the future from completion_futures immediately before
     # resolving it.
     client.completion_futures.pop(request_id)
+    client._mark_source_safe(request_id)
     future.set_result({"tokens": [1]})
     return request_id
 
@@ -507,6 +508,7 @@ def _consume_reply_for_a_finished_stream(client):
     stream = client.add_request_streaming("hello", SamplingParams())
     # _recv_task pops the stream before delivering the final frame.
     client.streams.pop(stream.request_id)
+    client._mark_source_safe(stream.request_id)
     return stream.request_id
 
 
