@@ -1615,6 +1615,10 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 request.sampling_params.streaming = True
                 request.sampling_params.streaming_interval = 1
             env.engine.use_coordinator = True
+            env.engine.is_mp_coordinator = (
+                parallel_state.get_tensor_model_parallel_rank() == 0
+                and parallel_state.get_pipeline_model_parallel_rank() == 0
+            )
             if env.engine.is_mp_coordinator:
                 env.engine.socket_for_receiving_requests = mock.MagicMock()
 
