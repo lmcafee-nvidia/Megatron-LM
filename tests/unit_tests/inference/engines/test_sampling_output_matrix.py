@@ -156,6 +156,7 @@ class TestSamplingOutputMatrix(RequestLifecyclePairwiseBase):
             async_sched_mode=mode,
             sampling_backend=sampling_backend,
             logprobs_mode="processed_logprobs",
+            materialize_only_last_token_logits=False,
             vocab_size=64,
         )
         engine = env.engine
