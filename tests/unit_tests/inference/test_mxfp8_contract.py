@@ -244,6 +244,15 @@ def test_from_bf16_rejects_nonstandard_group_size():
         MXFP8Tensor.from_bf16(x, group_size=64, backend="triton")
 
 
+@pytest.mark.parametrize(
+    "api", [mxfp8_quantize, mxfp8_quantize_into, mxfp8_quantize_rows, MXFP8Tensor.from_bf16]
+)
+def test_public_quantizers_document_finite_input_contract(api):
+    """NaN/Inf are an explicit precondition, not backend-dependent output promises."""
+    documentation = api.__doc__ or ""
+    assert "finite" in documentation
+
+
 def test_live_rows_rejects_nonintegral_count():
     x = torch.randn(8, 128, device="cuda", dtype=torch.bfloat16)
     with pytest.raises(AssertionError, match="int32 or int64"):
@@ -323,6 +332,16 @@ def test_validation_rejects_noncontiguous_storage():
     )
     with pytest.raises(ValueError, match="must both use CUDA storage"):
         validate_mxfp8_tensor(cross_device)
+
+
+def test_validation_rejects_unswizzled_triton_scale_layout():
+    """A logical 2D scale cannot be passed to scaled_mm as pre-swizzled storage."""
+    data = torch.empty((64, 128), device="cuda", dtype=torch.float8_e4m3fn)
+    logical_scale = torch.empty((64, 4), device="cuda", dtype=torch.float8_e8m0fnu)
+    tensor = MXFP8Tensor(data=data, scale=logical_scale, backend="triton", dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="SWIZZLE_32_4_4"):
+        validate_mxfp8_tensor(tensor)
 
 
 def test_public_validation_rejects_invalid_dtype_and_linear_geometry(monkeypatch):
@@ -473,6 +492,7 @@ def test_tp_sequence_parallel_production_linear_matches_quantized_reference(monk
             params_dtype=torch.bfloat16,
             bf16=True,
             transformer_impl="inference_optimized",
+            normalization="RMSNorm",
             add_bias_linear=False,
             inference_disable_triton_nvls_kernels=True,
         )

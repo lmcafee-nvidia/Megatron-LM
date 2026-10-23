@@ -105,6 +105,12 @@ def validate_mxfp8_tensor(
             f"got {cols}."
         )
     scale_cols = cols // MXFP8_BLOCK_SIZE
+    if backend == "triton" and tensor.scale.ndim != 1:
+        raise ValueError(
+            f"{tensor_name} scales for backend 'triton' must use 1D "
+            "SWIZZLE_32_4_4 storage; "
+            f"got shape {tuple(tensor.scale.shape)}."
+        )
     if tensor.scale.ndim == 2:
         expected_scale_shape = (rows, scale_cols)
         if tuple(tensor.scale.shape) != expected_scale_shape:
@@ -134,7 +140,7 @@ class MXFP8Tensor:
     """MXFP8 tensor wrapper storing quantized data and E8M0 scale bytes."""
 
     data: torch.Tensor  # [M, K] fp8_e4m3fn
-    scale: torch.Tensor  # 1D swizzled or [M, K // 32] unswizzled scales
+    scale: torch.Tensor  # Backend layout; Triton consumers require 1D swizzled storage.
     backend: Optional[MXFP8Backend] = None  # quantization and GEMM backend
     # Keyword-only preserves the pre-existing third positional ``backend`` argument.
     # This metadata supports tensor-like conversion consumers such as Megatron
@@ -231,7 +237,10 @@ class MXFP8Tensor:
 
         The historical method name is retained for compatibility. The Triton
         backend accepts BF16, FP16, and FP32 inputs; FlashInfer accepts BF16 and
-        FP16 inputs.
+        FP16 inputs. Inputs must contain only finite values. NaN and infinity are
+        outside the MXFP8 inference contract and are not scanned here because a
+        device-wide reduction would add synchronization or graph-visible work to
+        every quantization on the inference hot path.
 
         Args:
             x: [M, K] floating-point tensor on CUDA.
