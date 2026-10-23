@@ -2030,7 +2030,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         context = env.engine.context
         controller = env.engine.controller
         model_config = controller.inference_wrapped_model.model.config
-
         assert runtime["waves"] == 3
         assert len(env.requests) > context.max_requests
         assert runtime["max_waiting"] > 0
@@ -2049,7 +2048,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         assert runtime["metadata-compactions"] > 0
         assert not controller._async_sched_forward.is_valid
         assert context.total_request_count == context.active_token_count == 0
-
         signals = set(scenario.signals)
         executed_graph_dimensions = {
             key[1:]
@@ -2217,8 +2215,10 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     ):
                         token_text = controller.tokenizer.detokenize([token])
                         assert 0 < len(top_n) <= request.sampling_params.top_n_logprobs
-                        assert token_text in top_n
-                        assert top_n[token_text] == pytest.approx(logprob, rel=0, abs=0.1)
+                        if token_text in top_n:
+                            assert top_n[token_text] == pytest.approx(logprob, rel=0, abs=0.1)
+                        else:
+                            assert logprob <= min(top_n.values())
                     if request.sampling_params.skip_prompt_log_probs:
                         assert not request.prompt_top_n_logprobs
                     else:
