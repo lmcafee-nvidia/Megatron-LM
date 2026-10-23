@@ -6824,6 +6824,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         engine.use_coordinator = True
         engine.is_mp_coordinator = True
         engine.socket_for_receiving_requests = mock.MagicMock()
+        engine.model_parallel_publisher_socket = mock.MagicMock()
         streaming_history = {0: [], 1: []}
         partial_epochs = Counter()
         current_epoch = [None]
@@ -6872,21 +6873,18 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             return result
 
         def set_epoch(epoch):
-            """Simulate receiving a SET_GENERATION_EPOCH signal."""
-            engine._generation_epoch = epoch
-            for entry in engine.requests.values():
-                request = entry.record[-1]
-                total = len(request.prompt_tokens) + len(request.generated_tokens)
-                if total > 0:
-                    boundary = (total - 1, epoch)
-                    if request.policy_epoch is None:
-                        request.policy_epoch = [(0, epoch)]
-                    else:
-                        request.policy_epoch.append(boundary)
-                    if request.kv_cache_epoch is None:
-                        request.kv_cache_epoch = [(0, epoch)]
-                    else:
-                        request.kv_cache_epoch.append(boundary)
+            """Deliver the production epoch control message to the scheduler."""
+            message = [
+                msgpack.packb(
+                    [Headers.SET_GENERATION_EPOCH.value, epoch], use_bin_type=True
+                )
+            ]
+            engine.socket_for_receiving_requests.recv_multipart.side_effect = [
+                message,
+                dynamic_engine.zmq.Again,
+            ]
+            assert engine.schedule_requests() == 1
+            assert engine._generation_epoch == epoch
 
         def capture_epoch_boundaries(epoch):
             """Capture the expected boundary at the instant an epoch is changed."""
