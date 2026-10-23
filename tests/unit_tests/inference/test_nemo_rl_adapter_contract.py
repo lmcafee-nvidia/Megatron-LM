@@ -1214,7 +1214,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             coordinator_address = await engine.start_listening_to_data_parallel_coordinator(
                 hostname="127.0.0.1"
             )
-            client = InferenceClient(coordinator_address)
+            client = InferenceClient(coordinator_address, deserialize=True)
             client.start(loop=asyncio.get_running_loop(), connect_timeout_seconds=10)
             adapter = _protocol_adapter(mixin_cls, ignore_eos=True)
             adapter.inference_client = client
@@ -1448,7 +1448,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             address = await engine.start_listening_to_data_parallel_coordinator(
                 hostname="127.0.0.1"
             )
-            client = InferenceClient(address)
+            client = InferenceClient(address, deserialize=True)
             client.start(loop=asyncio.get_running_loop(), connect_timeout_seconds=10)
             adapter = _protocol_adapter(mixin_cls, ignore_eos=True)
             adapter.inference_client = client
@@ -1775,7 +1775,7 @@ class TestNeMoRLAdapterParallelContract(DynamicInferenceEngineTestBase):
             await asyncio.to_thread(torch.distributed.barrier, group=synchronization_group)
             if rank == 0:
                 try:
-                    client = InferenceClient(coordinator_address)
+                    client = InferenceClient(coordinator_address, deserialize=True)
                     client.start(loop=asyncio.get_running_loop(), connect_timeout_seconds=10)
                     adapter = _protocol_adapter(mixin_cls, ignore_eos=True)
                     adapter.inference_client = client
