@@ -1750,7 +1750,7 @@ class TestNeMoRLAdapterParallelContract(DynamicInferenceEngineTestBase):
             [
                 engine.add_request(request_id, prompt, request_params)
                 for request_id, prompt, request_params in zip(
-                    range(600, 602), prompts[: len(params)], params, strict=True
+                    range(600, 600 + len(params)), prompts[: len(params)], params, strict=True
                 )
             ],
         )
