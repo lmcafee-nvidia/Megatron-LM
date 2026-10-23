@@ -252,13 +252,24 @@ def test_live_rows_rejects_nonintegral_count():
 
 def test_quantize_into_rejects_aliasing_storage():
     rows, cols = 8, 128
-    storage = torch.empty(rows * cols * 2, device="cuda", dtype=torch.uint8)
-    x = storage.view(torch.bfloat16).reshape(rows, cols)
-    out_data = storage[: rows * cols].view(torch.float8_e4m3fn).reshape(rows, cols)
-    out_scale = torch.empty(512, device="cuda", dtype=torch.float8_e8m0fnu)
+    input_storage = torch.empty(rows * cols * 2, device="cuda", dtype=torch.uint8)
+    x = input_storage.view(torch.bfloat16).reshape(rows, cols)
+    out_data = input_storage[: rows * cols].view(torch.float8_e4m3fn).reshape(rows, cols)
+    independent_scale = torch.empty(512, device="cuda", dtype=torch.float8_e8m0fnu)
 
     with pytest.raises(AssertionError, match="must not share storage"):
-        mxfp8_quantize_into(x, out_data, out_scale)
+        mxfp8_quantize_into(x, out_data, independent_scale)
+
+    output_storage = torch.empty(rows * cols, device="cuda", dtype=torch.uint8)
+    out_data = output_storage.view(torch.float8_e4m3fn).reshape(rows, cols)
+    out_scale = output_storage[:512].view(torch.float8_e8m0fnu)
+    with pytest.raises(AssertionError, match="must not share storage"):
+        mxfp8_quantize_into(torch.randn_like(x), out_data, out_scale)
+
+    independent_data = torch.empty(rows, cols, device="cuda", dtype=torch.float8_e4m3fn)
+    out_scale = input_storage[:512].view(torch.float8_e8m0fnu)
+    with pytest.raises(AssertionError, match="must not share storage"):
+        mxfp8_quantize_into(x, independent_data, out_scale)
 
 
 def test_quantize_into_honors_offset_views_without_touching_sentinels():
