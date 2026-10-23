@@ -55,9 +55,7 @@ def _make_context(parameters):
             "seed": torch.full((len(parameters),), -1, dtype=torch.int64),
         },
         gpu_view=SimpleNamespace(
-            temperature=temperature.cuda(),
-            top_k=top_k.cuda(),
-            top_p=top_p.cuda(),
+            temperature=temperature.cuda(), top_k=top_k.cuda(), top_p=top_p.cuda()
         ),
     )
     context.active_sampling_filter_flags = lambda count=None: (
@@ -80,13 +78,7 @@ def _make_sampler(backend, vocab_size, seed=17):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_known_logits_match_independent_filter_and_score_oracle(backend, dtype):
     """Heterogeneous rows must agree with an independent analytic distribution."""
-    parameters = [
-        (1.0, 0, 0.0),
-        (0.0, 1, 0.0),
-        (0.75, 3, 0.0),
-        (1.25, 0, 0.72),
-        (0.5, 0, 0.0),
-    ]
+    parameters = [(1.0, 0, 0.0), (0.0, 1, 0.0), (0.75, 3, 0.0), (1.25, 0, 0.72), (0.5, 0, 0.0)]
     if backend == "flashinfer":
         parameters.append((0.9, 4, 0.83))
     logits = torch.tensor(
@@ -109,11 +101,7 @@ def test_known_logits_match_independent_filter_and_score_oracle(backend, dtype):
     expected_processed = []
     for row, (temperature, top_k, top_p) in zip(logits, parameters):
         raw, processed = _oracle_scores(
-            row.cpu(),
-            temperature,
-            top_k,
-            top_p,
-            compose_filters=backend == "flashinfer",
+            row.cpu(), temperature, top_k, top_p, compose_filters=backend == "flashinfer"
         )
         expected_raw.append(raw)
         expected_processed.append(processed)
@@ -149,11 +137,7 @@ def test_known_logits_match_independent_filter_and_score_oracle(backend, dtype):
 
     no_top_k, no_top_p = context.active_sampling_filter_flags()
     sampled = sampler.sample_kernel(
-        logits,
-        len(parameters),
-        context,
-        no_top_k=no_top_k,
-        no_top_p=no_top_p,
+        logits, len(parameters), context, no_top_k=no_top_k, no_top_p=no_top_p
     )
     rows = torch.arange(len(parameters), device="cuda")
     assert torch.isfinite(expected_processed[rows, sampled]).all()
