@@ -305,7 +305,10 @@ class TestMXFP8ReshardTransform:
         class Namespace:
             _stack_mxfp8_linear_weight = InferenceGroupedMLP._stack_mxfp8_linear_weight
 
-        num_experts = 2
+        # FlashInfer's production routing kernel requires expert count to be
+        # divisible by four. Keep the fixture compact while exercising a valid
+        # routed-MoE configuration.
+        num_experts = 4
         shapes = {"linear_fc1": (96, 128), "linear_fc2": (128, 96)}
         grouped_mlp = Namespace()
         grouped_mlp.num_local_experts = num_experts
@@ -334,7 +337,7 @@ class TestMXFP8ReshardTransform:
             grouped_mlp._fc2_weight.scale.data_ptr(),
         )
         hidden = torch.randn(16, 128, dtype=torch.bfloat16, device="cuda")
-        routing_map = torch.arange(16, device="cuda").remainder(2).unsqueeze(1)
+        routing_map = torch.arange(16, device="cuda").remainder(num_experts).unsqueeze(1)
         probs = torch.ones(16, 1, dtype=torch.float32, device="cuda")
         before = flashinfer_routed_mxfp8_moe(
             hidden,
@@ -342,7 +345,7 @@ class TestMXFP8ReshardTransform:
             probs,
             grouped_mlp._fc1_weight,
             grouped_mlp._fc2_weight,
-            num_experts=2,
+            num_experts=num_experts,
             local_expert_offset=0,
             activation_type=6,
         )
@@ -411,7 +414,7 @@ class TestMXFP8ReshardTransform:
             probs,
             grouped_mlp._fc1_weight,
             grouped_mlp._fc2_weight,
-            num_experts=2,
+            num_experts=num_experts,
             local_expert_offset=0,
             activation_type=6,
         )
@@ -421,7 +424,7 @@ class TestMXFP8ReshardTransform:
             probs,
             references["linear_fc1"],
             references["linear_fc2"],
-            num_experts=2,
+            num_experts=num_experts,
             local_expert_offset=0,
             activation_type=6,
         )
