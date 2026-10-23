@@ -56,6 +56,7 @@ def _make_worker_instance(cls):
     obj._loop_manager = None
     obj._coord_runtime = None
     obj._shutdown_called = False
+    obj._async_shutdown_lock = base_mod.threading.Lock()
     obj._shutdown_future = None
     obj._shutdown_complete_future = None
     obj._serve_started = False
@@ -235,6 +236,49 @@ class TestLifecycleGuards:
         assert not second.done()
         teardown.set_result(None)
         await asyncio.gather(first, second)
+        assert llm._loop_manager.stops == 1
+
+    def test_async_shutdown_is_atomic_across_caller_threads(self):
+        """A caller cannot observe shutdown-started before its shared future exists."""
+        llm = _make_worker_instance(MegatronAsyncLLM)
+        teardown = concurrent.futures.Future()
+        frontend_entered = concurrent.futures.Future()
+        release_frontend = concurrent.futures.Future()
+        second_started = concurrent.futures.Future()
+
+        class LoopManager:
+            stops = 0
+            stop_when_complete = base_mod._EventLoopManager.stop_when_complete
+
+            @staticmethod
+            def submit(coro):
+                coro.close()
+                return teardown
+
+            def stop(self):
+                self.stops += 1
+
+        def hold_first_caller():
+            frontend_entered.set_result(None)
+            release_frontend.result()
+
+        def run_second_caller():
+            second_started.set_result(None)
+            return asyncio.run(llm.shutdown())
+
+        llm._loop_manager = LoopManager()
+        llm._stop_frontend_if_started = hold_first_caller
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(asyncio.run, llm.shutdown())
+            frontend_entered.result(timeout=2)
+            second = executor.submit(run_second_caller)
+            second_started.result(timeout=2)
+            with pytest.raises(concurrent.futures.TimeoutError):
+                second.result(timeout=0.5)
+            release_frontend.set_result(None)
+            teardown.set_result(None)
+            first.result(timeout=2)
+            second.result(timeout=2)
         assert llm._loop_manager.stops == 1
 
     @pytest.mark.asyncio

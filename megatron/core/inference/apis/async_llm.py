@@ -172,23 +172,23 @@ class MegatronAsyncLLM(_MegatronLLMBase):
 
         Idempotent. No-op in direct mode.
         """
-        if not self._shutdown_called:
-            self._shutdown_called = True
-            self._stop_frontend_if_started()
+        with self._async_shutdown_lock:
+            if not self._shutdown_called:
+                self._shutdown_called = True
+                self._stop_frontend_if_started()
+                if self._use_coordinator:
+                    assert self._loop_manager is not None
+                    self._shutdown_future = self._loop_manager.submit(self._shutdown_impl())
+                    self._shutdown_complete_future = self._loop_manager.stop_when_complete(
+                        self._shutdown_future
+                    )
             if not self._use_coordinator:
                 return
-            assert self._loop_manager is not None
-            self._shutdown_future = self._loop_manager.submit(self._shutdown_impl())
-            self._shutdown_complete_future = self._loop_manager.stop_when_complete(
-                self._shutdown_future
-            )
-        elif self._shutdown_future is None:
-            return
-
-        assert self._shutdown_complete_future is not None
+            assert self._shutdown_complete_future is not None
+            shutdown_complete_future = self._shutdown_complete_future
         # Each caller gets a loop-local wrapper around the shared completion
         # future, so concurrent callers and callers on distinct loops are safe.
-        await asyncio.shield(asyncio.wrap_future(self._shutdown_complete_future))
+        await asyncio.shield(asyncio.wrap_future(shutdown_complete_future))
 
     async def serve(self, serve_config: ServeConfig, *, blocking: bool = True) -> None:
         """Start the OpenAI-compatible HTTP frontend.

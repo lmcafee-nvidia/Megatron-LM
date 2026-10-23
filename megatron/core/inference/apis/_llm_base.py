@@ -347,6 +347,7 @@ class _MegatronLLMBase:
         self._loop_manager: "Optional[_EventLoopManager]" = None
         self._coord_runtime: "Optional[_CoordinatorRuntime]" = None
         self._shutdown_called: bool = False
+        self._async_shutdown_lock = threading.Lock()
         self._shutdown_future: "Optional[concurrent.futures.Future]" = None
         self._shutdown_complete_future: "Optional[concurrent.futures.Future]" = None
         self._serve_started: bool = False
