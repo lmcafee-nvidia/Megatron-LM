@@ -3404,6 +3404,22 @@ def test_stop_word_checkpoint_boundary_preserves_result_alignment(
     assert serialized_event_tokens == merged.generated_tokens
 
 
+@pytest.mark.asyncio
+async def test_run_coroutine_sync_preserves_runtime_error_from_running_loop():
+    engine = object.__new__(DynamicInferenceEngine)
+    engine._loop = asyncio.get_running_loop()
+    call_count = 0
+
+    async def fail_from_engine():
+        nonlocal call_count
+        call_count += 1
+        raise RuntimeError("original engine failure")
+
+    with pytest.raises(RuntimeError, match="original engine failure"):
+        engine._run_coroutine_sync(fail_from_engine())
+    assert call_count == 1
+
+
 class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
     @classmethod
@@ -3430,21 +3446,24 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         """Cross real model steps, coordinator routing, and two independent clients."""
         config = DynamicEngineTestConfig(
             num_requests=0,
-            min_prompt_length=9,
-            max_prompt_length=9,
+            min_prompt_length=513,
+            max_prompt_length=514,
             num_tokens_to_generate=128,
             num_gap_steps=0,
             top_k=1,
             context_max_requests=4,
-            context_max_tokens=4,
-            context_block_size_tokens=4,
+            context_max_tokens=256,
+            context_block_size_tokens=256,
             enable_chunked_prefill=True,
             enable_prefix_caching=True,
         )
         env = self._build_test_env(config)
         env.engine.controller.tokenizer = _StreamingTransportTokenizer()
-        shared_prefix = [3, 5, 7, 11]
-        prompts = [[*shared_prefix, 13, 17, 19, 23], [*shared_prefix, 29, 31, 37, 41, 43]]
+        shared_prefix = [3, 5, 7, 11] * 64
+        prompts = [
+            [*shared_prefix, *([13, 17, 19, 23] * 65)[:257]],
+            [*shared_prefix, *([29, 31, 37, 41, 43] * 52)[:258]],
+        ]
         baseline_params = [
             SamplingParams(
                 num_tokens_to_generate=128,
