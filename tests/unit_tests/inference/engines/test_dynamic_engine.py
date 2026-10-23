@@ -4147,15 +4147,24 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             runtime["language-forwards"] += 1
             request = active_request[0]
             decoder_input = kwargs.get("decoder_input")
-            if request is None or decoder_input is None or decoder_input.shape[0] <= 1:
+            step_image_token_mask = engine.context.current_image_token_mask()
+            if (
+                request is None
+                or decoder_input is None
+                or decoder_input.shape[0] <= 1
+                or step_image_token_mask is None
+            ):
                 return
-            image_positions = request.image_token_mask >= 0
-            expected = request.image_embeddings.permute(1, 0, 2).reshape(
+            step_image_token_mask = step_image_token_mask[0]
+            image_positions = step_image_token_mask >= 0
+            if not image_positions.any():
+                return
+            image_indices = step_image_token_mask[image_positions]
+            image_embeddings = request.image_embeddings.permute(1, 0, 2).reshape(
                 -1, decoder_input.shape[-1]
             )
-            prompt_decoder_input = decoder_input[: image_positions.numel(), 0]
             runtime["vision-injections"] += int(
-                torch.equal(prompt_decoder_input[image_positions], expected)
+                torch.equal(decoder_input[:, 0][image_positions], image_embeddings[image_indices])
             )
 
         vision_hook = model.vision_model.register_forward_hook(vision_forwarded)
