@@ -179,14 +179,16 @@ class MegatronAsyncLLM(_MegatronLLMBase):
                 return
             assert self._loop_manager is not None
             self._shutdown_future = self._loop_manager.submit(self._shutdown_impl())
+            self._shutdown_complete_future = self._loop_manager.stop_when_complete(
+                self._shutdown_future
+            )
         elif self._shutdown_future is None:
             return
 
-        assert self._loop_manager is not None
-        assert self._shutdown_future is not None
-        # A caller cancellation must not cancel the one shared teardown future.
-        await asyncio.shield(asyncio.wrap_future(self._shutdown_future))
-        self._loop_manager.stop()
+        assert self._shutdown_complete_future is not None
+        # Each caller gets a loop-local wrapper around the shared completion
+        # future, so concurrent callers and callers on distinct loops are safe.
+        await asyncio.shield(asyncio.wrap_future(self._shutdown_complete_future))
 
     async def serve(self, serve_config: ServeConfig, *, blocking: bool = True) -> None:
         """Start the OpenAI-compatible HTTP frontend.

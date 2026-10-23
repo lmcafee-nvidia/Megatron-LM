@@ -131,6 +131,34 @@ class _EventLoopManager:
         self._stopped = True
         self._started = False
 
+    def stop_when_complete(self, future: concurrent.futures.Future) -> concurrent.futures.Future:
+        """Return a future that completes after ``future`` and the thread join.
+
+        A dedicated waiter makes cleanup independent of the event loop and
+        cancellation state of whichever public async caller initiated it.
+        """
+        complete: concurrent.futures.Future = concurrent.futures.Future()
+
+        def _wait_and_stop() -> None:
+            result = None
+            error: Optional[BaseException] = None
+            try:
+                result = future.result()
+            except BaseException as exc:  # Preserve the teardown failure.
+                error = exc
+            try:
+                self.stop()
+            except BaseException as exc:
+                if error is None:
+                    error = exc
+            if error is not None:
+                complete.set_exception(error)
+            else:
+                complete.set_result(result)
+
+        threading.Thread(target=_wait_and_stop, name="megatron-llm-shutdown", daemon=True).start()
+        return complete
+
 
 class _CoordinatorRuntime:
     """Owns the dynamic-inference coordinator and ``InferenceClient`` lifecycle.
@@ -320,6 +348,7 @@ class _MegatronLLMBase:
         self._coord_runtime: "Optional[_CoordinatorRuntime]" = None
         self._shutdown_called: bool = False
         self._shutdown_future: "Optional[concurrent.futures.Future]" = None
+        self._shutdown_complete_future: "Optional[concurrent.futures.Future]" = None
         self._serve_started: bool = False
 
         if use_coordinator:

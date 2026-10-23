@@ -57,6 +57,7 @@ def _make_worker_instance(cls):
     obj._coord_runtime = None
     obj._shutdown_called = False
     obj._shutdown_future = None
+    obj._shutdown_complete_future = None
     obj._serve_started = False
     return obj
 
@@ -209,6 +210,7 @@ class TestLifecycleGuards:
 
         class LoopManager:
             stops = 0
+            stop_when_complete = base_mod._EventLoopManager.stop_when_complete
 
             @staticmethod
             def submit(coro):
@@ -233,7 +235,60 @@ class TestLifecycleGuards:
         assert not second.done()
         teardown.set_result(None)
         await asyncio.gather(first, second)
-        assert llm._loop_manager.stops >= 1
+        assert llm._loop_manager.stops == 1
+
+    @pytest.mark.asyncio
+    async def test_cancelled_async_shutdown_caller_does_not_leak_runtime(self):
+        llm = _make_worker_instance(MegatronAsyncLLM)
+        teardown = concurrent.futures.Future()
+
+        class LoopManager:
+            stops = 0
+            stop_when_complete = base_mod._EventLoopManager.stop_when_complete
+
+            @staticmethod
+            def submit(coro):
+                coro.close()
+                return teardown
+
+            def stop(self):
+                self.stops += 1
+
+        llm._loop_manager = LoopManager()
+        caller = asyncio.create_task(llm.shutdown())
+        await asyncio.sleep(0)
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+
+        assert llm._loop_manager.stops == 0
+        teardown.set_result(None)
+        await llm.shutdown()
+        assert llm._loop_manager.stops == 1
+
+    @pytest.mark.asyncio
+    async def test_async_shutdown_propagates_teardown_error_after_runtime_join(self):
+        llm = _make_worker_instance(MegatronAsyncLLM)
+        teardown = concurrent.futures.Future()
+
+        class LoopManager:
+            stops = 0
+            stop_when_complete = base_mod._EventLoopManager.stop_when_complete
+
+            @staticmethod
+            def submit(coro):
+                coro.close()
+                return teardown
+
+            def stop(self):
+                self.stops += 1
+
+        llm._loop_manager = LoopManager()
+        teardown.set_exception(RuntimeError("teardown failed"))
+
+        with pytest.raises(RuntimeError, match="teardown failed"):
+            await llm.shutdown()
+        assert llm._loop_manager.stops == 1
 
     @pytest.mark.asyncio
     async def test_generate_after_shutdown_is_rejected(self):
