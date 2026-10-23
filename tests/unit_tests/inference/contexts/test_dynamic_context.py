@@ -361,6 +361,7 @@ class TestDynamicContext:
             moe_ffn_hidden_size=64,
             kv_channels=8,
             num_attention_heads=4,
+            normalization="RMSNorm",
             num_moe_experts=2,
             moe_router_topk=1,
             moe_router_pre_softmax=True,
