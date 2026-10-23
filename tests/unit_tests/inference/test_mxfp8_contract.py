@@ -139,7 +139,8 @@ def _boundary_input(rows: int, cols: int) -> torch.Tensor:
     values = signs * torch.exp2(exponent) * (0.5 + lane / 64)
     result = values.reshape(rows, cols)
     result[0, :32] = 0
-    result[32, 32:64] = torch.finfo(torch.float32).tiny / 4
+    if rows > 32:
+        result[32, 32:64] = torch.finfo(torch.float32).tiny / 4
     result[-1, -32:] = torch.linspace(-1.0e30, 1.0e30, 32, device="cuda")
     return result
 
@@ -431,9 +432,9 @@ def test_tp_sequence_parallel_production_linear_matches_quantized_reference(monk
         pytest.skip("native MXFP8 GEMM requires Blackwell")
     if not quantization_utils.HAVE_TORCH_SCALED_MM:
         pytest.skip("torch scaled_mm block scaling is unavailable")
+    if Utils.world_size != 2:
+        pytest.skip("requires an exact two-rank launch")
     Utils.initialize_distributed()
-    if dist.get_world_size() < 2:
-        pytest.skip("requires at least two ranks")
 
     world_size = dist.get_world_size()
     Utils.initialize_model_parallel(tensor_model_parallel_size=world_size)
