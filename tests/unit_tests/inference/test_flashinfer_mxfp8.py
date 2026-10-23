@@ -131,6 +131,59 @@ def test_bf16_config_ignores_inactive_mxfp8_recipe_gates():
     assert config.fp8 is None
 
 
+@pytest.mark.internal
+@pytest.mark.parametrize(
+    "activation_func", [F.gelu, F.relu, F.silu, squared_relu], ids=["gelu", "relu", "silu", "relu2"]
+)
+@torch.inference_mode()
+def test_flashinfer_bf16_gelu_layer_matches_training_reference(activation_func, record_property):
+    from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+    from megatron.core.transformer.moe.token_dispatcher_inference import (
+        InferenceAllGatherDispatcherBase,
+    )
+    from tests.unit_tests.test_utilities import Utils
+
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        config = _make_bounded_mxfp8_config(
+            fp8=None,
+            fp8_param=False,
+            activation_func=activation_func,
+            inference_flashinfer_mxfp8_token_capacity=None,
+            inference_moe_token_dispatcher_type="nccl",
+            expert_model_parallel_size=1,
+            moe_router_topk=1,
+            moe_router_pre_softmax=True,
+            moe_router_score_function="softmax",
+            moe_router_enable_expert_bias=False,
+            moe_aux_loss_coeff=0.0,
+        )
+        InferenceAllGatherDispatcherBase.allocate_valid_tokens_tensor()
+        layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+        assert layer.experts._mcore_activation_type is None
+
+        flashinfer_calls = []
+        original_flashinfer = layer.experts._flashinfer_forward
+
+        def tracked_flashinfer(hidden, routing_map, probs):
+            flashinfer_calls.append((hidden.shape[0], routing_map.shape[0]))
+            return original_flashinfer(hidden, routing_map, probs)
+
+        layer.experts._flashinfer_forward = tracked_flashinfer
+        hidden = torch.randn(7, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        reference, _ = layer(hidden.clone())
+        with InferenceMode.active():
+            output, _ = layer(hidden.clone())
+
+        assert flashinfer_calls == [(hidden.shape[0], hidden.shape[0])]
+        error = (output.float() - reference.float()).abs()
+        record_property("max_abs_error", error.max().item())
+        record_property("relative_l2_error", error.norm().div(reference.float().norm()).item())
+        torch.testing.assert_close(output, reference, atol=5e-2, rtol=5e-2)
+    finally:
+        Utils.destroy_model_parallel()
+
+
 def test_vllm_backend_accepts_mxfp8_config_for_per_layer_dispatch():
     config = _make_bounded_mxfp8_config(
         inference_grouped_gemm_backend="vllm",

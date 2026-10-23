@@ -282,9 +282,12 @@ class TestDynamicInferenceNVLS(_TestDynamicInferenceBase):
         """Dynamic prefill should exactly match the full-sequence forward."""
         from megatron.core.inference.inference_request import DynamicInferenceRequest
         from megatron.core.inference.sampling_params import SamplingParams
+        from megatron.core.ssm.mamba_mixer import MambaMixer
         from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
             set_batch_invariant_mode,
         )
+        from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+        from megatron.core.transformer.moe.moe_layer import MoELayer
 
         model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
         clear_nvte_env_vars()
@@ -306,41 +309,85 @@ class TestDynamicInferenceNVLS(_TestDynamicInferenceBase):
         ).cuda()
         model.eval()
 
+        moe_layer = next(module for module in model.modules() if isinstance(module, MoELayer))
+        experts = next(
+            module for module in model.modules() if isinstance(module, InferenceGroupedMLP)
+        )
+        mamba = next(module for module in model.modules() if isinstance(module, MambaMixer))
+        dispatcher = moe_layer._inference_token_dispatcher
+        evidence = {"dispatch": 0, "combine": 0, "expert": 0, "mamba": 0}
+        original_dispatch = dispatcher.token_dispatch
+        original_combine = dispatcher.token_combine
+
+        def tracked_dispatch(*args, **kwargs):
+            evidence["dispatch"] += 1
+            return original_dispatch(*args, **kwargs)
+
+        def tracked_combine(*args, **kwargs):
+            evidence["combine"] += 1
+            return original_combine(*args, **kwargs)
+
+        dispatcher.token_dispatch = tracked_dispatch
+        dispatcher.token_combine = tracked_combine
+
+        def record_expert(_module, inputs, kwargs, _output):
+            if InferenceMode.is_active():
+                evidence["expert"] += 1
+                evidence["expert_rows"] = inputs[0].shape[0]
+                evidence["route_rows"] = kwargs["routing_map"].shape[0]
+
+        def record_mamba(_module, _inputs, _output):
+            if InferenceMode.is_active():
+                evidence["mamba"] += 1
+
+        expert_hook = experts.register_forward_hook(record_expert, with_kwargs=True)
+        mamba_hook = mamba.register_forward_hook(record_mamba)
+
         input_ids = torch.arange(64, device="cuda", dtype=torch.long).unsqueeze(0)
-        with set_batch_invariant_mode(True):
-            InferenceMode.unset_active()
-            full_logits = model(
-                input_ids=input_ids,
-                position_ids=None,
-                attention_mask=None,
-                runtime_gather_output=True,
-            )
+        try:
+            with set_batch_invariant_mode(True):
+                InferenceMode.unset_active()
+                full_logits = model(
+                    input_ids=input_ids,
+                    position_ids=None,
+                    attention_mask=None,
+                    runtime_gather_output=True,
+                )
 
-            ctx = self._build_context(
-                model,
-                num_cuda_graphs=0,
-                use_cuda_graphs_for_non_decode_steps=False,
-                max_requests=4,
-                max_tokens=128,
-            )
-            request = DynamicInferenceRequest(
-                request_id=0,
-                prompt_tokens=input_ids.cpu().squeeze(0),
-                sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
-            )
-            ctx.add_request(request)
-            ctx.initialize_attention_state()
+                ctx = self._build_context(
+                    model,
+                    num_cuda_graphs=0,
+                    use_cuda_graphs_for_non_decode_steps=False,
+                    max_requests=4,
+                    max_tokens=128,
+                )
+                request = DynamicInferenceRequest(
+                    request_id=0,
+                    prompt_tokens=input_ids.cpu().squeeze(0),
+                    sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
+                )
+                ctx.add_request(request)
+                ctx.initialize_attention_state()
 
-            InferenceMode.set_active()
-            inference_logits = model(
-                input_ids=input_ids,
-                position_ids=None,
-                attention_mask=None,
-                inference_context=ctx,
-                runtime_gather_output=True,
-            )
+                InferenceMode.set_active()
+                inference_logits = model(
+                    input_ids=input_ids,
+                    position_ids=None,
+                    attention_mask=None,
+                    inference_context=ctx,
+                    runtime_gather_output=True,
+                )
+        finally:
+            expert_hook.remove()
+            mamba_hook.remove()
+            dispatcher.token_dispatch = original_dispatch
+            dispatcher.token_combine = original_combine
 
         torch.testing.assert_close(inference_logits, full_logits, atol=0, rtol=0)
+        assert evidence["dispatch"] == evidence["combine"] == evidence["expert"] > 0
+        assert evidence["mamba"] > 0
+        assert evidence["expert_rows"] == evidence["route_rows"]
+        assert experts.inference_grouped_gemm_backend.value == "torch"
 
     # ------------------------------------------------------------------
     # test_ep_state_cross_product: combinatorial sweep with mixed CUDA graphs

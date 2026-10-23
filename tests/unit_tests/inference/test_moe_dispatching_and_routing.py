@@ -105,6 +105,71 @@ def test_config_accepts_vllm_mxfp8():
     assert config.inference_grouped_gemm_backend.value == "vllm"
 
 
+def test_config_rejects_non_power_of_two_nvls_expert_parallelism():
+    with pytest.raises(ValueError, match="power-of-two expert_model_parallel_size"):
+        _make_base_config(
+            num_moe_experts=12,
+            expert_model_parallel_size=3,
+            inference_moe_token_dispatcher_type="nvls",
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {
+            "inference_grouped_gemm_backend": "torch",
+            "gated_linear_unit": True,
+            "activation_func": torch.nn.functional.silu,
+            "activation_func_clamp_value": 7.0,
+        },
+        {
+            "inference_grouped_gemm_backend": "vllm",
+            "gated_linear_unit": True,
+            "activation_func": torch.nn.functional.silu,
+            "glu_linear_offset": 0.5,
+        },
+        {
+            "inference_grouped_gemm_backend": "vllm",
+            "gated_linear_unit": True,
+            "activation_func": torch.nn.functional.silu,
+            "moe_mlp_glu_interleave_size": 32,
+        },
+        {
+            "inference_grouped_gemm_backend": "torch",
+            "gated_linear_unit": True,
+            "activation_func": torch.nn.functional.silu,
+            "activation_func_tanh_clamp_scale": 2.0,
+        },
+        {
+            "inference_grouped_gemm_backend": "torch",
+            "gated_linear_unit": True,
+            "activation_func": torch.nn.functional.silu,
+            "activation_func_tanh_clamp_scale_linear": 2.0,
+        },
+        {"inference_grouped_gemm_backend": "flashinfer", "activation_func_tanh_clamp_scale": 2.0},
+    ],
+)
+def test_config_rejects_unimplemented_inference_expert_activation_modifiers(overrides):
+    with pytest.raises(ValueError, match="support only plain SwiGLU|does not support"):
+        _make_base_config(**overrides)
+
+
+def test_config_rejects_non_mxfp8_inference_expert_parameter_storage():
+    with pytest.raises(ValueError, match="parameter storage supports only.*mxfp8"):
+        _make_base_config(fp8="hybrid", fp8_recipe="delayed", fp8_param=True)
+
+
+def test_config_rejects_transformer_engine_fp4_inference_experts():
+    with pytest.raises(ValueError, match="does not support Transformer Engine FP4"):
+        _make_base_config(fp4="e2m1", fp4_recipe="nvfp4", fp4_param=True)
+
+
+def test_config_rejects_inference_apply_probs_on_input():
+    with pytest.raises(ValueError, match="do not support moe_apply_probs_on_input"):
+        _make_base_config(moe_apply_probs_on_input=True)
+
+
 @pytest.mark.parametrize("backend", ["torch", "vllm"])
 @pytest.mark.parametrize("gated_linear_unit", [False, True])
 def test_config_accepts_mxfp8_batch_invariant_backends(backend, gated_linear_unit):
@@ -254,6 +319,29 @@ class TestInferenceTopKRouter:
         # Same expert selections
         assert training_experts == inference_experts
 
+    @pytest.mark.parametrize("topk", [1, NANOV3_BASE["moe_router_topk"]])
+    def test_sinkhorn_inference_matches_evaluation_probabilities(self, topk):
+        router = self._make_router(
+            moe_router_load_balancing_type="sinkhorn",
+            moe_aux_loss_coeff=0.0,
+            moe_router_score_function="softmax",
+            moe_router_enable_expert_bias=False,
+            moe_router_topk=topk,
+        )
+        router.eval()
+        input_tensor = torch.randn(
+            16, NANOV3_BASE["hidden_size"], device="cuda", dtype=torch.bfloat16
+        )
+
+        reference_probs, reference_map = router(input_tensor.clone())
+        with InferenceMode.active():
+            inference_probs, inference_indices = router(input_tensor.clone())
+
+        selected_reference = reference_probs.gather(1, inference_indices)
+        selected_by_reference = reference_map.gather(1, inference_indices)
+        assert selected_by_reference.all()
+        torch.testing.assert_close(inference_probs, selected_reference, atol=0, rtol=0)
+
 
 # ──────────────────────────────────────────────────────────────────────
 # NCCLAllGatherDispatcher
@@ -337,8 +425,7 @@ class TestNCCLAllGatherDispatcher:
         num_experts = NANOV3_BASE["num_moe_experts"]
 
         if use_allgather_v:
-            # Variable token counts: rank r contributes (r+1)*8 tokens
-            tokens_per_rank = [(r + 1) * 8 for r in range(ep_size)]
+            tokens_per_rank = [r * 8 for r in range(ep_size)]
         else:
             tokens_per_rank = [16] * ep_size
 
@@ -769,16 +856,11 @@ class TestNVLSAllGatherVDispatcher:
         config_overrides=None,
         base_local_tokens=17,
         outlier_tokens=False,
+        collect_inference_evidence=False,
+        shared_expert_overlap=False,
+        bf16_swiglu=False,
+        dispatcher_type="nvls",
     ):
-        """The NVLS inference MoE path should exactly match training AllToAll.
-
-        With activation_func_tanh_clamp_scale set, this is the only check that the
-        inference clamp kernels reproduce training's ``weighted_clamped_squared_relu``
-        through a whole layer rather than one kernel in isolation. The scale is small
-        relative to this layer's pre-activations so the tanh saturates rather than
-        staying in its near-linear region, where the two paths agree more easily.
-        """
-        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
         from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
         from megatron.core.parallel_state import get_expert_model_parallel_group
         from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
@@ -786,12 +868,13 @@ class TestNVLSAllGatherVDispatcher:
             set_batch_invariant_mode,
         )
         from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NCCLAllGatherDispatcher,
             NVLSAllGatherVDispatcher,
         )
 
         if Utils.world_size < 2:
             pytest.skip("Training-to-inference MoE parity requires expert parallelism.")
-        if Utils.world_size & (Utils.world_size - 1):
+        if dispatcher_type == "nvls" and Utils.world_size & (Utils.world_size - 1):
             pytest.skip("NVLS Triton symmetric-memory barrier requires power-of-two EP size.")
         if (
             inference_grouped_gemm_backend == "torch"
@@ -825,44 +908,42 @@ class TestNVLSAllGatherVDispatcher:
         torch.manual_seed(2028)
         torch.cuda.manual_seed(2028)
         config_overrides = config_overrides or {}
+        use_swiglu = mxfp8_swiglu or bf16_swiglu
 
         config = _make_base_config(
             **config_overrides,
             expert_model_parallel_size=Utils.world_size,
             inference_grouped_gemm_backend=inference_grouped_gemm_backend,
-            inference_moe_token_dispatcher_type="nvls",
-            batch_invariant_mode=True,
+            inference_moe_token_dispatcher_type=dispatcher_type,
+            batch_invariant_mode=dispatcher_type == "nvls",
             attention_backend=AttnBackend.flash,
             flash_attention_version=4,
             attention_dropout=0.0,
-            moe_shared_expert_intermediate_size=None,
+            moe_shared_expert_intermediate_size=64 if shared_expert_overlap else None,
+            moe_shared_expert_overlap=shared_expert_overlap,
             activation_func_tanh_clamp_scale=activation_clamp_scale,
-            # The inference clamp kernels target the fused weighted_clamped_squared_relu.
-            # The inference squared-ReLU kernel reproduces the fused training op, so train
-            # with it. use_fused_weighted_squared_relu defaults to False, which rounds the
-            # square to BF16 first (and, when clamped, routes through tanh_soft_clamp,
-            # which rounds the clamp to BF16): one ULP away from the kernel either way.
+            # Match the fused inference op; the unfused training form rounds the square
+            # (and clamp) to BF16 one operation earlier.
             use_fused_weighted_squared_relu=True,
-            gated_linear_unit=mxfp8_swiglu,
-            activation_func=(torch.nn.functional.silu if mxfp8_swiglu else squared_relu),
-            bias_activation_fusion=mxfp8_swiglu,
+            gated_linear_unit=use_swiglu,
+            activation_func=(torch.nn.functional.silu if use_swiglu else squared_relu),
+            bias_activation_fusion=use_swiglu,
             fp8=("hybrid" if mxfp8_swiglu else None),
             fp8_recipe=("mxfp8" if mxfp8_swiglu else "delayed"),
             fp8_param=mxfp8_swiglu,
             use_cpu_initialization=not mxfp8_swiglu,
             batch_invariant_backend="te_native",
         )
-        # Symmetric buffers are cached by name and sized on first use, so a buffer
-        # left by a smaller-hidden case cannot hold this case's tokens.
-        NVLSAllGatherVDispatcher._delete_buffers()
-        for key in ("ep_agv_h", "ep_agv_r", "ep_agv_p", "ep_rsv", "ep_meta"):
-            SymmetricMemoryManager.destroy(key)
-        NVLSAllGatherVDispatcher.allocate_buffers(
-            per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
-            topk=config.moe_router_topk,
-            hidden_size=config.hidden_size,
-            ep_group=get_expert_model_parallel_group(),
-        )
+        if dispatcher_type == "nvls":
+            NVLSAllGatherVDispatcher.allocate_buffers(
+                per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
+                topk=config.moe_router_topk,
+                hidden_size=config.hidden_size,
+                ep_group=get_expert_model_parallel_group(),
+            )
+        else:
+            NCCLAllGatherDispatcher.allocate_buffers()
+            NCCLAllGatherDispatcher._use_allgather_v = True
 
         if mxfp8_swiglu:
             training_config = _make_base_config(
@@ -876,7 +957,8 @@ class TestNVLSAllGatherVDispatcher:
                 attention_backend=AttnBackend.flash,
                 flash_attention_version=4,
                 attention_dropout=0.0,
-                moe_shared_expert_intermediate_size=None,
+                moe_shared_expert_intermediate_size=64 if shared_expert_overlap else None,
+                moe_shared_expert_overlap=shared_expert_overlap,
                 gated_linear_unit=True,
                 activation_func=torch.nn.functional.silu,
                 bias_activation_fusion=True,
@@ -901,6 +983,93 @@ class TestNVLSAllGatherVDispatcher:
             quantize_model_to_mxfp8(layer, backend="triton")
         else:
             layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+
+        evidence = None
+        original_expert_forward = None
+        original_mcore_forward = None
+        original_vllm_forward = None
+        original_shared_forward = None
+        original_token_dispatch = None
+        original_token_combine = None
+        if collect_inference_evidence:
+            dispatcher = layer._inference_token_dispatcher
+            evidence = {
+                "dispatch": [],
+                "expert": [],
+                "expert_backend": [],
+                "shared": [],
+                "combine": [],
+            }
+            original_expert_forward = layer.experts.forward
+            original_mcore_forward = layer.experts._mcore_fused_moe_forward
+            original_vllm_forward = layer.experts._vllm_forward
+            original_token_dispatch = dispatcher.token_dispatch
+            original_token_combine = dispatcher.token_combine
+
+            def tracked_expert_forward(*args, **kwargs):
+                if InferenceMode.is_active():
+                    evidence["expert"].append(
+                        {
+                            "input_rows": args[0].shape[0],
+                            "route_rows": kwargs["routing_map"].shape[0],
+                        }
+                    )
+                return original_expert_forward(*args, **kwargs)
+
+            def tracked_mcore_forward(*args, **kwargs):
+                evidence["expert_backend"].append("mcore")
+                return original_mcore_forward(*args, **kwargs)
+
+            def tracked_vllm_forward(*args, **kwargs):
+                evidence["expert_backend"].append("vllm")
+                return original_vllm_forward(*args, **kwargs)
+
+            def tracked_token_dispatch(hidden, probs):
+                evidence["dispatch"].append(
+                    {
+                        "local_rows": hidden.shape[0],
+                        "local_route_rows": dispatcher.routing_map.shape[0],
+                    }
+                )
+                dispatched_hidden, dispatched_probs = original_token_dispatch(hidden, probs)
+                evidence["dispatch"][-1]["dispatched_rows"] = dispatched_hidden.shape[0]
+                evidence["dispatch"][-1]["dispatched_route_rows"] = dispatcher.routing_map.shape[0]
+                evidence["dispatch"][-1]["valid_rows"] = int(
+                    NVLSAllGatherVDispatcher._valid_tokens().item()
+                )
+                return dispatched_hidden, dispatched_probs
+
+            def tracked_token_combine(hidden):
+                combined = original_token_combine(hidden)
+                evidence["combine"].append(
+                    {"input_rows": hidden.shape[0], "local_output_rows": combined.shape[0]}
+                )
+                return combined
+
+            layer.experts.forward = tracked_expert_forward
+            layer.experts._mcore_fused_moe_forward = tracked_mcore_forward
+            layer.experts._vllm_forward = tracked_vllm_forward
+            if layer.shared_experts is not None:
+                from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
+
+                original_shared_forward = layer.shared_experts.forward
+
+                def tracked_shared_forward(*args, **kwargs):
+                    if InferenceMode.is_active():
+                        evidence["shared"].append(
+                            {
+                                "input_rows": args[0].shape[0],
+                                "overlap_stream": (
+                                    torch.cuda.current_stream() == SharedExpertMLP.stream
+                                ),
+                            }
+                        )
+                    return original_shared_forward(*args, **kwargs)
+
+                layer.shared_experts.forward = tracked_shared_forward
+            dispatcher.token_dispatch = tracked_token_dispatch
+            dispatcher.token_combine = tracked_token_combine
+
         local_tokens = base_local_tokens + torch.distributed.get_rank()
         if outlier_tokens:
             # Per-token and per-channel log-normal scales give rows the outliers real
@@ -924,18 +1093,53 @@ class TestNVLSAllGatherVDispatcher:
             )
 
         backend = "te_native" if mxfp8_swiglu or inference_grouped_gemm_backend == "vllm" else None
-        with torch.no_grad(), set_batch_invariant_mode(True, backend=backend):
-            if mxfp8_swiglu:
-                with get_fp8_context(training_config, 0):
-                    training_output, _ = training_layer(hidden_states.clone())
-                with get_fp8_context(config, 0), InferenceMode.active():
-                    inference_output, _ = layer(hidden_states.clone())
-            else:
-                training_output, _ = layer(hidden_states.clone())
-                with InferenceMode.active():
-                    inference_output, _ = layer(hidden_states.clone())
+        synchronous_inference_output = None
+        try:
+            with torch.no_grad(), set_batch_invariant_mode(True, backend=backend):
+                if mxfp8_swiglu:
+                    with get_fp8_context(training_config, 0):
+                        training_output, _ = training_layer(hidden_states.clone())
+                    with get_fp8_context(config, 0), InferenceMode.active():
+                        inference_output, _ = layer(hidden_states.clone())
+                else:
+                    training_output, _ = layer(hidden_states.clone())
+                    if shared_expert_overlap:
+                        inference_dispatcher = layer._inference_token_dispatcher
+                        shared_experts = inference_dispatcher.shared_experts
+                        assert shared_experts is layer.shared_experts
+                        inference_dispatcher.shared_experts = None
+                        try:
+                            with InferenceMode.active():
+                                synchronous_inference_output, _ = layer(hidden_states.clone())
+                        finally:
+                            inference_dispatcher.shared_experts = shared_experts
+                    with InferenceMode.active():
+                        inference_output, _ = layer(hidden_states.clone())
+        finally:
+            if collect_inference_evidence:
+                layer.experts.forward = original_expert_forward
+                layer.experts._mcore_fused_moe_forward = original_mcore_forward
+                layer.experts._vllm_forward = original_vllm_forward
+                if original_shared_forward is not None:
+                    layer.shared_experts.forward = original_shared_forward
+                dispatcher.token_dispatch = original_token_dispatch
+                dispatcher.token_combine = original_token_combine
 
         torch.testing.assert_close(inference_output, training_output, atol=0, rtol=0)
+        if synchronous_inference_output is not None:
+            torch.testing.assert_close(
+                inference_output, synchronous_inference_output, atol=0, rtol=0
+            )
+        if evidence is not None:
+            evidence["shared_cleanup"] = dispatcher._shared_expert_output is None
+        return evidence
+
+    @pytest.mark.parametrize("backend", ["torch", "vllm"])
+    def test_batch_invariant_bf16_swiglu_matches_training(self, backend):
+        evidence = self.test_batch_invariant_moe_matches_training(
+            backend, None, False, False, collect_inference_evidence=True, bf16_swiglu=True
+        )
+        assert evidence["expert_backend"] == ["mcore" if backend == "torch" else "vllm"]
 
     @staticmethod
     def _make_nvfp4_inference_layer(**overrides):
@@ -1152,6 +1356,298 @@ class TestNVLSAllGatherVDispatcher:
             base_local_tokens=500,
             outlier_tokens=True,
         )
+
+    def test_vllm_selected_mxfp8_uses_mcore_scaled_grouped_gemm(self):
+        evidence = self.test_batch_invariant_moe_matches_training(
+            "vllm",
+            None,
+            True,
+            False,
+            config_overrides={"inference_moe_disable_fused_quant_kernels": True},
+            collect_inference_evidence=True,
+        )
+
+        assert evidence["expert_backend"] == ["mcore"]
+
+    def test_batch_invariant_mxfp8_moe_with_empty_ep_rank(self):
+        if Utils.world_size < 2:
+            pytest.skip("Empty-rank MXFP8 coverage requires expert parallelism.")
+
+        evidence = self.test_batch_invariant_moe_matches_training(
+            "torch", None, True, False, base_local_tokens=0, collect_inference_evidence=True
+        )
+        rank = torch.distributed.get_rank()
+        local_count = torch.tensor([rank], dtype=torch.int64, device="cuda")
+        all_counts = torch.empty(Utils.world_size, dtype=torch.int64, device="cuda")
+        torch.distributed.all_gather_into_tensor(all_counts, local_count)
+
+        assert all_counts[0].item() == 0 and all_counts.sum().item() > 0
+        assert evidence["expert_backend"] == ["mcore"]
+        assert evidence["dispatch"][0]["local_rows"] == rank
+        assert evidence["dispatch"][0]["valid_rows"] == all_counts.sum().item()
+        assert evidence["combine"][0]["local_output_rows"] == rank
+
+    @pytest.mark.parametrize(
+        "dispatcher_type,base_local_tokens",
+        [("nvls", 0), ("nccl", 0), ("nccl", 1)],
+        ids=["nvls-empty", "nccl-empty", "nccl-positive"],
+    )
+    def test_vllm_moe_with_variable_ep_work(self, dispatcher_type, base_local_tokens):
+        if Utils.world_size < 2:
+            pytest.skip("Variable-work expert parallelism requires at least two ranks.")
+
+        evidence = self.test_batch_invariant_moe_matches_training(
+            "vllm",
+            None,
+            False,
+            False,
+            base_local_tokens=base_local_tokens,
+            collect_inference_evidence=True,
+            dispatcher_type=dispatcher_type,
+        )
+        rank = torch.distributed.get_rank()
+        expected_local_rows = base_local_tokens + rank
+        local_counts = torch.tensor([expected_local_rows], dtype=torch.int64, device="cuda")
+        all_counts = torch.empty(Utils.world_size, dtype=torch.int64, device="cuda")
+        torch.distributed.all_gather_into_tensor(all_counts, local_counts)
+
+        assert all_counts[0].item() == base_local_tokens
+        assert all_counts.sum().item() > 0
+        assert len(evidence["dispatch"]) == 1
+        dispatch = evidence["dispatch"][0]
+        assert dispatch["local_rows"] == expected_local_rows
+        assert dispatch["local_route_rows"] == expected_local_rows
+        assert dispatch["valid_rows"] == all_counts.sum().item()
+        assert dispatch["dispatched_rows"] >= dispatch["valid_rows"]
+        assert dispatch["dispatched_route_rows"] == dispatch["dispatched_rows"]
+        assert len(evidence["expert"]) == 1
+        assert evidence["expert_backend"] == ["vllm"]
+        assert evidence["expert"][0]["input_rows"] >= all_counts.sum().item()
+        assert evidence["expert"][0]["route_rows"] >= all_counts.sum().item()
+        assert evidence["combine"][0]["local_output_rows"] == expected_local_rows
+
+    def test_nvls_cuda_graph_replay_masks_changed_zero_rank_work(self):
+        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+        from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+        from megatron.core.parallel_state import get_expert_model_parallel_group
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            set_batch_invariant_mode,
+        )
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        if Utils.world_size < 2:
+            pytest.skip("Changed-count NVLS replay requires expert parallelism.")
+        if Utils.world_size & (Utils.world_size - 1):
+            pytest.skip("NVLS metadata barriers require power-of-two EP size.")
+
+        config = _make_base_config(
+            expert_model_parallel_size=Utils.world_size,
+            inference_grouped_gemm_backend="vllm",
+            inference_moe_token_dispatcher_type="nvls",
+            batch_invariant_mode=True,
+            batch_invariant_backend="te_native",
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=4,
+            attention_dropout=0.0,
+            moe_shared_expert_intermediate_size=None,
+        )
+        NVLSAllGatherVDispatcher._delete_buffers()
+        for key in ("ep_agv_h", "ep_agv_r", "ep_agv_p", "ep_rsv", "ep_meta"):
+            SymmetricMemoryManager.destroy(key)
+        NVLSAllGatherVDispatcher.allocate_buffers(
+            per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
+            topk=config.moe_router_topk,
+            hidden_size=config.hidden_size,
+            ep_group=get_expert_model_parallel_group(),
+        )
+
+        layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+        reference = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+        reference.load_state_dict(layer.state_dict())
+        dispatcher = layer._inference_token_dispatcher
+        fixed_rows = 8
+        rank = torch.distributed.get_rank()
+        live_count = torch.zeros(1, dtype=torch.int32, device="cuda")
+        NVLSAllGatherVDispatcher.set_real_token_count_tensor(live_count)
+        static_hidden = torch.empty(
+            fixed_rows, 1, config.hidden_size, dtype=torch.bfloat16, device="cuda"
+        )
+        scenario_counts = [
+            [0 if peer == 0 else min(fixed_rows, peer + 3) for peer in range(Utils.world_size)],
+            [5 if peer == 0 else min(fixed_rows, peer + 1) for peer in range(Utils.world_size)],
+        ]
+        generator = torch.Generator(device="cuda").manual_seed(9000 + rank)
+        scenario_inputs = [
+            torch.randn(
+                static_hidden.shape, dtype=static_hidden.dtype, device="cuda", generator=generator
+            )
+            for _ in scenario_counts
+        ]
+
+        expert_replays = torch.zeros(1, dtype=torch.int32, device="cuda")
+        original_expert_forward = layer.experts.forward
+
+        def counted_expert_forward(*args, **kwargs):
+            expert_replays.add_(1)
+            return original_expert_forward(*args, **kwargs)
+
+        layer.experts.forward = counted_expert_forward
+        static_hidden.copy_(scenario_inputs[0])
+        live_count.fill_(scenario_counts[0][rank])
+        with (
+            torch.no_grad(),
+            InferenceMode.active(),
+            set_batch_invariant_mode(True, backend="te_native"),
+        ):
+            warmup = torch.cuda.Stream()
+            warmup.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(warmup):
+                for _ in range(3):
+                    layer(static_hidden)
+                    reference(static_hidden)
+            torch.cuda.current_stream().wait_stream(warmup)
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                graph_output, _ = layer(static_hidden)
+
+            for inputs, counts in zip(scenario_inputs, scenario_counts):
+                static_hidden.copy_(inputs)
+                live_count.fill_(counts[rank])
+                reference_output, _ = reference(static_hidden)
+                expert_replays.zero_()
+                graph.replay()
+                torch.cuda.synchronize()
+
+                assert expert_replays.item() == 1
+                torch.testing.assert_close(graph_output, reference_output, atol=0, rtol=0)
+                assert torch.count_nonzero(graph_output[counts[rank] :]).item() == 0
+                routed = dispatcher.routing_map[: fixed_rows * Utils.world_size]
+                for peer, peer_count in enumerate(counts):
+                    peer_routes = routed[peer * fixed_rows : (peer + 1) * fixed_rows]
+                    assert torch.all(peer_routes[:peer_count] >= 0)
+                    assert torch.all(peer_routes[peer_count:] == -1)
+
+        assert scenario_counts[0][0] == 0 and sum(scenario_counts[0]) > 0
+
+    def test_nvls_reallocation_recreates_ownership_and_preserves_output(self):
+        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+        from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+        from megatron.core.parallel_state import get_expert_model_parallel_group
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            set_batch_invariant_mode,
+        )
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        if Utils.world_size < 2:
+            pytest.skip("NVLS lifecycle coverage requires expert parallelism.")
+        if Utils.world_size & (Utils.world_size - 1):
+            pytest.skip("NVLS metadata barriers require power-of-two EP size.")
+        config = _make_base_config(
+            expert_model_parallel_size=Utils.world_size,
+            inference_grouped_gemm_backend="vllm",
+            inference_moe_token_dispatcher_type="nvls",
+            batch_invariant_mode=True,
+            batch_invariant_backend="te_native",
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=4,
+            attention_dropout=0.0,
+            moe_shared_expert_intermediate_size=None,
+        )
+        ep_group = get_expert_model_parallel_group()
+
+        def allocate(capacity):
+            NVLSAllGatherVDispatcher.allocate_buffers(
+                per_rank_worst_case_token_count=capacity,
+                topk=config.moe_router_topk,
+                hidden_size=config.hidden_size,
+                ep_group=ep_group,
+            )
+            return {
+                key: SymmetricMemoryManager.get_buffer(key)
+                for key in ("ep_agv_h", "ep_agv_r", "ep_agv_p", "ep_rsv", "ep_meta")
+            }
+
+        first_storage = allocate(8)
+        first_layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+        hidden = torch.randn(3, 1, config.hidden_size, dtype=torch.bfloat16, device="cuda")
+        with (
+            torch.no_grad(),
+            InferenceMode.active(),
+            set_batch_invariant_mode(True, backend="te_native"),
+        ):
+            first_output, _ = first_layer(hidden)
+        state = {
+            name: value.detach().clone() if torch.is_tensor(value) else value
+            for name, value in first_layer.state_dict().items()
+        }
+        del first_layer
+        gc.collect()
+
+        second_storage = allocate(16)
+        second_layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+        second_layer.load_state_dict(state)
+        with (
+            torch.no_grad(),
+            InferenceMode.active(),
+            set_batch_invariant_mode(True, backend="te_native"),
+        ):
+            second_output, _ = second_layer(hidden)
+
+        assert all(second_storage[key] is not first_storage[key] for key in first_storage)
+        assert NVLSAllGatherVDispatcher._symm_agv_hidden["tensor"].shape == (
+            16 * Utils.world_size,
+            config.hidden_size,
+        )
+        torch.testing.assert_close(second_output, first_output, atol=0, rtol=0)
+        NVLSAllGatherVDispatcher.release_buffers()
+        assert not any(
+            SymmetricMemoryManager.is_initialized(key)
+            for key in NVLSAllGatherVDispatcher._BUFFER_KEYS
+        )
+
+    def test_sinkhorn_vllm_moe_matches_evaluation_layer(self):
+        evidence = self.test_batch_invariant_moe_matches_training(
+            "vllm",
+            None,
+            False,
+            False,
+            config_overrides={
+                "moe_router_load_balancing_type": "sinkhorn",
+                "moe_aux_loss_coeff": 0.0,
+                "moe_router_score_function": "softmax",
+                "moe_router_enable_expert_bias": False,
+                "moe_router_topk_scaling_factor": None,
+            },
+            base_local_tokens=5,
+            collect_inference_evidence=True,
+        )
+
+        assert len(evidence["dispatch"]) == 1
+        assert len(evidence["expert"]) == 1
+        assert len(evidence["combine"]) == 1
+        assert evidence["dispatch"][0]["valid_rows"] > 0
+        assert evidence["expert"][0]["input_rows"] >= evidence["dispatch"][0]["valid_rows"]
+
+    def test_nvls_shared_expert_overlap_matches_synchronous_inference_output(self):
+        evidence = self.test_batch_invariant_moe_matches_training(
+            "vllm", None, False, False, collect_inference_evidence=True, shared_expert_overlap=True
+        )
+
+        assert len(evidence["dispatch"]) == 2
+        assert len(evidence["expert"]) == 2
+        assert len(evidence["shared"]) == 2
+        assert {receipt["overlap_stream"] for receipt in evidence["shared"]} == {False, True}
+        assert all(
+            receipt["input_rows"] == evidence["dispatch"][0]["local_rows"]
+            for receipt in evidence["shared"]
+        )
+        assert len(evidence["combine"]) == 2
+        assert evidence["shared_cleanup"]
 
 
 # ──────────────────────────────────────────────────────────────────────

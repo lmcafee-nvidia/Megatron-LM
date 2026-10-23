@@ -43,7 +43,9 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     DynamicBatchControllerStepResult,
     TextGenerationController,
 )
+from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
+from megatron.core.transformer.attention import HAVE_FMLA
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.utils import is_layer_window_attention
@@ -714,6 +716,67 @@ _ASYNC_PAIR_SCENARIOS = (
         atol=5.0e-3,
     ),
     _pair_scenario(
+        "mla-moe",
+        "model:mla-moe",
+        "attention:flashmla",
+        "implementation:inference-optimized",
+        config={
+            "use_moe_layer_spec": True,
+            "transformer_impl": "inference_optimized",
+            "multi_latent_attention": True,
+            "hidden_size": 256,
+            "context_block_size_tokens": 64,
+            "position_embedding_type": "rope",
+            "use_flashinfer_fused_rope": False,
+            "flash_attention_version": 3,
+        },
+        signals=("ep1-moe", "inference-optimized", "mla"),
+        prerequisite="flashmla",
+        atol=5.0e-3,
+    ),
+    _pair_scenario(
+        "local-moe",
+        "model:moe",
+        "implementation:local",
+        config={
+            "use_moe_layer_spec": True,
+            "transformer_impl": "local",
+            "moe_router_topk": 1,
+            "moe_router_score_function": "sigmoid",
+            "moe_apply_probs_on_input": True,
+        },
+        signals=("reference-moe",),
+    ),
+    _pair_scenario(
+        "flashinfer-bf16-moe",
+        "model:moe",
+        "implementation:flashinfer-bf16",
+        config={
+            "use_moe_layer_spec": True,
+            "transformer_impl": "inference_optimized",
+            "inference_grouped_gemm_backend": "flashinfer",
+            "moe_latent_size": 16,
+            "moe_use_norm_before_up_proj": True,
+        },
+        signals=("ep1-moe", "inference-optimized", "latent-moe"),
+        prerequisite="flashinfer",
+    ),
+    _pair_scenario(
+        "transformer-engine-fp8-moe",
+        "model:moe",
+        "implementation:transformer-engine",
+        "precision:fp8",
+        config={
+            "use_moe_layer_spec": True,
+            "transformer_impl": "transformer_engine",
+            "fp8": True,
+            "hidden_size": 128,
+        },
+        signals=("fp8", "reference-moe", "transformer-engine"),
+        prerequisite="fp8",
+        atol=5.0e-3,
+    ),
+    _pair_scenario(
         "transformer-engine",
         "implementation:transformer-engine",
         config={"transformer_impl": "transformer_engine"},
@@ -778,6 +841,32 @@ _ASYNC_SUSPEND_RESUME_SCENARIOS = (
         config={"kv_cache_management_mode": "recompute", "static_kv_memory_pointers": False},
         signals=("recompute", "suspend-resume"),
     ),
+    _pair_scenario(
+        "moe-offload-suspend-resume",
+        "model:moe",
+        "kv:offload",
+        "lifecycle:suspend-resume",
+        config={
+            "use_moe_layer_spec": True,
+            "transformer_impl": "inference_optimized",
+            "kv_cache_management_mode": "offload",
+            "static_kv_memory_pointers": False,
+        },
+        signals=("ep1-moe", "inference-optimized", "offload", "suspend-resume"),
+    ),
+    _pair_scenario(
+        "moe-recompute-suspend-resume",
+        "model:moe",
+        "kv:recompute",
+        "lifecycle:suspend-resume",
+        config={
+            "use_moe_layer_spec": True,
+            "transformer_impl": "inference_optimized",
+            "kv_cache_management_mode": "recompute",
+            "static_kv_memory_pointers": False,
+        },
+        signals=("ep1-moe", "inference-optimized", "recompute", "suspend-resume"),
+    ),
 )
 
 _ASYNC_PARALLEL_SCENARIOS = (
@@ -808,8 +897,220 @@ _ASYNC_PARALLEL_SCENARIOS = (
             "use_moe_layer_spec": True,
             "inference_moe_token_dispatcher_type": "nccl",
             "transformer_impl": "inference_optimized",
+            "moe_enable_routing_replay": True,
+            "return_log_probs": True,
+            "materialize_only_last_token_logits": False,
+        },
+        sampling=(
+            {
+                "temperature": 0.8,
+                "top_k": 8,
+                "top_p": 0.0,
+                "seed": 111,
+                "return_log_probs": True,
+                "top_n_logprobs": 4,
+            },
+            {
+                "temperature": 1.1,
+                "top_k": 0,
+                "top_p": 0.85,
+                "seed": 222,
+                "return_log_probs": True,
+                "top_n_logprobs": 4,
+            },
+        ),
+        signals=(
+            "inference-optimized",
+            "full-logits",
+            "logprobs",
+            "metadata-compaction",
+            "moe",
+            "nccl-dispatch",
+            "parallel",
+            "sampled",
+            "request-seed",
+            "routing-reconstruction",
+            "temperature-filter",
+            "top-k-filter",
+            "top-n",
+            "top-p-filter",
+        ),
+        parity="reproducible",
+    ),
+    _pair_scenario(
+        "moe-ep2-nvfp4-nccl",
+        "model:moe",
+        "precision:nvfp4",
+        "topology:ep",
+        "dispatcher:nccl",
+        config={
+            "expert_model_parallel_size": 2,
+            "use_moe_layer_spec": True,
+            "transformer_impl": "inference_optimized",
+            "inference_grouped_gemm_backend": "flashinfer",
+            "inference_moe_nvfp4_recipe": "per_token",
+            "inference_moe_token_dispatcher_type": "nccl",
+            "hidden_size": 256,
         },
         signals=("inference-optimized", "moe", "nccl-dispatch", "parallel"),
+        prerequisite="nvfp4",
+    ),
+    _pair_scenario(
+        "moe-ep2-tp2-sp-nccl",
+        "model:moe",
+        "topology:ep",
+        "topology:tp",
+        "topology:sp",
+        "dispatcher:nccl",
+        "interaction:moe-tp-sp",
+        config={
+            "tensor_model_parallel_size": 2,
+            "expert_model_parallel_size": 2,
+            "sequence_parallel": True,
+            "use_moe_layer_spec": True,
+            "inference_moe_token_dispatcher_type": "nccl",
+            "transformer_impl": "inference_optimized",
+            "moe_router_topk": 1,
+            "moe_router_load_balancing_type": "quantile_balancing",
+            "moe_router_score_function": "sigmoid",
+            "inference_disable_triton_nvls_kernels": True,
+        },
+        signals=("inference-optimized", "moe", "nccl-dispatch", "parallel", "quantile-routing"),
+    ),
+    _pair_scenario(
+        "moe-ep2-dp2-nccl",
+        "model:moe",
+        "topology:ep",
+        "topology:dp",
+        "seed:offset-by-dp-rank",
+        "dispatcher:nccl",
+        config={
+            "expert_model_parallel_size": 2,
+            "use_moe_layer_spec": True,
+            "inference_moe_token_dispatcher_type": "nccl",
+            "transformer_impl": "inference_optimized",
+        },
+        sampling=({"temperature": 0.8, "top_k": 8},),
+        signals=(
+            "dp-offset",
+            "inference-optimized",
+            "moe",
+            "nccl-dispatch",
+            "parallel",
+            "sampled",
+            "temperature-filter",
+            "top-k-filter",
+        ),
+        parity="reproducible",
+    ),
+    _pair_scenario(
+        "moe-ep2-mtp-nccl",
+        "model:moe",
+        "topology:ep",
+        "dispatcher:nccl",
+        "speculation:mtp-depth-one",
+        "interaction:moe-mtp-accept-rewind",
+        config={
+            "expert_model_parallel_size": 2,
+            "use_moe_layer_spec": True,
+            "inference_moe_token_dispatcher_type": "nccl",
+            "transformer_impl": "inference_optimized",
+            "num_speculative_tokens": 1,
+        },
+        signals=(
+            "inference-optimized",
+            "moe",
+            "mtp",
+            "mtp-accept-rewind",
+            "nccl-dispatch",
+            "parallel",
+        ),
+    ),
+    _pair_scenario(
+        "moe-ep2-pp2-nccl",
+        "model:moe",
+        "topology:ep",
+        "topology:pp",
+        "dispatcher:nccl",
+        "interaction:moe-pp",
+        config={
+            "pipeline_model_parallel_size": 2,
+            "expert_model_parallel_size": 2,
+            "use_moe_layer_spec": True,
+            "inference_moe_token_dispatcher_type": "nccl",
+            "transformer_impl": "inference_optimized",
+        },
+        signals=("inference-optimized", "moe", "nccl-dispatch", "parallel"),
+    ),
+    _pair_scenario(
+        "hybrid-gdn-moe-ep2-nccl",
+        "model:hybrid-gdn-moe",
+        "topology:ep",
+        "dispatcher:nccl",
+        "interaction:gdn-moe-state-compaction",
+        config={
+            "model_provider": "hybrid",
+            "ssm_mixer": "gdn",
+            "expert_model_parallel_size": 2,
+            "use_moe_layer_spec": True,
+            "inference_moe_token_dispatcher_type": "nccl",
+            "transformer_impl": "inference_optimized",
+            "moe_num_hash_layers": 1,
+        },
+        signals=(
+            "hybrid",
+            "hash-routing",
+            "inference-optimized",
+            "metadata-compaction",
+            "moe",
+            "nccl-dispatch",
+            "parallel",
+        ),
+        prerequisite="gdn",
+        atol=5.0e-3,
+    ),
+    _pair_scenario(
+        "moe-ep2-swa-sink-nccl",
+        "model:moe",
+        "topology:ep",
+        "dispatcher:nccl",
+        "attention:swa-alternating",
+        "attention:learnable-sink",
+        config={
+            "expert_model_parallel_size": 2,
+            "use_moe_layer_spec": True,
+            "inference_moe_token_dispatcher_type": "nccl",
+            "transformer_impl": "inference_optimized",
+            "window_size": (4, 0),
+            "window_attn_skip_freq": 2,
+            "softmax_type": "learnable",
+        },
+        signals=(
+            "inference-optimized",
+            "moe",
+            "moe-attention",
+            "nccl-dispatch",
+            "parallel",
+            "softmax-sink",
+            "swa-alternating",
+        ),
+    ),
+    _pair_scenario(
+        "moe-ep2-chunked-nccl",
+        "model:moe",
+        "topology:ep",
+        "dispatcher:nccl",
+        "prefill:chunked",
+        "interaction:continuous-batching",
+        config={
+            "expert_model_parallel_size": 2,
+            "use_moe_layer_spec": True,
+            "inference_moe_token_dispatcher_type": "nccl",
+            "transformer_impl": "inference_optimized",
+            "enable_chunked_prefill": True,
+            "context_max_tokens": 8,
+        },
+        signals=("chunked", "inference-optimized", "moe", "nccl-dispatch", "parallel"),
     ),
     _pair_scenario(
         "optimized-tp2-sp",
@@ -846,6 +1147,12 @@ def _check_scenario_prerequisite(scenario):
         available, reason = _check_mamba_sequence_packing_support()
         if not available:
             pytest.skip(reason)
+    elif scenario.prerequisite == "gdn":
+        if not HAVE_FLA:
+            pytest.skip("GDN dynamic inference requires flash-linear-attention")
+    elif scenario.prerequisite == "flashmla":
+        if not HAVE_FMLA:
+            pytest.skip("MLA dynamic decode requires FlashMLA")
     elif scenario.prerequisite == "transformer-engine":
         if not is_te_min_version("2.2.0"):
             pytest.skip("Transformer Engine 2.2.0 is required")
@@ -853,6 +1160,11 @@ def _check_scenario_prerequisite(scenario):
         available, reason = check_fp8_support()
         if not available:
             pytest.skip(reason)
+    elif scenario.prerequisite == "nvfp4":
+        from megatron.core.inference.moe.flashinfer_nvfp4 import HAVE_FLASHINFER_ROUTED_NVFP4
+
+        if torch.cuda.get_device_capability()[0] < 10 or not HAVE_FLASHINFER_ROUTED_NVFP4:
+            pytest.skip("FlashInfer >=0.7 per-token NVFP4 requires Blackwell")
 
 
 def _sampling_params_for_request(scenario, request_id, prompt_length):
@@ -964,6 +1276,7 @@ def _instrument_attention_runtime(module, runtime):
     original_flash = module.flash_decode_and_prefill
 
     def traced_flash(*args, **kwargs):
+        runtime[("attention-step", runtime["model-forward"] + 1)] += 1
         if is_layer_window_attention(
             module.config.window_size, module.config.window_attn_skip_freq, module.layer_number
         ):
@@ -1066,6 +1379,7 @@ def _instrument_parallel_runtime(module, runtime):
         def traced_all_gather(*args, **kwargs):
             input_ = args[0]
             output = original_all_gather(*args, **kwargs)
+            runtime["tp-nvls-disabled-calls"] += int(not module.triton_nvls_kernels_allowed)
             runtime["tp-collective:optimized-all-gather"] += 1
             runtime["tp-sp-gather-dimensions"] += int(output.shape[0] == input_.shape[0] * tp_size)
             return output
@@ -1078,6 +1392,7 @@ def _instrument_parallel_runtime(module, runtime):
         def traced_reduce_scatter(*args, **kwargs):
             input_ = args[0]
             output = original_reduce_scatter(*args, **kwargs)
+            runtime["tp-nvls-disabled-calls"] += int(not module.triton_nvls_kernels_allowed)
             runtime["tp-collective:optimized-reduce-scatter"] += 1
             runtime["tp-sp-reduce-scatter-dimensions"] += int(
                 output.shape[0] * tp_size == input_.shape[0]
@@ -1098,15 +1413,20 @@ def _instrument_nccl_dispatch_runtime(module, runtime):
 
     def traced_dispatch(*args, **kwargs):
         result = original_dispatch(*args, **kwargs)
+        step = runtime["model-forward"] + 1
         runtime["nccl-token-dispatches"] += 1
         runtime["nccl-dispatch-inflight"] += 1
+        runtime[("nccl-dispatch-step", step)] += 1
+        runtime[("nccl-local-rows", step, args[0].shape[0])] += 1
         return result
 
     def traced_combine(*args, **kwargs):
         runtime["nccl-combine-before-dispatch"] += int(runtime["nccl-dispatch-inflight"] <= 0)
         result = original_combine(*args, **kwargs)
+        step = runtime["model-forward"] + 1
         runtime["nccl-token-combines"] += 1
         runtime["nccl-dispatch-inflight"] -= 1
+        runtime[("nccl-combine-step", step)] += 1
         return result
 
     dispatcher.token_dispatch = traced_dispatch
@@ -1118,10 +1438,29 @@ def _instrument_scenario_runtime(env, scenario, runtime):
     controller = env.engine.controller
     context = env.engine.context
     _instrument_async_phases(controller, runtime)
+    if "mtp" in scenario.signals:
+        original_mtp_rewind = controller._run_async_sched_mtp_rewind
+
+        def traced_mtp_rewind(sample_result):
+            counts = sample_result.accepted_counts_cpu_view
+            decode_count = context.num_decode_requests
+            if counts is not None and decode_count > 0:
+                accepted = counts[:decode_count].clamp(min=0)
+                runtime["mtp-acceptance-decisions"] += decode_count
+                runtime["mtp-accepted-tokens"] += int(accepted.sum())
+                runtime["mtp-rejected-tokens"] += int(
+                    (controller.num_speculative_tokens - accepted).sum()
+                )
+            runtime["mtp-rewind-calls"] += 1
+            return original_mtp_rewind(sample_result)
+
+        controller._run_async_sched_mtp_rewind = traced_mtp_rewind
 
     original_forward = controller._dynamic_step_forward_logits
 
     def traced_forward(*args, **kwargs):
+        if context.chunked_prefill_request_id >= 0:
+            runtime[("chunked-forward-step", runtime["model-forward"] + 1)] += 1
         if context.using_cuda_graph_this_step():
             dimensions = context.padded_batch_dimensions
             runtime[
@@ -1175,12 +1514,16 @@ def _instrument_scenario_runtime(env, scenario, runtime):
         runtime["sampling-kernel"] += 1
         runtime[f"sampling-backend:{controller._sampling_backend}"] += 1
         runtime["metadata-consumed"] += int(active_count > 0)
+        runtime["request-seeded-samples"] += int(
+            active_count > 0 and bool((metadata["seed"][:active_count] >= 0).any())
+        )
         sampling_class = type(controller._sampling).__name__
 
         if sampling_class == "TorchSampling":
             from megatron.core.inference.sampling.torch_sampling import TorchSampling
 
             original_filter_logits = TorchSampling.filter_logits
+            original_sample_from_logits = TorchSampling.sample_from_logits
 
             def traced_filter_logits(logits, temperature, top_k, top_p, **filter_kwargs):
                 runtime["temperature-filter"] += int(temperature != 1.0)
@@ -1188,8 +1531,24 @@ def _instrument_scenario_runtime(env, scenario, runtime):
                 runtime["top-p-filter"] += int(top_p > 0.0)
                 return original_filter_logits(logits, temperature, top_k, top_p, **filter_kwargs)
 
-            with mock.patch.object(
-                TorchSampling, "filter_logits", new=staticmethod(traced_filter_logits)
+            def traced_sample_from_logits(logits, temperature, top_k, top_p, **sample_kwargs):
+                sampled = original_sample_from_logits(
+                    logits, temperature, top_k, top_p, **sample_kwargs
+                )
+                support = original_filter_logits(
+                    logits, temperature, top_k, top_p, vocab_size=sample_kwargs.get("vocab_size")
+                )
+                assert torch.isfinite(support.gather(1, sampled[:, None])).all()
+                runtime["sampling-support-valid"] += sampled.numel()
+                return sampled
+
+            with (
+                mock.patch.object(
+                    TorchSampling, "filter_logits", new=staticmethod(traced_filter_logits)
+                ),
+                mock.patch.object(
+                    TorchSampling, "sample_from_logits", new=staticmethod(traced_sample_from_logits)
+                ),
             ):
                 return original_sample_kernel(*args, **kwargs)
 
@@ -1310,7 +1669,7 @@ def _instrument_scenario_runtime(env, scenario, runtime):
         "inference-optimized": lambda name, module: name.startswith("Inference")
         and "inference_layers" in module,
         "fp8": lambda name, module: name.startswith("TE") or "transformer_engine" in module,
-        "hybrid": lambda name, module: name == "MambaMixer",
+        "hybrid": lambda name, module: name in {"MambaMixer", "GatedDeltaNet"},
         "moe": lambda name, module: name in {"MoELayer", "InferenceTopKRouter"},
         "parallel": lambda name, module: "ParallelLinear" in name
         or name in {"ColumnParallelLinear", "RowParallelLinear"},
@@ -1322,12 +1681,119 @@ def _instrument_scenario_runtime(env, scenario, runtime):
         module_name = type(module).__module__
         if "softmax-sink" in scenario.signals and class_name == "SelfAttention":
             _instrument_attention_runtime(module, runtime)
+        if "mla" in scenario.signals and class_name == "MLASelfAttention":
+            original_mla_attention = module.flash_decode_and_prefill
+            original_prepare_for_absorption = module.prepare_for_absorption
+            norm_hook_state = {"installed": False}
+
+            def traced_prepare_for_absorption(
+                _original=original_prepare_for_absorption, _module=module, _state=norm_hook_state
+            ):
+                result = _original()
+                if not _state["installed"]:
+
+                    def trace_norm_input(_norm, args):
+                        runtime["mla-kv-norm-inputs"] += 1
+                        runtime["mla-kv-norm-device-mismatches"] += int(
+                            _norm.weight.device != args[0].device
+                        )
+
+                    _module.kv_layernorm.register_forward_pre_hook(trace_norm_input)
+                    _state["installed"] = True
+                return result
+
+            def traced_mla_attention(*args, _original=original_mla_attention, **kwargs):
+                result = _original(*args, **kwargs)
+                step = runtime["model-forward"] + 1
+                runtime[("mla-attention-step", step)] += 1
+                is_decode_only = kwargs.get("is_decode_only", args[9] if len(args) > 9 else False)
+                runtime["flash-mla-decode"] += int(is_decode_only)
+                return result
+
+            module.prepare_for_absorption = traced_prepare_for_absorption
+            module.flash_decode_and_prefill = traced_mla_attention
         if "parallel" in scenario.signals and (
             "ColumnParallelLinear" in class_name or "RowParallelLinear" in class_name
         ):
             _instrument_parallel_runtime(module, runtime)
-        if "nccl-dispatch" in scenario.signals and class_name == "MoELayer":
+        if (
+            "nccl-dispatch" in scenario.signals or "ep1-moe" in scenario.signals
+        ) and class_name == "MoELayer":
             _instrument_nccl_dispatch_runtime(module, runtime)
+        if (
+            "moe" in scenario.signals or "ep1-moe" in scenario.signals
+        ) and class_name == "InferenceGroupedMLP":
+
+            for kernel_name, method_name in (
+                ("flashinfer", "_flashinfer_forward"),
+                ("mcore", "_mcore_fused_moe_forward"),
+                ("vllm", "_vllm_forward"),
+            ):
+                original_kernel = getattr(module, method_name)
+
+                def record_kernel(
+                    *args, _kernel_name=kernel_name, _original=original_kernel, **kwargs
+                ):
+                    runtime[("moe-kernel-step", runtime["model-forward"] + 1, _kernel_name)] += 1
+                    return _original(*args, **kwargs)
+
+                setattr(module, method_name, record_kernel)
+
+            def record_expert(_module, inputs, kwargs, _output):
+                step = runtime["model-forward"] + 1
+                routing_map = kwargs["routing_map"]
+                runtime["moe-expert-forwards"] += 1
+                runtime[("moe-expert-step", step)] += 1
+                runtime[("moe-expert-input-rows", step, inputs[0].shape[0])] += 1
+                runtime[f"moe-expert-input-width:{inputs[0].shape[-1]}"] += 1
+                runtime[("moe-expert-route-rows", step, routing_map.shape[0])] += 1
+                runtime[f"moe-expert-backend:{_module.inference_grouped_gemm_backend.value}"] += 1
+
+            module.register_forward_hook(record_expert, with_kwargs=True)
+        if class_name == "InferenceTopKRouter" and "hash-routing" in scenario.signals:
+
+            def record_hash_route(router, _inputs, kwargs, output):
+                expected = router.tid2eid[kwargs["input_ids"].T.reshape(-1)].long()
+                assert torch.equal(output[1], expected)
+                runtime["hash-route-forwards"] += 1
+
+            module.register_forward_hook(record_hash_route, with_kwargs=True)
+        if class_name == "InferenceTopKRouter" and "quantile-routing" in scenario.signals:
+
+            def record_quantile_route(router, inputs, _kwargs, output):
+                logits = router.gating(inputs[0]).squeeze(1)
+                assert torch.count_nonzero(router.qb_beta)
+                expected = (logits - router.qb_beta).topk(router.topk, dim=1).indices
+                assert torch.equal(output[1], expected)
+                runtime["quantile-route-forwards"] += 1
+
+            module.register_forward_hook(record_quantile_route, with_kwargs=True)
+        if class_name == "MoELayer" and "latent-moe" in scenario.signals:
+
+            def record_latent_projection(_module, _inputs, _output):
+                runtime[("latent-projection-step", runtime["model-forward"] + 1)] += 1
+
+            for projection in (module.fc1_latent_proj, module.fc2_latent_proj):
+                projection.register_forward_hook(record_latent_projection)
+        if "reference-moe" in scenario.signals and class_name == "MoELayer":
+
+            def record_reference_layer(_module, _inputs):
+                step = runtime["model-forward"] + 1
+                runtime[("reference-moe-layer-step", step)] += 1
+
+            module.register_forward_pre_hook(record_reference_layer)
+        if "reference-moe" in scenario.signals and class_name in {"SequentialMLP", "TEGroupedMLP"}:
+
+            def record_reference_expert(_module, inputs, _output):
+                step = runtime["model-forward"] + 1
+                runtime[("reference-moe-expert-step", step)] += 1
+                runtime[f"reference-moe-expert:{type(_module).__name__}"] += 1
+                runtime[("reference-moe-expert-rows", step, inputs[0].shape[0])] += 1
+                runtime["reference-moe-input-probs"] += int(
+                    _module.config.moe_apply_probs_on_input and bool((inputs[2] != 1).any())
+                )
+
+            module.register_forward_hook(record_reference_expert)
         for tag in active_tags:
             if watched_modules[tag](class_name, module_name):
 
@@ -1389,6 +1855,9 @@ def _snapshot_requests(requests):
                 "generated_logprobs": _as_float_list(request.generated_log_probs),
                 "prompt_top_n": request.prompt_top_n_logprobs,
                 "generated_top_n": request.generated_top_n_logprobs,
+                "routing": (
+                    None if request.routing_indices is None else request.routing_indices.tolist()
+                ),
                 "events": [event.type for event in request.events],
             }
         )
@@ -1443,6 +1912,10 @@ def _assert_request_parity(
         _assert_top_n_parity(
             request.generated_top_n_logprobs, reference["generated_top_n"], atol, exact_top_n
         )
+        actual_routing = (
+            None if request.routing_indices is None else request.routing_indices.tolist()
+        )
+        assert actual_routing == reference["routing"]
         if compare_events:
             assert [event.type for event in request.events] == reference["events"]
 
@@ -1456,9 +1929,39 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         config.update(scenario.config)
         config["async_sched_mode"] = mode
         env = cls._build_test_env(_DynamicEngineTestConfig(**config))
+        if "suspend-resume" in scenario.signals:
+            env.engine._generation_epoch = 7
         env.requests = _make_scenario_requests(
             env, scenario, stop_tokens=stop_tokens, termination_token=termination_token
         )
+        if "quantile-routing" in scenario.signals:
+            for module in env.engine.controller.inference_wrapped_model.model.modules():
+                if type(module).__name__ == "InferenceTopKRouter":
+                    module.qb_beta.copy_(torch.arange(module.num_experts, device="cuda") * 0.25)
+        if "mtp-accept-rewind" in scenario.signals:
+            language_model = env.engine.controller._language_model
+            real_forward = language_model.forward
+            real_mtp_forward = language_model.compute_mtp_single_step
+
+            def controlled_forward(*args, **kwargs):
+                logits = real_forward(*args, **kwargs)
+                logits.zero_()
+                logits[..., 0] = 100.0
+                return logits
+
+            def controlled_mtp_forward(
+                hidden_states, next_token_ids, position_ids, depth, **kwargs
+            ):
+                hidden_states, logits = real_mtp_forward(
+                    hidden_states, next_token_ids, position_ids, depth, **kwargs
+                )
+                preferred = position_ids.reshape(-1).remainder(2)
+                logits.zero_()
+                logits[torch.arange(logits.shape[0], device=logits.device), 0, preferred] = 100.0
+                return hidden_states, logits
+
+            language_model.forward = controlled_forward
+            language_model.compute_mtp_single_step = controlled_mtp_forward
         runtime = Counter()
         if mode == AsyncScheduleMode.ASYNC:
             _instrument_scenario_runtime(env, scenario, runtime)
@@ -1511,6 +2014,14 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 runtime["pending-after-suspend"] += int(
                     env.engine.controller._async_sched_forward.is_valid
                 )
+                suspended = [entry.record[-1] for entry in env.engine.requests.values()]
+                runtime["suspended-request-count"] = len(suspended)
+                runtime["policy-epoch-after-suspend"] = sum(
+                    request.policy_epoch == [(0, 7)] for request in suspended
+                )
+                runtime["kv-epoch-after-suspend"] = sum(
+                    request.kv_cache_epoch == [(0, 7)] for request in suspended
+                )
                 env.engine.resume()
                 for request_id in env.engine.resume_request_ids:
                     env.requests[request_id] = env.engine.get_request(request_id)
@@ -1518,6 +2029,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     env.engine.controller._async_sched_forward.is_valid
                 )
                 runtime["suspend-resume"] += 1
+                runtime["suspend-boundary-step"] = runtime["model-forward"]
                 runtime["static-pointer-preserved"] += int(
                     env.engine.context.memory_buffer.data_ptr() == memory_ptr
                 )
@@ -1575,12 +2087,20 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert context.static_kv_memory_pointers
         if "suspend-resume" in signals:
             assert runtime["suspend-resume"] == runtime["pending-before-suspend"] == 1
+            assert runtime["suspended-request-count"] > 0
+            assert runtime["policy-epoch-after-suspend"] == runtime["suspended-request-count"]
             if "recompute" in signals:
                 assert runtime["pending-after-suspend"] == 0
                 assert runtime["pending-after-resume"] == 0
+                assert runtime["kv-epoch-after-suspend"] == 0
             else:
                 assert runtime["pending-after-suspend"] == 1
                 assert runtime["pending-after-resume"] == 1
+                assert runtime["kv-epoch-after-suspend"] == runtime["suspended-request-count"]
+            assert all(
+                request.policy_epoch == request.kv_cache_epoch == [(0, 7)]
+                for request in env.requests
+            )
             if "static-pointers" in signals:
                 assert runtime["static-pointer-preserved"] == 1
         if "dp-offset" in signals:
@@ -1682,6 +2202,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["cuda-graph-prefill-forwards"] > 0
         if "sampled" in signals:
             assert all(request.generated_tokens for request in env.requests)
+            if controller._sampling_backend == "torch":
+                assert runtime["sampling-support-valid"] > 0
         for sampling_filter in ("temperature-filter", "top-k-filter", "top-p-filter"):
             if sampling_filter in signals:
                 assert runtime[sampling_filter] > 0
@@ -1752,6 +2274,11 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         if "mtp" in signals:
             assert env.engine._spec_steps > 0
             assert int(env.engine._spec_tokens_proposed_per_pos.sum()) > 0
+            assert runtime["mtp-rewind-calls"] > 0
+            assert runtime["mtp-acceptance-decisions"] > 0
+            if "mtp-accept-rewind" in signals:
+                assert runtime["mtp-accepted-tokens"] > 0
+                assert runtime["mtp-rejected-tokens"] > 0
         if "metadata-compaction" in signals:
             assert runtime["non-prefix-survivor-compactions"] > 0
         if "hybrid" in signals:
@@ -1760,6 +2287,24 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["mamba-state-commits"] > 0
             assert runtime["mamba-state-compactions"] > 0
             assert runtime["module-forward:hybrid"] > 0
+        if "mla" in signals:
+            assert model_config.multi_latent_attention
+            assert model_config.cache_mla_latents
+            assert context.cache_mla_latent
+            assert runtime["flash-mla-decode"] > 0
+            assert runtime["mla-kv-norm-inputs"] > 0
+            assert runtime["mla-kv-norm-device-mismatches"] == 0
+            mla_steps = {
+                key[1]
+                for key, count in runtime.items()
+                if isinstance(key, tuple) and key[0] == "mla-attention-step" and count > 0
+            }
+            expert_steps = {
+                key[1]
+                for key, count in runtime.items()
+                if isinstance(key, tuple) and key[0] == "moe-expert-step" and count > 0
+            }
+            assert mla_steps == expert_steps
         if "transformer-engine" in signals:
             assert model_config.transformer_impl == "transformer_engine"
             assert runtime["module-forward:transformer-engine"] > 0
@@ -1792,6 +2337,21 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["softmax-offset-calls"] > 0
             assert runtime["softmax-offset-produced"] == runtime["softmax-offset-calls"]
             assert runtime["sink-correction-calls"] > 0
+        if "request-seed" in signals:
+            assert {request.sampling_params.seed for request in env.requests} == {111, 222}
+            assert runtime["request-seeded-samples"] > 0
+        if "routing-reconstruction" in signals:
+            assert model_config.moe_enable_routing_replay
+            for request in env.requests:
+                routing = request.routing_indices
+                assert routing is not None
+                assert routing.shape == (
+                    len(request.prompt_tokens) + len(request.generated_tokens) - 1,
+                    model_config.num_layers,
+                    model_config.moe_router_topk,
+                )
+                assert (routing >= 0).all()
+                assert (routing < model_config.num_moe_experts).all()
         if "shared-seed" in signals:
             assert not context.config.offset_sampling_seed_by_dp_rank
             assert controller.sampling_rng.initial_seed() == model_config.inference_sampling_seed
@@ -1858,13 +2418,80 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     assert runtime["tp-collective:reduce_from_tensor_model_parallel_region"] > 0
             if model_config.pipeline_model_parallel_size > 1:
                 assert runtime["pipeline-logits-broadcasts"] > 0
+            if model_config.inference_disable_triton_nvls_kernels:
+                assert runtime["tp-nvls-disabled-calls"] > 0
+        if "hash-routing" in signals:
+            assert runtime["hash-route-forwards"] > 0
+        if "quantile-routing" in signals:
+            assert runtime["quantile-route-forwards"] > 0
+
+        def observed_steps(kind, backend=None):
+            return {
+                key[1]
+                for key, count in runtime.items()
+                if isinstance(key, tuple)
+                and key[0] == kind
+                and count > 0
+                and (backend is None or key[2] == backend)
+            }
+
+        def optimized_moe_steps():
+            assert runtime["nccl-token-dispatches"] > 0
+            assert runtime["moe-expert-forwards"] > 0
+            expert_steps = observed_steps("moe-expert-step")
+            assert observed_steps("nccl-dispatch-step") == expert_steps
+            assert observed_steps("nccl-combine-step") == expert_steps
+            backend = model_config.inference_grouped_gemm_backend.value
+            assert runtime[f"moe-expert-backend:{backend}"] > 0
+            kernel = {"torch": "mcore", "vllm": "vllm", "flashinfer": "flashinfer"}[backend]
+            assert observed_steps("moe-kernel-step", kernel) == expert_steps
+            return expert_steps
+
         if "moe" in signals:
             assert model_config.num_moe_experts is not None
             assert context._nccl_ep_dispatcher
-            # Inference MoE may dispatch through split execution helpers that
-            # bypass nn.Module forward hooks. The live dispatcher calls below
-            # are the feature-owning runtime boundary.
-            assert runtime["nccl-token-dispatches"] > 0
+            expert_steps = optimized_moe_steps()
+            if "moe-attention" in signals:
+                assert observed_steps("attention-step") == expert_steps
+            if "chunked" in signals:
+                chunked_steps = observed_steps("chunked-forward-step")
+                assert chunked_steps
+                assert chunked_steps <= expert_steps
+        if "ep1-moe" in signals:
+            assert model_config.num_moe_experts == 2
+            assert model_config.expert_model_parallel_size == 1
+            expert_steps = optimized_moe_steps()
+            if "latent-moe" in signals:
+                assert all(runtime[("latent-projection-step", step)] == 2 for step in expert_steps)
+                assert (
+                    runtime[f"moe-expert-input-width:{model_config.moe_latent_size}"]
+                    == runtime["moe-expert-forwards"]
+                )
+            if "suspend-resume" in signals:
+                boundary = runtime["suspend-boundary-step"]
+                assert any(step <= boundary for step in expert_steps)
+                assert any(step > boundary for step in expert_steps)
+        if "reference-moe" in signals:
+            assert model_config.num_moe_experts == 2
+            layer_steps = {
+                key[1]
+                for key, count in runtime.items()
+                if isinstance(key, tuple) and key[0] == "reference-moe-layer-step" and count > 0
+            }
+            expert_steps = {
+                key[1]
+                for key, count in runtime.items()
+                if isinstance(key, tuple) and key[0] == "reference-moe-expert-step" and count > 0
+            }
+            assert layer_steps == expert_steps
+            expert_class = (
+                "TEGroupedMLP"
+                if model_config.transformer_impl == "transformer_engine"
+                else "SequentialMLP"
+            )
+            assert runtime[f"reference-moe-expert:{expert_class}"] > 0
+            if model_config.moe_apply_probs_on_input:
+                assert runtime["reference-moe-input-probs"] > 0
         if "nccl-dispatch" in signals:
             assert model_config.expert_model_parallel_size > 1
             assert model_config.inference_moe_token_dispatcher_type == "nccl"
@@ -2027,6 +2654,8 @@ class TestAsyncSchedulePairwiseParallel(_AsyncPairwiseHarness):
                 "expert_model_parallel_size", 1
             )
             if scenario.name == "tp2-pp2-sp-dp2":
+                assert parallel_state.get_data_parallel_world_size() == 2
+            if scenario.name == "moe-ep2-dp2-nccl":
                 assert parallel_state.get_data_parallel_world_size() == 2
             self._assert_scenario_pair(scenario)
         finally:

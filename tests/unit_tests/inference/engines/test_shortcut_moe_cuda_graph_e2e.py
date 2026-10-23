@@ -2,6 +2,7 @@
 
 """Exercise Shortcut MoE and wide residuals through the inference graph manager."""
 
+import pytest
 import torch
 
 from megatron.core import parallel_state
@@ -47,6 +48,8 @@ class TestShortcutMoECudaGraphE2E(_GDPGraphTest):
             super().teardown_class()
 
     def _create_model(self):
+        from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
         torch.manual_seed(1234)
         config = TransformerConfig(
             params_dtype=torch.bfloat16,
@@ -102,4 +105,51 @@ class TestShortcutMoECudaGraphE2E(_GDPGraphTest):
         for module in model.modules():
             if isinstance(module, Attention):
                 module.batch_invariant_mode = True
+        model.moe_eager_counter = torch.zeros(1, dtype=torch.int32, device="cuda")
+        model.moe_graph_counter = torch.zeros(1, dtype=torch.int32, device="cuda")
+        model.moe_graph_padding_counter = torch.zeros(1, dtype=torch.int32, device="cuda")
+        model.moe_backend_witnesses = set()
+        instrumented_experts = 0
+        for module in model.modules():
+            if not isinstance(module, InferenceGroupedMLP):
+                continue
+            original_forward = module.forward
+
+            def traced_expert(*args, _module=module, _original=original_forward, **kwargs):
+                result = _original(*args, **kwargs)
+                model.moe_backend_witnesses.add(_module.inference_grouped_gemm_backend.value)
+                counter = (
+                    model.moe_graph_counter
+                    if torch.cuda.is_current_stream_capturing()
+                    else model.moe_eager_counter
+                )
+                counter.add_(1)
+                if torch.cuda.is_current_stream_capturing():
+                    model.moe_graph_padding_counter.add_(
+                        (kwargs["routing_map"] == -1).all(dim=-1).sum()
+                    )
+                return result
+
+            module.forward = traced_expert
+            instrumented_experts += 1
+        assert instrumented_experts > 0
+        self._last_model = model
         return model
+
+    def _build_engine(self, model, num_cuda_graphs):
+        engine = super()._build_engine(model, num_cuda_graphs)
+        if num_cuda_graphs is not None:
+            self._moe_graph_counter_before_run = int(model.moe_graph_counter.item())
+            self._moe_graph_padding_before_run = int(model.moe_graph_padding_counter.item())
+        return engine
+
+    @pytest.mark.parametrize("stagger", [False, True], ids=["uniform", "mixed_steps"])
+    @torch.inference_mode()
+    def test_cuda_graphs_do_not_change_generated_tokens(self, stagger):
+        super().test_cuda_graphs_do_not_change_generated_tokens(stagger)
+
+        model = self._last_model
+        assert model.moe_backend_witnesses == {model.config.inference_grouped_gemm_backend.value}
+        assert model.moe_eager_counter.item() > 0
+        assert model.moe_graph_counter.item() > self._moe_graph_counter_before_run
+        assert model.moe_graph_padding_counter.item() > self._moe_graph_padding_before_run

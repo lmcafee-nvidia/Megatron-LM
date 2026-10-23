@@ -349,6 +349,66 @@ class TestMXFP8ReshardTransform:
             grouped_mlp._fc2_weight.scale.data_ptr(),
         )
 
+    @pytest.mark.skipif(
+        not HAVE_FLASHINFER_ROUTED_MXFP8, reason="test requires FlashInfer routed MXFP8"
+    )
+    def test_flashinfer_routed_moe_output_changes_only_after_refresh(self):
+        from megatron.core.inference.moe import InferenceGroupedGemmBackend
+        from megatron.core.inference.moe.flashinfer_mxfp8 import flashinfer_routed_mxfp8_moe
+        from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+        class Namespace:
+            _stack_mxfp8_linear_weight = InferenceGroupedMLP._stack_mxfp8_linear_weight
+
+        torch.manual_seed(321)
+        grouped_mlp = Namespace()
+        grouped_mlp.num_local_experts = 2
+        grouped_mlp.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.FLASHINFER
+        grouped_mlp._concatenated_weights_built = False
+        buffers = {}
+        for linear_name, shape in (("linear_fc1", (96, 128)), ("linear_fc2", (128, 96))):
+            linear = Namespace()
+            setattr(grouped_mlp, linear_name, linear)
+            for expert_idx in range(grouped_mlp.num_local_experts):
+                weight = MXFP8Tensor.from_bf16(
+                    torch.randn(*shape, dtype=torch.bfloat16, device="cuda"), backend="triton"
+                )
+                setattr(linear, f"weight{expert_idx}", weight)
+                buffers[f"{linear_name}.weight{expert_idx}"] = weight
+
+        InferenceGroupedMLP._build_concatenated_mxfp8_weights(grouped_mlp)
+        grouped_mlp._concatenated_weights_built = True
+        hidden = torch.randn(4, 128, dtype=torch.bfloat16, device="cuda")
+        routes = torch.tensor([[0, 1]] * 4, dtype=torch.int64, device="cuda")
+        probs = torch.tensor([[0.75, 0.25]] * 4, dtype=torch.float32, device="cuda")
+
+        def run():
+            return flashinfer_routed_mxfp8_moe(
+                hidden,
+                routes,
+                probs,
+                grouped_mlp._fc1_weight,
+                grouped_mlp._fc2_weight,
+                num_experts=2,
+                local_expert_offset=0,
+                activation_type=6,
+            )
+
+        before = run()
+        transform = MXFP8ReshardTransform(
+            convertible_params=set(buffers), persistent_buffers=buffers, backend="triton"
+        )
+        for name, weight in buffers.items():
+            replacement = torch.zeros(weight.shape, dtype=torch.bfloat16, device="cuda")
+            transform.finalize_recv(name, (slice(None), slice(None)), [replacement])
+
+        stale = run()
+        assert torch.equal(stale, before)
+        assert InferenceGroupedMLP.refresh_flashinfer_mxfp8_weights(grouped_mlp)
+        refreshed = run()
+        assert torch.count_nonzero(refreshed).item() == 0
+        assert not torch.equal(refreshed, before)
+
 
 # ===========================================================================
 # quantize_params_to_mxfp8
