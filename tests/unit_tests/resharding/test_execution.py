@@ -314,17 +314,20 @@ class TestExecutionBatches:
             {"first": torch.zeros(2, device="cuda"), "second": torch.zeros(2, device="cuda")}
         )
         service = FailSecondRun()
+        Utils.initialize_distributed()
 
         with (
             patch("megatron.core.resharding.execution.dist.barrier") as barrier,
             patch("megatron.core.resharding.execution.refresh_module_caches") as refresh,
             pytest.raises(RuntimeError, match="injected transport failure"),
         ):
-            _run(self._two_parameter_plan(), src_module, dst_module, service)
+            execute_reshard_plan(self._two_parameter_plan(), src_module, dst_module, service)
 
         destination = dict(dst_module.named_parameters())
-        assert torch.equal(destination["first"], torch.tensor([1.0, 2.0], device="cuda"))
-        assert torch.equal(destination["second"], torch.zeros(2, device="cuda"))
+        assert torch.equal(
+            destination["first"], torch.tensor([1.0, 2.0], device=destination["first"].device)
+        )
+        assert torch.equal(destination["second"], torch.zeros_like(destination["second"]))
         assert service.runs == [([0], [0]), ([1], [1])]
         assert service.sends and service.recvs
         barrier.assert_not_called()
