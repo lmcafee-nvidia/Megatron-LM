@@ -592,7 +592,10 @@ def test_huggingface_fast_incremental_detokenizer_drops_eos_and_special_map_toke
 @pytest.mark.parametrize("remove_eos", [False, True])
 def test_huggingface_fast_incremental_detokenizer_matches_trailing_eos_policy(remove_eos):
     tokenizer, huggingface_tokenizer = _with_chat_markers(eos_marker="<|im_end|>")
-    token_ids = huggingface_tokenizer.encode("a<|im_end|>b<|im_end|>", add_special_tokens=False)
+    huggingface_tokenizer.add_special_tokens({"additional_special_tokens": ["<special>"]})
+    token_ids = huggingface_tokenizer.encode(
+        "a<special><|im_end|>b<|im_end|>", add_special_tokens=False
+    )
     detokenizer = HuggingFaceFastIncrementalDetokenizer(tokenizer, [], remove_eos=remove_eos)
 
     streamed_text = detokenizer.update(token_ids) + detokenizer.finish()
