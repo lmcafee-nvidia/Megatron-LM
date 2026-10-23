@@ -332,6 +332,17 @@ def test_streaming_chat_parser_emits_structured_stable_tool_call_deltas():
     )
 
 
+def test_streaming_chat_parser_propagates_parser_failures():
+    def parse(_text, *, finished=False):
+        del finished
+        raise RuntimeError("parser failed")
+
+    parser = StreamingChatParser(parse)
+
+    with pytest.raises(RuntimeError, match="parser failed"):
+        parser.parse("generated text", finished=True)
+
+
 def test_streaming_chat_parser_handles_single_multi_turn_tool_call_request():
     tools = [
         {
