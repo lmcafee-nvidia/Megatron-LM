@@ -1538,7 +1538,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
 @pytest.mark.internal
 def test_real_noncolocated_consumer_refit_then_adapter_output():
     """Transfer two weight versions across disjoint workers before packing output."""
-    if torch.distributed.get_world_size() != 4:
+    if Utils.world_size != 4:
         pytest.skip("noncolocated source/destination contract requires four ranks")
 
     from megatron.core.inference.shards import build_inference_pg_collection
