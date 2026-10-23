@@ -495,14 +495,15 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         [
             {},
             {
-                "context_block_size_tokens": 4,
-                "context_max_tokens": 8,
+                "context_block_size_tokens": 256,
+                "context_max_tokens": 256,
                 "enable_chunked_prefill": True,
                 "enable_prefix_caching": True,
                 "prefix_caching_eviction_policy": PrefixCachingEvictionPolicy.LRU,
             },
             {
-                "context_block_size_tokens": 4,
+                "context_block_size_tokens": 256,
+                "context_max_tokens": 1024,
                 "enable_prefix_caching": True,
                 "prefix_caching_eviction_policy": PrefixCachingEvictionPolicy.REF_ZERO,
             },
@@ -549,14 +550,15 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         """Exercise request lowering, FlashInfer decode, and response packing together."""
         BatchedDataDict, mixin_cls = _load_nemo_rl_adapter()
         stresses_chunking = feature_config.get("enable_chunked_prefill", False)
+        stresses_prefix = feature_config.get("enable_prefix_caching", False)
         adapter_sampling = feature_config.get("adapter_sampling")
         uses_mla = feature_config.get("mla", False)
         uses_mxfp8 = feature_config.get("mxfp8", False)
-        prompts = (
-            [[3, 5, 7, 9, 11, 13, 15, 17], [3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25]]
-            if stresses_chunking
-            else [[3, 5, 7, 9], [2, 4, 6, 8, 10, 12]]
-        )
+        if stresses_prefix:
+            shared_prefix = [index % 89 + 1 for index in range(256)]
+            prompts = [shared_prefix + [3, 5], shared_prefix + [7, 9, 11, 13]]
+        else:
+            prompts = [[3, 5, 7, 9], [2, 4, 6, 8, 10, 12]]
         config = DynamicEngineTestConfig(
             num_requests=0,
             max_prompt_length=max(map(len, prompts)),
