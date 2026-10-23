@@ -12,8 +12,8 @@ from megatron.core.inference.sampling.torch_sampling import TorchSampling
 
 def _oracle_scores(logits, temperature, top_k, top_p, *, compose_filters):
     """Independently compute raw and filtered distributions for one row."""
+    raw = torch.log_softmax(logits.float(), dim=-1)
     scaled = logits.float() / max(float(temperature), 1.0e-6)
-    raw = torch.log_softmax(scaled, dim=-1)
     probabilities = torch.softmax(scaled, dim=-1)
 
     if top_k > 0:
@@ -85,6 +85,7 @@ def test_known_logits_match_independent_filter_and_score_oracle(backend, dtype):
         (0.0, 1, 0.0),
         (0.75, 3, 0.0),
         (1.25, 0, 0.72),
+        (0.5, 0, 0.0),
     ]
     if backend == "flashinfer":
         parameters.append((0.9, 4, 0.83))
@@ -94,6 +95,7 @@ def test_known_logits_match_independent_filter_and_score_oracle(backend, dtype):
             [0.1, 1.7, -0.5, 0.6, 2.8, 1.1],
             [2.0, -0.7, 0.4, 1.1, 3.2, -1.3],
             [-1.0, 0.2, 0.8, 2.4, 1.3, -0.2],
+            [1.3, -0.4, 0.9, -1.1, 0.2, 2.0],
             [0.5, 2.7, -0.6, 1.6, 0.1, 1.0],
         ],
         device="cuda",
@@ -118,8 +120,15 @@ def test_known_logits_match_independent_filter_and_score_oracle(backend, dtype):
     expected_raw = torch.stack(expected_raw).cuda()
     expected_processed = torch.stack(expected_processed).cuda()
 
+    raw_context = SimpleNamespace(config=SimpleNamespace(logprobs_mode="raw_logprobs"))
+    actual_raw = DynamicInferenceContext._processed_log_probs(
+        raw_context, logits.float(), sampling=None
+    )
+
     assert actual_scores.dtype == torch.float32
+    assert actual_raw.dtype == torch.float32
     assert torch.equal(torch.isfinite(actual_scores), torch.isfinite(expected_processed))
+    torch.testing.assert_close(actual_raw, expected_raw, rtol=2.0e-5, atol=2.0e-6)
     torch.testing.assert_close(
         actual_scores[torch.isfinite(actual_scores)],
         expected_processed[torch.isfinite(expected_processed)],
@@ -132,6 +141,7 @@ def test_known_logits_match_independent_filter_and_score_oracle(backend, dtype):
     torch.testing.assert_close(
         expected_processed.exp().sum(1), torch.ones(len(parameters), device="cuda")
     )
+    assert not torch.allclose(actual_raw[4], actual_scores[4])
 
     no_top_k, no_top_p = context.active_sampling_filter_flags()
     sampled = sampler.sample_kernel(
