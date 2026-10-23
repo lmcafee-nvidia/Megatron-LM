@@ -3,6 +3,7 @@
 """Unit tests for the high-level inference APIs."""
 
 import asyncio
+import concurrent.futures
 from unittest.mock import MagicMock
 
 import pytest
@@ -55,6 +56,7 @@ def _make_worker_instance(cls):
     obj._loop_manager = None
     obj._coord_runtime = None
     obj._shutdown_called = False
+    obj._shutdown_future = None
     obj._serve_started = False
     return obj
 
@@ -199,6 +201,53 @@ class TestLifecycleGuards:
 
         client.stop.assert_called_once_with()
         assert runtime._client is None
+
+    @pytest.mark.asyncio
+    async def test_concurrent_async_shutdown_callers_wait_for_same_teardown(self):
+        llm = _make_worker_instance(MegatronAsyncLLM)
+        teardown = concurrent.futures.Future()
+
+        class LoopManager:
+            stops = 0
+
+            @staticmethod
+            def submit(coro):
+                coro.close()
+                return teardown
+
+            @staticmethod
+            async def run_async(coro):
+                coro.close()
+                await asyncio.wrap_future(teardown)
+
+            def stop(self):
+                self.stops += 1
+
+        llm._loop_manager = LoopManager()
+        first = asyncio.create_task(llm.shutdown())
+        await asyncio.sleep(0)
+        second = asyncio.create_task(llm.shutdown())
+        await asyncio.sleep(0)
+
+        assert not first.done()
+        assert not second.done()
+        teardown.set_result(None)
+        await asyncio.gather(first, second)
+        assert llm._loop_manager.stops >= 1
+
+    @pytest.mark.asyncio
+    async def test_generate_after_shutdown_is_rejected(self):
+        sync_llm = _make_worker_instance(MegatronLLM)
+        sync_llm._is_primary_rank = True
+        sync_llm._shutdown_called = True
+        with pytest.raises(RuntimeError, match="shut down"):
+            sync_llm.generate("late")
+
+        async_llm = _make_worker_instance(MegatronAsyncLLM)
+        async_llm._is_primary_rank = True
+        async_llm._shutdown_called = True
+        with pytest.raises(RuntimeError, match="shut down"):
+            await async_llm.generate("late")
 
     def test_bridge_and_serve_raise_in_direct_mode(self, mock_pipeline, fake_model_and_tokenizer):
         model, tok = fake_model_and_tokenizer
