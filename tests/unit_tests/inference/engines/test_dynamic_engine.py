@@ -3930,14 +3930,17 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.internal
     @pytest.mark.skipif(
         not torch.distributed.is_initialized() or torch.distributed.get_world_size() != 2,
-        reason="real NCCL handoff witness requires exactly two distributed ranks",
+        reason="real KV handoff witness requires exactly two distributed ranks",
     )
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @pytest.mark.parametrize("kv_transport_backend", ["nccl", "nixl"])
     @torch.inference_mode()
-    def test_real_nccl_handoff_streams_imported_decode_and_matches_greedy(self):
-        """Transfer real prompt KV across ranks and stream from decode admission."""
+    def test_real_kv_handoff_streams_imported_decode_and_matches_greedy(
+        self, kv_transport_backend
+    ):
+        """Transfer real prompt KV by push and pull backends, then stream decode."""
         rank = torch.distributed.get_rank()
         config = DynamicEngineTestConfig(
             num_requests=0,
@@ -3947,7 +3950,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             max_sequence_length=24,
             top_k=1,
             enable_prefix_caching=True,
-            kv_transport_backend="nccl",
+            kv_transport_backend=kv_transport_backend,
             context_block_size_tokens=4,
             context_max_requests=4,
             context_max_tokens=32,
@@ -4006,7 +4009,10 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             # Signal readiness immediately before the backend posts irecvs. Rank
             # zero leaves the barrier by posting the matching sends, matching the
             # native coordinator's KV_TRANSFER_READY -> SEND_KV order.
-            engine._notify_kv_transfer_ready = lambda _rid, _cached: (torch.distributed.barrier())
+            if kv_transport_backend == "nccl":
+                engine._notify_kv_transfer_ready = lambda _rid, _cached: (
+                    torch.distributed.barrier()
+                )
             stream_params = SamplingParams(
                 num_tokens_to_generate=6,
                 termination_id=-1,
@@ -4021,17 +4027,19 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             pending = engine._pending_kv_imports[0]
             assert pending.handle is not None
         else:
-            # Paired with the decode readiness callback above. Both ranks then
-            # enter their production backend concurrently (isend versus irecv).
-            torch.distributed.barrier()
-            engine.push_handoff_kv(71, [decode_meta[0]])
-            assert engine.pending_kv_push_count == 1
+            if kv_transport_backend == "nccl":
+                # Paired with the decode readiness callback above. Both ranks then
+                # enter their production backend concurrently (isend versus irecv).
+                torch.distributed.barrier()
+                engine.push_handoff_kv(71, [decode_meta[0]])
+                assert engine.pending_kv_push_count == 1
         torch.distributed.barrier()
 
         if role == "prefill":
-            for _, handles in engine._pending_kv_pushes:
-                for handle in handles:
-                    handle.wait()
+            if kv_transport_backend == "nccl":
+                for _, handles in engine._pending_kv_pushes:
+                    for handle in handles:
+                        handle.wait()
         else:
             pending.handle.wait()
         torch.distributed.barrier()
@@ -4046,7 +4054,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert digests[0] == digests[1]
 
         if role == "prefill":
-            assert engine._poll_pending_kv_pushes() == 1
+            assert engine._poll_pending_kv_pushes() == int(kv_transport_backend == "nccl")
             engine.release_handoff_blocks(71)
             assert engine.pinned_handoff_block_count == 0
         else:
@@ -4100,6 +4108,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             assert not engine._pending_kv_imports
 
         torch.distributed.barrier()
+        if kv_transport_backend == "nixl":
+            engine._kv_transfer_agent.close()
 
     @pytest.mark.internal
     @pytest.mark.skipif(
