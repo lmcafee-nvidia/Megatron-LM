@@ -14,7 +14,7 @@ from collections import Counter, OrderedDict, deque
 from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, field
-from functools import partial
+from functools import partial, wraps
 from typing import Dict, List, Optional, Tuple
 from unittest import mock
 
@@ -116,6 +116,19 @@ try:
     HAVE_TORCH_MEMORY_SAVER = True
 except ImportError:
     HAVE_TORCH_MEMORY_SAVER = False
+
+
+def _async_inference_mode(function):
+    """Keep inference mode active while an async test coroutine executes."""
+
+    @wraps(function)
+    async def wrapped(*args, **kwargs):
+        # torch.inference_mode's regular decorator exits as soon as an async
+        # function returns its coroutine, before that coroutine is awaited.
+        with torch.inference_mode():
+            return await function(*args, **kwargs)
+
+    return wrapped
 
 
 class _ImageOnlyCapabilityWrapper:
@@ -3443,6 +3456,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @_async_inference_mode
     async def test_real_coordinator_streams_before_completion_and_matches_greedy(self):
         """Cross real model steps, coordinator routing, and two independent clients."""
         config = DynamicEngineTestConfig(
