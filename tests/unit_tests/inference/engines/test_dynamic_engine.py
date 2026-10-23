@@ -1800,6 +1800,57 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
     assert replayed == [23, 24, 26, 25]
 
 
+def test_offload_resume_isolates_live_requests_during_graph_recapture():
+    """OFFLOAD graph warmup cannot overwrite restored resident request state."""
+
+    calls = []
+    live_state = object()
+    context = types.SimpleNamespace(
+        kv_cache_management_mode=KVCacheManagementMode.OFFLOAD,
+        static_kv_memory_pointers=False,
+        total_request_count=1,
+        chunked_prefill_request_id=-1,
+        reinitialize_inference_state_buffers=mock.Mock(),
+        _snapshot_live_request_state_for_graph_recapture=mock.Mock(
+            side_effect=lambda: calls.append("snapshot") or live_state
+        ),
+        reset=mock.Mock(side_effect=lambda **_: calls.append("reset")),
+        _restore_live_request_state_after_graph_recapture=mock.Mock(
+            side_effect=lambda state: calls.append(("restore", state))
+        ),
+    )
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.context = context
+    engine.state = EngineState.SUSPENDED
+    engine._weight_epoch = 0
+    engine.requests = {}
+    engine.resume_request_ids = []
+    engine.waiting_request_ids = deque()
+    engine.unified_memory_level = 0
+    engine.use_coordinator = False
+    engine._loop = types.SimpleNamespace(call_soon_threadsafe=mock.Mock())
+    engine._notify_cond_for_new_request = mock.Mock(return_value=None)
+    engine.create_cuda_graphs = mock.Mock(
+        side_effect=lambda **kwargs: calls.append(("capture", kwargs))
+    )
+
+    with (
+        mock.patch.object(DynamicInferenceEngine, "suspend_resume_ctx", return_value=nullcontext()),
+        mock.patch.object(InferenceMode, "set_active"),
+        mock.patch.object(torch.cuda, "synchronize"),
+    ):
+        engine.resume()
+
+    assert calls == [
+        "snapshot",
+        "reset",
+        ("capture", {"reset_context": False}),
+        ("restore", live_state),
+    ]
+    context.reset.assert_called_once_with(preserve_prefix_cache=True, preserve_counters=True)
+    assert engine.state == EngineState.RUNNING
+
+
 def test_resume_resalts_requests_admitted_before_the_weight_epoch_bump():
     """Requests holding no KV at resume must hash under the post-refit weights.
 
