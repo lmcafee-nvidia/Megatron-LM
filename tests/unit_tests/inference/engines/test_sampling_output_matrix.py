@@ -182,7 +182,7 @@ class TestSamplingOutputMatrix(RequestLifecyclePairwiseBase):
         ]
         assert [request.finish_reason for request in finished] == ["stop", "stop", "length"]
         assert all(request.status == Status.COMPLETED for request in finished)
-        assert finished[0].stop_word_ids == [[12, 13], [11, 12, 13]]
+        assert finished[0].sampling_params.stop_words == ["12 13", "11 12 13"]
         assert finished[1].sampling_params.stop_token_ids == [22, 55]
         assert finished[1].generated_length == finished[1].sampling_params.num_tokens_to_generate
         assert runtime["middle-finished-with-survivors"] > 0
