@@ -349,9 +349,26 @@ class TestBatchInvariantMambaPrefixCaching:
                 if chunked:
                     assert post_refit_chunked_steps > 0
         if sampling_backend == "torch":
-            assert outputs[1] == outputs[11]
-            assert outputs[2] == outputs[12]
-            assert outputs[61] != outputs[1]
+            for first_id, repeated_id in ((1, 11), (2, 12)):
+                first_tokens, first_log_probs = outputs[first_id]
+                repeated_tokens, repeated_log_probs = outputs[repeated_id]
+                assert first_tokens == repeated_tokens
+                assert len(first_log_probs) == len(repeated_log_probs)
+                for first, repeated in zip(first_log_probs, repeated_log_probs):
+                    if math.isnan(first) or math.isnan(repeated):
+                        assert math.isnan(first) and math.isnan(repeated)
+                    else:
+                        assert first == repeated
+
+            before_tokens, before_log_probs = outputs[1]
+            after_tokens, after_log_probs = outputs[61]
+            assert len(before_log_probs) == len(after_log_probs)
+            finite_log_probs_differ = any(
+                (math.isnan(before) != math.isnan(after))
+                or (not math.isnan(before) and before != after)
+                for before, after in zip(before_log_probs, after_log_probs)
+            )
+            assert before_tokens != after_tokens or finite_log_probs_differ
         else:
             # FlashInfer owns one global Philox stream and intentionally does
             # not promise request-local seeded trajectories. Prove that its
