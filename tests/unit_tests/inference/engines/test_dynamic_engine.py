@@ -4149,7 +4149,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             decoder_input = kwargs.get("decoder_input")
             if request is None or decoder_input is None or decoder_input.shape[0] <= 1:
                 return
-            image_positions = request.image_token_mask[0] >= 0
+            image_positions = request.image_token_mask >= 0
             expected = request.image_embeddings.permute(1, 0, 2).reshape(
                 -1, decoder_input.shape[-1]
             )
