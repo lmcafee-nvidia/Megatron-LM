@@ -335,6 +335,32 @@ class TestLifecycleGuards:
         assert llm._loop_manager.stops == 1
 
     @pytest.mark.asyncio
+    async def test_wait_after_async_shutdown_does_not_reuse_stopped_loop(self):
+        llm = _make_worker_instance(MegatronAsyncLLM)
+        teardown = concurrent.futures.Future()
+        teardown.set_result(None)
+
+        class LoopManager:
+            stop_when_complete = base_mod._EventLoopManager.stop_when_complete
+
+            @staticmethod
+            def submit(coro):
+                coro.close()
+                return teardown
+
+            @staticmethod
+            async def run_async(coro):
+                coro.close()
+                raise AssertionError("stopped runtime loop was reused")
+
+            def stop(self):
+                pass
+
+        llm._loop_manager = LoopManager()
+        await llm.shutdown()
+        await llm.wait_for_shutdown()
+
+    @pytest.mark.asyncio
     async def test_generate_after_shutdown_is_rejected(self):
         sync_llm = _make_worker_instance(MegatronLLM)
         sync_llm._is_primary_rank = True
