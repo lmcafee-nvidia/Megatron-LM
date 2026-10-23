@@ -321,6 +321,9 @@ class TestBatchInvariantMambaPrefixCaching:
                     assert not engine.controller._async_sched_forward.is_valid
                     assert queued.block_hash_salt != old_salt
                     assert engine.get_request(5999).block_hash_salt == resident_salt
+                    if kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
+                        assert context.request_ids[: context.total_request_count].tolist() == [5999]
+                        assert context.mamba_metadata.request_to_mamba_state_idx[0] >= 0
                 else:
                     # Preserve the legacy cache-equivalence owner unchanged: it
                     # exercises deterministic request-local sampling around the

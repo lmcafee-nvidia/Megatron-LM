@@ -1731,6 +1731,26 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         state = {
             "bookkeeping": self._cpu_bookkeeping_buf.clone(),
+            "request_tensors": {
+                name: getattr(self, name).clone()
+                for name in (
+                    "request_ids",
+                    "request_query_lengths",
+                    "request_in_prefill_status_tensor",
+                    "request_output_lengths",
+                    "request_kv_length_offsets",
+                    "request_kv_block_counts",
+                    "request_last_kv_block_id",
+                    "request_last_kv_block_offset",
+                    "request_to_kv_block_ids",
+                )
+            },
+            "request_metadata": {
+                name: tensor.clone() for name, tensor in self.request_metadata.items()
+            },
+            "active_request_metadata": {
+                name: tensor.clone() for name, tensor in self.active_request_metadata.items()
+            },
             "block_allocator": {
                 "block_bag": self.kv_block_allocator.block_bag.clone(),
                 "pool_avail": self.kv_block_allocator.pool_avail,
@@ -1765,9 +1785,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             },
         }
         if self.mamba_metadata is not None:
+            state["mamba_request_slots"] = self.mamba_metadata.request_to_mamba_state_idx.clone()
             state["mamba_free_slots"] = self.mamba_metadata.mamba_state_free_slots.clone()
             state["mamba_free_slot_count"] = self.mamba_metadata.mamba_state_free_slot_count
         if self.mtp_metadata.enabled:
+            state["mtp_request_rows"] = self.mtp_metadata.request_matched_prefix_blocks.clone()
             state["mtp_boundary"] = {
                 "valid": self.mtp_metadata.chunk_boundary_valid,
                 "request_id": self.mtp_metadata.chunk_boundary_req_id,
@@ -1780,6 +1802,12 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         """Restore OFFLOAD bookkeeping and state buffers after graph recapture."""
 
         self._cpu_bookkeeping_buf.copy_(state["bookkeeping"])
+        for name, value in state["request_tensors"].items():
+            getattr(self, name).copy_(value)
+        for name, value in state["request_metadata"].items():
+            self.request_metadata[name].copy_(value)
+        for name, value in state["active_request_metadata"].items():
+            self.active_request_metadata[name].copy_(value)
         allocator_state = state["block_allocator"]
         self.kv_block_allocator.block_bag.copy_(allocator_state["block_bag"])
         self.kv_block_allocator.pool_avail = allocator_state["pool_avail"]
@@ -1789,6 +1817,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             setattr(self, name, value)
         if "mamba_free_slots" in state:
             assert self.mamba_metadata is not None
+            self.mamba_metadata.request_to_mamba_state_idx.copy_(state["mamba_request_slots"])
             self.mamba_metadata.mamba_state_free_slots.copy_(state["mamba_free_slots"])
             self.mamba_metadata.mamba_state_free_slot_count = state["mamba_free_slot_count"]
         for name, value in state["vlm_maps"].items():
@@ -1796,6 +1825,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             target.clear()
             target.update(value)
         if "mtp_boundary" in state:
+            self.mtp_metadata.request_matched_prefix_blocks.copy_(state["mtp_request_rows"])
             boundary = state["mtp_boundary"]
             self.mtp_metadata.chunk_boundary_valid = boundary["valid"]
             self.mtp_metadata.chunk_boundary_req_id = boundary["request_id"]
