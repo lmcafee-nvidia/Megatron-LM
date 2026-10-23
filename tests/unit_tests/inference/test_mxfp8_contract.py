@@ -140,6 +140,20 @@ def test_boundary_payload_scales_and_padding_match_independent_reference():
     assert torch.equal(scale.view(torch.uint8), expected_scale)
 
 
+def test_conversion_verifier_decodes_e8m0_byte_zero_as_finite_scale():
+    x = torch.full(
+        (1, MXFP8_BLOCK_SIZE),
+        torch.finfo(torch.float32).tiny / 4,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    quantized = MXFP8Tensor.from_bf16(x, backend="triton")
+
+    assert quantized.scale.view(torch.uint8)[0].item() == 0
+    assert torch.all(quantized.data.float() == 0.5)
+    quantization_utils._verify_te_to_mcore_mxfp8_conversion(x, quantized)
+
+
 def test_noncontiguous_input_uses_logical_rows():
     """The public quantizer must not silently treat a strided view as row-major."""
     logical = _boundary_input(17, 160)
