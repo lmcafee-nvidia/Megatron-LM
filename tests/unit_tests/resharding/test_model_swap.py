@@ -647,6 +647,11 @@ def test_repeated_refit_matches_fresh_models_and_reuses_plan(src_tp: int, precis
     source_outputs = [logits(model, src_pgs) for model in sources]
     references = [logits(model, dst_pgs) for model in fresh_targets]
     initial = logits(target, dst_pgs)
+    # TP2 and TP1 execute BF16 reductions in a different order. The measured
+    # cross-topology variation is one BF16 step (0.001953125); same-topology
+    # cases retain the tighter bound. Transfer correctness is independently
+    # exact below by comparing every destination parameter to its fresh TP1 load.
+    cross_topology_tolerance = 2e-3 if src_tp > 1 else 5e-4
     for oracle_index, (source_output, reference) in enumerate(zip(source_outputs, references)):
         source_oracle_max_abs = (source_output - reference).abs().max().item()
         if dist.get_rank() == 0:
@@ -656,7 +661,9 @@ def test_repeated_refit_matches_fresh_models_and_reuses_plan(src_tp: int, precis
                 f"max_abs={source_oracle_max_abs:.9g}"
             )
         assert torch.equal(source_output.argmax(dim=-1), reference.argmax(dim=-1))
-        assert torch.allclose(source_output, reference, atol=5e-4, rtol=5e-4)
+        assert torch.allclose(
+            source_output, reference, atol=cross_topology_tolerance, rtol=cross_topology_tolerance
+        )
     if precision == "fp8":
         assert any(fp8_activation), "No module executed inside Transformer Engine FP8 autocast"
     for left, right in zip(references, references[1:]):
@@ -697,11 +704,10 @@ def test_repeated_refit_matches_fresh_models_and_reuses_plan(src_tp: int, precis
             name: (tuple(param.shape), param.dtype, tuple(param.stride()), param.data_ptr())
             for name, param in target.named_parameters()
         } == target_layout
-        if src_tp == 1:
-            source_params = dict(sources[source_index].named_parameters())
-            assert all(
-                torch.equal(param, source_params[name]) for name, param in target.named_parameters()
-            )
+        reference_params = dict(fresh_targets[source_index].named_parameters())
+        assert all(
+            torch.equal(param, reference_params[name]) for name, param in target.named_parameters()
+        )
 
     # Returning to A must return to A's exact greedy trajectory, while B/C proved
     # that neither unchanged initialization nor a one-time copy can satisfy the test.
