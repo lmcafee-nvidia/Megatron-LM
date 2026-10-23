@@ -788,9 +788,24 @@ def test_refit_reshards_expert_tensor_parallel_weights_and_executes_them():
             .eval()
         )
 
-    source = build(1701, source_pgs, 2)
     reference = build(1701, reference_pgs, 1)
+    source = build(1701, source_pgs, 2)
     target = build(1802, target_pgs, 1)
+    # A matching random seed does not define the same logical grouped-expert
+    # weights across different ETP layouts.  Start from the independently
+    # initialized ETP1 oracle and materialize those exact weights in ETP2, then
+    # clear the setup plan so the ETP2 -> ETP1 transfer below is planned and
+    # executed independently.
+    source_expert_pointers = {
+        name: param.data_ptr() for name, param in source.named_parameters() if ".experts." in name
+    }
+    clear_all_caches()
+    swap_model_weights([reference], [source], refit_method="nccl")
+    torch.cuda.synchronize()
+    assert source_expert_pointers == {
+        name: param.data_ptr() for name, param in source.named_parameters() if ".experts." in name
+    }
+    clear_all_caches()
     tokens = torch.arange(8, device=device, dtype=torch.long).unsqueeze(0)
     positions = torch.arange(8, device=device, dtype=torch.long).unsqueeze(0)
     attention_mask = torch.triu(
