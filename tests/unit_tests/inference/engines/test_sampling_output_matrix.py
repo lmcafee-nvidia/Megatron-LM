@@ -286,9 +286,9 @@ class TestSamplingOutputMatrix(RequestLifecyclePairwiseBase):
             assert actual["generated_scores"] == pytest.approx(
                 expected["generated_scores"], abs=1.0e-4
             )
-            # Non-selected alternatives are tied at logit zero, so their token
-            # identities are not part of the contract. Compare row sizes and score
-            # multisets; _assert_scores separately pins selected-token membership.
+            # Top-k=1 maps all non-selected alternatives to the same -inf score, so
+            # their token identities are not part of the contract. Compare row sizes
+            # and score multisets; _assert_scores pins selected-token membership.
             for field in ("prompt_top_n", "generated_top_n"):
                 actual_rows = actual[field] or []
                 expected_rows = expected[field] or []
