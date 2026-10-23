@@ -1233,8 +1233,8 @@ try:
         stream_options = req.get("stream_options")
         if stream_requested and stream_options is not None and not isinstance(stream_options, dict):
             return Response("'stream_options' must be an object", status=400)
-        include_usage = bool((stream_options or {}).get("include_usage", False))
         if stream_requested:
+            include_usage = bool((stream_options or {}).get("include_usage", False))
             # Streaming currently supports only Hugging Face fast tokenizers.
             try:
                 incremental_detokenizers = [
