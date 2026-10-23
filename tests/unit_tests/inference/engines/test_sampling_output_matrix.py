@@ -271,7 +271,8 @@ class TestSamplingOutputMatrix(RequestLifecyclePairwiseBase):
         expected_survivor_metadata = {
             "temperature": (1.0, 1.0),
             "top_k": (1, 2),
-            "top_p": (1.0, 1.0),
+            # SamplingParams canonicalizes the disabled public value 1.0 to 0.0.
+            "top_p": (0.0, 0.0),
             "termination_id": (-1, -1),
             "return_log_probs": (True, False),
             "skip_prompt_log_probs": (False, False),
