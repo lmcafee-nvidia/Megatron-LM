@@ -727,6 +727,59 @@ def test_repeated_refit_matches_fresh_models_and_reuses_plan(src_tp: int, precis
     torch.cuda.empty_cache()
 
 
+def test_structural_plan_cache_change_replans_and_executes_new_shape():
+    """A changed tensor shape must not execute a cached plan for the old shape."""
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    source_pgs = _build_pg_collection(tp_size=1)
+    target_pgs = _build_pg_collection(tp_size=1)
+
+    class TinyWeightModel(torch.nn.Module):
+        def __init__(self, weight, pg_collection):
+            super().__init__()
+            self.weight = torch.nn.Parameter(weight)
+            self.pg_collection = pg_collection
+            self.config = types.SimpleNamespace(num_moe_experts=None)
+
+        def forward(self, inputs):
+            return inputs @ self.weight.t()
+
+    from megatron.core.resharding import refit as refit_module
+
+    clear_all_caches()
+    inputs = torch.arange(12, device=device, dtype=torch.float32).reshape(3, 4)
+    cached_plans = []
+    for rows, offset in ((4, 10), (6, 100)):
+        source_weight = (
+            torch.arange(rows * 4, device=device, dtype=torch.float32).reshape(rows, 4) + offset
+        )
+        source = TinyWeightModel(source_weight.clone(), source_pgs)
+        target = TinyWeightModel(torch.full_like(source_weight, -17), target_pgs)
+        expected = source(inputs)
+        assert not torch.equal(target(inputs), expected)
+        target_pointer = target.weight.data_ptr()
+
+        prepare_swap_model_weights([source], [target])
+        plan = list(refit_module._plan_cache.values())[-1]
+        assert plan not in cached_plans
+        cached_plans.append(plan)
+        swap_model_weights([source], [target], refit_method="nccl")
+        torch.cuda.synchronize()
+
+        assert target.weight.data_ptr() == target_pointer
+        assert torch.equal(target.weight, source.weight)
+        assert torch.equal(target(inputs), expected)
+
+    assert len(refit_module._plan_cache) == 2
+    dist.barrier()
+    clear_all_caches()
+    _destroy_pg_collection(source_pgs)
+    _destroy_pg_collection(target_pgs)
+    Utils.destroy_model_parallel()
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 def test_refit_reshards_expert_tensor_parallel_weights_and_executes_them():
     """ETP2 expert shards become an executing ETP1 model matching a fresh load."""
     world = dist.get_world_size()
