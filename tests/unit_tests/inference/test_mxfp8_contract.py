@@ -110,6 +110,25 @@ def _dequantize(tensor: MXFP8Tensor) -> torch.Tensor:
     return (values * scales.unsqueeze(-1)).reshape(tensor.shape)
 
 
+def _assert_backend_gemm_close(actual: torch.Tensor, reference: torch.Tensor, label: str) -> None:
+    """Report backend accumulation error before applying the BF16 output bound."""
+    actual_f32, reference_f32 = actual.float(), reference.float()
+    absolute_error = (actual_f32 - reference_f32).abs()
+    significant = reference_f32.abs() >= 0.1
+    max_relative = (
+        (absolute_error[significant] / reference_f32[significant].abs()).max().item()
+        if significant.any()
+        else 0.0
+    )
+    print(
+        f"{label}: max_abs_error={absolute_error.max().item():.8f}, "
+        f"max_relative_error_for_abs_reference_ge_0.1={max_relative:.8f}"
+    )
+    # Both sides use the exact same quantized operands. The allowance covers only
+    # backend accumulation order and final BF16 rounding over 256-term dot products.
+    torch.testing.assert_close(actual_f32, reference_f32, rtol=0.02, atol=0.02)
+
+
 def _boundary_input(rows: int, cols: int) -> torch.Tensor:
     """Give every row/group a distinct range while retaining exact binary values."""
     row = torch.arange(rows, device="cuda", dtype=torch.int64)[:, None, None]
@@ -402,7 +421,7 @@ def test_direct_linear_backend_matches_dequantized_matmul(
     assert torch.count_nonzero(_logical_scale_bytes(activation)) > 0
     assert output.data_ptr() == output_ptr
     assert torch.isnan(output_storage[x.shape[0] :]).all()
-    torch.testing.assert_close(output.squeeze(1).float(), reference.float(), rtol=0.02, atol=0.02)
+    _assert_backend_gemm_close(output.squeeze(1), reference, backend)
 
 
 @pytest.mark.launch_on_gb200
@@ -519,12 +538,10 @@ def test_tp_sequence_parallel_production_linear_matches_quantized_reference(monk
         assert output.shape == local_input.shape
         assert torch.count_nonzero(column_activation.data.view(torch.uint8)) > 0
         assert torch.count_nonzero(row_activation.data.view(torch.uint8)) > 0
-        torch.testing.assert_close(
-            intermediate.squeeze(1).float(), column_reference.float(), rtol=0.02, atol=0.02
+        _assert_backend_gemm_close(
+            intermediate.squeeze(1), column_reference, "tp-column-all-gather"
         )
-        torch.testing.assert_close(
-            output.squeeze(1).float(), row_reference.float(), rtol=0.02, atol=0.02
-        )
+        _assert_backend_gemm_close(output.squeeze(1), row_reference, "sp-row-reduce-scatter")
     finally:
         SymmetricMemoryManager.destroy()
         Utils.destroy_model_parallel()
