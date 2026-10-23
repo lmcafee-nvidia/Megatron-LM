@@ -1095,7 +1095,7 @@ class TestNVLSAllGatherVDispatcher:
         backend = "te_native" if mxfp8_swiglu or inference_grouped_gemm_backend == "vllm" else None
         synchronous_inference_output = None
         try:
-            with torch.no_grad(), set_batch_invariant_mode(True, backend=backend):
+            with torch.no_grad(), set_batch_invariant_mode(config.batch_invariant_mode, backend):
                 if mxfp8_swiglu:
                     with get_fp8_context(training_config, 0):
                         training_output, _ = training_layer(hidden_states.clone())
