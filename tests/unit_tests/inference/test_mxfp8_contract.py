@@ -249,7 +249,7 @@ def test_from_bf16_rejects_nonstandard_group_size():
 )
 def test_public_quantizers_document_finite_input_contract(api):
     """NaN/Inf are an explicit precondition, not backend-dependent output promises."""
-    documentation = api.__doc__ or ""
+    documentation = (api.__doc__ or "").lower()
     assert "finite" in documentation
 
 
