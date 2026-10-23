@@ -6,7 +6,7 @@
 import logging
 from typing import Any
 
-from megatron.core.inference.utils import model_eos_token_ids
+from megatron.core.inference.utils import detokenize_tokens, model_eos_token_ids
 
 logger = logging.getLogger(__name__)
 
@@ -136,3 +136,28 @@ class HuggingFaceFastIncrementalDetokenizer:
     def text_length(self) -> int:
         """Return the number of emitted characters."""
         return self._text_length
+
+
+def detokenize_generated_tokens(
+    tokenizer: Any,
+    prompt_token_ids: list[int],
+    generated_token_ids: list[int],
+    *,
+    remove_eos: bool = True,
+) -> str:
+    """Decode a completed generation with the same prompt context used for streaming.
+
+    Tokenizers may insert or withhold text at the prompt/generation boundary. A
+    prompt-prefilled decoder therefore produces the authoritative generated suffix for
+    Hugging Face fast tokenizers. Non-streaming-only tokenizer backends retain the
+    established generated-token decoding behavior.
+    """
+    try:
+        detokenizer = HuggingFaceFastIncrementalDetokenizer(
+            tokenizer, prompt_token_ids, remove_eos=remove_eos
+        )
+    except (ImportError, ValueError):
+        return detokenize_tokens(
+            tokenizer, generated_token_ids, remove_EOD=remove_eos, skip_special_tokens=remove_eos
+        )
+    return detokenizer.update(generated_token_ids) + detokenizer.finish()

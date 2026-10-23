@@ -16,6 +16,7 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endp
 )
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.incremental_detokenizer import (
     HuggingFaceFastIncrementalDetokenizer,
+    detokenize_generated_tokens,
 )
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.openai_streaming import (
     JSON_SAFE_LOGPROB_FLOOR,
@@ -510,6 +511,21 @@ def test_huggingface_fast_incremental_detokenizer_uses_prompt_context():
 
     assert full_text.startswith(prompt_text)
     assert streamed_text == full_text[len(prompt_text) :]
+
+
+def test_completed_generation_uses_streaming_prompt_context():
+    backend = Tokenizer(models.WordPiece(vocab={"[UNK]": 0, "hello": 1, "world": 2}))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    backend.decoder = decoders.WordPiece(prefix="##", cleanup=False)
+    huggingface_tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend)
+    tokenizer = SimpleNamespace(
+        _tokenizer=SimpleNamespace(tokenizer=huggingface_tokenizer, include_special_tokens=True)
+    )
+
+    text = detokenize_generated_tokens(tokenizer, [1], [2])
+
+    assert huggingface_tokenizer.decode([2]) == "world"
+    assert text == " world"
 
 
 def test_huggingface_fast_incremental_detokenizer_skips_special_tokens():
