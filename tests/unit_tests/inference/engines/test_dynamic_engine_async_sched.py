@@ -5,7 +5,7 @@ import gc
 import os
 from collections import Counter, deque
 from contextlib import ExitStack, nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from unittest import mock
 
@@ -135,7 +135,6 @@ def _make_engine(
     ],
 )
 def test_validate_async_sched_support_for_config(overrides, should_raise):
-    """Ensure engine config validation accepts only supported async scheduling configs."""
     engine = _make_engine(**overrides)
 
     if should_raise:
@@ -155,7 +154,6 @@ def test_validate_async_sched_support_for_config(overrides, should_raise):
     ],
 )
 def test_should_run_async_sched_overlap(can_prepare, has_waiting, availability, expected):
-    """The overlap probe observes prefill eligibility without admitting the request."""
     engine = _make_engine()
     engine.context.can_prepare_requests.return_value = can_prepare
     engine.context.check_availability = mock.Mock(return_value=availability)
@@ -171,7 +169,6 @@ def test_should_run_async_sched_overlap(can_prepare, has_waiting, availability, 
 
 
 def test_async_sched_overlap_probe_uses_non_mutating_cuda_graph_match():
-    """A scheduling probe does not update CUDA-graph wait accounting."""
     engine = _make_engine()
     engine.context.active_token_count = 2
     engine.context.num_prefill_requests = 0
@@ -200,7 +197,6 @@ def test_async_sched_overlap_probe_uses_non_mutating_cuda_graph_match():
 def test_can_schedule_chunked_prefill(
     availability, active_token_count, chunked_prefill_request_id, expected
 ):
-    """The chunk probe requires request, KV-cache, and partial-token capacity."""
     engine = _make_engine(enable_chunked_prefill=True)
     engine.context.active_token_count = active_token_count
     engine.context.chunked_prefill_request_id = chunked_prefill_request_id
@@ -211,7 +207,6 @@ def test_can_schedule_chunked_prefill(
 
 
 def test_async_sched_overlap_probe_routes_schedulable_chunk_to_no_overlap():
-    """A schedulable chunk is admitted only after no-overlap lifecycle bookkeeping."""
     engine = _make_engine(enable_chunked_prefill=True)
     engine.context.active_token_count = 2
     engine.context.check_availability = mock.Mock(return_value=(True, False, True))
@@ -222,7 +217,6 @@ def test_async_sched_overlap_probe_routes_schedulable_chunk_to_no_overlap():
 
 
 def test_ready_handoff_uses_safe_no_overlap_admission_point():
-    """A completed import cannot join the batch before pending logits are consumed."""
 
     engine = _make_engine(engine_cls=DisaggDynamicInferenceEngine)
     engine._initialize_disaggregation_state()
@@ -297,7 +291,6 @@ def test_ready_handoff_uses_safe_no_overlap_admission_point():
 def test_async_forward_routes_one_controller_iteration(
     mode, run_async_overlap, decode_only, primer_only, expected_schedule_calls, expected_nvtx_range
 ):
-    """Primer-only work crosses the engine boundary without an internal controller loop."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.state = EngineState.RUNNING
     engine.logging_step_interval = 0
@@ -375,7 +368,6 @@ def test_async_forward_routes_one_controller_iteration(
 
 @pytest.mark.parametrize("track_paused_request_events", [False, True])
 def test_async_bookkeep_uses_consumed_chunked_prefill_request_id(track_paused_request_events):
-    """Bookkeeping uses consumed-forward state and records requested pause events."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.track_paused_request_events = track_paused_request_events
     engine.post_process_requests = mock.Mock(return_value=([10], []))
@@ -450,7 +442,6 @@ def test_async_bookkeep_uses_consumed_chunked_prefill_request_id(track_paused_re
     ],
 )
 def test_get_decode_only_log_state(mode, decode_only, expected):
-    """Console logging reports transitions and colors the latest available phase."""
     assert _get_decode_only_log_state(mode, decode_only) == expected
 
 
@@ -458,7 +449,6 @@ def test_get_decode_only_log_state(mode, decode_only, expected):
 # transition during both async phase shapes and checks parity or an exact invariant.
 @dataclass(frozen=True)
 class _AsyncPairScenario:
-    """A runtime-backed async-scheduling interaction scenario."""
 
     name: str
     pairs: tuple[str, ...]
@@ -485,7 +475,6 @@ _BASE_PAIR_CONFIG = {
 
 
 def _pair_scenario(name, *pairs, **kwargs):
-    """Build a compact scenario declaration."""
     return _AsyncPairScenario(name=name, pairs=pairs, **kwargs)
 
 
@@ -1262,7 +1251,6 @@ def _instrument_async_phases(controller, runtime):
 
 
 def _instrument_attention_runtime(module, runtime):
-    """Observe the window and sink branches taken by dynamic attention."""
     original_offset = module._get_inference_softmax_offset
 
     def traced_offset():
@@ -1301,7 +1289,6 @@ def _instrument_attention_runtime(module, runtime):
 
 
 def _instrument_parallel_runtime(module, runtime):
-    """Observe executed tensor partitions and their inference collectives."""
     class_name = type(module).__name__
     weight = getattr(module, "weight", None)
     tp_group = getattr(module, "tp_group", None)
@@ -1403,7 +1390,6 @@ def _instrument_parallel_runtime(module, runtime):
 
 
 def _instrument_nccl_dispatch_runtime(module, runtime):
-    """Observe inference MoE dispatch, combine, and their ordering."""
     dispatcher = getattr(module, "_inference_token_dispatcher", None)
     if dispatcher is None or type(dispatcher).__name__ != "NCCLAllGatherDispatcher":
         return
@@ -1434,7 +1420,6 @@ def _instrument_nccl_dispatch_runtime(module, runtime):
 
 
 def _instrument_scenario_runtime(env, scenario, runtime):
-    """Record production calls and state transitions used as pairwise evidence."""
     controller = env.engine.controller
     context = env.engine.context
     _instrument_async_phases(controller, runtime)
@@ -1512,6 +1497,7 @@ def _instrument_scenario_runtime(env, scenario, runtime):
         active_count = context.total_request_count - context.paused_request_count
         metadata = context.active_request_metadata
         runtime["sampling-kernel"] += 1
+        runtime[("sampling-step", runtime["model-forward"])] += 1
         runtime[f"sampling-backend:{controller._sampling_backend}"] += 1
         runtime["metadata-consumed"] += int(active_count > 0)
         runtime["request-seeded-samples"] += int(
@@ -1594,6 +1580,7 @@ def _instrument_scenario_runtime(env, scenario, runtime):
 
     def traced_calculate_log_probs_tensors(*args, **kwargs):
         runtime["log-probs-calculations"] += 1
+        runtime[("log-probs-step", runtime["model-forward"])] += 1
         runtime[f"log-probs-mode:{context.config.logprobs_mode}"] += 1
         return original_calculate_log_probs_tensors(*args, **kwargs)
 
@@ -1921,7 +1908,6 @@ def _assert_request_parity(
 
 
 class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
-    """Shared real-engine runner for the async pair owners."""
 
     @classmethod
     def _run_scenario_mode(cls, scenario, mode, stop_tokens=None, termination_token=None):
@@ -2451,6 +2437,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert model_config.num_moe_experts is not None
             assert context._nccl_ep_dispatcher
             expert_steps = optimized_moe_steps()
+            assert "sampled" not in signals or observed_steps("sampling-step") <= expert_steps
+            assert "logprobs" not in signals or observed_steps("log-probs-step") <= expert_steps
             if "moe-attention" in signals:
                 assert observed_steps("attention-step") == expert_steps
             if "chunked" in signals:
@@ -2578,7 +2566,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
     not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
 )
 class TestAsyncSchedulePairwise(_AsyncPairwiseHarness):
-    """Async scheduling crossed with every major single-topology inference feature."""
 
     @classmethod
     def setup_class(cls):
@@ -2611,7 +2598,6 @@ class TestAsyncSchedulePairwise(_AsyncPairwiseHarness):
     )
     @torch.inference_mode()
     def test_async_suspend_resume_mode_matches_legacy(self, scenario):
-        """Real OFFLOAD and RECOMPUTE cycles preserve output parity."""
         try:
             self._assert_scenario_pair(scenario)
         finally:
@@ -2625,7 +2611,6 @@ class TestAsyncSchedulePairwise(_AsyncPairwiseHarness):
     not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
 )
 class TestAsyncSchedulePairwiseParallel(_AsyncPairwiseHarness):
-    """Pair owners that require a non-default distributed topology."""
 
     @pytest.mark.parametrize("scenario", _ASYNC_PARALLEL_SCENARIOS, ids=lambda case: case.name)
     @torch.inference_mode()
@@ -2636,6 +2621,33 @@ class TestAsyncSchedulePairwiseParallel(_AsyncPairwiseHarness):
         if world_size < 4:
             pytest.skip("parallel async pair owners require at least four GPUs")
         _check_scenario_prerequisite(scenario)
+        owned_scenarios = [scenario]
+        if scenario.name == "moe-ep2-nccl":
+            for output in _ASYNC_PAIR_SCENARIOS:
+                if output.request_profile not in {
+                    "bos",
+                    "termination",
+                    "stop-keep",
+                    "stop-strip",
+                } and ("processed-logprobs" not in output.signals):
+                    continue
+                owned_scenarios.append(
+                    replace(
+                        scenario,
+                        request_profile=output.request_profile,
+                        config={
+                            **scenario.config,
+                            **output.config,
+                            "track_generated_token_events": True,
+                        },
+                        sampling=(
+                            tuple({**params, **output.sampling[0]} for params in scenario.sampling)
+                            if output.sampling
+                            else scenario.sampling
+                        ),
+                        signals=scenario.signals + output.signals + ("events",),
+                    )
+                )
         config = scenario.config
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=config.get("tensor_model_parallel_size", 1),
@@ -2657,7 +2669,8 @@ class TestAsyncSchedulePairwiseParallel(_AsyncPairwiseHarness):
                 assert parallel_state.get_data_parallel_world_size() == 2
             if scenario.name == "moe-ep2-dp2-nccl":
                 assert parallel_state.get_data_parallel_world_size() == 2
-            self._assert_scenario_pair(scenario)
+            for owned_scenario in owned_scenarios:
+                self._assert_scenario_pair(owned_scenario)
         finally:
             gc.collect()
             delete_cuda_graphs()
