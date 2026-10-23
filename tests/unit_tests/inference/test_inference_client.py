@@ -193,17 +193,20 @@ async def test_terminal_error_and_abort_acknowledgement():
         await asyncio.wait_for(failed, timeout=2.0)
     assert error.value.source_safe
 
+    fake_socket.send.reset_mock()
     unsafe = client.add_request("unsafe", SamplingParams())
     recv_queue.append([msgpack.packb([Headers.REQUEST_ERROR.value, 1, "read failed", False])])
     with pytest.raises(InferenceRequestError, match="read failed") as error:
         await asyncio.wait_for(unsafe, timeout=2.0)
     assert not error.value.source_safe
+    automatic_abort = msgpack.unpackb(fake_socket.send.call_args.args[0], raw=False)
+    assert automatic_abort == [Headers.ABORT_REQUEST.value, 1]
     assert 1 not in client.abort_futures
+    fake_socket.send.reset_mock()
     abort_ack = client.abort_request_and_wait(1)
     assert abort_ack.get_loop() is asyncio.get_running_loop()
     assert not abort_ack.done()
-    abort_payload = msgpack.unpackb(fake_socket.send.call_args.args[0], raw=False)
-    assert abort_payload == [Headers.ABORT_REQUEST.value, 1]
+    fake_socket.send.assert_not_called()
     recv_queue.append([msgpack.packb([Headers.REQUEST_ABORTED.value, 1, True])])
     assert await asyncio.wait_for(abort_ack, timeout=2.0)
     await asyncio.sleep(0)
