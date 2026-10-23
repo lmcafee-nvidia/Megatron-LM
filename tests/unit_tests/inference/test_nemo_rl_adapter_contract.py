@@ -242,7 +242,7 @@ async def _drive_engine(engine, futures, witness=None):
     """Run the real dynamic engine until all submitted requests complete."""
     step_count = 0
     while not all(future.done() for future in futures):
-        engine.step_modern()
+        await engine.async_step()
         step_count += 1
         if witness is not None:
             witness["chunked_prefill_steps"] += int(engine.context.chunked_prefill_request_id >= 0)
