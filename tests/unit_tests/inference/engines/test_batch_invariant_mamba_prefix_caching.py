@@ -105,6 +105,7 @@ class TestBatchInvariantMambaPrefixCaching:
         chunked,
         kv_cache_management_mode=KVCacheManagementMode.PERSIST,
         sampling_backend="torch",
+        exercise_real_refit=True,
     ):
         model_parallel_cuda_manual_seed(321, inference_rng_tracker=True, force_reset_rng=True)
         torch.manual_seed(321)
@@ -146,23 +147,27 @@ class TestBatchInvariantMambaPrefixCaching:
                 .eval()
             )
 
-        source_core = build_model(654)
         target_core = build_model(321)
+        source_core = build_model(654) if exercise_real_refit else None
         mamba_config = MambaInferenceStateConfig.from_model(target_core)
         assert mamba_config.ssm_states_dtype == torch.float32
-        source_model = Float16Module(cfg, source_core).cuda().eval()
         model = Float16Module(cfg, target_core).cuda().eval()
-        source_parameters = dict(source_model.named_parameters())
         target_parameters = dict(model.named_parameters())
-        assert source_parameters.keys() == target_parameters.keys()
-        assert any(
-            not torch.equal(source_parameters[name], target_parameters[name])
-            for name in source_parameters
-        )
-        target_storage = {
-            name: parameter.data_ptr() for name, parameter in target_parameters.items()
-        }
-        prepare_swap_model_weights([source_model], [model])
+        source_model = None
+        source_parameters = {}
+        target_storage = {}
+        if exercise_real_refit:
+            source_model = Float16Module(cfg, source_core).cuda().eval()
+            source_parameters = dict(source_model.named_parameters())
+            assert source_parameters.keys() == target_parameters.keys()
+            assert any(
+                not torch.equal(source_parameters[name], target_parameters[name])
+                for name in source_parameters
+            )
+            target_storage = {
+                name: parameter.data_ptr() for name, parameter in target_parameters.items()
+            }
+            prepare_swap_model_weights([source_model], [model])
         context = DynamicInferenceContext(
             cfg,
             InferenceConfig(
@@ -224,96 +229,107 @@ class TestBatchInvariantMambaPrefixCaching:
         post_refit_graph_steps = 0
         post_refit_chunked_steps = 0
         post_refit_sampling_start = None
+        torch_top_k = int(exercise_real_refit and sampling_backend == "torch")
         for wave, order in enumerate(([0, 1], [1, 0], [2], [3], [4], [5], [0])):
             if wave == 6:
-                # First create resident KV under the old weights. PERSIST/OFFLOAD
-                # intentionally retain this mixed-generation request, while
-                # RECOMPUTE re-admits it from its checkpoint on resume.
-                engine.add_request(
-                    5999,
-                    [125] * 577,
-                    SamplingParams(
-                        seed=99 if sampling_backend == "torch" else None,
-                        num_tokens_to_generate=8,
-                        temperature=1.0,
-                        # Torch top-k=1 is exact greedy sampling, so token identity
-                        # remains a cache/refit oracle rather than a stochastic-
-                        # trajectory assertion. FlashInfer retains its support-
-                        # invariant stochastic owner below.
-                        top_k=1 if sampling_backend == "torch" else 0,
-                        top_p=1.0,
-                        return_log_probs=True,
-                        skip_prompt_log_probs=True,
-                        termination_id=-1,
-                    ),
-                )
-                # The first async step primes old-weight logits. The second
-                # consumes that result into resident state and launches the
-                # next old-weight forward that must be invalidated by refit.
-                for _ in range(2):
-                    pre_refit_result = engine.step_modern()
-                    assert not pre_refit_result["finished_requests"]
-                assert engine.controller._async_sched_forward.is_valid
-                resident = engine.get_request(5999)
-                assert resident.finished_chunk_token_count > 0 or resident.generated_tokens
-                resident_salt = resident.block_hash_salt
+                if exercise_real_refit:
+                    # First create resident KV under the old weights. PERSIST/OFFLOAD
+                    # intentionally retain this mixed-generation request, while
+                    # RECOMPUTE re-admits it from its checkpoint on resume.
+                    engine.add_request(
+                        5999,
+                        [125] * 577,
+                        SamplingParams(
+                            seed=99 if sampling_backend == "torch" else None,
+                            num_tokens_to_generate=8,
+                            temperature=1.0,
+                            # Torch top-k=1 is exact greedy sampling, so token identity
+                            # remains a cache/refit oracle rather than a stochastic-
+                            # trajectory assertion. FlashInfer retains its support-
+                            # invariant stochastic owner below.
+                            top_k=torch_top_k,
+                            top_p=1.0,
+                            return_log_probs=True,
+                            skip_prompt_log_probs=True,
+                            termination_id=-1,
+                        ),
+                    )
+                    # The first async step primes old-weight logits. The second
+                    # consumes that result into resident state and launches the
+                    # next old-weight forward that must be invalidated by refit.
+                    for _ in range(2):
+                        pre_refit_result = engine.step_modern()
+                        assert not pre_refit_result["finished_requests"]
+                    assert engine.controller._async_sched_forward.is_valid
+                    resident = engine.get_request(5999)
+                    assert resident.finished_chunk_token_count > 0 or resident.generated_tokens
+                    resident_salt = resident.block_hash_salt
 
-                # This request is admitted under the old weight epoch but has
-                # no KV yet. It must execute wholly under the new generation.
-                engine.add_request(
-                    6000,
-                    [126] * 577,
-                    SamplingParams(
-                        seed=100 if sampling_backend == "torch" else None,
-                        num_tokens_to_generate=8,
-                        temperature=1.0,
-                        top_k=1 if sampling_backend == "torch" else 0,
-                        top_p=1.0,
-                        return_log_probs=True,
-                        skip_prompt_log_probs=True,
-                        termination_id=-1,
-                    ),
-                )
-                queued = engine.get_request(6000)
-                assert queued.finished_chunk_token_count == 0 and not queued.generated_tokens
-                old_salt = queued.block_hash_salt
-                # Old cached states must not be reused after a weight update.
-                engine.suspend()
-                pending_survived_suspend = engine.controller._async_sched_forward.is_valid
-                swap_model_weights([source_model], [model], refit_method="nccl")
-                assert all(
-                    torch.equal(source_parameters[name], target_parameters[name])
-                    for name in source_parameters
-                )
-                assert {
-                    name: parameter.data_ptr() for name, parameter in target_parameters.items()
-                } == target_storage
-                assert pending_survived_suspend is (
-                    kv_cache_management_mode != KVCacheManagementMode.RECOMPUTE
-                )
+                    # This request is admitted under the old weight epoch but has
+                    # no KV yet. It must execute wholly under the new generation.
+                    engine.add_request(
+                        6000,
+                        [126] * 577,
+                        SamplingParams(
+                            seed=100 if sampling_backend == "torch" else None,
+                            num_tokens_to_generate=8,
+                            temperature=1.0,
+                            top_k=torch_top_k,
+                            top_p=1.0,
+                            return_log_probs=True,
+                            skip_prompt_log_probs=True,
+                            termination_id=-1,
+                        ),
+                    )
+                    queued = engine.get_request(6000)
+                    assert queued.finished_chunk_token_count == 0 and not queued.generated_tokens
+                    old_salt = queued.block_hash_salt
+                    # Old cached states must not be reused after a weight update.
+                    engine.suspend()
+                    pending_survived_suspend = engine.controller._async_sched_forward.is_valid
+                    swap_model_weights([source_model], [model], refit_method="nccl")
+                    assert all(
+                        torch.equal(source_parameters[name], target_parameters[name])
+                        for name in source_parameters
+                    )
+                    assert {
+                        name: parameter.data_ptr() for name, parameter in target_parameters.items()
+                    } == target_storage
+                    assert pending_survived_suspend is (
+                        kv_cache_management_mode != KVCacheManagementMode.RECOMPUTE
+                    )
 
-                # Drive the same epoch message used by the RL coordinator.  The
-                # pending logits above came from the old weights and must not be
-                # sampled after the real transfer. Production sends this while
-                # suspended and only then resumes the inference engine.
-                engine.is_mp_coordinator = True
-                engine.socket_for_receiving_requests = mock.Mock()
-                engine.model_parallel_publisher_socket = mock.Mock()
-                engine.socket_for_receiving_requests.recv_multipart.side_effect = [
-                    [msgpack.packb([Headers.SET_GENERATION_EPOCH.value, 1])],
-                    dynamic_engine.zmq.Again,
-                ]
-                assert engine.schedule_requests() == 1
-                assert not engine.controller._async_sched_forward.is_valid
-                assert engine._generation_epoch == 1
-                assert all(
-                    engine.get_request(request_id).policy_epoch[-1][1] == 1
-                    for request_id in (5999, 6000)
-                )
-                engine.resume()
-                assert not engine.controller._async_sched_forward.is_valid
-                assert queued.block_hash_salt != old_salt
-                assert engine.get_request(5999).block_hash_salt == resident_salt
+                    # Drive the same epoch message used by the RL coordinator.  The
+                    # pending logits above came from the old weights and must not be
+                    # sampled after the real transfer. Production sends this while
+                    # suspended and only then resumes the inference engine.
+                    engine.is_mp_coordinator = True
+                    engine.socket_for_receiving_requests = mock.Mock()
+                    engine.model_parallel_publisher_socket = mock.Mock()
+                    engine.socket_for_receiving_requests.recv_multipart.side_effect = [
+                        [msgpack.packb([Headers.SET_GENERATION_EPOCH.value, 1])],
+                        dynamic_engine.zmq.Again,
+                    ]
+                    assert engine.schedule_requests() == 1
+                    assert not engine.controller._async_sched_forward.is_valid
+                    assert engine._generation_epoch == 1
+                    assert all(
+                        engine.get_request(request_id).policy_epoch[-1][1] == 1
+                        for request_id in (5999, 6000)
+                    )
+                    engine.resume()
+                    assert not engine.controller._async_sched_forward.is_valid
+                    assert queued.block_hash_salt != old_salt
+                    assert engine.get_request(5999).block_hash_salt == resident_salt
+                else:
+                    # Preserve the legacy cache-equivalence owner unchanged: it
+                    # exercises deterministic request-local sampling around the
+                    # original in-place weight mutation without adding a second
+                    # model whose CUDA initialization perturbs that strict test.
+                    engine.suspend()
+                    for parameter in model.parameters():
+                        parameter.mul_(1.03)
+                    engine.resume()
                 skipped_before_refit_request = engine._prefill_tokens_skipped
                 post_refit_sampling_start = flashinfer_sampling_calls
             for i in order:
@@ -324,7 +340,7 @@ class TestBatchInvariantMambaPrefixCaching:
                         seed=100 + i if sampling_backend == "torch" else None,
                         num_tokens_to_generate=8,
                         temperature=1.0,
-                        top_k=1 if sampling_backend == "torch" else 0,
+                        top_k=torch_top_k,
                         top_p=1.0,
                         return_log_probs=True,
                         skip_prompt_log_probs=True,
@@ -353,16 +369,17 @@ class TestBatchInvariantMambaPrefixCaching:
                 if chunked:
                     assert post_refit_chunked_steps > 0
         if sampling_backend == "torch":
-            for first_id, repeated_id in ((1, 11), (2, 12)):
-                first_tokens, first_log_probs = outputs[first_id]
-                repeated_tokens, repeated_log_probs = outputs[repeated_id]
-                assert first_tokens == repeated_tokens
-                assert len(first_log_probs) == len(repeated_log_probs)
-                for first, repeated in zip(first_log_probs, repeated_log_probs):
-                    if math.isnan(first) or math.isnan(repeated):
-                        assert math.isnan(first) and math.isnan(repeated)
-                    else:
-                        assert first == repeated
+            if not exercise_real_refit:
+                for first_id, repeated_id in ((1, 11), (2, 12)):
+                    first_tokens, first_log_probs = outputs[first_id]
+                    repeated_tokens, repeated_log_probs = outputs[repeated_id]
+                    assert first_tokens == repeated_tokens
+                    assert len(first_log_probs) == len(repeated_log_probs)
+                    for first, repeated in zip(first_log_probs, repeated_log_probs):
+                        if math.isnan(first) or math.isnan(repeated):
+                            assert math.isnan(first) and math.isnan(repeated)
+                        else:
+                            assert first == repeated
 
             before_tokens, before_log_probs = outputs[1]
             after_tokens, after_log_probs = outputs[61]
@@ -385,8 +402,9 @@ class TestBatchInvariantMambaPrefixCaching:
                 assert len(tokens) == len(log_probs) == 8
                 assert all(0 <= token < 128 for token in tokens)
                 assert all(math.isfinite(float(log_prob)) for log_prob in log_probs)
-        assert len(outputs[5999][0]) == 8
-        assert len(outputs[6000][0]) == 8
+        if exercise_real_refit:
+            assert len(outputs[5999][0]) == 8
+            assert len(outputs[6000][0]) == 8
         if prefix:
             assert engine._prefill_tokens_skipped > 0
         if graphs:
@@ -408,16 +426,25 @@ class TestBatchInvariantMambaPrefixCaching:
         monkeypatch.setenv("NVTE_FUSED_ATTN", "0")
         monkeypatch.setenv("NVTE_UNFUSED_ATTN", "0")
         with set_batch_invariant_mode(True, backend="te_native"):
-            baseline = self._run(prefix=False, graphs=False, chunked=False)
-            cached = self._run(prefix=True, graphs=graphs, chunked=chunked)
+            baseline = self._run(
+                prefix=False, graphs=False, chunked=False, exercise_real_refit=False
+            )
+            cached = self._run(
+                prefix=True, graphs=graphs, chunked=chunked, exercise_real_refit=False
+            )
         assert cached == baseline
 
     @pytest.mark.parametrize(
-        "kv_cache_management_mode", [KVCacheManagementMode.OFFLOAD, KVCacheManagementMode.RECOMPUTE]
+        "kv_cache_management_mode",
+        [
+            KVCacheManagementMode.PERSIST,
+            KVCacheManagementMode.OFFLOAD,
+            KVCacheManagementMode.RECOMPUTE,
+        ],
     )
     @torch.inference_mode()
     def test_refit_across_reallocating_cache_lifecycle(self, kv_cache_management_mode, monkeypatch):
-        """A real refit remains observable after OFFLOAD/RECOMPUTE reallocation."""
+        """A real refit remains observable across every cache lifecycle mode."""
         monkeypatch.setenv("MAMBA_DETERMINISTIC", "1")
         monkeypatch.setenv("NVTE_FLASH_ATTN", "1")
         monkeypatch.setenv("NVTE_FUSED_ATTN", "0")
