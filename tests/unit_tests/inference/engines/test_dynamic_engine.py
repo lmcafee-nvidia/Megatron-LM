@@ -4153,8 +4153,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             expected = request.image_embeddings.permute(1, 0, 2).reshape(
                 -1, decoder_input.shape[-1]
             )
+            prompt_decoder_input = decoder_input[: image_positions.numel(), 0]
             runtime["vision-injections"] += int(
-                torch.equal(decoder_input[:, 0][image_positions], expected)
+                torch.equal(prompt_decoder_input[image_positions], expected)
             )
 
         vision_hook = model.vision_model.register_forward_hook(vision_forwarded)
