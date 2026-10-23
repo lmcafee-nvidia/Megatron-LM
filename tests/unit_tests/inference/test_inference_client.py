@@ -474,6 +474,21 @@ async def test_add_request_with_id_returns_the_id_abort_needs():
     delegated.cancel()
 
 
+async def test_fire_and_forget_abort_after_unsafe_terminal_error():
+    client, _, socket = _make_client()
+    request_id, future = client.add_request_with_id("unsafe", SamplingParams())
+    # REQUEST_ERROR(source_safe=False) pops the public future but deliberately
+    # retains this ownership marker until an abort acknowledgement arrives.
+    client.completion_futures.pop(request_id)
+    socket.send.reset_mock()
+
+    client.abort_request(request_id)
+
+    payload = msgpack.unpackb(socket.send.call_args.args[0], raw=False)
+    assert payload == [Headers.ABORT_REQUEST.value, request_id]
+    future.cancel()
+
+
 def _consume_reply_for_a_completed_request(client):
     """Submit, then stand in for _recv_task delivering the final reply."""
     request_id, future = client.add_request_with_id("hello", SamplingParams())
