@@ -32,6 +32,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_local_submodules,
+    get_gpt_layer_with_transformer_engine_spec,
 )
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.resharding.refit import clear_all_caches
@@ -309,8 +310,11 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
 
     @pytest.mark.internal
     @pytest.mark.parametrize("modality", ["image", "video"])
-    def test_real_multimodal_adapter_runs_vision_and_language_models(self, modality):
+    def test_real_multimodal_adapter_runs_vision_and_language_models(self, modality, monkeypatch):
         """Run consumer-prepared pixels through real LLaVA encoder and decoder weights."""
+        monkeypatch.setenv("NVTE_FLASH_ATTN", "1")
+        monkeypatch.setenv("NVTE_FUSED_ATTN", "0")
+        monkeypatch.setenv("NVTE_UNFUSED_ATTN", "0")
         BatchedDataDict, mixin_cls = _load_nemo_rl_adapter()
         source = Path(os.environ["NEMO_RL_SOURCE"]).resolve(strict=True)
         sys.path.insert(0, str(source))
@@ -326,7 +330,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             num_attention_heads=4,
             use_cpu_initialization=False,
             bf16=True,
-            attention_backend=AttnBackend.local,
+            attention_backend=AttnBackend.flash,
         )
         vision_config = TransformerConfig(
             num_layers=1,
@@ -334,7 +338,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             num_attention_heads=2,
             use_cpu_initialization=False,
             bf16=True,
-            attention_backend=AttnBackend.local,
+            attention_backend=AttnBackend.flash,
         )
         projection_config = TransformerConfig(
             num_layers=1,
@@ -345,16 +349,14 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             bf16=True,
         )
         submodules = get_gpt_layer_local_submodules()
-        vision_spec = ModuleSpec(module=TransformerLayer, submodules=copy.deepcopy(submodules))
+        vision_spec = get_gpt_layer_with_transformer_engine_spec()
         projection_spec = copy.deepcopy(get_submodules(submodules.mlp))
         assert isinstance(projection_spec, MLPSubmodules)
         language_config.language_model_type = "dummy"
-        vision_config.vision_model_type = "clip"
+        vision_config.vision_model_type = "radio"
         model = LLaVAModel(
             language_transformer_config=language_config,
-            language_transformer_layer_spec=ModuleSpec(
-                module=TransformerLayer, submodules=submodules
-            ),
+            language_transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
             language_vocab_size=128,
             language_max_sequence_length=64,
             vision_transformer_config=vision_config,
