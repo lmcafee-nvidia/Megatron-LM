@@ -236,7 +236,11 @@ class TestBatchInvariantMambaPrefixCaching:
                         seed=99 if sampling_backend == "torch" else None,
                         num_tokens_to_generate=8,
                         temperature=1.0,
-                        top_k=0,
+                        # Torch top-k=1 is exact greedy sampling, so token identity
+                        # remains a cache/refit oracle rather than a stochastic-
+                        # trajectory assertion. FlashInfer retains its support-
+                        # invariant stochastic owner below.
+                        top_k=1 if sampling_backend == "torch" else 0,
                         top_p=1.0,
                         return_log_probs=True,
                         skip_prompt_log_probs=True,
@@ -263,7 +267,7 @@ class TestBatchInvariantMambaPrefixCaching:
                         seed=100 if sampling_backend == "torch" else None,
                         num_tokens_to_generate=8,
                         temperature=1.0,
-                        top_k=0,
+                        top_k=1 if sampling_backend == "torch" else 0,
                         top_p=1.0,
                         return_log_probs=True,
                         skip_prompt_log_probs=True,
@@ -320,7 +324,7 @@ class TestBatchInvariantMambaPrefixCaching:
                         seed=100 + i if sampling_backend == "torch" else None,
                         num_tokens_to_generate=8,
                         temperature=1.0,
-                        top_k=0,
+                        top_k=1 if sampling_backend == "torch" else 0,
                         top_p=1.0,
                         return_log_probs=True,
                         skip_prompt_log_probs=True,
