@@ -2630,7 +2630,8 @@ class TestAsyncSchedulePairwiseParallel(_AsyncPairwiseHarness):
                     "stop-keep",
                     "stop-strip",
                 } and ("processed-logprobs" not in output.signals):
-                    continue
+                    if output.name != "sampling-top-k-top-p":
+                        continue
                 owned_scenarios.append(
                     replace(
                         scenario,
