@@ -11,6 +11,7 @@ import threading
 import types
 from collections import OrderedDict, deque
 from contextlib import nullcontext
+from copy import deepcopy
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Dict, List, Optional, Tuple
@@ -69,6 +70,9 @@ from megatron.core.inference.inference_request import (
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
+from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (
+    VLMInferenceWrapper,
+)
 from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.openai_streaming import (
@@ -79,6 +83,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_submodules,
     get_gpt_layer_local_spec,
     get_gpt_layer_with_inference_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -86,11 +91,15 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
+from megatron.core.transformer.mlp import MLPSubmodules
+from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.inference.engines.ssm_test_helpers import (
     hybrid_mixer_kwargs,
@@ -1442,6 +1451,64 @@ class DynamicInferenceEngineTestBase:
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
             ).cuda()
+        elif test_config.model_provider == "vlm":
+            assert test_config.tensor_model_parallel_size == 1
+            assert test_config.pipeline_model_parallel_size == 1
+            transformer_config = TransformerConfig(
+                params_dtype=torch.bfloat16,
+                num_layers=2,
+                hidden_size=64,
+                num_attention_heads=4,
+                use_cpu_initialization=True,
+                inference_rng_tracker=True,
+                pipeline_dtype=torch.bfloat16,
+                inference_sampling_seed=test_config.random_seed,
+                transformer_impl="local",
+            )
+            vision_config = TransformerConfig(
+                params_dtype=torch.bfloat16,
+                num_layers=1,
+                hidden_size=16,
+                num_attention_heads=2,
+                use_cpu_initialization=True,
+                transformer_impl="local",
+            )
+            projection_config = TransformerConfig(
+                params_dtype=torch.bfloat16,
+                num_layers=1,
+                hidden_size=64,
+                ffn_hidden_size=32,
+                num_attention_heads=1,
+                use_cpu_initialization=True,
+                transformer_impl="local",
+            )
+            language_submodules = get_gpt_layer_local_submodules()
+            projection_submodules = deepcopy(get_submodules(language_submodules.mlp))
+            assert isinstance(projection_submodules, MLPSubmodules)
+            transformer_config.language_model_type = "dummy"
+            vision_config.vision_model_type = "radio"
+            model = LLaVAModel(
+                language_transformer_config=transformer_config,
+                language_transformer_layer_spec=ModuleSpec(
+                    module=TransformerLayer, submodules=language_submodules
+                ),
+                language_vocab_size=test_config.vocab_size,
+                language_max_sequence_length=test_config.max_sequence_length,
+                vision_transformer_config=vision_config,
+                vision_transformer_layer_spec=ModuleSpec(
+                    module=TransformerLayer,
+                    submodules=deepcopy(language_submodules),
+                ),
+                drop_vision_class_token=True,
+                vision_projection_config=projection_config,
+                vision_projection_layer_spec=projection_submodules,
+                img_h=28,
+                img_w=28,
+                patch_dim=14,
+                dynamic_resolution=True,
+                class_token_len=0,
+                radio_disable_cpe=True,
+            ).cuda()
         else:
             raise ValueError(f"Invalid model provider {test_config.model_provider}")
 
@@ -1461,7 +1528,11 @@ class DynamicInferenceEngineTestBase:
         )
 
         # Inference model wrapper.
-        inference_wrapped_model = GPTInferenceWrapper(model, inference_context)
+        inference_wrapped_model = (
+            VLMInferenceWrapper(model, inference_context)
+            if test_config.model_provider == "vlm"
+            else GPTInferenceWrapper(model, inference_context)
+        )
 
         # Note: the following is taken from AbstractModelInferenceWrapper.prep_model_for_inference().
         inference_wrapped_model.model_is_pipeline_parallel = not (
@@ -1469,11 +1540,17 @@ class DynamicInferenceEngineTestBase:
         )
 
         # Text generation controller.
+        tokenizer = types.SimpleNamespace(
+            vocab_size=test_config.vocab_size,
+            eod=test_config.vocab_size - 1,
+            unk_token_id=0,
+            detokenize=lambda tokens, **_kwargs: "".join(f"<{token}>" for token in tokens),
+            tokenize=lambda text: [ord(char) % (test_config.vocab_size - 1) for char in text],
+            convert_tokens_to_ids=lambda token: 98 if token == "<image>" else 0,
+        )
         text_generation_controller = TextGenerationController(
             inference_wrapped_model=inference_wrapped_model,
-            tokenizer=types.SimpleNamespace(
-                vocab_size=test_config.vocab_size, detokenize=lambda tokens: "tokenized_prompt"
-            ),
+            tokenizer=tokenizer,
         )
 
         delete_cuda_graphs()
@@ -3674,6 +3751,137 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         if rank_zero_error is not None:
             raise rank_zero_error
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("modality", ["image", "video"])
+    @torch.inference_mode()
+    def test_real_vlm_media_stream_matches_nonstreaming(self, modality):
+        """Real vision and language forwards execute before live media-token partials."""
+        config = DynamicEngineTestConfig(
+            model_provider="vlm",
+            num_requests=0,
+            min_prompt_length=6,
+            max_prompt_length=6,
+            num_tokens_to_generate=8,
+            max_sequence_length=32,
+            top_k=1,
+            context_max_requests=4,
+            context_max_tokens=32,
+        )
+        env = self._build_test_env(config)
+        engine = env.engine
+        model = engine.controller.inference_wrapped_model.model
+        prompt = [11, 98, 13]
+        frame_count = 1 if modality == "image" else 2
+        media = torch.linspace(
+            -1,
+            1,
+            frame_count * 4 * 3 * 14 * 14,
+            dtype=torch.bfloat16,
+            device="cuda",
+        ).reshape(1, frame_count * 4, 3 * 14 * 14)
+        media_kwargs = {
+            "imgs": media,
+            "imgs_sizes": torch.tensor(
+                [[28, 28]] * frame_count, dtype=torch.int32, device="cuda"
+            ),
+        }
+        if modality == "video":
+            media_kwargs["num_frames"] = torch.tensor([frame_count], dtype=torch.int32)
+
+        runtime = Counter()
+        active_request = [None]
+
+        def vision_forwarded(_module, _args, _output):
+            runtime["vision-forwards"] += 1
+
+        def language_forwarded(_module, _args, kwargs):
+            runtime["language-forwards"] += 1
+            request = active_request[0]
+            decoder_input = kwargs.get("decoder_input")
+            if request is None or decoder_input is None or decoder_input.shape[0] <= 1:
+                return
+            image_positions = request.image_token_mask[0] >= 0
+            expected = request.image_embeddings.permute(1, 0, 2).reshape(
+                -1, decoder_input.shape[-1]
+            )
+            runtime["vision-injections"] += int(
+                torch.equal(decoder_input[:, 0][image_positions], expected)
+            )
+
+        vision_hook = model.vision_model.register_forward_hook(vision_forwarded)
+        language_hook = model.language_model.register_forward_pre_hook(
+            language_forwarded, with_kwargs=True
+        )
+
+        def submit_and_drain(request_id, *, streaming):
+            params = SamplingParams(
+                num_tokens_to_generate=8,
+                termination_id=-1,
+                top_k=1,
+                streaming=streaming,
+                streaming_interval=1,
+                return_prompt_tokens=True,
+            )
+            future = engine.add_request(request_id, prompt, params, **media_kwargs)
+            active_request[0] = engine.get_request(request_id)
+            assert active_request[0].image_embeddings.is_cuda
+            assert torch.isfinite(active_request[0].image_embeddings).all()
+            assert int((active_request[0].image_token_mask >= 0).sum()) == (
+                active_request[0].image_embeddings.shape[0]
+                * active_request[0].image_embeddings.shape[1]
+            )
+            partial_history = []
+            first_partial_live = False
+            sent = 0
+            while not future.done():
+                engine.step_modern()
+                if not streaming:
+                    continue
+                calls = engine.socket_for_receiving_requests.send_multipart.call_args_list
+                for call in calls[sent:]:
+                    frames = call.args[0]
+                    header, request_ids = msgpack.unpackb(frames[0], raw=False)
+                    if header != Headers.ENGINE_REPLY_PARTIAL.value:
+                        continue
+                    assert request_ids == [request_id]
+                    partial = msgpack.unpackb(frames[1], raw=False)
+                    if not partial_history:
+                        first_partial_live = not future.done() and engine.has_unfinished_requests()
+                    partial_history.extend(partial["new_tokens"])
+                sent = len(calls)
+            return future.result(), partial_history, first_partial_live
+
+        try:
+            baseline, _, _ = submit_and_drain(0, streaming=False)
+            engine.reset()
+            engine.use_coordinator = True
+            engine.is_mp_coordinator = True
+            engine.socket_for_receiving_requests = mock.MagicMock()
+            streamed, history, first_partial_live = submit_and_drain(1, streaming=True)
+
+            assert runtime["vision-forwards"] == 2
+            assert runtime["language-forwards"] > 0
+            assert runtime["vision-injections"] == 2
+            assert first_partial_live
+            assert history
+            assert history == streamed.generated_tokens[: len(history)]
+            assert history != streamed.generated_tokens
+            assert streamed.generated_tokens == baseline.generated_tokens
+            final_frames = [
+                call.args[0]
+                for call in engine.socket_for_receiving_requests.send_multipart.call_args_list
+                if msgpack.unpackb(call.args[0][0], raw=False)[0]
+                == Headers.ENGINE_REPLY.value
+            ]
+            assert len(final_frames) == 1
+            assert msgpack.unpackb(final_frames[0][1], raw=False)["request_id"] == 1
+        finally:
+            vision_hook.remove()
+            language_hook.remove()
 
     @pytest.mark.internal
     @pytest.mark.skipif(
