@@ -352,7 +352,6 @@ class TestDynamicContext:
             "_real_token_count_tensor",
             NVLSAllGatherVDispatcher._real_token_count_tensor,
         )
-
         model_config = TransformerConfig(
             params_dtype=torch.bfloat16,
             num_layers=1,
@@ -362,6 +361,7 @@ class TestDynamicContext:
             kv_channels=8,
             num_attention_heads=4,
             normalization="RMSNorm",
+            add_bias_linear=False,
             num_moe_experts=2,
             moe_router_topk=1,
             moe_router_pre_softmax=True,
