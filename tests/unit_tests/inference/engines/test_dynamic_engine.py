@@ -99,9 +99,8 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.mlp import MLPSubmodules
-from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
+from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.inference.engines.ssm_test_helpers import (
     hybrid_mixer_kwargs,
@@ -1525,6 +1524,7 @@ class DynamicInferenceEngineTestBase:
         elif test_config.model_provider == "vlm":
             assert test_config.tensor_model_parallel_size == 1
             assert test_config.pipeline_model_parallel_size == 1
+            # RADIO forwards packed-sequence metadata, which requires TE attention.
             transformer_config = TransformerConfig(
                 params_dtype=torch.bfloat16,
                 num_layers=2,
@@ -1534,7 +1534,7 @@ class DynamicInferenceEngineTestBase:
                 inference_rng_tracker=True,
                 pipeline_dtype=torch.bfloat16,
                 inference_sampling_seed=test_config.random_seed,
-                transformer_impl="local",
+                transformer_impl="transformer_engine",
             )
             vision_config = TransformerConfig(
                 params_dtype=torch.bfloat16,
@@ -1542,7 +1542,7 @@ class DynamicInferenceEngineTestBase:
                 hidden_size=16,
                 num_attention_heads=2,
                 use_cpu_initialization=True,
-                transformer_impl="local",
+                transformer_impl="transformer_engine",
             )
             projection_config = TransformerConfig(
                 params_dtype=torch.bfloat16,
@@ -1553,22 +1553,18 @@ class DynamicInferenceEngineTestBase:
                 use_cpu_initialization=True,
                 transformer_impl="local",
             )
-            language_submodules = get_gpt_layer_local_submodules()
-            projection_submodules = deepcopy(get_submodules(language_submodules.mlp))
+            language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+            projection_submodules = deepcopy(get_submodules(get_gpt_layer_local_submodules().mlp))
             assert isinstance(projection_submodules, MLPSubmodules)
             transformer_config.language_model_type = "dummy"
             vision_config.vision_model_type = "radio"
             model = LLaVAModel(
                 language_transformer_config=transformer_config,
-                language_transformer_layer_spec=ModuleSpec(
-                    module=TransformerLayer, submodules=language_submodules
-                ),
+                language_transformer_layer_spec=language_layer_spec,
                 language_vocab_size=test_config.vocab_size,
                 language_max_sequence_length=test_config.max_sequence_length,
                 vision_transformer_config=vision_config,
-                vision_transformer_layer_spec=ModuleSpec(
-                    module=TransformerLayer, submodules=deepcopy(language_submodules)
-                ),
+                vision_transformer_layer_spec=deepcopy(language_layer_spec),
                 drop_vision_class_token=True,
                 vision_projection_config=projection_config,
                 vision_projection_layer_spec=projection_submodules,
@@ -3786,9 +3782,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                         final_cached = final_payload["usage"]["prompt_tokens_details"][
                             "cached_tokens"
                         ]
-                        stream_cached = usage_records[0]["prompt_tokens_details"][
-                            "cached_tokens"
-                        ]
+                        stream_cached = usage_records[0]["prompt_tokens_details"]["cached_tokens"]
                         # The final-response oracle runs first and can warm more
                         # prefix blocks for the otherwise identical stream.
                         assert final_cached > 0
@@ -3937,9 +3931,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     )
     @pytest.mark.parametrize("kv_transport_backend", ["nccl", "nixl"])
     @torch.inference_mode()
-    def test_real_kv_handoff_streams_imported_decode_and_matches_greedy(
-        self, kv_transport_backend
-    ):
+    def test_real_kv_handoff_streams_imported_decode_and_matches_greedy(self, kv_transport_backend):
         """Transfer real prompt KV by push and pull backends, then stream decode."""
         rank = torch.distributed.get_rank()
         config = DynamicEngineTestConfig(
