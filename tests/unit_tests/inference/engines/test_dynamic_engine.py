@@ -2,6 +2,7 @@
 
 import asyncio
 import gc
+import hashlib
 import json
 import logging
 import math
@@ -46,6 +47,7 @@ from megatron.core.inference.contexts.dynamic_context import (
     RequestOverflowError,
     TokenOverflowError,
 )
+from megatron.core.inference.disaggregation.engine import StateHandoffDynamicInferenceEngine
 from megatron.core.inference.engines import DynamicInferenceEngine, dynamic_engine
 from megatron.core.inference.engines.dynamic_engine import EngineState, RequestEntry
 from megatron.core.inference.headers import Headers
@@ -986,6 +988,7 @@ class DynamicEngineTestConfig:
     skip_prompt_log_probs: bool = False
     enable_chunked_prefill: bool = False
     enable_prefix_caching: bool = False
+    kv_transport_backend: str = "nixl"
     # Hybrid (Mamba) models need a Mamba-state cache budget for prefix caching to skip any
     # prefill. Left None, `DynamicInferenceContext` logs a warning and runs in memory-only
     # mode: prefixes are deduplicated but `prefix_skip_tokens` is forced to 0, so every token
@@ -1199,6 +1202,7 @@ class DynamicInferenceEngineTestBase:
                 static_kv_memory_pointers=test_config.static_kv_memory_pointers,
                 enable_chunked_prefill=test_config.enable_chunked_prefill,
                 enable_prefix_caching=test_config.enable_prefix_caching,
+                kv_transport_backend=test_config.kv_transport_backend,
                 prefix_caching_mamba_gb=test_config.prefix_caching_mamba_gb,
                 prefix_caching_eviction_policy=test_config.prefix_caching_eviction_policy,
                 use_flashinfer_fused_rope=test_config.use_flashinfer_fused_rope,
@@ -1218,7 +1222,7 @@ class DynamicInferenceEngineTestBase:
 
     @classmethod
     @torch.inference_mode()
-    def _build_test_env(cls, test_config):
+    def _build_test_env(cls, test_config, engine_cls=DynamicInferenceEngine):
         clear_nvte_env_vars()
         set_rounder(4)
 
@@ -1556,7 +1560,7 @@ class DynamicInferenceEngineTestBase:
         delete_cuda_graphs()
 
         # Inference engine.
-        engine = DynamicInferenceEngine(text_generation_controller, inference_context)
+        engine = engine_cls(text_generation_controller, inference_context)
 
         # Test env.
         env = DynamicEngineTestEnv(config=test_config, requests=requests, engine=engine)
@@ -3751,6 +3755,192 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         if rank_zero_error is not None:
             raise rank_zero_error
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not torch.distributed.is_initialized() or torch.distributed.get_world_size() != 2,
+        reason="real NCCL handoff witness requires exactly two distributed ranks",
+    )
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_real_nccl_handoff_streams_imported_decode_and_matches_greedy(self):
+        """Transfer real prompt KV across ranks and stream from decode admission."""
+        rank = torch.distributed.get_rank()
+        config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=8,
+            max_prompt_length=8,
+            num_tokens_to_generate=6,
+            max_sequence_length=24,
+            top_k=1,
+            enable_prefix_caching=True,
+            kv_transport_backend="nccl",
+            context_block_size_tokens=4,
+            context_max_requests=4,
+            context_max_tokens=32,
+        )
+        prompt = [11, 12, 13, 14, 15, 16, 17, 18]
+
+        baseline_env = self._build_test_env(config)
+        baseline_params = SamplingParams(
+            num_tokens_to_generate=6, termination_id=-1, top_k=1
+        )
+        baseline_future = baseline_env.engine.add_request(70, prompt, baseline_params)
+        for _ in range(32):
+            if baseline_future.done():
+                break
+            baseline_env.engine.step_modern()
+        assert baseline_future.done()
+        baseline_tokens = list(baseline_future.result().generated_tokens)
+        del baseline_future, baseline_env
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        role = "prefill" if rank == 0 else "decode"
+        env = self._build_test_env(config, engine_cls=StateHandoffDynamicInferenceEngine)
+        engine = env.engine
+        engine.setup_kv_transfer(role)
+        if role == "decode":
+            engine.use_coordinator = True
+            engine.is_mp_coordinator = True
+            engine.socket_for_receiving_requests = mock.MagicMock()
+
+        decode_meta = [engine._kv_peer_metas if role == "decode" else None]
+        torch.distributed.broadcast_object_list(decode_meta, src=1)
+
+        handoff = [None]
+        if role == "prefill":
+            prefill_params = SamplingParams(
+                num_tokens_to_generate=0,
+                termination_id=-1,
+                top_k=1,
+                do_kv_handoff=True,
+                skip_prompt_log_probs=True,
+            )
+            prefill_future = engine.add_request(71, prompt, prefill_params)
+            for _ in range(32):
+                if prefill_future.done():
+                    break
+                engine.step_modern()
+            assert prefill_future.done()
+            prefilled = prefill_future.result()
+            assert prefilled.generated_tokens == []
+            assert prefilled.disaggregated_params["kv_meta"]["resume_tokens"]
+            handoff[0] = prefilled.disaggregated_params
+        torch.distributed.broadcast_object_list(handoff, src=0)
+
+        decode_future = None
+        pending = None
+        if role == "decode":
+            # Signal readiness immediately before the backend posts irecvs. Rank
+            # zero leaves the barrier by posting the matching sends, matching the
+            # native coordinator's KV_TRANSFER_READY -> SEND_KV order.
+            engine._notify_kv_transfer_ready = lambda _rid, _cached: (
+                torch.distributed.barrier()
+            )
+            stream_params = SamplingParams(
+                num_tokens_to_generate=6,
+                termination_id=-1,
+                top_k=1,
+                streaming=True,
+                streaming_interval=1,
+            )
+            decode_future = engine.add_request_with_kv_handoff(
+                71,
+                prompt,
+                stream_params,
+                handoff[0]["kv_meta"],
+                handoff[0]["block_ids"],
+            )
+            assert len(engine._pending_kv_imports) == 1
+            pending = engine._pending_kv_imports[0]
+            assert pending.handle is not None
+        else:
+            # Paired with the decode readiness callback above. Both ranks then
+            # enter their production backend concurrently (isend versus irecv).
+            torch.distributed.barrier()
+            engine.push_handoff_kv(71, [decode_meta[0]])
+            assert engine.pending_kv_push_count == 1
+        torch.distributed.barrier()
+
+        if role == "prefill":
+            for _, handles in engine._pending_kv_pushes:
+                for handle in handles:
+                    handle.wait()
+        else:
+            pending.handle.wait()
+        torch.distributed.barrier()
+
+        block_ids = (
+            handoff[0]["block_ids"] if role == "prefill" else pending.local_blocks
+        )
+        transferred = engine.context.memory_buffer[:, :, block_ids].contiguous()
+        block_digest = hashlib.sha256(
+            transferred.view(torch.uint8).cpu().numpy().tobytes()
+        ).hexdigest()
+        digests = [None, None]
+        torch.distributed.all_gather_object(digests, block_digest)
+        assert digests[0] == digests[1]
+
+        if role == "prefill":
+            assert engine._poll_pending_kv_pushes() == 1
+            engine.release_handoff_blocks(71)
+            assert engine.pinned_handoff_block_count == 0
+        else:
+            assert engine._poll_pending_kv_imports() == 1
+            assert engine._admit_pending_kv_imports() == 1
+            assert not decode_future.done()
+            assert engine.has_unfinished_requests()
+
+            wire_calls = engine.socket_for_receiving_requests.send_multipart.call_args_list
+            partial_frames = [
+                call.args[0]
+                for call in wire_calls
+                if msgpack.unpackb(call.args[0][0], raw=False)[0]
+                == Headers.ENGINE_REPLY_PARTIAL.value
+            ]
+            assert len(partial_frames) == 1
+            imported_partial = msgpack.unpackb(partial_frames[0][1], raw=False)
+            assert imported_partial["request_id"] == 71
+            assert imported_partial["new_tokens"] == handoff[0]["kv_meta"]["resume_tokens"][:1]
+            streamed_tokens = list(imported_partial["new_tokens"])
+            sent_calls = len(wire_calls)
+
+            for _ in range(32):
+                if decode_future.done():
+                    break
+                engine.step_modern()
+                calls = engine.socket_for_receiving_requests.send_multipart.call_args_list
+                for call in calls[sent_calls:]:
+                    frames = call.args[0]
+                    if (
+                        msgpack.unpackb(frames[0], raw=False)[0]
+                        == Headers.ENGINE_REPLY_PARTIAL.value
+                    ):
+                        streamed_tokens.extend(
+                            msgpack.unpackb(frames[1], raw=False)["new_tokens"]
+                        )
+                sent_calls = len(calls)
+            assert decode_future.done()
+
+            engine._loop.run_until_complete(asyncio.sleep(0))
+            decoded = decode_future.result()
+            assert decoded.generated_tokens == baseline_tokens
+            assert streamed_tokens == decoded.generated_tokens[: len(streamed_tokens)]
+            assert streamed_tokens != decoded.generated_tokens
+            final_frames = [
+                call.args[0]
+                for call in engine.socket_for_receiving_requests.send_multipart.call_args_list
+                if msgpack.unpackb(call.args[0][0], raw=False)[0] == Headers.ENGINE_REPLY.value
+            ]
+            assert len(final_frames) == 1
+            assert msgpack.unpackb(final_frames[0][1], raw=False)["request_id"] == 71
+            assert not engine.requests
+            assert not engine._pending_kv_imports
+
+        torch.distributed.barrier()
 
     @pytest.mark.internal
     @pytest.mark.skipif(
