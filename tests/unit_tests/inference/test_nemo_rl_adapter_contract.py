@@ -627,8 +627,6 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         if uses_mxfp8:
             model_config = engine.controller.inference_wrapped_model.model.config
             assert "mxfp8" in str(model_config.fp8_recipe).lower()
-        if feature_config.get("num_cuda_graphs") is not None:
-            engine.create_cuda_graphs()
         generation_length = 4
         witness = {
             "adapter_submissions": [],
