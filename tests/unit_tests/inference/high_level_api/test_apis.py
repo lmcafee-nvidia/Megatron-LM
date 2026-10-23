@@ -144,7 +144,7 @@ class TestLifecycleGuards:
         request, future = MagicMock(), asyncio.get_running_loop().create_future()
         future.set_result(request)
         llm._coord_runtime = MagicMock()
-        llm._coord_runtime.client.add_request.return_value = future
+        llm._coord_runtime.client.add_request_with_id.return_value = (0, future)
         assert await llm._generate_impl(["hello"], MagicMock()) == [request]
         request.finalize_text.assert_not_called()
 

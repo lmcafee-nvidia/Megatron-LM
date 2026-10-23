@@ -894,6 +894,8 @@ try:
         parsers = current_app.config['parsers']
 
         req = await request.get_json()
+        if not isinstance(req, dict):
+            return Response("Invalid or missing JSON body", status=400)
         offload_params = req.get("offload_params")
         offload_params_error = validate_offload_params(offload_params)
         if offload_params_error is not None:
@@ -1145,6 +1147,8 @@ try:
                 tokenizer, {"temperature": temperature, "top_p": top_p, "top_k": top_k}
             )
             n = int(_get_non_none(req, "n", 1))  # Number of choices to generate
+            if n < 1:
+                return Response("'n' must be at least 1", status=400)
 
             if temperature == 0.0:
                 top_k = 1
@@ -1216,7 +1220,7 @@ try:
                 # coordinator matters because that is one process shared by all DP ranks.
                 detokenize_generations=False,
             )
-        except ValueError as e:
+        except (TypeError, ValueError) as e:
             return Response(f"Invalid sampling parameter: {e}", status=400)
 
         # --- 3. Send Requests to Engine ---
@@ -1226,25 +1230,24 @@ try:
         # requests on the engine that owns the cached vision embedding.
         prepared_multimodal_data = prepare_multimodal_data(multi_modal_data)
         stream_requested = bool(req.get("stream", False))
+        stream_options = req.get("stream_options")
+        if stream_requested and stream_options is not None and not isinstance(stream_options, dict):
+            return Response("'stream_options' must be an object", status=400)
+        include_usage = bool((stream_options or {}).get("include_usage", False))
         if stream_requested:
             # Streaming currently supports only Hugging Face fast tokenizers.
             try:
                 incremental_detokenizers = [
-                    HuggingFaceFastIncrementalDetokenizer(tokenizer, prompt_tokens)
+                    HuggingFaceFastIncrementalDetokenizer(
+                        tokenizer,
+                        prompt_tokens,
+                        remove_eos=not sampling_params.detokenize_stop_sequence,
+                    )
                     for _ in range(n)
                 ]
             except ValueError as error:
                 return Response(str(error), status=400)
 
-            streams = [
-                client.add_request_streaming(
-                    prompt_tokens,
-                    sampling_params_for_choice(sampling_params, index),
-                    multi_modal_data=prepared_multimodal_data,
-                    offload_params=offload_params,
-                )
-                for index in range(n)
-            ]
             chat_parsers = None
             if parsers:
                 marker_prefixes = (
@@ -1280,7 +1283,22 @@ try:
                     )
                     for _ in range(n)
                 ]
-            include_usage = bool((req.get("stream_options") or {}).get("include_usage", False))
+            streams = []
+            stream_request_ids = []
+            try:
+                for index in range(n):
+                    stream = client.add_request_streaming(
+                        prompt_tokens,
+                        sampling_params_for_choice(sampling_params, index),
+                        multi_modal_data=prepared_multimodal_data,
+                        offload_params=offload_params,
+                    )
+                    streams.append(stream)
+                    stream_request_ids.append(stream.request_id)
+            except Exception as error:
+                abort_requests(client, stream_request_ids, f"submission failed: {error}")
+                logger.error("Error submitting request: %s", error)
+                return Response(f"Error submitting request: {error}", status=500)
             response = Response(
                 openai_stream(
                     streams,
@@ -1402,6 +1420,7 @@ try:
                 tokenizer,
                 result["generated_tokens"],
                 remove_EOD=not sampling_params.detokenize_stop_sequence,
+                skip_special_tokens=not sampling_params.detokenize_stop_sequence,
             )
             # The engine always reports prompt_length (for usage), but drops the
             # prompt_tokens tensor unless return_prompt_tokens was set.

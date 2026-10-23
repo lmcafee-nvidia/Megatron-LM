@@ -21,7 +21,9 @@ class HuggingFaceFastIncrementalDetokenizer:
     until equivalent incremental decoders exist for the other tokenizer backends.
     """
 
-    def __init__(self, tokenizer: Any, prompt_token_ids: list[int]) -> None:
+    def __init__(
+        self, tokenizer: Any, prompt_token_ids: list[int], *, remove_eos: bool = True
+    ) -> None:
         try:
             import tokenizers
             from transformers import PreTrainedTokenizerFast
@@ -50,12 +52,18 @@ class HuggingFaceFastIncrementalDetokenizer:
         # their reasoning and tool-call markers (`<think>`, `</think>`,
         # `<tool_call>`) as special, and the reasoning and tool parsers need them.
         # `DecodeStream(skip_special_tokens=True)` would drop those markers too.
-        self._skipped_token_ids = frozenset(huggingface_tokenizer.all_special_ids) | (
-            model_eos_token_ids(tokenizer)
+        self._remove_eos = remove_eos
+        self._eos_token_ids = model_eos_token_ids(tokenizer)
+        # The non-streaming path keeps special tokens when the caller explicitly
+        # asks to include the stop sequence. Mirror that policy here.
+        self._skipped_token_ids = (
+            frozenset(huggingface_tokenizer.all_special_ids) if remove_eos else frozenset()
         )
+        self._pending_eos_token_ids: list[int] = []
         self._decode_stream = self._new_decode_stream(prompt_token_ids)
         self._text_fragments: list[str] = []
         self._text_length = 0
+        self._finished = False
 
     def _new_decode_stream(self, prompt_token_ids: list[int] | None = None):
         kwargs = {"skip_special_tokens": False}
@@ -68,8 +76,30 @@ class HuggingFaceFastIncrementalDetokenizer:
 
     def update(self, token_ids: list[int]) -> str:
         """Decode token IDs and return only newly stable text."""
+        decode_ids = []
+        for token_id in token_ids:
+            if token_id in self._skipped_token_ids:
+                continue
+            if token_id in self._eos_token_ids:
+                self._pending_eos_token_ids.append(token_id)
+                continue
+            decode_ids.extend(self._pending_eos_token_ids)
+            self._pending_eos_token_ids.clear()
+            decode_ids.append(token_id)
+        return self._decode(decode_ids)
+
+    def finish(self) -> str:
+        """Resolve buffered EOS tokens once their trailing position is known."""
+        if self._finished:
+            return ""
+        self._finished = True
+        decode_ids = [] if self._remove_eos else self._pending_eos_token_ids
+        self._pending_eos_token_ids = []
+        return self._decode(decode_ids)
+
+    def _decode(self, token_ids: list[int]) -> str:
         fragments = []
-        for token_id in self._kept(token_ids):
+        for token_id in token_ids:
             fragment = self._decode_next(token_id)
             if fragment:
                 fragments.append(fragment)

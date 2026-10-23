@@ -2,6 +2,7 @@
 
 import asyncio
 import gc
+import json
 import logging
 import math
 import os
@@ -24,6 +25,8 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
 from megatron.core.activations import squared_relu
+from megatron.core.inference.apis.async_llm import MegatronAsyncLLM
+from megatron.core.inference.apis.llm import MegatronLLM
 from megatron.core.inference.batch_dimensions_utils import TOKEN_ROUNDER
 from megatron.core.inference.config import (
     AsyncScheduleMode,
@@ -45,6 +48,7 @@ from megatron.core.inference.contexts.dynamic_context import (
 from megatron.core.inference.engines import DynamicInferenceEngine, dynamic_engine
 from megatron.core.inference.engines.dynamic_engine import EngineState, RequestEntry
 from megatron.core.inference.headers import Headers
+from megatron.core.inference.inference_client import InferenceClient, InferenceRequestAborted
 from megatron.core.inference.inference_request import (
     PREFIX_EOS_TOKEN_ID_FIELD,
     PREFIX_EXPANDED_TOKEN_COUNT_FIELD,
@@ -67,6 +71,9 @@ from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper 
 )
 from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.text_generation_server.dynamic_text_gen_server.openai_streaming import (
+    openai_stream,
+)
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -83,7 +90,7 @@ from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.inference.engines.ssm_test_helpers import (
     hybrid_mixer_kwargs,
@@ -880,6 +887,38 @@ def mock_forward(input_ids, position_ids, attention_mask, *args, **kwargs):
     )
 
 
+class _StreamingTransportTokenizer:
+    """Pickle-safe tokenizer for the real coordinator transport witness."""
+
+    vocab_size = 100
+    eod = 99
+
+    def tokenize(self, prompt):
+        return prompt if isinstance(prompt, list) else [ord(char) % 99 for char in prompt]
+
+    def detokenize(self, tokens, **_kwargs):
+        return "".join(f"<{token}>" for token in tokens)
+
+
+class _TokenTextDetokenizer:
+    """Deterministic incremental text boundary for real engine SSE records."""
+
+    def __init__(self):
+        self.text = ""
+
+    @property
+    def text_length(self):
+        return len(self.text)
+
+    def update(self, token_ids):
+        delta = "".join(f"<{token}>" for token in token_ids)
+        self.text += delta
+        return delta
+
+    def finish(self):
+        return ""
+
+
 @dataclass
 class DynamicEngineTestConfig:
     """Test configuration args."""
@@ -920,8 +959,11 @@ class DynamicEngineTestConfig:
     cuda_graph_mixed_prefill_count: Optional[int] = 16
     cuda_graph_max_tokens: int = 512
     fp8: bool = False
+    fp8_recipe: str = "tensorwise"
     hidden_size: Optional[int] = None
     model_provider: str = "gpt"
+    multi_latent_attention: bool = False
+    cache_mla_latents: bool = False
     flash_attention_version: Optional[int] = 2
     # Which linear-attention mixer a hybrid stack uses ("mamba", "gdp", or
     # "gdn"). Ignored unless model_provider == "hybrid": all three build a
@@ -1193,7 +1235,17 @@ class DynamicInferenceEngineTestBase:
 
         if test_config.model_provider == "gpt":
             # Transformer config.
-            transformer_config = TransformerConfig(
+            config_type = (
+                MLATransformerConfig
+                if test_config.multi_latent_attention
+                else TransformerConfig
+            )
+            mla_config = (
+                {"cache_mla_latents": test_config.cache_mla_latents}
+                if test_config.multi_latent_attention
+                else {}
+            )
+            transformer_config = config_type(
                 params_dtype=torch.bfloat16,
                 flash_attention_version=test_config.flash_attention_version,
                 num_layers=4,
@@ -1238,7 +1290,7 @@ class DynamicInferenceEngineTestBase:
                 add_bias_linear=test_config.expert_model_parallel_size == 1
                 and not (test_config.transformer_impl == "inference_optimized"),
                 fp8="hybrid" if test_config.fp8 else None,
-                fp8_recipe="tensorwise" if test_config.fp8 else None,
+                fp8_recipe=test_config.fp8_recipe if test_config.fp8 else None,
                 inference_sampling_seed=test_config.random_seed,
                 cuda_graph_modules=test_config.cuda_graph_modules,
                 inference_cuda_graph_scope=(
@@ -1267,6 +1319,7 @@ class DynamicInferenceEngineTestBase:
                 # inference optimized currently only supports RMS Norm
                 window_size=test_config.window_size,
                 window_attn_skip_freq=test_config.window_attn_skip_freq,
+                **mla_config,
             )
             # Layer-spec factories do not receive TransformerConfig. Forward num_moe_experts
             # explicitly for MoE test cases so they build MoE layers instead of a dense MLP.
@@ -1274,9 +1327,15 @@ class DynamicInferenceEngineTestBase:
                 transformer_config.num_moe_experts if test_config.use_moe_layer_spec else None
             )
             if test_config.fp8 or test_config.transformer_impl == "transformer_engine":
-                layer_spec = get_gpt_layer_with_transformer_engine_spec(num_experts=num_experts)
+                layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                    num_experts=num_experts,
+                    multi_latent_attention=test_config.multi_latent_attention,
+                )
             elif test_config.transformer_impl == "local":
-                layer_spec = get_gpt_layer_local_spec(num_experts=num_experts)
+                layer_spec = get_gpt_layer_local_spec(
+                    num_experts=num_experts,
+                    multi_latent_attention=test_config.multi_latent_attention,
+                )
             elif test_config.transformer_impl == "inference_optimized":
                 layer_spec = get_gpt_layer_with_inference_spec(num_experts=num_experts)
 
@@ -1340,7 +1399,7 @@ class DynamicInferenceEngineTestBase:
                 add_bias_linear=test_config.expert_model_parallel_size == 1
                 and not (test_config.transformer_impl == "inference_optimized"),
                 fp8="hybrid" if test_config.fp8 else None,
-                fp8_recipe="tensorwise" if test_config.fp8 else None,
+                fp8_recipe=test_config.fp8_recipe if test_config.fp8 else None,
                 inference_sampling_seed=test_config.random_seed,
                 cuda_graph_modules=test_config.cuda_graph_modules,
                 inference_cuda_graph_scope=(
@@ -3229,6 +3288,392 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         delete_cuda_graphs()
         reset_rounder()
         Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    async def test_real_coordinator_streams_before_completion_and_matches_greedy(self):
+        """Cross real model steps, coordinator routing, and two independent clients."""
+        config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=9,
+            max_prompt_length=9,
+            num_tokens_to_generate=128,
+            num_gap_steps=0,
+            top_k=1,
+            context_max_requests=16,
+            context_max_tokens=4,
+            context_block_size_tokens=4,
+            enable_chunked_prefill=True,
+            enable_prefix_caching=True,
+        )
+        env = self._build_test_env(config)
+        env.engine.controller.tokenizer = _StreamingTransportTokenizer()
+        shared_prefix = [3, 5, 7, 11]
+        prompts = [
+            [*shared_prefix, 13, 17, 19, 23],
+            [*shared_prefix, 29, 31, 37, 41, 43],
+        ]
+        baseline_params = [
+            SamplingParams(
+                num_tokens_to_generate=128,
+                termination_id=-1,
+                top_k=1,
+                return_log_probs=True,
+                top_n_logprobs=2,
+                skip_prompt_log_probs=True,
+                return_prompt_tokens=True,
+            ),
+            SamplingParams(
+                num_tokens_to_generate=48,
+                termination_id=-1,
+                top_k=1,
+                return_prompt_tokens=True,
+            ),
+        ]
+        baseline_tokens = []
+        for prompt, params in zip(prompts, baseline_params, strict=True):
+            completed = env.engine.generate([prompt], params)[0]
+            baseline_tokens.append(list(completed.generated_tokens))
+        string_prompt = "serve"
+        string_baseline = env.engine.generate(
+            [string_prompt],
+            SamplingParams(
+                num_tokens_to_generate=24,
+                termination_id=-1,
+                top_k=1,
+                return_prompt_tokens=True,
+            ),
+        )[0]
+        env.engine.reset()
+        env.engine.generate(
+            [shared_prefix],
+            SamplingParams(
+                num_tokens_to_generate=1,
+                termination_id=-1,
+                top_k=1,
+            ),
+        )
+        chunked_request_ids = []
+        schedule_chunked_prefill = env.engine.schedule_chunked_prefill
+
+        def observe_chunked_prefill():
+            schedule_chunked_prefill()
+            if env.engine.context.chunked_prefill_request_id >= 0:
+                chunked_request_ids.append(
+                    env.engine.context.chunked_prefill_request_id
+                )
+
+        env.engine.schedule_chunked_prefill = observe_chunked_prefill
+
+        coordinator_addr = await env.engine.start_listening_to_data_parallel_coordinator(
+            hostname="127.0.0.1"
+        )
+        rank = torch.distributed.get_rank()
+        clients = []
+        primary_client = None
+        rank_zero_error = None
+        try:
+            if rank == 0:
+                primary_client = InferenceClient(coordinator_addr)
+                peer_client = InferenceClient(coordinator_addr)
+                clients = [primary_client, peer_client]
+                for client in clients:
+                    client.start(
+                        loop=asyncio.get_running_loop(), connect_timeout_seconds=30
+                    )
+
+                stream_params = [
+                    SamplingParams(
+                        num_tokens_to_generate=128,
+                        termination_id=-1,
+                        top_k=1,
+                        return_log_probs=True,
+                        top_n_logprobs=2,
+                        skip_prompt_log_probs=True,
+                        return_prompt_tokens=True,
+                        streaming_interval=2,
+                    ),
+                    SamplingParams(
+                        num_tokens_to_generate=48,
+                        termination_id=-1,
+                        top_k=1,
+                        return_prompt_tokens=True,
+                        streaming_interval=3,
+                    ),
+                ]
+                streams = [
+                    client.add_request_streaming(prompt, params)
+                    for client, prompt, params in zip(
+                        clients, prompts, stream_params, strict=True
+                    )
+                ]
+                # Each independent client starts its local ID space at zero.
+                assert [stream.request_id for stream in streams] == [0, 0]
+
+                async def collect(stream, expect_logprobs):
+                    partials = []
+                    final = None
+                    first_partial_was_live = False
+                    active_steps = []
+                    final_count = 0
+                    async for item in stream:
+                        if "partial" in item:
+                            partial = item["partial"]
+                            if not partials:
+                                first_partial_was_live = (
+                                    not stream.finished
+                                    and env.engine.has_unfinished_requests()
+                                )
+                            active_steps.append(env.engine.context.step_count)
+                            assert partial["new_tokens"]
+                            if expect_logprobs:
+                                assert len(partial["new_tokens"]) == len(
+                                    partial["new_log_probs"]
+                                )
+                                assert len(partial["new_tokens"]) == len(
+                                    partial["new_top_n_logprobs"]
+                                )
+                            else:
+                                assert "new_log_probs" not in partial
+                                assert "new_top_n_logprobs" not in partial
+                            partials.append(partial)
+                        else:
+                            final_count += 1
+                            final = item["final"]
+                    assert first_partial_was_live
+                    assert len(partials) >= 2
+                    assert final_count == 1
+                    assert final is not None
+                    streamed_prefix = []
+                    histories = []
+                    for partial in partials:
+                        streamed_prefix.extend(partial["new_tokens"])
+                        histories.append(list(streamed_prefix))
+                    final_tokens = list(final["generated_tokens"])
+                    assert all(
+                        final_tokens[: len(history)] == history for history in histories
+                    )
+                    assert len(set(active_steps)) >= 2
+                    return partials, final
+
+                collected = await asyncio.wait_for(
+                    asyncio.gather(
+                        collect(streams[0], True), collect(streams[1], False)
+                    ),
+                    timeout=120,
+                )
+                partials, finals = zip(*collected, strict=True)
+                assert [list(final["generated_tokens"]) for final in finals] == baseline_tokens
+                assert partials[0][0]["request_id"] != partials[1][0]["request_id"]
+                for request_partials, final in zip(partials, finals, strict=True):
+                    assert {
+                        partial["request_id"] for partial in request_partials
+                    } == {final["request_id"]}
+                assert len(finals[0]["generated_log_probs"]) == len(
+                    finals[0]["generated_tokens"]
+                )
+                assert len(finals[0]["generated_top_n_logprobs"]) == len(
+                    finals[0]["generated_tokens"]
+                )
+                assert env.engine.context.async_sched_step_count > 0
+                assert env.engine._prefill_tokens_skipped >= len(shared_prefix)
+                assert any(final["num_cached_tokens"] >= len(shared_prefix) for final in finals)
+                assert chunked_request_ids
+                streamed_global_ids = {
+                    partial["request_id"]
+                    for request_partials in partials
+                    for partial in request_partials
+                }
+                assert streamed_global_ids.intersection(chunked_request_ids)
+                for client in clients:
+                    assert client.streams == {}
+                    assert client.request_submission_times == {}
+
+                sse_params = [
+                    SamplingParams(
+                        num_tokens_to_generate=length,
+                        termination_id=-1,
+                        top_k=1,
+                        streaming_interval=2,
+                    )
+                    for length in (24, 12)
+                ]
+                sse_streams = [
+                    client.add_request_streaming(prompt, params)
+                    for client, prompt, params in zip(
+                        clients, prompts, sse_params, strict=True
+                    )
+                ]
+                sse_generator = openai_stream(
+                    sse_streams,
+                    env.engine.controller.tokenizer,
+                    [_TokenTextDetokenizer(), _TokenTextDetokenizer()],
+                    chat=False,
+                    include_usage=True,
+                )
+                first_sse = await asyncio.wait_for(anext(sse_generator), timeout=30)
+                assert env.engine.has_unfinished_requests()
+                assert any(not stream.finished for stream in sse_streams)
+                sse_frames = [first_sse]
+                async for frame in sse_generator:
+                    sse_frames.append(frame)
+                payloads = [
+                    json.loads(frame.removeprefix("data: ").strip())
+                    for frame in sse_frames
+                    if frame != "data: [DONE]\n\n"
+                ]
+                assert sse_frames[-1] == "data: [DONE]\n\n"
+                reconstructed = ["", ""]
+                terminals = [[], []]
+                for payload in payloads:
+                    for choice in payload["choices"]:
+                        if choice["finish_reason"] is None:
+                            reconstructed[choice["index"]] += choice["text"]
+                        else:
+                            terminals[choice["index"]].append(choice)
+                expected_sse_tokens = [baseline_tokens[0][:24], baseline_tokens[1][:12]]
+                assert reconstructed == [
+                    env.engine.controller.tokenizer.detokenize(tokens)
+                    for tokens in expected_sse_tokens
+                ]
+                assert [len(choices) for choices in terminals] == [1, 1]
+                for index, choices in enumerate(terminals):
+                    assert choices[0]["generation_token_ids"] == expected_sse_tokens[index]
+                    assert choices[0]["generated_text"] == reconstructed[index]
+                    assert choices[0]["finish_reason"] == "length"
+                usage_payloads = [payload for payload in payloads if "usage" in payload]
+                assert len(usage_payloads) == 1
+                usage = usage_payloads[0]["usage"]
+                assert usage["prompt_tokens"] == sum(map(len, prompts))
+                assert usage["completion_tokens"] == 36
+                assert usage["total_tokens"] == sum(map(len, prompts)) + 36
+                assert usage["prompt_tokens_details"]["cached_tokens"] >= len(shared_prefix)
+
+                class CurrentLoopBridge:
+                    def __init__(self, loop):
+                        self.loop = loop
+
+                    async def run_async(self, coroutine):
+                        return await coroutine
+
+                    def run_sync(self, coroutine):
+                        return asyncio.run_coroutine_threadsafe(
+                            coroutine, self.loop
+                        ).result()
+
+                def high_level(cls):
+                    llm = cls.__new__(cls)
+                    llm._is_primary_rank = True
+                    llm._use_coordinator = True
+                    llm._loop_manager = CurrentLoopBridge(
+                        asyncio.get_running_loop()
+                    )
+                    llm._coord_runtime = types.SimpleNamespace(
+                        client=primary_client
+                    )
+                    return llm
+
+                high_level_params = SamplingParams(
+                    num_tokens_to_generate=24,
+                    termination_id=-1,
+                    top_k=1,
+                    return_prompt_tokens=True,
+                )
+                async_result = await high_level(MegatronAsyncLLM).generate(
+                    prompts[0], high_level_params
+                )
+                sync_llm = high_level(MegatronLLM)
+                # The sync facade blocks its caller while scheduling the request
+                # on the real client loop, exactly as its production bridge does.
+                [sync_result] = await asyncio.to_thread(
+                    sync_llm.generate,
+                    string_prompt,
+                    SamplingParams(
+                        num_tokens_to_generate=24,
+                        termination_id=-1,
+                        top_k=1,
+                        return_prompt_tokens=True,
+                    ),
+                )
+                assert list(async_result["generated_tokens"]) == baseline_tokens[0][:24]
+                assert list(sync_result["generated_tokens"]) == list(
+                    string_baseline.generated_tokens
+                )
+
+                cancelled_stream = primary_client.add_request_streaming(
+                    prompts[1],
+                    SamplingParams(
+                        num_tokens_to_generate=128,
+                        termination_id=-1,
+                        top_k=1,
+                        streaming_interval=1,
+                    ),
+                )
+                survivor_stream = peer_client.add_request_streaming(
+                    prompts[0],
+                    SamplingParams(
+                        num_tokens_to_generate=128,
+                        termination_id=-1,
+                        top_k=1,
+                        streaming_interval=2,
+                    ),
+                )
+                first_cancelled_item = await asyncio.wait_for(
+                    anext(cancelled_stream), timeout=30
+                )
+                assert "partial" in first_cancelled_item
+                cancel_ack = primary_client.abort_request_and_wait(
+                    cancelled_stream.request_id
+                )
+
+                async def drain_cancelled():
+                    with pytest.raises(InferenceRequestAborted):
+                        async for _ in cancelled_stream:
+                            pass
+
+                cancel_results = await asyncio.wait_for(
+                    asyncio.gather(
+                        cancel_ack,
+                        drain_cancelled(),
+                        collect(survivor_stream, False),
+                    ),
+                    timeout=120,
+                )
+                _, survivor_result = cancel_results[2]
+                assert list(survivor_result["generated_tokens"]) == baseline_tokens[0]
+                assert cancelled_stream.request_id not in primary_client.streams
+                assert (
+                    cancelled_stream.request_id
+                    not in primary_client.request_submission_times
+                )
+                assert (
+                    cancelled_stream.request_id
+                    not in primary_client._pending_source_requests
+                )
+        except BaseException as error:
+            rank_zero_error = error
+        finally:
+            if rank == 0 and primary_client is not None:
+                primary_client.pause_engines()
+            await asyncio.wait_for(env.engine.wait_until(EngineState.PAUSED), timeout=30)
+            if rank == 0 and primary_client is not None:
+                primary_client.stop_engines()
+            await asyncio.wait_for(asyncio.shield(env.engine.engine_loop_task), timeout=30)
+            if rank == 0 and primary_client is not None:
+                primary_client.shutdown_coordinator()
+                for client in clients:
+                    client.stop()
+                process = env.engine.inference_coordinator_process
+                process.join(timeout=10)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5)
+
+        if rank_zero_error is not None:
+            raise rank_zero_error
 
     @pytest.mark.internal
     @pytest.mark.skipif(

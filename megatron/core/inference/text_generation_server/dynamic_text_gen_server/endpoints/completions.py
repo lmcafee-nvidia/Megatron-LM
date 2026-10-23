@@ -42,7 +42,7 @@ try:
         tokenizer = current_app.config['tokenizer']
 
         req = await request.get_json(force=True)
-        if req is None:
+        if not isinstance(req, dict):
             return "Invalid or missing JSON body", 400
 
         # Opaque metadata forwarded to the engine's payload stager. Keys starting
@@ -195,25 +195,31 @@ try:
                 termination_id=-1 if ignore_eos else None,
                 streaming_interval=int(req.get("streaming_interval", 1)),
             )
-        except ValueError as e:
+        except (TypeError, ValueError) as e:
             return f"Invalid sampling parameter: {e}", 400
 
         # --- 3. Send Requests to Engine ---
         stream_requested = bool(req.get("stream", False))
+        stream_options = req.get("stream_options")
+        if stream_requested and stream_options is not None and not isinstance(stream_options, dict):
+            return "'stream_options' must be an object", 400
+        include_usage = bool((stream_options or {}).get("include_usage", False))
         incremental_detokenizers = []
         if stream_requested:
             # Streaming currently supports only Hugging Face fast tokenizers.
             try:
                 incremental_detokenizers = [
-                    HuggingFaceFastIncrementalDetokenizer(tokenizer, prompt_tokens)
+                    HuggingFaceFastIncrementalDetokenizer(
+                        tokenizer,
+                        prompt_tokens,
+                        remove_eos=not sampling_params.detokenize_stop_sequence,
+                    )
                     for prompt_tokens in prompts_as_tokens
                 ]
             except ValueError as error:
                 return str(error), 400
 
         tasks = []
-        # Populated on the non-streaming path only; the streaming path aborts
-        # through the AsyncStream callback its generator already owns.
         request_ids = []
         # The submission loop itself can fail partway -- the zmq send, or
         # multimodal serialization on a malformed payload -- with the earlier
@@ -221,10 +227,6 @@ try:
         # escapes the handler and those requests generate to their token limit
         # holding batch slots, the same leak the abort below closes.
         #
-        # TODO: streaming submissions made before a mid-loop failure are not
-        # covered. Their handles are AsyncStreams, not ids, and they abort
-        # through openai_stream's finally, which never runs because the
-        # generator is never started.
         try:
             # Hash and serialize shared media once before fanning it out across
             # the prompts in this batch, the same way chat completions does.
@@ -252,14 +254,14 @@ try:
                 )
                 per_req_params.seed = sampling_params_for_choice(sampling_params, index).seed
                 if stream_requested:
-                    tasks.append(
-                        client.add_request_streaming(
-                            prompt_tokens,
-                            per_req_params,
-                            multi_modal_data=prepared_multimodal_data,
-                            offload_params=offload_params,
-                        )
+                    stream = client.add_request_streaming(
+                        prompt_tokens,
+                        per_req_params,
+                        multi_modal_data=prepared_multimodal_data,
+                        offload_params=offload_params,
                     )
+                    request_ids.append(stream.request_id)
+                    tasks.append(stream)
                 else:
                     # add_request_with_id, not add_request: a non-streaming response
                     # writes nothing to the socket while generating, so a disconnect
@@ -278,7 +280,6 @@ try:
             return f"Error submitting request: {e}", 500
 
         if stream_requested:
-            include_usage = bool((req.get("stream_options") or {}).get("include_usage", False))
             response = Response(
                 openai_stream(
                     tasks,
@@ -357,7 +358,10 @@ try:
             collect_stage_metadata(response_metadata, result)
             generated_tokens = result.get("generated_tokens") or []
             full_text = detokenize_tokens(
-                tokenizer, generated_tokens, remove_EOD=not sampling_params.detokenize_stop_sequence
+                tokenizer,
+                generated_tokens,
+                remove_EOD=not sampling_params.detokenize_stop_sequence,
+                skip_special_tokens=not sampling_params.detokenize_stop_sequence,
             )
             text_output = (prompts_as_strings[request_idx] + full_text) if echo else full_text
 
@@ -420,13 +424,12 @@ try:
                     # When echo=False, only return generated tokens and their logprobs
                     tokens = [tokenizer.detokenize([tok]) for tok in generated_tokens_list]
 
-                    # Prepend [None] to match OpenAI format
-                    token_logprobs = [None] + list(generated_log_probs)
+                    token_logprobs = list(generated_log_probs)
 
                     # Build top_logprobs
                     top_logprobs = None
                     if generated_top_n_logprobs:
-                        top_logprobs = [None] + list(generated_top_n_logprobs)
+                        top_logprobs = list(generated_top_n_logprobs)
 
                     # Calculate text_offset for generated tokens only
                     text_offset = []
@@ -474,7 +477,7 @@ try:
             choices.append(choice_data)
             request_idx += 1
 
-        prompt_token_count = max(prompt_tokens_counts) if prompt_tokens_counts else 0
+        prompt_token_count = sum(prompt_tokens_counts)
         response = {
             "id": response_uid,
             "object": "text_completion",  # as per the openAI spec

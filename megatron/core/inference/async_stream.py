@@ -78,6 +78,9 @@ class AsyncStream(Generic[T]):
         try:
             async for result in self:
                 yield result
+        except asyncio.CancelledError:
+            await self.aclose()
+            raise
         except GeneratorExit:
             await self.aclose()
             raise asyncio.CancelledError from None

@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from unittest import mock
 
+import msgpack
 import pytest
 import torch
 from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, check_fp8_support
@@ -31,6 +32,7 @@ from megatron.core.inference.disaggregation.inference_state_handoff import (
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.engines.dynamic_engine import EngineState, _get_decode_only_log_state
+from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import (
     DynamicInferenceEventType,
     DynamicInferenceRequest,
@@ -43,6 +45,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     DynamicBatchControllerStepResult,
     TextGenerationController,
 )
+from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import InferenceCudaGraphScope
@@ -55,6 +58,9 @@ from tests.unit_tests.inference.engines.test_dynamic_engine import (
     DynamicInferenceEngineTestBase as _DynamicInferenceEngineTestBase,
 )
 from tests.unit_tests.inference.engines.test_dynamic_engine import reset_rounder as _reset_rounder
+from tests.unit_tests.inference.engines.ssm_test_helpers import (
+    skip_if_sequence_packing_not_available,
+)
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -709,8 +715,26 @@ _ASYNC_PAIR_SCENARIOS = (
         "model:hybrid-mamba",
         "interaction:mamba-state-compaction",
         config={"model_provider": "hybrid"},
-        signals=("hybrid", "metadata-compaction"),
+        signals=("hybrid", "mamba", "metadata-compaction"),
         prerequisite="mamba",
+        atol=5.0e-3,
+    ),
+    _pair_scenario(
+        "hybrid-gdp",
+        "model:hybrid-gdp",
+        "interaction:gdp-state-compaction",
+        config={"model_provider": "hybrid", "ssm_mixer": "gdp"},
+        signals=("gdp", "hybrid", "metadata-compaction"),
+        prerequisite="gdp",
+        atol=5.0e-3,
+    ),
+    _pair_scenario(
+        "hybrid-gdn",
+        "model:hybrid-gdn",
+        "interaction:gdn-state-compaction",
+        config={"model_provider": "hybrid", "ssm_mixer": "gdn"},
+        signals=("gdn", "hybrid", "metadata-compaction"),
+        prerequisite="gdn",
         atol=5.0e-3,
     ),
     _pair_scenario(
@@ -734,6 +758,29 @@ _ASYNC_PAIR_SCENARIOS = (
         prerequisite="fp8",
         atol=5.0e-3,
         parity="reproducible",
+    ),
+    _pair_scenario(
+        "mxfp8-transformer-engine",
+        "precision:mxfp8",
+        config={"fp8": True, "fp8_recipe": "mxfp8", "hidden_size": 128},
+        signals=("fp8", "mxfp8"),
+        prerequisite="mxfp8",
+        atol=5.0e-3,
+        parity="reproducible",
+    ),
+    _pair_scenario(
+        "mla-latent-cache",
+        "model:mla",
+        "kv:mla-latent-cache",
+        config={
+            "multi_latent_attention": True,
+            "cache_mla_latents": True,
+            "context_block_size_tokens": 64,
+            "position_embedding_type": "rope",
+        },
+        signals=("mla",),
+        prerequisite="flash-mla",
+        atol=5.0e-3,
     ),
     # Four heads of width 64 exercise FlashInfer's supported fused-RoPE kernel.
     # Width 16 crosses half-head boundaries in its vectorized NeoX rotation.
@@ -838,18 +885,56 @@ _PROMPT_LENGTHS = (9, 5, 12, 7, 10, 6, 11)
 _OUTPUT_LENGTHS = (10, 5, 9, 7, 11, 6, 8)
 _REQUEST_WAVES = ((0, 1, 2), (3, 4), (5, 6))
 
+_STREAMING_SIGNAL_COUNTERS = {
+    "cuda-graph": "cuda_graph_steps",
+    "flashinfer": "sampling-backend:flashinfer",
+    "fp8": "fp8-quantized-forwards",
+    "full-logits": "full-logits-forward",
+    "fused-rope": "fused-rope-kernel",
+    "gdn": "module-forward:gdn",
+    "gdp": "module-forward:gdp",
+    "gpt": "module-forward:gpt",
+    "hybrid": "module-forward:hybrid",
+    "inference-optimized": "module-forward:inference-optimized",
+    "logprobs": "log-probs-calculations",
+    "mamba": "module-forward:mamba",
+    "mla": "module-forward:mla",
+    "mxfp8": "fp8-quantized-forwards",
+    "moe": "nccl-token-dispatches",
+    "nccl-dispatch": "nccl-token-dispatches",
+    "parallel": "module-forward:parallel",
+    "processed-logprobs": "log-probs-kernel",
+    "softmax-sink": "sink-correction-calls",
+    "swa-all": "swa-kernel-calls",
+    "swa-alternating": "swa-kernel-calls",
+    "top-n": "log-probs-calculations",
+    "transformer-engine": "module-forward:transformer-engine",
+}
+
 
 def _check_scenario_prerequisite(scenario):
     if scenario.prerequisite == "flashinfer":
         pytest.importorskip("flashinfer")
+    elif scenario.prerequisite == "flash-mla":
+        pytest.importorskip("flash_mla")
     elif scenario.prerequisite == "mamba":
         available, reason = _check_mamba_sequence_packing_support()
         if not available:
             pytest.skip(reason)
+    elif scenario.prerequisite == "gdp":
+        skip_if_sequence_packing_not_available("gdp")
+    elif scenario.prerequisite == "gdn" and not HAVE_FLA:
+        pytest.skip("FLA is not installed")
     elif scenario.prerequisite == "transformer-engine":
         if not is_te_min_version("2.2.0"):
             pytest.skip("Transformer Engine 2.2.0 is required")
     elif scenario.prerequisite == "fp8":
+        available, reason = check_fp8_support()
+        if not available:
+            pytest.skip(reason)
+    elif scenario.prerequisite == "mxfp8":
+        if torch.cuda.get_device_capability()[0] < 10:
+            pytest.skip("MXFP8 requires Blackwell or newer")
         available, reason = check_fp8_support()
         if not available:
             pytest.skip(reason)
@@ -1310,7 +1395,12 @@ def _instrument_scenario_runtime(env, scenario, runtime):
         "inference-optimized": lambda name, module: name.startswith("Inference")
         and "inference_layers" in module,
         "fp8": lambda name, module: name.startswith("TE") or "transformer_engine" in module,
-        "hybrid": lambda name, module: name == "MambaMixer",
+        "hybrid": lambda name, module: name
+        in {"GatedDeltaNet", "GatedDeltaProductMixer", "MambaMixer"},
+        "mamba": lambda name, module: name == "MambaMixer",
+        "gdp": lambda name, module: name == "GatedDeltaProductMixer",
+        "gdn": lambda name, module: name == "GatedDeltaNet",
+        "mla": lambda name, module: name in {"FusedMLASelfAttention", "MLASelfAttention"},
         "moe": lambda name, module: name in {"MoELayer", "InferenceTopKRouter"},
         "parallel": lambda name, module: "ParallelLinear" in name
         or name in {"ColumnParallelLinear", "RowParallelLinear"},
@@ -1461,10 +1551,37 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         )
         runtime = Counter()
         if mode == AsyncScheduleMode.ASYNC:
+            runtime["streaming-counter-steps"] = {}
+            runtime["streaming-partial-steps"] = set()
+            runtime["streaming-token-history"] = {}
             _instrument_scenario_runtime(env, scenario, runtime)
+            for request in env.requests:
+                request.sampling_params.streaming = True
+                request.sampling_params.streaming_interval = 1
+            env.engine.use_coordinator = True
+            if env.engine.is_mp_coordinator:
+                env.engine.socket_for_receiving_requests = mock.MagicMock()
+
+        watched_counters = {
+            "model-forward",
+            *(
+                _STREAMING_SIGNAL_COUNTERS[signal]
+                for signal in scenario.signals
+                if signal in _STREAMING_SIGNAL_COUNTERS
+            ),
+        }
 
         def step():
             context = env.engine.context
+            step_id = runtime["steps"] + 1
+            before = {key: runtime[key] for key in watched_counters}
+            spec_steps_before = env.engine._spec_steps
+            prefix_skipped_before = env.engine._prefill_tokens_skipped
+            sent_before = (
+                len(env.engine.socket_for_receiving_requests.send_multipart.call_args_list)
+                if mode == AsyncScheduleMode.ASYNC and env.engine.is_mp_coordinator
+                else 0
+            )
             runtime["max_active"] = max(
                 runtime["max_active"], context.total_request_count - context.paused_request_count
             )
@@ -1472,7 +1589,42 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             result = env.engine.step_modern()
             runtime["steps"] += 1
             runtime["cuda_graph_steps"] += int(context.using_cuda_graph_this_step())
+            counter_steps = runtime.setdefault("streaming-counter-steps", {})
+            for key in watched_counters:
+                if runtime[key] > before[key]:
+                    counter_steps.setdefault(key, set()).add(step_id)
+            if env.engine._spec_steps > spec_steps_before:
+                counter_steps.setdefault("mtp", set()).add(step_id)
+            if env.engine._prefill_tokens_skipped > prefix_skipped_before:
+                counter_steps.setdefault("prefix-hit", set()).add(step_id)
             runtime["max_paused"] = max(runtime["max_paused"], context.paused_request_count)
+            if mode == AsyncScheduleMode.ASYNC and env.engine.is_mp_coordinator:
+                for call in env.engine.socket_for_receiving_requests.send_multipart.call_args_list[
+                    sent_before:
+                ]:
+                    frames = call.args[0]
+                    header, _ = msgpack.unpackb(frames[0], raw=False)
+                    if header != Headers.ENGINE_REPLY_PARTIAL.value:
+                        continue
+                    runtime["streaming-partial-steps"].add(step_id)
+                    for frame in frames[1:]:
+                        partial = msgpack.unpackb(frame, raw=False)
+                        request_id = partial["request_id"]
+                        assert request_id in env.engine.requests
+                        assert partial["new_tokens"]
+                        history = runtime["streaming-token-history"].setdefault(request_id, [])
+                        history.extend(partial["new_tokens"])
+                        request = env.engine.get_request(request_id)
+                        if request.sampling_params.return_log_probs:
+                            assert len(partial["new_tokens"]) == len(
+                                partial["new_log_probs"]
+                            )
+                            assert len(partial["new_tokens"]) == len(
+                                partial["new_top_n_logprobs"]
+                            )
+                        else:
+                            assert "new_log_probs" not in partial
+                            assert "new_top_n_logprobs" not in partial
             for request in result["finished_requests"]:
                 env.requests[request.request_id] = request
                 if request.request_id == 1 and any(
@@ -1504,6 +1656,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             )
             step()
             if wave_idx == 0 and "suspend-resume" in scenario.signals:
+                suspend_step = runtime["steps"]
                 memory_ptr = env.engine.context.memory_buffer.data_ptr()
                 pending_before_suspend = env.engine.controller._async_sched_forward.is_valid
                 runtime["pending-before-suspend"] += int(pending_before_suspend)
@@ -1521,10 +1674,34 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 runtime["static-pointer-preserved"] += int(
                     env.engine.context.memory_buffer.data_ptr() == memory_ptr
                 )
+                runtime["streaming-counter-steps"].setdefault(
+                    "suspend-resume", set()
+                ).add(suspend_step)
 
         while env.engine.has_unfinished_requests():
             step()
             assert runtime["steps"] < 400, f"{scenario.name} did not converge"
+
+        if mode == AsyncScheduleMode.ASYNC and env.engine.is_mp_coordinator:
+            partial_steps = runtime["streaming-partial-steps"]
+            histories = runtime["streaming-token-history"]
+            assert partial_steps
+            assert histories
+            assert partial_steps & runtime["streaming-counter-steps"]["model-forward"]
+            for request_id, history in histories.items():
+                final_tokens = env.requests[request_id].generated_tokens
+                assert history == final_tokens[: len(history)]
+                assert len(history) < len(final_tokens)
+            for signal in scenario.signals:
+                counter = _STREAMING_SIGNAL_COUNTERS.get(signal)
+                if counter is not None:
+                    assert partial_steps & runtime["streaming-counter-steps"][counter]
+            if "mtp" in scenario.signals:
+                assert partial_steps & runtime["streaming-counter-steps"]["mtp"]
+            if "prefix-hit" in scenario.signals:
+                assert partial_steps & runtime["streaming-counter-steps"]["prefix-hit"]
+            if "suspend-resume" in scenario.signals:
+                assert partial_steps & runtime["streaming-counter-steps"]["suspend-resume"]
         return env, runtime
 
     @staticmethod
@@ -1760,6 +1937,11 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["mamba-state-commits"] > 0
             assert runtime["mamba-state-compactions"] > 0
             assert runtime["module-forward:hybrid"] > 0
+        for model_family in ("mamba", "gdp", "gdn", "mla"):
+            if model_family in signals:
+                assert runtime[f"module-forward:{model_family}"] > 0
+        if "mla" in signals:
+            assert context.cache_mla_latent
         if "transformer-engine" in signals:
             assert model_config.transformer_impl == "transformer_engine"
             assert runtime["module-forward:transformer-engine"] > 0
@@ -1772,6 +1954,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["fp8-context-forwards"] > 0
             assert runtime["fp8-quantized-forwards"] > 0
             assert runtime["fp8-recipe-forwards"] > 0
+        if "mxfp8" in signals:
+            assert str(model_config.fp8_recipe).lower().endswith("mxfp8")
         if "fused-rope" in signals:
             assert context.use_flashinfer_fused_rope
             assert model_config.hidden_size // model_config.num_attention_heads == 64
