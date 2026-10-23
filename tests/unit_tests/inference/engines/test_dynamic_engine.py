@@ -3840,6 +3840,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     llm = cls.__new__(cls)
                     llm._is_primary_rank = True
                     llm._use_coordinator = True
+                    llm._shutdown_called = False
                     llm._loop_manager = CurrentLoopBridge(asyncio.get_running_loop())
                     llm._coord_runtime = types.SimpleNamespace(client=primary_client)
                     return llm
