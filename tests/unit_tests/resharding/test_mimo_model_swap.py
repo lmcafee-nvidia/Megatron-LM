@@ -311,6 +311,12 @@ def test_mimo_to_llava_repeated_refit(language_tp, vision_tp, backend, wrapped):
             wrapped,
         )
         prepare_swap_model_weights(source, target)
+        source_a = {
+            prefix: {
+                name: tensor.detach().clone() for name, tensor in _tensor_state(module).items()
+            }
+            for prefix, module in components.items()
+        }
         target_outputs = []
         target_projections = []
         _, cached_projection = _run_llava_refit_witness(target)
@@ -337,7 +343,7 @@ def test_mimo_to_llava_repeated_refit(language_tp, vision_tp, backend, wrapped):
             cache_engine._vision_embedding_cache_bytes = projection.untyped_storage().nbytes()
 
         cache_projection(cached_projection)
-        for update in range(3):
+        for update in range(4):
             if update == 2 and source is not None:
                 # Rebuild only training models; inference keeps its cached plan.
                 source, _, components = _models(
@@ -350,11 +356,21 @@ def test_mimo_to_llava_repeated_refit(language_tp, vision_tp, backend, wrapped):
                     None,
                     wrapped,
                 )
-            if update:
+            if update in (1, 2):
                 with torch.no_grad():
                     for module in components.values():
                         for tensor in _tensor_state(module).values():
-                            tensor.add_(1)
+                            if tensor.is_floating_point():
+                                pattern = torch.arange(
+                                    tensor.numel(), device=tensor.device, dtype=torch.float32
+                                ).remainder(17)
+                                pattern = pattern.sub(8).reshape(tensor.shape).to(tensor.dtype)
+                                tensor.mul_(1 + update / 8).add_(pattern, alpha=update / 32)
+            elif update == 3:
+                with torch.no_grad():
+                    for prefix, module in components.items():
+                        for name, tensor in _tensor_state(module).items():
+                            tensor.copy_(source_a[prefix][name])
             expected = _collect_source_state(components)
             if cache_engine is not None:
                 assert cache_engine._vision_embedding_cache["media"].embedding is cached_projection
@@ -375,6 +391,10 @@ def test_mimo_to_llava_repeated_refit(language_tp, vision_tp, backend, wrapped):
             assert all(
                 not torch.equal(left, right)
                 for left, right in zip(target_projections, target_projections[1:])
+            )
+            torch.testing.assert_close(target_outputs[0], target_outputs[-1], rtol=0, atol=0)
+            torch.testing.assert_close(
+                target_projections[0], target_projections[-1], rtol=0, atol=0
             )
     finally:
         clear_all_caches()
