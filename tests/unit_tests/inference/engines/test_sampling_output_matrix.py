@@ -113,7 +113,7 @@ def _install_step_witnesses(env, runtime, step_index, vocab_size):
     original_compact = engine.controller._compact_async_sched_forward
 
     def traced_compact(survivor_idxs):
-        runtime[("compact", tuple(survivor_idxs.tolist()))] += 1
+        runtime[("compact", step_index[0], tuple(survivor_idxs.tolist()))] += 1
         return original_compact(survivor_idxs)
 
     engine.controller._compact_async_sched_forward = traced_compact
@@ -219,6 +219,22 @@ class TestSamplingOutputMatrix(RequestLifecyclePairwiseBase):
             if isinstance(key, tuple) and key[0] == "scores" and set(key[2]) == {0, 1, 2}
         }
         assert model_steps & sample_steps & score_steps
+        survivor_model_steps = {
+            key[1]
+            for key in runtime
+            if isinstance(key, tuple) and key[0] == "model" and key[2] == (0, 2)
+        }
+        survivor_sample_steps = {
+            key[1]
+            for key in runtime
+            if isinstance(key, tuple) and key[0] == "sample" and key[2] == (0, 2)
+        }
+        survivor_score_steps = {
+            key[1]
+            for key in runtime
+            if isinstance(key, tuple) and key[0] == "scores" and key[2] == (0, 2)
+        }
+        assert survivor_model_steps & survivor_sample_steps & survivor_score_steps
         survivor_score_support = {
             value
             for key, value in runtime.items()
@@ -229,7 +245,12 @@ class TestSamplingOutputMatrix(RequestLifecyclePairwiseBase):
         }
         assert (1, 2) in survivor_score_support
         if mode == AsyncScheduleMode.ASYNC:
-            assert runtime[("compact", (0, 2))] > 0
+            compact_steps = {
+                key[1]
+                for key in runtime
+                if isinstance(key, tuple) and key[0] == "compact" and key[2] == (0, 2)
+            }
+            assert compact_steps
 
         snapshot = {
             request.request_id: {
