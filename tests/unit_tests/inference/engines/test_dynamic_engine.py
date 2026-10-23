@@ -3435,7 +3435,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             num_tokens_to_generate=128,
             num_gap_steps=0,
             top_k=1,
-            context_max_requests=16,
+            context_max_requests=4,
             context_max_tokens=4,
             context_block_size_tokens=4,
             enable_chunked_prefill=True,
