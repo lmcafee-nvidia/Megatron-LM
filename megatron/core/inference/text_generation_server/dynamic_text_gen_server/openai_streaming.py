@@ -437,7 +437,7 @@ async def openai_stream(
                             }
                         ]
                     )
-            elif delta:
+            elif delta or logprobs is not None:
                 choice = {"index": index, "logprobs": logprobs, "finish_reason": None}
                 choice["delta" if chat else "text"] = {"content": delta} if chat else delta
                 yield sse([choice])
@@ -473,11 +473,12 @@ async def openai_stream(
             prompt_len = result.get("prompt_length")
             if prompt_len is None:
                 prompt_len = len(result.get("prompt_tokens") or [])
-            prompt_tokens = (
-                max(prompt_tokens, prompt_len) if chat else prompt_tokens + prompt_len
-            )
+            prompt_tokens = max(prompt_tokens, prompt_len) if chat else prompt_tokens + prompt_len
             completion_tokens += len(result.get("generated_tokens") or [])
-            cached_token_count = max(cached_token_count, result.get("num_cached_tokens", 0))
+            if chat:
+                cached_token_count = max(cached_token_count, result.get("num_cached_tokens", 0))
+            else:
+                cached_token_count += result.get("num_cached_tokens", 0)
 
         if include_usage:
             yield sse(

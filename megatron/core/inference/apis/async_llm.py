@@ -2,6 +2,7 @@
 
 """Async high-level inference API for Megatron (``MegatronAsyncLLM``)."""
 
+import asyncio
 from typing import List, Optional, Type, Union
 
 from megatron.core.inference.apis._llm_base import _MegatronLLMBase
@@ -102,6 +103,7 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         Raises:
             RuntimeError: if called on a non-primary rank.
         """
+        self._assert_not_shutdown()
         self._assert_primary()
         if sampling_params is None:
             sampling_params = SamplingParams()
@@ -170,16 +172,20 @@ class MegatronAsyncLLM(_MegatronLLMBase):
 
         Idempotent. No-op in direct mode.
         """
-        if self._shutdown_called:
+        if not self._shutdown_called:
+            self._shutdown_called = True
+            self._stop_frontend_if_started()
+            if not self._use_coordinator:
+                return
+            assert self._loop_manager is not None
+            self._shutdown_future = self._loop_manager.submit(self._shutdown_impl())
+        elif self._shutdown_future is None:
             return
-        self._shutdown_called = True
 
-        self._stop_frontend_if_started()
-
-        if not self._use_coordinator:
-            return
         assert self._loop_manager is not None
-        await self._loop_manager.run_async(self._shutdown_impl())
+        assert self._shutdown_future is not None
+        # A caller cancellation must not cancel the one shared teardown future.
+        await asyncio.shield(asyncio.wrap_future(self._shutdown_future))
         self._loop_manager.stop()
 
     async def serve(self, serve_config: ServeConfig, *, blocking: bool = True) -> None:
@@ -200,6 +206,7 @@ class MegatronAsyncLLM(_MegatronLLMBase):
             ValueError: if ``use_coordinator=False`` (HTTP serving requires
                 the coordinator path).
         """
+        self._assert_not_shutdown()
         if not self._use_coordinator:
             raise ValueError("MegatronAsyncLLM.serve() requires use_coordinator=True")
 
@@ -230,6 +237,12 @@ class MegatronAsyncLLM(_MegatronLLMBase):
                 default_top_p=serve_config.default_top_p,
                 default_top_k=serve_config.default_top_k,
                 eval_mode=serve_config.eval_mode,
+                block_size_tokens=(
+                    self._context.block_size_tokens if self._context.enable_prefix_caching else None
+                ),
+                prefix_caching_coordinator_policy=(
+                    self._context.config.prefix_caching_coordinator_policy
+                ),
             )
             self._serve_started = True
 

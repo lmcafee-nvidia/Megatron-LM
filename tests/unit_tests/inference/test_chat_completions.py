@@ -1618,9 +1618,7 @@ _FTP_IMAGE = {"type": "image_url", "image_url": {"url": "ftp://example.com/a.png
             "Invalid sampling parameter: int() argument must be a string, a bytes-like object or a real number, not 'list'",
             id="top-k-list",
         ),
-        pytest.param(
-            {**CHAT_BODY, "n": 0}, {}, 400, "'n' must be at least 1", id="zero-choices"
-        ),
+        pytest.param({**CHAT_BODY, "n": 0}, {}, 400, "'n' must be at least 1", id="zero-choices"),
         pytest.param(
             {"messages": [{"role": "user", "content": [_FTP_IMAGE]}]},
             {},

@@ -141,7 +141,9 @@ async def test_client_stop_terminates_open_streams():
 
     iterator = client.add_request_streaming("hi", SamplingParams())
     request_id = iterator.request_id
-    assert client.request_submission_times == {request_id: client.request_submission_times[request_id]}
+    assert client.request_submission_times == {
+        request_id: client.request_submission_times[request_id]
+    }
     assert client._pending_source_requests == {request_id}
     client.stop()
 

@@ -96,6 +96,7 @@ class MegatronLLM(_MegatronLLMBase):
         Raises:
             RuntimeError: if called on a non-primary rank in coordinator mode.
         """
+        self._assert_not_shutdown()
         self._assert_primary()
         if sampling_params is None:
             sampling_params = SamplingParams()
@@ -193,6 +194,7 @@ class MegatronLLM(_MegatronLLMBase):
             ValueError: if ``use_coordinator=False`` (HTTP serving requires
                 the coordinator path).
         """
+        self._assert_not_shutdown()
         if not self._use_coordinator:
             raise ValueError("MegatronLLM.serve() requires use_coordinator=True")
 
@@ -223,6 +225,12 @@ class MegatronLLM(_MegatronLLMBase):
                 default_top_p=serve_config.default_top_p,
                 default_top_k=serve_config.default_top_k,
                 eval_mode=serve_config.eval_mode,
+                block_size_tokens=(
+                    self._context.block_size_tokens if self._context.enable_prefix_caching else None
+                ),
+                prefix_caching_coordinator_policy=(
+                    self._context.config.prefix_caching_coordinator_policy
+                ),
             )
             self._serve_started = True
 

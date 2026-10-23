@@ -319,6 +319,7 @@ class _MegatronLLMBase:
         self._loop_manager: "Optional[_EventLoopManager]" = None
         self._coord_runtime: "Optional[_CoordinatorRuntime]" = None
         self._shutdown_called: bool = False
+        self._shutdown_future: "Optional[concurrent.futures.Future]" = None
         self._serve_started: bool = False
 
         if use_coordinator:
@@ -427,6 +428,10 @@ class _MegatronLLMBase:
                 "generate(...) is only valid on the primary rank in coordinator mode"
             )
 
+    def _assert_not_shutdown(self) -> None:
+        if self._shutdown_called:
+            raise RuntimeError("This Megatron LLM instance has been shut down")
+
     def _assert_coordinator(self) -> None:
         if not self._use_coordinator:
             raise RuntimeError("This method requires use_coordinator=True")
@@ -529,9 +534,7 @@ class _MegatronLLMBase:
             request_ids = []
             futures = []
             try:
-                for p, sample_multi_modal_data in zip(
-                    prompts, multi_modal_data_list, strict=True
-                ):
+                for p, sample_multi_modal_data in zip(prompts, multi_modal_data_list, strict=True):
                     request_id, future = self._coord_runtime.client.add_request_with_id(
                         p, sp, multi_modal_data=sample_multi_modal_data
                     )

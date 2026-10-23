@@ -51,6 +51,9 @@ from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.utils import is_layer_window_attention
 from megatron.core.utils import is_fa_min_version, is_te_min_version
+from tests.unit_tests.inference.engines.ssm_test_helpers import (
+    skip_if_sequence_packing_not_available,
+)
 from tests.unit_tests.inference.engines.test_dynamic_engine import (
     DynamicEngineTestConfig as _DynamicEngineTestConfig,
 )
@@ -58,9 +61,6 @@ from tests.unit_tests.inference.engines.test_dynamic_engine import (
     DynamicInferenceEngineTestBase as _DynamicInferenceEngineTestBase,
 )
 from tests.unit_tests.inference.engines.test_dynamic_engine import reset_rounder as _reset_rounder
-from tests.unit_tests.inference.engines.ssm_test_helpers import (
-    skip_if_sequence_packing_not_available,
-)
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -1672,12 +1672,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                         history.extend(partial["new_tokens"])
                         request = env.engine.get_request(request_id)
                         if request.sampling_params.return_log_probs:
-                            assert len(partial["new_tokens"]) == len(
-                                partial["new_log_probs"]
-                            )
-                            assert len(partial["new_tokens"]) == len(
-                                partial["new_top_n_logprobs"]
-                            )
+                            assert len(partial["new_tokens"]) == len(partial["new_log_probs"])
+                            assert len(partial["new_tokens"]) == len(partial["new_top_n_logprobs"])
                         else:
                             assert "new_log_probs" not in partial
                             assert "new_top_n_logprobs" not in partial
@@ -1730,9 +1726,9 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 runtime["static-pointer-preserved"] += int(
                     env.engine.context.memory_buffer.data_ptr() == memory_ptr
                 )
-                runtime["streaming-counter-steps"].setdefault(
-                    "suspend-resume", set()
-                ).add(suspend_step)
+                runtime["streaming-counter-steps"].setdefault("suspend-resume", set()).add(
+                    suspend_step
+                )
 
         while env.engine.has_unfinished_requests():
             step()

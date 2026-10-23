@@ -77,16 +77,16 @@ from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_w
 )
 from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.text_generation_server.dynamic_text_gen_server.openai_streaming import (
-    openai_stream,
-)
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.inference.text_generation_server.dynamic_text_gen_server.openai_streaming import (
+    openai_stream,
+)
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_local_submodules,
     get_gpt_layer_local_spec,
+    get_gpt_layer_local_submodules,
     get_gpt_layer_with_inference_spec,
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_mtp_block_spec,
@@ -928,9 +928,7 @@ class _FastEndpointTokenizer:
         tokenizer.chat_template = (
             "{% for message in messages %}{{ message['content'] }} {% endfor %}"
         )
-        self._tokenizer = types.SimpleNamespace(
-            tokenizer=tokenizer, include_special_tokens=True
-        )
+        self._tokenizer = types.SimpleNamespace(tokenizer=tokenizer, include_special_tokens=True)
         self.vocab_size = 100
         self.unk_token_id = 0
         self.bos = None
@@ -938,9 +936,7 @@ class _FastEndpointTokenizer:
         self.eos_id = 99
 
     def tokenize(self, text):
-        return self._tokenizer.tokenizer.encode(
-            text, add_special_tokens=False
-        ).ids
+        return self._tokenizer.tokenizer.encode(text, add_special_tokens=False).ids
 
     def detokenize(self, tokens, **kwargs):
         tokens = list(tokens)
@@ -1296,9 +1292,7 @@ class DynamicInferenceEngineTestBase:
         if test_config.model_provider == "gpt":
             # Transformer config.
             config_type = (
-                MLATransformerConfig
-                if test_config.multi_latent_attention
-                else TransformerConfig
+                MLATransformerConfig if test_config.multi_latent_attention else TransformerConfig
             )
             mla_config = (
                 {"cache_mla_latents": test_config.cache_mla_latents}
@@ -1559,8 +1553,7 @@ class DynamicInferenceEngineTestBase:
                 language_max_sequence_length=test_config.max_sequence_length,
                 vision_transformer_config=vision_config,
                 vision_transformer_layer_spec=ModuleSpec(
-                    module=TransformerLayer,
-                    submodules=deepcopy(language_submodules),
+                    module=TransformerLayer, submodules=deepcopy(language_submodules)
                 ),
                 drop_vision_class_token=True,
                 vision_projection_config=projection_config,
@@ -1612,8 +1605,7 @@ class DynamicInferenceEngineTestBase:
             convert_tokens_to_ids=lambda token: 98 if token == "<image>" else 0,
         )
         text_generation_controller = TextGenerationController(
-            inference_wrapped_model=inference_wrapped_model,
-            tokenizer=tokenizer,
+            inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
         )
 
         delete_cuda_graphs()
@@ -3452,10 +3444,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         env = self._build_test_env(config)
         env.engine.controller.tokenizer = _StreamingTransportTokenizer()
         shared_prefix = [3, 5, 7, 11]
-        prompts = [
-            [*shared_prefix, 13, 17, 19, 23],
-            [*shared_prefix, 29, 31, 37, 41, 43],
-        ]
+        prompts = [[*shared_prefix, 13, 17, 19, 23], [*shared_prefix, 29, 31, 37, 41, 43]]
         baseline_params = [
             SamplingParams(
                 num_tokens_to_generate=128,
@@ -3467,10 +3456,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 return_prompt_tokens=True,
             ),
             SamplingParams(
-                num_tokens_to_generate=48,
-                termination_id=-1,
-                top_k=1,
-                return_prompt_tokens=True,
+                num_tokens_to_generate=48, termination_id=-1, top_k=1, return_prompt_tokens=True
             ),
         ]
         baseline_tokens = []
@@ -3481,20 +3467,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         string_baseline = env.engine.generate(
             [string_prompt],
             SamplingParams(
-                num_tokens_to_generate=24,
-                termination_id=-1,
-                top_k=1,
-                return_prompt_tokens=True,
+                num_tokens_to_generate=24, termination_id=-1, top_k=1, return_prompt_tokens=True
             ),
         )[0]
         env.engine.reset()
         env.engine.generate(
-            [shared_prefix],
-            SamplingParams(
-                num_tokens_to_generate=1,
-                termination_id=-1,
-                top_k=1,
-            ),
+            [shared_prefix], SamplingParams(num_tokens_to_generate=1, termination_id=-1, top_k=1)
         )
         chunked_request_ids = []
         schedule_chunked_prefill = env.engine.schedule_chunked_prefill
@@ -3502,9 +3480,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         def observe_chunked_prefill():
             schedule_chunked_prefill()
             if env.engine.context.chunked_prefill_request_id >= 0:
-                chunked_request_ids.append(
-                    env.engine.context.chunked_prefill_request_id
-                )
+                chunked_request_ids.append(env.engine.context.chunked_prefill_request_id)
 
         env.engine.schedule_chunked_prefill = observe_chunked_prefill
 
@@ -3521,9 +3497,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 peer_client = InferenceClient(coordinator_addr)
                 clients = [primary_client, peer_client]
                 for client in clients:
-                    client.start(
-                        loop=asyncio.get_running_loop(), connect_timeout_seconds=30
-                    )
+                    client.start(loop=asyncio.get_running_loop(), connect_timeout_seconds=30)
 
                 stream_params = [
                     SamplingParams(
@@ -3546,9 +3520,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 ]
                 streams = [
                     client.add_request_streaming(prompt, params)
-                    for client, prompt, params in zip(
-                        clients, prompts, stream_params, strict=True
-                    )
+                    for client, prompt, params in zip(clients, prompts, stream_params, strict=True)
                 ]
                 # Each independent client starts its local ID space at zero.
                 assert [stream.request_id for stream in streams] == [0, 0]
@@ -3564,15 +3536,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                             partial = item["partial"]
                             if not partials:
                                 first_partial_was_live = (
-                                    not stream.finished
-                                    and env.engine.has_unfinished_requests()
+                                    not stream.finished and env.engine.has_unfinished_requests()
                                 )
                             active_steps.append(env.engine.context.step_count)
                             assert partial["new_tokens"]
                             if expect_logprobs:
-                                assert len(partial["new_tokens"]) == len(
-                                    partial["new_log_probs"]
-                                )
+                                assert len(partial["new_tokens"]) == len(partial["new_log_probs"])
                                 assert len(partial["new_tokens"]) == len(
                                     partial["new_top_n_logprobs"]
                                 )
@@ -3593,28 +3562,22 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                         streamed_prefix.extend(partial["new_tokens"])
                         histories.append(list(streamed_prefix))
                     final_tokens = list(final["generated_tokens"])
-                    assert all(
-                        final_tokens[: len(history)] == history for history in histories
-                    )
+                    assert all(final_tokens[: len(history)] == history for history in histories)
                     assert len(set(active_steps)) >= 2
                     return partials, final
 
                 collected = await asyncio.wait_for(
-                    asyncio.gather(
-                        collect(streams[0], True), collect(streams[1], False)
-                    ),
+                    asyncio.gather(collect(streams[0], True), collect(streams[1], False)),
                     timeout=120,
                 )
                 partials, finals = zip(*collected, strict=True)
                 assert [list(final["generated_tokens"]) for final in finals] == baseline_tokens
                 assert partials[0][0]["request_id"] != partials[1][0]["request_id"]
                 for request_partials, final in zip(partials, finals, strict=True):
-                    assert {
-                        partial["request_id"] for partial in request_partials
-                    } == {final["request_id"]}
-                assert len(finals[0]["generated_log_probs"]) == len(
-                    finals[0]["generated_tokens"]
-                )
+                    assert {partial["request_id"] for partial in request_partials} == {
+                        final["request_id"]
+                    }
+                assert len(finals[0]["generated_log_probs"]) == len(finals[0]["generated_tokens"])
                 assert len(finals[0]["generated_top_n_logprobs"]) == len(
                     finals[0]["generated_tokens"]
                 )
@@ -3643,9 +3606,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 ]
                 sse_streams = [
                     client.add_request_streaming(prompt, params)
-                    for client, prompt, params in zip(
-                        clients, prompts, sse_params, strict=True
-                    )
+                    for client, prompt, params in zip(clients, prompts, sse_params, strict=True)
                 ]
                 sse_generator = openai_stream(
                     sse_streams,
@@ -3731,7 +3692,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                         ]
                         assert all(
                             len(choice["logprobs"]["content"]) == len(token_ids)
-                            for choice, token_ids in zip(final_choices, final_token_ids, strict=True)
+                            for choice, token_ids in zip(
+                                final_choices, final_token_ids, strict=True
+                            )
                         )
                     else:
                         final_texts = [choice["text"] for choice in final_choices]
@@ -3740,29 +3703,26 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                         ]
                         assert all(
                             len(choice["logprobs"]["token_logprobs"]) == len(token_ids)
-                            for choice, token_ids in zip(final_choices, final_token_ids, strict=True)
+                            for choice, token_ids in zip(
+                                final_choices, final_token_ids, strict=True
+                            )
                         )
 
                     streaming_response = await endpoint_client.post(
                         path,
-                        json={
-                            **body,
-                            "stream": True,
-                            "stream_options": {"include_usage": True},
-                        },
+                        json={**body, "stream": True, "stream_options": {"include_usage": True}},
                     )
                     assert streaming_response.status_code == 200
                     records = [
                         record
-                        for record in (
-                            await streaming_response.get_data(as_text=True)
-                        ).split("\n\n")
+                        for record in (await streaming_response.get_data(as_text=True)).split(
+                            "\n\n"
+                        )
                         if record
                     ]
                     assert records[-1] == "data: [DONE]"
                     stream_payloads = [
-                        json.loads(record.removeprefix("data: "))
-                        for record in records[:-1]
+                        json.loads(record.removeprefix("data: ")) for record in records[:-1]
                     ]
                     reconstructed = [""] * len(final_choices)
                     terminal_choices = [[] for _ in final_choices]
@@ -3771,9 +3731,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                             index = choice["index"]
                             if choice["finish_reason"] is None:
                                 reconstructed[index] += (
-                                    choice["delta"].get("content", "")
-                                    if chat
-                                    else choice["text"]
+                                    choice["delta"].get("content", "") if chat else choice["text"]
                                 )
                             else:
                                 terminal_choices[index].append(choice)
@@ -3789,18 +3747,16 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
                         assert usage_records[0][field] == final_payload["usage"][field]
                     if "prompt_tokens_details" in final_payload["usage"]:
-                        assert usage_records[0]["prompt_tokens_details"] == final_payload[
-                            "usage"
-                        ]["prompt_tokens_details"]
+                        assert (
+                            usage_records[0]["prompt_tokens_details"]
+                            == final_payload["usage"]["prompt_tokens_details"]
+                        )
 
                 endpoint_prompt = " ".join(f"t{token}" for token in prompts[0])
                 await assert_endpoint_stream_matches_final(
                     "/v1/completions",
                     {
-                        "prompt": [
-                            endpoint_prompt,
-                            " ".join(f"t{token}" for token in prompts[1]),
-                        ],
+                        "prompt": [endpoint_prompt, " ".join(f"t{token}" for token in prompts[1])],
                         "max_tokens": 12,
                         "temperature": 0,
                         "ignore_eos": True,
@@ -3842,27 +3798,18 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                         return await coroutine
 
                     def run_sync(self, coroutine):
-                        return asyncio.run_coroutine_threadsafe(
-                            coroutine, self.loop
-                        ).result()
+                        return asyncio.run_coroutine_threadsafe(coroutine, self.loop).result()
 
                 def high_level(cls):
                     llm = cls.__new__(cls)
                     llm._is_primary_rank = True
                     llm._use_coordinator = True
-                    llm._loop_manager = CurrentLoopBridge(
-                        asyncio.get_running_loop()
-                    )
-                    llm._coord_runtime = types.SimpleNamespace(
-                        client=primary_client
-                    )
+                    llm._loop_manager = CurrentLoopBridge(asyncio.get_running_loop())
+                    llm._coord_runtime = types.SimpleNamespace(client=primary_client)
                     return llm
 
                 high_level_params = SamplingParams(
-                    num_tokens_to_generate=24,
-                    termination_id=-1,
-                    top_k=1,
-                    return_prompt_tokens=True,
+                    num_tokens_to_generate=24, termination_id=-1, top_k=1, return_prompt_tokens=True
                 )
                 async_result = await high_level(MegatronAsyncLLM).generate(
                     prompts[0], high_level_params
@@ -3888,28 +3835,18 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 cancelled_stream = primary_client.add_request_streaming(
                     prompts[1],
                     SamplingParams(
-                        num_tokens_to_generate=128,
-                        termination_id=-1,
-                        top_k=1,
-                        streaming_interval=1,
+                        num_tokens_to_generate=128, termination_id=-1, top_k=1, streaming_interval=1
                     ),
                 )
                 survivor_stream = peer_client.add_request_streaming(
                     prompts[0],
                     SamplingParams(
-                        num_tokens_to_generate=128,
-                        termination_id=-1,
-                        top_k=1,
-                        streaming_interval=2,
+                        num_tokens_to_generate=128, termination_id=-1, top_k=1, streaming_interval=2
                     ),
                 )
-                first_cancelled_item = await asyncio.wait_for(
-                    anext(cancelled_stream), timeout=30
-                )
+                first_cancelled_item = await asyncio.wait_for(anext(cancelled_stream), timeout=30)
                 assert "partial" in first_cancelled_item
-                cancel_ack = primary_client.abort_request_and_wait(
-                    cancelled_stream.request_id
-                )
+                cancel_ack = primary_client.abort_request_and_wait(cancelled_stream.request_id)
 
                 async def drain_cancelled():
                     with pytest.raises(InferenceRequestAborted):
@@ -3917,24 +3854,14 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                             pass
 
                 cancel_results = await asyncio.wait_for(
-                    asyncio.gather(
-                        cancel_ack,
-                        drain_cancelled(),
-                        collect(survivor_stream, False),
-                    ),
+                    asyncio.gather(cancel_ack, drain_cancelled(), collect(survivor_stream, False)),
                     timeout=120,
                 )
                 _, survivor_result = cancel_results[2]
                 assert list(survivor_result["generated_tokens"]) == baseline_tokens[0]
                 assert cancelled_stream.request_id not in primary_client.streams
-                assert (
-                    cancelled_stream.request_id
-                    not in primary_client.request_submission_times
-                )
-                assert (
-                    cancelled_stream.request_id
-                    not in primary_client._pending_source_requests
-                )
+                assert cancelled_stream.request_id not in primary_client.request_submission_times
+                assert cancelled_stream.request_id not in primary_client._pending_source_requests
         except BaseException as error:
             rank_zero_error = error
         finally:
@@ -3985,9 +3912,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         prompt = [11, 12, 13, 14, 15, 16, 17, 18]
 
         baseline_env = self._build_test_env(config)
-        baseline_params = SamplingParams(
-            num_tokens_to_generate=6, termination_id=-1, top_k=1
-        )
+        baseline_params = SamplingParams(num_tokens_to_generate=6, termination_id=-1, top_k=1)
         baseline_future = baseline_env.engine.add_request(70, prompt, baseline_params)
         for _ in range(32):
             if baseline_future.done():
@@ -4038,9 +3963,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             # Signal readiness immediately before the backend posts irecvs. Rank
             # zero leaves the barrier by posting the matching sends, matching the
             # native coordinator's KV_TRANSFER_READY -> SEND_KV order.
-            engine._notify_kv_transfer_ready = lambda _rid, _cached: (
-                torch.distributed.barrier()
-            )
+            engine._notify_kv_transfer_ready = lambda _rid, _cached: (torch.distributed.barrier())
             stream_params = SamplingParams(
                 num_tokens_to_generate=6,
                 termination_id=-1,
@@ -4049,11 +3972,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 streaming_interval=1,
             )
             decode_future = engine.add_request_with_kv_handoff(
-                71,
-                prompt,
-                stream_params,
-                handoff[0]["kv_meta"],
-                handoff[0]["block_ids"],
+                71, prompt, stream_params, handoff[0]["kv_meta"], handoff[0]["block_ids"]
             )
             assert len(engine._pending_kv_imports) == 1
             pending = engine._pending_kv_imports[0]
@@ -4074,9 +3993,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             pending.handle.wait()
         torch.distributed.barrier()
 
-        block_ids = (
-            handoff[0]["block_ids"] if role == "prefill" else pending.local_blocks
-        )
+        block_ids = handoff[0]["block_ids"] if role == "prefill" else pending.local_blocks
         transferred = engine.context.memory_buffer[:, :, block_ids].contiguous()
         block_digest = hashlib.sha256(
             transferred.view(torch.uint8).cpu().numpy().tobytes()
@@ -4120,9 +4037,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                         msgpack.unpackb(frames[0], raw=False)[0]
                         == Headers.ENGINE_REPLY_PARTIAL.value
                     ):
-                        streamed_tokens.extend(
-                            msgpack.unpackb(frames[1], raw=False)["new_tokens"]
-                        )
+                        streamed_tokens.extend(msgpack.unpackb(frames[1], raw=False)["new_tokens"])
                 sent_calls = len(calls)
             assert decode_future.done()
 
@@ -4168,17 +4083,11 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         prompt = [11, 98, 13]
         frame_count = 1 if modality == "image" else 2
         media = torch.linspace(
-            -1,
-            1,
-            frame_count * 4 * 3 * 14 * 14,
-            dtype=torch.bfloat16,
-            device="cuda",
+            -1, 1, frame_count * 4 * 3 * 14 * 14, dtype=torch.bfloat16, device="cuda"
         ).reshape(1, frame_count * 4, 3 * 14 * 14)
         media_kwargs = {
             "imgs": media,
-            "imgs_sizes": torch.tensor(
-                [[28, 28]] * frame_count, dtype=torch.int32, device="cuda"
-            ),
+            "imgs_sizes": torch.tensor([[28, 28]] * frame_count, dtype=torch.int32, device="cuda"),
         }
         if modality == "video":
             media_kwargs["num_frames"] = torch.tensor([frame_count], dtype=torch.int32)
@@ -4286,8 +4195,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             final_frames = [
                 call.args[0]
                 for call in engine.socket_for_receiving_requests.send_multipart.call_args_list
-                if msgpack.unpackb(call.args[0][0], raw=False)[0]
-                == Headers.ENGINE_REPLY.value
+                if msgpack.unpackb(call.args[0][0], raw=False)[0] == Headers.ENGINE_REPLY.value
             ]
             assert len(final_frames) == 1
             assert msgpack.unpackb(final_frames[0][1], raw=False)["request_id"] == 1
@@ -6877,10 +6785,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             calls = engine.socket_for_receiving_requests.send_multipart.call_args_list
             for call in calls[sent:]:
                 frames = call.args[0]
-                if (
-                    msgpack.unpackb(frames[0], raw=False)[0]
-                    != Headers.ENGINE_REPLY_PARTIAL.value
-                ):
+                if msgpack.unpackb(frames[0], raw=False)[0] != Headers.ENGINE_REPLY_PARTIAL.value:
                     continue
                 for frame in frames[1:]:
                     partial = msgpack.unpackb(frame, raw=False)
@@ -6889,16 +6794,14 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     request = engine.get_request(request_id)
                     if current_epoch[0] is not None:
                         assert request.policy_epoch[-1][1] == current_epoch[0]
-                        partial_epochs[current_epoch[0]] += 1
+                        partial_epochs[(request_id, current_epoch[0])] += 1
                     streaming_history[request_id].extend(partial["new_tokens"])
             return result
 
         def set_epoch(epoch):
             """Deliver the production epoch control message to the scheduler."""
             message = [
-                msgpack.packb(
-                    [Headers.SET_GENERATION_EPOCH.value, epoch], use_bin_type=True
-                )
+                msgpack.packb([Headers.SET_GENERATION_EPOCH.value, epoch], use_bin_type=True)
             ]
             engine.socket_for_receiving_requests.recv_multipart.side_effect = [
                 message,
@@ -6971,7 +6874,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             result = step_and_capture()
             finished_requests.extend(result["finished_requests"])
 
-        assert set(partial_epochs) == {0, 1, 2}
+        assert set(partial_epochs) == {
+            (request_id, epoch) for request_id in streaming_history for epoch in (0, 1, 2)
+        }
 
         for finished_request in finished_requests:
             expected_policy_epoch = [

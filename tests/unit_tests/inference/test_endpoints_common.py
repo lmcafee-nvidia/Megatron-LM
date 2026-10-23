@@ -707,9 +707,7 @@ async def test_streaming_disconnect_aborts_every_open_stream(path, monkeypatch):
     client = PendingStreamingClient()
     app = build_streaming_app(path, client, monkeypatch)
 
-    sent = await _post_then_disconnect(
-        app, path, {**FAN_OUT_BODIES[path], "stream": True}, client
-    )
+    sent = await _post_then_disconnect(app, path, {**FAN_OUT_BODIES[path], "stream": True}, client)
 
     assert client.aborted == [1, 2, 3]
     assert not any(b"[DONE]" in message.get("body", b"") for message in sent)
@@ -901,9 +899,7 @@ async def test_streaming_fans_out_and_reports_usage_on_request(path, include_usa
     offload_params = {"store": "x"}
     client = ReplyingClient(
         [
-            completed_reply(
-                f"req-{index}", [10, 11], [12, 13], num_cached_tokens=index
-            )
+            completed_reply(f"req-{index}", [10, 11], [12, 13], num_cached_tokens=index)
             for index in range(1, 4)
         ]
     )
@@ -936,9 +932,7 @@ async def test_streaming_fans_out_and_reports_usage_on_request(path, include_usa
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": 6,
                 "total_tokens": prompt_tokens + 6,
-                "prompt_tokens_details": {
-                    "cached_tokens": 3 if path == CHAT_PATH else 6
-                },
+                "prompt_tokens_details": {"cached_tokens": 3 if path == CHAT_PATH else 6},
             }
         ]
         if include_usage
@@ -949,9 +943,7 @@ async def test_streaming_fans_out_and_reports_usage_on_request(path, include_usa
 
 @pytest.mark.asyncio
 @PATHS
-async def test_streaming_partial_admission_failure_aborts_admitted_work(
-    path, monkeypatch
-):
+async def test_streaming_partial_admission_failure_aborts_admitted_work(path, monkeypatch):
     class PartiallyFailingClient(ReplyingClient):
         def add_request_streaming(
             self, prompt_tokens, sampling_params, *, multi_modal_data=None, offload_params=None
@@ -965,15 +957,14 @@ async def test_streaming_partial_admission_failure_aborts_admitted_work(
             request_id = len(self.prompt_tokens)
             self.streamed.append(request_id)
             return AsyncStream(
-                request_id=request_id, cancel=lambda request_id=request_id: self.aborted.append(request_id)
+                request_id=request_id,
+                cancel=lambda request_id=request_id: self.aborted.append(request_id),
             )
 
     client = PartiallyFailingClient()
     app = build_streaming_app(path, client, monkeypatch)
 
-    response = await app.test_client().post(
-        path, json={**FAN_OUT_BODIES[path], "stream": True}
-    )
+    response = await app.test_client().post(path, json={**FAN_OUT_BODIES[path], "stream": True})
 
     assert response.status_code == 500
     assert await response.get_data(as_text=True) == "Error submitting request: zmq send failed"
@@ -987,8 +978,7 @@ async def test_malformed_stream_options_is_rejected_before_submission(path, monk
     app = build_streaming_app(path, client, monkeypatch)
 
     response = await app.test_client().post(
-        path,
-        json={**BODIES[path], "stream": True, "stream_options": ["include_usage"]},
+        path, json={**BODIES[path], "stream": True, "stream_options": ["include_usage"]}
     )
 
     assert response.status_code == 400

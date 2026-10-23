@@ -187,21 +187,14 @@ async def test_openai_stream_preserves_scores_while_detokenizer_buffers_text():
     records = [
         json.loads(record.removeprefix("data: "))
         async for record in openai_stream(
-            [stream],
-            _Tokenizer(),
-            [BufferedDetokenizer()],
-            chat=False,
-            return_log_probs=True,
+            [stream], _Tokenizer(), [BufferedDetokenizer()], chat=False, return_log_probs=True
         )
         if record != "data: [DONE]\n\n"
     ]
     deltas = [record["choices"][0] for record in records[:-1]]
 
     assert [delta["text"] for delta in deltas] == ["", "ab"]
-    assert [delta["logprobs"]["token_logprobs"] for delta in deltas] == [
-        [-0.1],
-        [-0.2],
-    ]
+    assert [delta["logprobs"]["token_logprobs"] for delta in deltas] == [[-0.1], [-0.2]]
     assert records[-1]["choices"][0]["generated_text"] == "ab"
 
 
@@ -583,12 +576,8 @@ def test_huggingface_fast_incremental_detokenizer_drops_eos_and_special_map_toke
 @pytest.mark.parametrize("remove_eos", [False, True])
 def test_huggingface_fast_incremental_detokenizer_matches_trailing_eos_policy(remove_eos):
     tokenizer, huggingface_tokenizer = _with_chat_markers(eos_marker="<|im_end|>")
-    token_ids = huggingface_tokenizer.encode(
-        "a<|im_end|>b<|im_end|>", add_special_tokens=False
-    )
-    detokenizer = HuggingFaceFastIncrementalDetokenizer(
-        tokenizer, [], remove_eos=remove_eos
-    )
+    token_ids = huggingface_tokenizer.encode("a<|im_end|>b<|im_end|>", add_special_tokens=False)
+    detokenizer = HuggingFaceFastIncrementalDetokenizer(tokenizer, [], remove_eos=remove_eos)
 
     streamed_text = detokenizer.update(token_ids) + detokenizer.finish()
     expected_tokens = token_ids[:-1] if remove_eos else token_ids
