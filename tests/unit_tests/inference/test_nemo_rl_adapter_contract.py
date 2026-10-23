@@ -471,17 +471,21 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         assert output["output_ids"][0, len(prompt)].item() == direct_token
         assert output["logprobs"][0, len(prompt)].item() == direct_score
         assert output["truncated"].tolist() == [True]
-        engine._invalidate_vision_state()
-        assert not engine._vision_embedding_cache
-        build_request(1302, media[0])
-        assert cache_key in engine._vision_embedding_cache
-        assert vision_calls == [modality, modality]
-        stale_embedding = engine._vision_embedding_cache[cache_key].embedding
+        cached_embedding = engine._vision_embedding_cache[cache_key].embedding
         engine.allow_stale_multimodal_embeddings = True
         engine._invalidate_vision_state()
-        assert engine._vision_embedding_cache[cache_key].embedding is stale_embedding
-        stale_request = build_request(1303, media[0])
-        assert stale_request.image_embeddings is stale_embedding
+        assert engine._vision_embedding_cache[cache_key].embedding is cached_embedding
+        stale_request = build_request(1302, media[0])
+        assert stale_request.image_embeddings is cached_embedding
+        assert vision_calls == [modality]
+        engine.allow_stale_multimodal_embeddings = False
+        engine._invalidate_vision_state()
+        assert not engine._vision_embedding_cache
+        rebuilt_request = build_request(1303, media[0])
+        assert rebuilt_request.image_embeddings is not cached_embedding
+        torch.testing.assert_close(
+            rebuilt_request.image_embeddings, cached_embedding, rtol=0, atol=0
+        )
         assert vision_calls == [modality, modality]
 
     @pytest.mark.internal
