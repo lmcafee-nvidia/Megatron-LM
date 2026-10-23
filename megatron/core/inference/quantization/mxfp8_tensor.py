@@ -67,6 +67,17 @@ def validate_mxfp8_tensor(
         raise TypeError(
             f"{tensor_name} data must use torch.float8_e4m3fn, got {tensor.data.dtype}."
         )
+    if not tensor.data.is_cuda or not tensor.scale.is_cuda:
+        raise ValueError(f"{tensor_name} data and scale must both use CUDA storage.")
+    if tensor.data.device != tensor.scale.device:
+        raise ValueError(
+            f"{tensor_name} data and scale must use the same device, got "
+            f"{tensor.data.device} and {tensor.scale.device}."
+        )
+    if not tensor.data.is_contiguous():
+        raise ValueError(f"{tensor_name} data must be contiguous.")
+    if not tensor.scale.is_contiguous():
+        raise ValueError(f"{tensor_name} scale must be contiguous.")
     backend = expected_backend if expected_backend is not None else tensor.backend
     if expected_backend is not None and tensor.backend != expected_backend:
         raise ValueError(
@@ -229,9 +240,20 @@ class MXFP8Tensor:
                      'flashinfer' (single fused FlashInfer CUDA kernel).
         """
         assert x.is_cuda and x.dim() == 2
+        if group_size != MXFP8_BLOCK_SIZE:
+            raise ValueError(
+                f"MXFP8 backends implement group size {MXFP8_BLOCK_SIZE}, got {group_size}."
+            )
+        if x.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+            raise TypeError(f"MXFP8 quantization requires BF16, FP16, or FP32, got {x.dtype}.")
+        if x.shape[0] == 0 or x.shape[1] == 0:
+            raise ValueError(f"MXFP8 input dimensions must be nonzero, got {tuple(x.shape)}.")
         assert x.shape[-1] % group_size == 0
+        x = x.contiguous()
         if backend == "flashinfer":
             assert HAVE_FLASHINFER, "FlashInfer not available"
+            if x.dtype == torch.float32:
+                raise TypeError("FlashInfer MXFP8 quantization accepts BF16 or FP16, not FP32.")
             data, scale = flashinfer_mxfp8_quantize(x)
             if scale.dtype == torch.float8_e8m0fnu:
                 scale = scale.view(torch.uint8)

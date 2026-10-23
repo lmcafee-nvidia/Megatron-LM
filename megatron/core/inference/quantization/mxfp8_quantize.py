@@ -73,10 +73,14 @@ def _mxfp8_quant_swizzle_row(
     # (exponent-only mask) bumps the exponent if any mantissa bits are set.
     # Result: 2^ceil(log2(max/448)) as a uint32-encoded float.
     dequant_exp = (dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000
-    # Reinterpret uint32 back as float32 — now a power-of-2 dequantization scale.
-    dequant_rounded = dequant_exp.to(tl.float32, bitcast=True)
-    # Quantization scale is the reciprocal; guard against div-by-zero for all-zero groups.
-    quant_scale = tl.where(dequant_rounded == 0, 0.0, 1.0 / dequant_rounded)
+    # E8M0 byte zero represents 2^-127, one exponent below float32's minimum normal
+    # value. The exponent-only bit trick rounds all nonzero subnormal values to
+    # 2^-126, so restore the byte-zero bin explicitly before computing the reciprocal.
+    scale_exp = (dequant_exp >> 23).to(tl.uint8)
+    scale_exp = tl.where(dequant_scale <= 5.877471754111438e-39, 0, scale_exp)
+    # Guard all-zero groups separately: they share the byte-zero scale encoding but
+    # must keep a zero payload instead of multiplying by 2^127.
+    quant_scale = tl.where(max_vals == 0.0, 0.0, tl.exp2(127.0 - scale_exp.to(tl.float32)))
 
     # Quantize
     quantized = x_grouped * quant_scale[:, None]
@@ -87,7 +91,6 @@ def _mxfp8_quant_swizzle_row(
     tl.store(out_row + offs, out_fp8, mask=mask)
 
     # Store swizzled scales
-    scale_exp = (dequant_exp >> 23).to(tl.uint8)
     col_offs = tl.arange(0, BLOCK_GROUPS)
     col_mask = col_offs < REAL_GROUPS
 
@@ -191,6 +194,7 @@ def mxfp8_quantize_into(x: torch.Tensor, out_data: torch.Tensor, out_scale: torc
     assert x.is_cuda and x.dim() == 2
     assert x.dtype in (torch.bfloat16, torch.float16, torch.float32)
     M, K = x.shape
+    assert M > 0 and K > 0, f"MXFP8 input dimensions must be nonzero, got {tuple(x.shape)}"
     assert K % MXFP8_BLOCK_SIZE == 0, f"K ({K}) must be divisible by {MXFP8_BLOCK_SIZE}"
     assert out_data.is_cuda and out_data.device == x.device
     assert out_data.shape == x.shape and out_data.dtype == torch.float8_e4m3fn
@@ -198,6 +202,15 @@ def mxfp8_quantize_into(x: torch.Tensor, out_data: torch.Tensor, out_scale: torc
     assert out_scale.is_cuda and out_scale.device == x.device
     assert out_scale.dim() == 1 and out_scale.is_contiguous()
     assert out_scale.dtype in (torch.uint8, torch.float8_e8m0fnu)
+
+    # Triton pointer arithmetic below is intentionally dense row-major. Materialize
+    # arbitrary public input strides rather than silently interpreting their storage.
+    x = x.contiguous()
+    storages = (x.untyped_storage(), out_data.untyped_storage(), out_scale.untyped_storage())
+    storage_ptrs = tuple(storage.data_ptr() for storage in storages)
+    assert len(set(storage_ptrs)) == len(
+        storage_ptrs
+    ), "MXFP8 input, data output, and scale output must not share storage"
 
     scale_cols = K // MXFP8_BLOCK_SIZE
     n_row_blocks = _ceil_div(M, MXFP8_SCALE_ROW_BLOCK)
@@ -231,6 +244,7 @@ def _mxfp8_quant_swizzle_rows_kernel(
     scale_ptr,
     src_ptr,
     n_rows_ptr,  # scalar int32/int64 CUDA tensor: rows [0, n_rows) are quantized
+    M,
     K,
     n_col_blocks,
     REAL_GROUPS: tl.constexpr,
@@ -246,6 +260,10 @@ def _mxfp8_quant_swizzle_rows_kernel(
     """
     pid = tl.program_id(0)
     n_rows = tl.load(n_rows_ptr).to(tl.int64)
+    # The live count is device-resident so it can change between graph replays and
+    # cannot be validated on the host without a synchronization. Clamp it in the
+    # kernel to keep malformed scheduler state from reading or writing past storage.
+    n_rows = tl.minimum(tl.maximum(n_rows, 0), M)
     for row in tl.range(pid, n_rows, NUM_PROGRAMS):
         _mxfp8_quant_swizzle_row(
             row.to(tl.int64),
@@ -265,16 +283,23 @@ def mxfp8_quantize_rows(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Like ``mxfp8_quantize`` but only rows ``[0, n_rows)`` are quantized.
 
-    ``n_rows`` is a 1-element CUDA tensor (device-side count, CUDA-graph safe). Data rows
-    at or beyond ``n_rows`` are left uninitialized and their scales are zero; callers
-    must not read them (grouped GEMMs bounded by expert offsets ending at ``n_rows``).
-    Quantized rows are bitwise identical to ``mxfp8_quantize``.
+    ``n_rows`` is a 1-element CUDA tensor (device-side count, CUDA-graph safe) and is
+    clamped to ``[0, x.shape[0]]`` in the kernel. Data rows at or beyond the clamped
+    count are left uninitialized and their scales are zero; callers must not read them
+    (grouped GEMMs are bounded by expert offsets ending at ``n_rows``). Quantized rows
+    are bitwise identical to ``mxfp8_quantize``.
     """
     assert x.is_cuda and x.dim() == 2
     assert x.dtype in (torch.bfloat16, torch.float16, torch.float32)
-    assert n_rows.is_cuda and n_rows.numel() == 1
+    assert n_rows.is_cuda and n_rows.device == x.device and n_rows.numel() == 1
+    assert n_rows.dtype in (
+        torch.int32,
+        torch.int64,
+    ), f"n_rows must use int32 or int64, got {n_rows.dtype}"
     M, K = x.shape
+    assert M > 0 and K > 0, f"MXFP8 input dimensions must be nonzero, got {tuple(x.shape)}"
     assert K % MXFP8_BLOCK_SIZE == 0, f"K ({K}) must be divisible by {MXFP8_BLOCK_SIZE}"
+    x = x.contiguous()
     scale_cols = K // MXFP8_BLOCK_SIZE
     n_row_blocks = _ceil_div(M, MXFP8_SCALE_ROW_BLOCK)
     n_col_blocks = _ceil_div(scale_cols, MXFP8_SCALE_COL_BLOCK)
@@ -288,6 +313,7 @@ def mxfp8_quantize_rows(
         out_scale,
         x,
         n_rows,
+        M,
         K,
         n_col_blocks,
         REAL_GROUPS=scale_cols,
@@ -312,6 +338,7 @@ def mxfp8_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     assert x.is_cuda and x.dim() == 2
     assert x.dtype in (torch.bfloat16, torch.float16, torch.float32)
     M, K = x.shape
+    assert M > 0 and K > 0, f"MXFP8 input dimensions must be nonzero, got {tuple(x.shape)}"
     assert K % MXFP8_BLOCK_SIZE == 0, f"K ({K}) must be divisible by {MXFP8_BLOCK_SIZE}"
     scale_cols = K // MXFP8_BLOCK_SIZE
     n_row_blocks = _ceil_div(M, MXFP8_SCALE_ROW_BLOCK)
