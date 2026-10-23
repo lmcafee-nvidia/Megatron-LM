@@ -264,7 +264,7 @@ _INVALID_PROMPT_FORMAT = (
             id="top-k-list",
         ),
         # Sampling fields are read with a plain .get(), so an explicit null reaches the
-        # float()/int() conversion and escapes as a 500 (chat treats null as "use the default").
+        # float()/int() conversion and is rejected as a client error.
         pytest.param(
             {
                 "prompt": "hello",
@@ -275,7 +275,7 @@ _INVALID_PROMPT_FORMAT = (
                 "streaming_interval": None,
             },
             {},
-            500,
+            400,
             None,
             id="null-sampling-fields",
         ),
