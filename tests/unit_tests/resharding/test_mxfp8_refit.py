@@ -17,6 +17,7 @@ from megatron.core.resharding.refit import (
 )
 from megatron.core.resharding.transforms import MXFP8ReshardTransform
 from megatron.core.resharding.utils import ReshardPlan, TransferOp
+from tests.unit_tests.test_utilities import Utils
 
 _IS_BLACKWELL = torch.cuda.is_available() and (torch.cuda.get_device_properties(0).major >= 10)
 
@@ -723,8 +724,10 @@ class TestMXFP8RefitIntegration:
             assert torch.equal(actual.data, expected.data)
             assert torch.equal(actual.scale, expected.scale)
 
-    def test_public_refit_repeats_and_rebinds_equivalent_destination(self):
+    def test_public_refit_repeats_and_rebinds_equivalent_destination(self, request):
         """A-B-C-A updates and a replacement target match fresh MXFP8 loads."""
+        Utils.initialize_model_parallel(1, 1)
+        request.addfinalizer(Utils.destroy_model_parallel)
 
         class TinyModel(torch.nn.Module):
             def __init__(self, seed, *, quantized):

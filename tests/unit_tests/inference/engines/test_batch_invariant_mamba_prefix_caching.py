@@ -230,8 +230,12 @@ class TestBatchInvariantMambaPrefixCaching:
                         termination_id=-1,
                     ),
                 )
-                pre_refit_result = engine.step_modern()
-                assert not pre_refit_result["finished_requests"]
+                # The first async step primes old-weight logits. The second
+                # consumes that result into resident state and launches the
+                # next old-weight forward that must be invalidated by refit.
+                for _ in range(2):
+                    pre_refit_result = engine.step_modern()
+                    assert not pre_refit_result["finished_requests"]
                 assert engine.controller._async_sched_forward.is_valid
                 resident = engine.get_request(5999)
                 assert resident.finished_chunk_token_count > 0 or resident.generated_tokens
