@@ -451,18 +451,13 @@ class InferenceClient:
 
     def _send_abort(self, request_id: int) -> None:
         request_id = int(request_id)
+        if (
+            request_id not in self._pending_source_requests
+            or request_id in self.aborted_request_ids
+        ):
+            return
         stream = self.streams.pop(request_id, None)
         future = self.completion_futures.pop(request_id, None)
-        abort_future = self.abort_futures.get(request_id)
-        if stream is None and future is None and abort_future is None:
-            # Already completed (or never submitted): _submit_request and
-            # _submit_stream register synchronously and _recv_task pops only
-            # immediately before delivering, so absence from both means the
-            # reply has been consumed. No further ENGINE_REPLY will arrive to
-            # prune aborted_request_ids, and the coordinator has already
-            # dropped its mapping, so recording the id would leak an entry
-            # nothing ever removes and the ABORT_REQUEST send would be wasted.
-            return
         if stream is not None:
             stream.finish(exception=InferenceRequestAborted("Inference request cancelled"))
         if future is not None and not future.done():
@@ -626,10 +621,12 @@ class InferenceClient:
                     stream = self.streams.pop(request_id, None)
                     if stream is not None:
                         stream.finish(exception=error)
-                        continue
-                    future = self.completion_futures.pop(request_id, None)
-                    if future is not None and not future.done():
-                        future.set_exception(error)
+                    else:
+                        future = self.completion_futures.pop(request_id, None)
+                        if future is not None and not future.done():
+                            future.set_exception(error)
+                    if not source_safe:
+                        self._send_abort(request_id)
                 elif header == Headers.REQUEST_ABORTED:
                     request_id, source_safe = int(data[1]), bool(data[2])
                     if source_safe:
