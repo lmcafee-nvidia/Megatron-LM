@@ -154,6 +154,11 @@ class ReshardPlan:
     send_ops: list[TransferOp]
     recv_ops: list[TransferOp]
     transform: Optional["ReshardTransform"] = None
+    # Weak target identity for transforms created automatically by refit. A
+    # caller-supplied transform leaves this unset and is never replaced.
+    _auto_transform_target_ref: object | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
     # Cache of persistent-buffer dtypes keyed by local destination module path.
     # Populated by _harmonize_buffer_dtypes on first call; reused thereafter to
     # skip the all_gather_object + named_modules() walks on the hot path.

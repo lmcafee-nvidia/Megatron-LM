@@ -7,6 +7,7 @@ import torch.distributed as dist
 
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TERowParallelLinear
 from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, _VisionCacheEntry
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mimo import MimoModel, MimoModelConfig
@@ -243,6 +244,46 @@ def _assert_refit(components, target, gathered):
         )
 
 
+def _run_llava_refit_witness(target):
+    """Execute all three refitted LLaVA components on a fixed multimodal history."""
+    if target is None:
+        return None, None
+    calls = {"vision": 0, "projection": 0, "language": 0}
+    observations = {}
+    handles = []
+
+    def observe(_module, _inputs, output, *, key):
+        calls[key] += 1
+        if key == "projection":
+            observations[key] = output.detach().clone()
+
+    for name, module in (
+        ("vision", target.vision_model),
+        ("projection", target.vision_projection),
+        ("language", target.language_model),
+    ):
+        handles.append(
+            module.register_forward_hook(lambda *args, key=name: observe(*args, key=key))
+        )
+    input_ids = torch.tensor([[1, target.image_token_index, 2, 3, 4, 5, 6, 7]], device="cuda")
+    with torch.no_grad():
+        output, _ = target(
+            images=torch.linspace(-1, 1, 3 * 32 * 32, device="cuda", dtype=torch.bfloat16).reshape(
+                1, 3, 32, 32
+            ),
+            input_ids=input_ids,
+            position_ids=torch.arange(8, device="cuda").unsqueeze(0),
+            attention_mask=None,
+            num_image_tiles=torch.ones(1, dtype=torch.int, device="cuda"),
+        )
+    for handle in handles:
+        handle.remove()
+    assert calls == {"vision": 1, "projection": 1, "language": 1}
+    assert output.shape[0] == 1 and output.shape[-1] == 256
+    assert torch.isfinite(output).all() and torch.isfinite(observations["projection"]).all()
+    return output.detach().clone(), observations["projection"]
+
+
 @pytest.mark.parametrize('wrapped', [False, True])
 @pytest.mark.parametrize('language_tp,vision_tp', [(2, 1), (1, 2)])
 @pytest.mark.parametrize('backend', ['nccl', 'gloo'])
@@ -270,6 +311,32 @@ def test_mimo_to_llava_repeated_refit(language_tp, vision_tp, backend, wrapped):
             wrapped,
         )
         prepare_swap_model_weights(source, target)
+        target_outputs = []
+        target_projections = []
+        _, cached_projection = _run_llava_refit_witness(target)
+        cache_engine = None
+        if target is not None:
+            cache_engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+            cache_engine.allow_stale_multimodal_embeddings = False
+            cache_engine.requests = {}
+
+        def cache_projection(projection):
+            if cache_engine is None:
+                return
+            cache_engine._vision_embedding_cache = {
+                "media": _VisionCacheEntry(
+                    embedding=projection,
+                    modality="image",
+                    imgs=torch.ones(1, device="cuda"),
+                    num_tiles=torch.ones(1, dtype=torch.int, device="cuda"),
+                    num_img_embeddings_per_tile=projection.shape[0],
+                    imgs_sizes=None,
+                    num_frames=None,
+                )
+            }
+            cache_engine._vision_embedding_cache_bytes = projection.untyped_storage().nbytes()
+
+        cache_projection(cached_projection)
         for update in range(3):
             if update == 2 and source is not None:
                 # Rebuild only training models; inference keeps its cached plan.
@@ -289,8 +356,26 @@ def test_mimo_to_llava_repeated_refit(language_tp, vision_tp, backend, wrapped):
                         for tensor in _tensor_state(module).values():
                             tensor.add_(1)
             expected = _collect_source_state(components)
+            if cache_engine is not None:
+                assert cache_engine._vision_embedding_cache["media"].embedding is cached_projection
+                cache_engine._invalidate_vision_state()
+                assert not cache_engine._vision_embedding_cache
+                assert cache_engine._vision_embedding_cache_bytes == 0
             swap_model_weights(source, target, backend)
             _assert_refit(components, target, expected)
+            output, cached_projection = _run_llava_refit_witness(target)
+            target_outputs.append(output)
+            target_projections.append(cached_projection)
+            cache_projection(cached_projection)
+        if target is not None:
+            assert all(
+                not torch.equal(left, right)
+                for left, right in zip(target_outputs, target_outputs[1:])
+            )
+            assert all(
+                not torch.equal(left, right)
+                for left, right in zip(target_projections, target_projections[1:])
+            )
     finally:
         clear_all_caches()
         for grid in (language_grid, image_grid, target_grid):
