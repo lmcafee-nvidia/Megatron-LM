@@ -305,20 +305,21 @@ class TestMXFP8ReshardTransform:
         class Namespace:
             _stack_mxfp8_linear_weight = InferenceGroupedMLP._stack_mxfp8_linear_weight
 
-        # FlashInfer's production routing kernel requires expert count to be
-        # divisible by four. Keep the fixture compact while exercising a valid
-        # routed-MoE configuration.
-        num_experts = 4
-        shapes = {"linear_fc1": (96, 128), "linear_fc2": (128, 96)}
+        # Match a production-supported FlashInfer configuration: the global
+        # expert count is divisible by four and this rank owns two experts.
+        # The SM100 runner has no tuning configuration for the earlier compact
+        # 96x128/16-token synthetic shape.
+        num_experts, num_local_experts = 8, 2
+        shapes = {"linear_fc1": (256, 256), "linear_fc2": (256, 256)}
         grouped_mlp = Namespace()
-        grouped_mlp.num_local_experts = num_experts
+        grouped_mlp.num_local_experts = num_local_experts
         grouped_mlp.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.FLASHINFER
         grouped_mlp._concatenated_weights_built = False
         buffers = {}
         for linear_name in ("linear_fc1", "linear_fc2"):
             linear = Namespace()
             setattr(grouped_mlp, linear_name, linear)
-            for expert_idx in range(num_experts):
+            for expert_idx in range(num_local_experts):
                 tensor = MXFP8Tensor.from_bf16(
                     torch.randn(*shapes[linear_name], dtype=torch.bfloat16, device="cuda"),
                     backend="triton",
@@ -336,9 +337,9 @@ class TestMXFP8ReshardTransform:
             grouped_mlp._fc1_weight.scale.data_ptr(),
             grouped_mlp._fc2_weight.scale.data_ptr(),
         )
-        hidden = torch.randn(16, 128, dtype=torch.bfloat16, device="cuda")
-        routing_map = torch.arange(16, device="cuda").remainder(num_experts).unsqueeze(1)
-        probs = torch.ones(16, 1, dtype=torch.float32, device="cuda")
+        hidden = torch.randn(512, 256, dtype=torch.bfloat16, device="cuda")
+        routing_map = torch.tensor([0, 1], device="cuda").expand(512, -1)
+        probs = torch.full((512, 2), 0.5, dtype=torch.float32, device="cuda")
         before = flashinfer_routed_mxfp8_moe(
             hidden,
             routing_map,
