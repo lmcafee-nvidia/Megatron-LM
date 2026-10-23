@@ -45,7 +45,7 @@ def _requests(context):
         SamplingParams(
             num_tokens_to_generate=4,
             termination_id=-1,
-            top_k=1,
+            top_k=2,
             return_log_probs=False,
             top_n_logprobs=0,
         ),
@@ -77,8 +77,10 @@ def _install_step_witnesses(env, runtime, step_index, vocab_size):
         if logits.shape[1] != tokens.shape[1]:
             tokens = tokens[:, context.active_logit_idxs[: logits.shape[1]]]
         next_tokens = torch.remainder(tokens + 1, vocab_size)
-        logits.zero_()
-        logits.scatter_(-1, next_tokens.unsqueeze(-1), 100.0)
+        logits.copy_(-torch.arange(vocab_size, device=logits.device, dtype=logits.dtype))
+        # A 40-logit gap makes the selected token effectively deterministic while
+        # retaining a normal-range second probability for the top-k=2 support oracle.
+        logits.scatter_(-1, next_tokens.unsqueeze(-1), 40.0)
         runtime[("model", step_index[0], request_ids)] += 1
         return logits
 
@@ -101,6 +103,9 @@ def _install_step_witnesses(env, runtime, step_index, vocab_size):
         request_ids = tuple(_active_request_ids(context))
         result = original_scores(*args, **kwargs)
         runtime[("scores", step_index[0], request_ids)] += 1
+        runtime[("score-support", step_index[0], request_ids)] = tuple(
+            torch.isfinite(result).sum(dim=-1).tolist()
+        )
         return result
 
     sampler.log_probs_kernel = traced_scores
@@ -214,6 +219,15 @@ class TestSamplingOutputMatrix(RequestLifecyclePairwiseBase):
             if isinstance(key, tuple) and key[0] == "scores" and set(key[2]) == {0, 1, 2}
         }
         assert model_steps & sample_steps & score_steps
+        survivor_score_support = {
+            value
+            for key, value in runtime.items()
+            if isinstance(key, tuple)
+            and key[0] == "score-support"
+            and key[2] == (0, 2)
+            and len(value) == 2
+        }
+        assert (1, 2) in survivor_score_support
         if mode == AsyncScheduleMode.ASYNC:
             assert runtime[("compact", (0, 2))] > 0
 
