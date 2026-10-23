@@ -1495,7 +1495,7 @@ class InferenceTopKRouter(TopKRouter):
             dense_output=True,
             precomputed_indices=precomputed_indices,
         )
-        return probs.squeeze(1), top_indices.squeeze(1)
+        return probs, top_indices
 
     def forward(
         self,
