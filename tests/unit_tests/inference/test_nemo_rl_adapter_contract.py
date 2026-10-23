@@ -418,6 +418,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         engine._vision_embedding_cache = OrderedDict()
         engine._vision_embedding_cache_bytes = 0
         engine._weight_epoch = 0
+        engine.requests = {}
 
         def build_request(request_id, media_data):
             payload = media_data[modality]
