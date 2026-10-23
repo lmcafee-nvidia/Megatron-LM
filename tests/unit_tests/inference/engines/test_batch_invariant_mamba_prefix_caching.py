@@ -32,6 +32,7 @@ from megatron.core.resharding.refit import (
     swap_model_weights,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.attention import HAVE_FA3, HAVE_FA4
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     set_batch_invariant_mode,
@@ -43,12 +44,39 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.inference.engines.ssm_test_helpers import (
     skip_if_sequence_packing_not_available,
 )
-from tests.unit_tests.models.test_gpt_model_batch_invariant import (
-    HAVE_FA3,
-    HAVE_FA4,
-    DummyTokenizer,
-)
 from tests.unit_tests.test_utilities import Utils
+
+
+class DummyTokenizer:
+    """Minimal tokenizer for the self-contained inference lifecycle fixture."""
+
+    def __init__(self, vocab_size: int, bos: int | None = None, eod: int = 0, pad: int = 0):
+        self.vocab_size = vocab_size
+        self.bos = bos
+        self.eod = eod
+        self.pad = pad
+
+    def tokenize(self, prompt):
+        if isinstance(prompt, str):
+            return [int(token) % self.vocab_size for token in prompt.strip().split()]
+        return list(prompt)
+
+    def detokenize(self, tokens, skip_special_tokens: bool = False):
+        if isinstance(tokens, torch.Tensor):
+            tokens = tokens.tolist()
+        if skip_special_tokens:
+            tokens = [token for token in tokens if token != self.eod]
+        return " ".join(str(token) for token in tokens)
+
+    def offsets(self, tokens, text):
+        del text
+        if isinstance(tokens, torch.Tensor):
+            tokens = tokens.tolist()
+        offsets, cursor = [], 0
+        for token in tokens:
+            offsets.append(cursor)
+            cursor += len(str(token)) + 1
+        return offsets
 
 
 @pytest.mark.internal
