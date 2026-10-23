@@ -931,6 +931,7 @@ class DynamicEngineTestConfig:
     return_log_probs: bool = False
     top_n_logprobs: int = 0
     logprobs_mode: str = "raw_logprobs"
+    request_metadata_types: Optional[List[Tuple[str, torch.dtype]]] = None
     materialize_only_last_token_logits: bool = True
     skip_prompt_log_probs: bool = False
     enable_chunked_prefill: bool = False
@@ -1160,6 +1161,7 @@ class DynamicInferenceEngineTestBase:
                 offset_sampling_seed_by_dp_rank=test_config.offset_sampling_seed_by_dp_rank,
                 async_sched_mode=test_config.async_sched_mode,
                 logprobs_mode=test_config.logprobs_mode,
+                request_metadata_types=test_config.request_metadata_types,
             ),
         )
 
