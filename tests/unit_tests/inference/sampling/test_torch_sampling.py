@@ -23,10 +23,10 @@ def _make_context(temperature, top_k, top_p, *, paused_request_count=0):
 class TestLogProbsKernelDtype:
     """Regression test for the fp32 log-probs precision fix.
 
-    `log_probs_kernel` computes `torch.log_softmax(..., dtype=torch.float32)`
+    `log_probs_kernel` computes temperature scaling and log-softmax in float32
     specifically to avoid the tail erosion low precision causes on wide
     vocabularies. The returned tensor must stay fp32 even when the caller's
-    raw logits are bf16/fp16 -- allocating the output buffer with
+    raw logits are bf16/fp16 -- scaling them in place or allocating the output buffer with
     `torch.empty_like(logits)` would silently downcast the fp32 result back
     to the logits dtype on assignment and defeat the fix.
     """
@@ -38,7 +38,7 @@ class TestLogProbsKernelDtype:
         num_rows = 4
 
         logits = torch.randn(num_rows, vocab_size, dtype=logits_dtype)
-        temperature = torch.ones(num_rows)
+        temperature = torch.tensor([0.5, 0.75, 1.25, 2.0])
         top_k = torch.zeros(num_rows, dtype=torch.long)
         top_p = torch.zeros(num_rows)
 
@@ -50,9 +50,9 @@ class TestLogProbsKernelDtype:
         assert log_probs.dtype == torch.float32
         assert log_probs.shape == (num_rows, vocab_size)
 
-        # The fp32 result should match computing log_softmax directly on the
-        # fp32-upcast logits -- not the (lossy) low-precision computation.
-        expected = torch.log_softmax(logits.float(), dim=-1)
+        # The fp32 result should match scaling and normalizing the fp32-upcast
+        # logits -- not quantizing temperature division in the input dtype.
+        expected = torch.log_softmax(logits.float() / temperature.unsqueeze(1), dim=-1)
         torch.testing.assert_close(log_probs, expected)
 
     def test_low_precision_logits_do_not_collapse_tail_precision(self):
