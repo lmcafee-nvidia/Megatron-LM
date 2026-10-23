@@ -239,13 +239,14 @@ class TestBatchInvariantMambaPrefixCaching:
                 assert {
                     name: parameter.data_ptr() for name, parameter in target_parameters.items()
                 } == target_storage
-                engine.resume()
-                assert engine.controller._async_sched_forward.is_valid is pending_survived_suspend
+                assert pending_survived_suspend is (
+                    kv_cache_management_mode != KVCacheManagementMode.RECOMPUTE
+                )
 
                 # Drive the same epoch message used by the RL coordinator.  The
                 # pending logits above came from the old weights and must not be
-                # sampled after the real transfer, even when suspend preserved
-                # their backing buffers.
+                # sampled after the real transfer. Production sends this while
+                # suspended and only then resumes the inference engine.
                 engine.is_mp_coordinator = True
                 engine.socket_for_receiving_requests = mock.Mock()
                 engine.model_parallel_publisher_socket = mock.Mock()
@@ -260,6 +261,8 @@ class TestBatchInvariantMambaPrefixCaching:
                     engine.get_request(request_id).policy_epoch[-1][1] == 1
                     for request_id in (5999, 6000)
                 )
+                engine.resume()
+                assert not engine.controller._async_sched_forward.is_valid
                 assert queued.block_hash_salt != old_salt
                 assert engine.get_request(5999).block_hash_salt == resident_salt
                 skipped_before_refit_request = engine._prefill_tokens_skipped
