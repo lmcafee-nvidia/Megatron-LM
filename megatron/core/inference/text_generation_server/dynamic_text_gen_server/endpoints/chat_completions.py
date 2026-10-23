@@ -1355,6 +1355,11 @@ try:
             abort_requests(client, request_ids, "client disconnected")
             raise
         except Exception as e:
+            # gather returns as soon as one request raises, but does not cancel
+            # the remaining engine work. Abort every admitted request: completed
+            # IDs are harmless no-ops at the client, while pending siblings
+            # would otherwise keep generating after this HTTP response ends.
+            abort_requests(client, request_ids, f"inference failed: {e}")
             logger.error(f"Error during inference: {e}")
             return Response(f"Error during inference: {e}", status=500)
 
