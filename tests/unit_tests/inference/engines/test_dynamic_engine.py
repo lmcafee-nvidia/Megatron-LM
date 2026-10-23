@@ -3498,7 +3498,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         del baseline
         gc.collect()
         torch.cuda.empty_cache()
-
         rank = torch.distributed.get_rank()
         control_group = torch.distributed.new_group(backend="gloo")
         env = self._build_test_env(config, engine_cls=StateHandoffDynamicInferenceEngine)
@@ -3511,7 +3510,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         torch.distributed.barrier()  # Initialize the default NCCL communicator before P2P.
         expert_count = {"count": 0}
         count_experts(env, expert_count)
-
         payload = [None]
         if rank == 0:
             request = env.requests[0]
@@ -3528,7 +3526,11 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             assert env.engine.pinned_handoff_block_count == 2
         torch.distributed.broadcast_object_list(payload, src=0, group=control_group)
         handoff = payload[0]
-
+        ready = torch.empty(1, dtype=torch.int32)
+        if rank == 1:
+            env.engine._notify_kv_transfer_ready = lambda *_: torch.distributed.send(
+                ready, 0, group=control_group
+            )
         future = None
         if rank == 1:
             future = env.engine.add_request_with_kv_handoff(
@@ -3539,9 +3541,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 handoff["block_ids"],
             )
             assert env.engine.pending_kv_import_count == 1
-        torch.distributed.barrier(group=control_group)
-
         if rank == 0:
+            torch.distributed.recv(ready, 1, group=control_group)
             env.engine.push_handoff_kv(handoff["request_id"], [peer_metas[1]])
             assert env.engine.pending_kv_push_count == 1
             for handle in env.engine._pending_kv_pushes[0][1]:
@@ -3560,7 +3561,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             assert future.done() and future.result().generated_tokens == expected
             assert env.engine.pending_kv_import_count == 0
             assert env.engine.context.total_request_count == 0
-
         receipts = [None, None]
         torch.distributed.all_gather_object(
             receipts,
