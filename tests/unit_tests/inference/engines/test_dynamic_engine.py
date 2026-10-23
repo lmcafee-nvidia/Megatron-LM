@@ -950,7 +950,7 @@ class _FastEndpointTokenizer:
         self.eos_id = 99
 
     def tokenize(self, text):
-        return self._tokenizer.tokenizer.encode(text, add_special_tokens=False).ids
+        return self._tokenizer.tokenizer.encode(text, add_special_tokens=False)
 
     def detokenize(self, tokens, **kwargs):
         tokens = list(tokens)
