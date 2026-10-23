@@ -245,7 +245,8 @@ async def _drive_engine(engine, futures, witness=None):
     """Run the real dynamic engine until all submitted requests complete."""
     step_count = 0
     while not all(future.done() for future in futures):
-        await engine.async_step()
+        with torch.inference_mode():
+            await engine.async_step()
         step_count += 1
         if witness is not None:
             witness["chunked_prefill_steps"] += int(engine.context.chunked_prefill_request_id >= 0)
@@ -1602,7 +1603,9 @@ def test_real_noncolocated_consumer_refit_then_adapter_output():
     refitter = object.__new__(refit_cls)
     refitter.model = source_model if rank < 2 else target_model
     refitter.refit_execution_batch_bytes = None
-    refitter.refit_dst_rank_offset = 2
+    # The destination PGC already records global ranks 2-3. NeMo-RL applies an
+    # offset only when its source and destination use independent rank worlds.
+    refitter.refit_dst_rank_offset = 0
     with pytest.raises(RuntimeError, match="was not initialized"):
         refitter.swap_weights_via_reshard(is_source=rank < 2)
     refitter.refit_execution_batch_bytes = 1 << 20
