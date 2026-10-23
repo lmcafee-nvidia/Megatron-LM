@@ -326,9 +326,9 @@ def test_streaming_chat_parser_emits_structured_stable_tool_call_deltas():
     assert all(tool_call["index"] == 0 for tool_call in tool_deltas)
     assert (
         parser.finish_reason(
-            {"generated_tokens": [1], "sampling_params": {"num_tokens_to_generate": 2}}
+            {"generated_tokens": [1, 2], "sampling_params": {"num_tokens_to_generate": 2}}
         )
-        == "tool_calls"
+        == "length"
     )
 
 
@@ -501,6 +501,38 @@ def test_huggingface_fast_incremental_detokenizer_drops_eos_and_special_map_toke
     streamed_text = "".join(detokenizer.update([token_id]) for token_id in token_ids)
 
     assert streamed_text == "<think>x</think>ab"
+
+
+@pytest.mark.parametrize("remove_eos", [False, True])
+def test_huggingface_fast_incremental_detokenizer_matches_trailing_eos_policy(remove_eos):
+    tokenizer, huggingface_tokenizer = _with_chat_markers(eos_marker="<|im_end|>")
+    token_ids = huggingface_tokenizer.encode(
+        "a<|im_end|>b<|im_end|>", add_special_tokens=False
+    )
+    detokenizer = HuggingFaceFastIncrementalDetokenizer(
+        tokenizer, [], remove_eos=remove_eos
+    )
+
+    streamed_text = detokenizer.update(token_ids) + detokenizer.finish()
+    expected_tokens = token_ids[:-1] if remove_eos else token_ids
+
+    assert streamed_text == _non_streaming_text(huggingface_tokenizer, expected_tokens)
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_rejects_clean_termination_without_a_final_record():
+    stream = AsyncStream(request_id=1, cancel=lambda: None)
+    stream.finish()
+
+    records = [
+        record
+        async for record in openai_stream(
+            [stream], _Tokenizer(), [_IncrementalDetokenizer()], chat=False
+        )
+    ]
+
+    assert records[-1] != "data: [DONE]\n\n"
+    assert "error" in json.loads(records[-1].removeprefix("data: "))
 
 
 def test_incremental_detokenizer_rejects_unsupported_tokenizer():

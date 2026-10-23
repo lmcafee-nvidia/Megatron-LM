@@ -148,6 +148,58 @@ class TestLifecycleGuards:
         assert await llm._generate_impl(["hello"], MagicMock()) == [request]
         request.finalize_text.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_cancelled_coordinator_generation_aborts_every_submitted_request(self):
+        """Cancelling a batch must not leave any sibling generating remotely."""
+        llm = _make_worker_instance(MegatronAsyncLLM)
+        llm._is_primary_rank = True
+        futures = [asyncio.get_running_loop().create_future() for _ in range(2)]
+
+        class Client:
+            def __init__(self):
+                self.submitted = 0
+                self.aborted = []
+
+            def add_request(self, *_args, **_kwargs):
+                future = futures[self.submitted]
+                self.submitted += 1
+                return future
+
+            def add_request_with_id(self, *_args, **_kwargs):
+                index = self.submitted
+                self.submitted += 1
+                return 40 + index, futures[index]
+
+            def abort_request(self, request_id):
+                self.aborted.append(request_id)
+
+        client = Client()
+        llm._coord_runtime = MagicMock()
+        llm._coord_runtime.client = client
+        task = asyncio.create_task(llm._generate_impl(["a", "b"], MagicMock()))
+        await asyncio.sleep(0)
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert client.aborted == [40, 41]
+
+    @pytest.mark.asyncio
+    async def test_runtime_teardown_stops_client_when_shutdown_signal_fails(self):
+        runtime = base_mod._CoordinatorRuntime.__new__(base_mod._CoordinatorRuntime)
+        runtime._is_primary = True
+        runtime._engine = MagicMock()
+        runtime._client = MagicMock()
+        runtime._client.shutdown_coordinator.side_effect = RuntimeError("coordinator gone")
+        client = runtime._client
+
+        with pytest.raises(RuntimeError, match="coordinator gone"):
+            await runtime.teardown()
+
+        client.stop.assert_called_once_with()
+        assert runtime._client is None
+
     def test_bridge_and_serve_raise_in_direct_mode(self, mock_pipeline, fake_model_and_tokenizer):
         model, tok = fake_model_and_tokenizer
         llm = MegatronLLM(model=model, tokenizer=tok, use_coordinator=False)

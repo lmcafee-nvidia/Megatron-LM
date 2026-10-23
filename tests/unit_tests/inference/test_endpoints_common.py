@@ -889,12 +889,13 @@ async def test_streaming_fans_out_and_reports_usage_on_request(path, include_usa
     assert sorted(choice["index"] for choice in finals) == [0, 1, 2]
     assert all(choice["generated_text"] == "<12><13>" for choice in finals)
     usage = [p["usage"] for p in payloads if "usage" in p]
+    prompt_tokens = 2 if path == CHAT_PATH else 6
     assert usage == (
         [
             {
-                "prompt_tokens": 2,
+                "prompt_tokens": prompt_tokens,
                 "completion_tokens": 6,
-                "total_tokens": 8,
+                "total_tokens": prompt_tokens + 6,
                 "prompt_tokens_details": {"cached_tokens": 0},
             }
         ]
@@ -902,3 +903,51 @@ async def test_streaming_fans_out_and_reports_usage_on_request(path, include_usa
         else []
     )
     assert client.aborted == []
+
+
+@pytest.mark.asyncio
+@PATHS
+async def test_streaming_partial_admission_failure_aborts_admitted_work(
+    path, monkeypatch
+):
+    class PartiallyFailingClient(ReplyingClient):
+        def add_request_streaming(
+            self, prompt_tokens, sampling_params, *, multi_modal_data=None, offload_params=None
+        ):
+            if len(self.prompt_tokens) == 2:
+                raise RuntimeError("zmq send failed")
+            self.prompt_tokens.append(list(prompt_tokens))
+            self.sampling_params.append(sampling_params)
+            self.multi_modal_data.append(multi_modal_data)
+            self.offload_params.append(offload_params)
+            request_id = len(self.prompt_tokens)
+            self.streamed.append(request_id)
+            return AsyncStream(
+                request_id=request_id, cancel=lambda request_id=request_id: self.aborted.append(request_id)
+            )
+
+    client = PartiallyFailingClient()
+    app = build_streaming_app(path, client, monkeypatch)
+
+    response = await app.test_client().post(
+        path, json={**FAN_OUT_BODIES[path], "stream": True}
+    )
+
+    assert response.status_code == 500
+    assert await response.get_data(as_text=True) == "Error submitting request: zmq send failed"
+    assert client.aborted == [1, 2]
+
+
+@pytest.mark.asyncio
+@PATHS
+async def test_malformed_stream_options_is_rejected_before_submission(path, monkeypatch):
+    client = ReplyingClient()
+    app = build_streaming_app(path, client, monkeypatch)
+
+    response = await app.test_client().post(
+        path,
+        json={**BODIES[path], "stream": True, "stream_options": ["include_usage"]},
+    )
+
+    assert response.status_code == 400
+    assert client.prompt_tokens == []
