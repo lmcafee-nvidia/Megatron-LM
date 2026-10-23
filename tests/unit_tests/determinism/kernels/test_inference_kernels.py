@@ -251,12 +251,18 @@ def test_mxfp8_quantize_replays():
 
     seeded()
     x = torch.randn(16384, 8192, device="cuda", dtype=torch.bfloat16)
+    x[0, :32] = torch.finfo(torch.float32).tiny / 4
+    x[1, :32] = 0
 
     def fn(x):
         data, scale = mxfp8_quantize(x)
         return data.view(torch.uint8), scale.view(torch.uint8)
 
     assert_replays_bit_exact(fn, (x,), backward=False, what="mxfp8_quantize")
+    data, scale = fn(x)
+    assert scale[0].item() == 0  # E8M0 byte zero is the finite 2**-127 scale.
+    assert torch.count_nonzero(data[0, :32]) == 32
+    assert torch.count_nonzero(data[1, :32]) == 0
 
 
 @pytest.mark.skipif(not hasattr(torch, "float8_e8m0fnu"), reason="needs torch float8 e8m0 dtype")
