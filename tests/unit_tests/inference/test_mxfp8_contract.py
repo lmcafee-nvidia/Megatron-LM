@@ -308,6 +308,15 @@ def test_validation_rejects_noncontiguous_storage():
     with pytest.raises(ValueError, match="data must be contiguous"):
         validate_mxfp8_tensor(invalid)
 
+    strided_scale = torch.empty(
+        quantized.scale.numel() * 2, device="cuda", dtype=torch.float8_e8m0fnu
+    )[::2]
+    invalid = MXFP8Tensor(
+        data=quantized.data, scale=strided_scale, backend="triton", dtype=torch.bfloat16
+    )
+    with pytest.raises(ValueError, match="scale must be contiguous"):
+        validate_mxfp8_tensor(invalid)
+
     cpu_scale = quantized.scale.view(torch.uint8).cpu().view(torch.float8_e8m0fnu)
     cross_device = MXFP8Tensor(
         data=quantized.data, scale=cpu_scale, backend="triton", dtype=torch.bfloat16
