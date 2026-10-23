@@ -448,9 +448,12 @@ class TestBatchInvariantMambaPrefixCaching:
             KVCacheManagementMode.RECOMPUTE,
         ],
     )
+    @pytest.mark.parametrize("chunked", [False, True])
     @torch.inference_mode()
-    def test_refit_across_reallocating_cache_lifecycle(self, kv_cache_management_mode, monkeypatch):
-        """A real refit remains observable across every cache lifecycle mode."""
+    def test_refit_across_reallocating_cache_lifecycle(
+        self, kv_cache_management_mode, chunked, monkeypatch
+    ):
+        """A real refit remains observable across cache lifecycle and chunking modes."""
         monkeypatch.setenv("MAMBA_DETERMINISTIC", "1")
         monkeypatch.setenv("NVTE_FLASH_ATTN", "1")
         monkeypatch.setenv("NVTE_FUSED_ATTN", "0")
@@ -459,7 +462,7 @@ class TestBatchInvariantMambaPrefixCaching:
             self._run(
                 prefix=True,
                 graphs=True,
-                chunked=False,
+                chunked=chunked,
                 kv_cache_management_mode=kv_cache_management_mode,
             )
 
