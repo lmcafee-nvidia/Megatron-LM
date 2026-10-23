@@ -419,7 +419,7 @@ def test_bounded_flashinfer_mxfp8_executes_live_prefix_into_fp32_output(monkeypa
 
     torch.manual_seed(4321)
     full_rows, token_capacity = 128, 37
-    num_experts, hidden_size, intermediate_size, topk = 2, 256, 256, 2
+    num_experts, hidden_size, intermediate_size, topk = 4, 256, 256, 2
     fc1_weight = _prepare_routed_mxfp8_weight(
         torch.randn(
             num_experts, intermediate_size, hidden_size, device="cuda", dtype=torch.bfloat16
