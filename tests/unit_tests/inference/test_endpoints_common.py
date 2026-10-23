@@ -610,11 +610,11 @@ async def test_include_stop_str_in_output_keeps_the_stop_sequence_in_the_respons
                 [
                     completed_reply("req-0", [10, 11], [12]),
                     ValueError("boom"),
-                    completed_reply("req-2", [10, 11], [12]),
+                    PENDING,
                 ]
             ),
             "Error during inference: boom",
-            [],
+            [1, 2, 3],
             id="engine-error",
         ),
     ],
