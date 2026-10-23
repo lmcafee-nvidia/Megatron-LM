@@ -212,13 +212,15 @@ class TestBatchInvariantMambaPrefixCaching:
 
             engine.controller._sampling.sample_kernel = observe_flashinfer_sampling
         graph_recaptures = 0
+        graph_recapture_reset_context = []
         if graphs and kv_cache_management_mode != KVCacheManagementMode.PERSIST:
             create_cuda_graphs = engine.create_cuda_graphs
 
-            def observe_graph_recapture():
+            def observe_graph_recapture(*args, **kwargs):
                 nonlocal graph_recaptures
                 graph_recaptures += 1
-                return create_cuda_graphs()
+                graph_recapture_reset_context.append(kwargs.get("reset_context", True))
+                return create_cuda_graphs(*args, **kwargs)
 
             engine.create_cuda_graphs = observe_graph_recapture
         prompts = [[i % 120 + 1 for i in range(n)] for n in (600, 650, 512, 513, 768, 769)]
@@ -409,6 +411,9 @@ class TestBatchInvariantMambaPrefixCaching:
             assert graph_steps > 0
             if kv_cache_management_mode != KVCacheManagementMode.PERSIST:
                 assert graph_recaptures == 1
+                assert graph_recapture_reset_context == [
+                    kv_cache_management_mode != KVCacheManagementMode.OFFLOAD
+                ]
         del engine, context, model, source_model, target_core, source_core
         clear_all_caches()
         delete_cuda_graphs()
