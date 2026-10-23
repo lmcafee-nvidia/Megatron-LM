@@ -20,7 +20,15 @@ from tests.unit_tests.inference.engines.request_lifecycle_test_utils import (
 )
 
 
-def _requests(context):
+class _ReorderedMetadataRequest(DynamicInferenceRequest):
+    """Exercise a supported non-default schema without changing field semantics."""
+
+    @staticmethod
+    def get_metadata_types():
+        return list(reversed(DynamicInferenceRequest.get_metadata_types()))
+
+
+def _requests(context, request_type=DynamicInferenceRequest):
     policies = (
         SamplingParams(
             num_tokens_to_generate=6,
@@ -52,7 +60,7 @@ def _requests(context):
     )
     prompts = ([8, 9, 10], [18, 19, 20], [28, 29, 30])
     return [
-        DynamicInferenceRequest(
+        request_type(
             request_id=request_id,
             prompt_tokens=torch.tensor(prompt, dtype=torch.int64, device="cuda"),
             sampling_params=policies[request_id],
@@ -82,6 +90,10 @@ def _install_step_witnesses(env, runtime, step_index, vocab_size):
         # retaining a normal-range second probability for the top-k=2 support oracle.
         logits.scatter_(-1, next_tokens.unsqueeze(-1), 40.0)
         runtime[("model", step_index[0], request_ids)] += 1
+        runtime[("metadata", step_index[0], request_ids)] = {
+            label: tuple(context.active_request_metadata[label][: len(request_ids)].tolist())
+            for label, _ in context.request_metadata_types
+        }
         return logits
 
     model.forward = deterministic_forward
@@ -149,19 +161,25 @@ def _assert_scores(request):
 
 class TestSamplingOutputMatrix(RequestLifecyclePairwiseBase):
     @classmethod
-    def _run_mode(cls, mode, sampling_backend):
+    def _run_mode(cls, mode, sampling_backend, request_type=DynamicInferenceRequest):
         if sampling_backend == "flashinfer":
             pytest.importorskip("flashinfer")
+        request_metadata_types = request_type.get_metadata_types()
+        configured_metadata_types = (
+            None if request_type is DynamicInferenceRequest else request_metadata_types
+        )
         config, env = cls._manual_env(
             async_sched_mode=mode,
             sampling_backend=sampling_backend,
             logprobs_mode="processed_logprobs",
             materialize_only_last_token_logits=False,
+            request_metadata_types=configured_metadata_types,
             vocab_size=64,
         )
         engine = env.engine
         assert engine.controller._sampling_backend == sampling_backend
-        requests = _requests(engine.context)
+        assert engine.context.request_metadata_types == request_metadata_types
+        requests = _requests(engine.context, request_type)
         futures = [engine._add_request(request) for request in requests]
         runtime = Counter()
         step_index = [-1]
@@ -245,6 +263,22 @@ class TestSamplingOutputMatrix(RequestLifecyclePairwiseBase):
             and len(value) == 2
         }
         assert (1, 2) in survivor_score_support
+        survivor_metadata = [
+            values
+            for key, values in runtime.items()
+            if isinstance(key, tuple) and key[0] == "metadata" and key[2] == (0, 2)
+        ]
+        expected_survivor_metadata = {
+            "temperature": (1.0, 1.0),
+            "top_k": (1, 2),
+            "top_p": (1.0, 1.0),
+            "termination_id": (-1, -1),
+            "return_log_probs": (True, False),
+            "skip_prompt_log_probs": (False, False),
+            "top_n_logprobs": (3, 0),
+            "seed": (-1, -1),
+        }
+        assert expected_survivor_metadata in survivor_metadata
         if mode == AsyncScheduleMode.ASYNC:
             compact_steps = {
                 key[1]
@@ -299,3 +333,16 @@ class TestSamplingOutputMatrix(RequestLifecyclePairwiseBase):
                     assert sorted(actual_row.values()) == pytest.approx(
                         sorted(expected_row.values()), abs=1.0e-4
                     )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="real dynamic engine requires CUDA")
+    @torch.inference_mode()
+    def test_custom_metadata_schema_survives_gpu_compaction(self):
+        """A configured non-default schema stays aligned through live GPU compaction."""
+        legacy = self._run_mode(
+            AsyncScheduleMode.LEGACY, "torch", request_type=_ReorderedMetadataRequest
+        )
+        asynchronous = self._run_mode(
+            AsyncScheduleMode.ASYNC, "torch", request_type=_ReorderedMetadataRequest
+        )
+        assert asynchronous == legacy
