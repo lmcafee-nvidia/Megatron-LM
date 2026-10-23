@@ -188,9 +188,7 @@ class TestBatchInvariantMambaPrefixCaching:
                 # PERSIST naturally retains graph addresses. OFFLOAD and
                 # RECOMPUTE deliberately exercise deallocation/reallocation
                 # without requiring the optional torch-memory-saver runtime.
-                static_kv_memory_pointers=(
-                    kv_cache_management_mode == KVCacheManagementMode.PERSIST
-                ),
+                static_kv_memory_pointers=False,
                 use_flashinfer_fused_rope=False,
                 unified_memory_level=0,
                 sampling_backend=sampling_backend,
