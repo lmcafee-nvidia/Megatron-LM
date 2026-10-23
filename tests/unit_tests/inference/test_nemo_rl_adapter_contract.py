@@ -1559,6 +1559,7 @@ def test_real_noncolocated_consumer_refit_then_adapter_output():
         "nemo_rl.models.generation.megatron.megatron_worker"
     ).MegatronGenerationRefitMixin
     Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
     rank = torch.distributed.get_rank()
     source_pgs = build_inference_pg_collection(world_size=2, tp_size=1, rank_offset=0)
     target_pgs = build_inference_pg_collection(world_size=2, tp_size=1, rank_offset=2)
