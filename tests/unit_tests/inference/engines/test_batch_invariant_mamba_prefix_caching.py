@@ -320,7 +320,15 @@ class TestBatchInvariantMambaPrefixCaching:
                     engine.resume()
                     assert not engine.controller._async_sched_forward.is_valid
                     assert queued.block_hash_salt != old_salt
-                    assert engine.get_request(5999).block_hash_salt == resident_salt
+                    resumed_resident_salt = engine.get_request(5999).block_hash_salt
+                    if kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
+                        # RECOMPUTE discards the resident's old KV and re-admits it from
+                        # its checkpoint, so every token now belongs to the new generation.
+                        assert resumed_resident_salt != resident_salt
+                        assert resumed_resident_salt == queued.block_hash_salt
+                    else:
+                        # PERSIST/OFFLOAD retain old-generation KV and its cache identity.
+                        assert resumed_resident_salt == resident_salt
                     if kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
                         assert context.request_ids[: context.total_request_count].tolist() == [5999]
                         assert context.mamba_metadata.request_to_mamba_state_idx[0] >= 0
