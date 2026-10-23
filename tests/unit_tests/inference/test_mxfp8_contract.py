@@ -334,13 +334,16 @@ def test_validation_rejects_noncontiguous_storage():
         validate_mxfp8_tensor(cross_device)
 
 
-def test_validation_rejects_unswizzled_triton_scale_layout():
-    """A logical 2D scale cannot be passed to scaled_mm as pre-swizzled storage."""
+@pytest.mark.parametrize(
+    ("backend", "scale_dtype"), (("triton", torch.float8_e8m0fnu), ("flashinfer", torch.uint8))
+)
+def test_validation_rejects_unswizzled_scale_layout(backend, scale_dtype):
+    """A logical 2D scale cannot be passed to either GEMM as swizzled storage."""
     data = torch.empty((64, 128), device="cuda", dtype=torch.float8_e4m3fn)
-    logical_scale = torch.empty((64, 4), device="cuda", dtype=torch.float8_e8m0fnu)
-    tensor = MXFP8Tensor(data=data, scale=logical_scale, backend="triton", dtype=torch.bfloat16)
+    logical_scale = torch.empty((64, 4), device="cuda", dtype=scale_dtype)
+    tensor = MXFP8Tensor(data=data, scale=logical_scale, backend=backend, dtype=torch.bfloat16)
 
-    with pytest.raises(ValueError, match="SWIZZLE_32_4_4"):
+    with pytest.raises(ValueError, match="1D swizzled storage"):
         validate_mxfp8_tensor(tensor)
 
 

@@ -105,33 +105,20 @@ def validate_mxfp8_tensor(
             f"got {cols}."
         )
     scale_cols = cols // MXFP8_BLOCK_SIZE
-    if backend == "triton" and tensor.scale.ndim != 1:
+    if tensor.scale.ndim != 1:
         raise ValueError(
-            f"{tensor_name} scales for backend 'triton' must use 1D "
-            "SWIZZLE_32_4_4 storage; "
+            f"{tensor_name} scales for backend {backend!r} must use 1D "
+            "swizzled storage; "
             f"got shape {tuple(tensor.scale.shape)}."
         )
-    if tensor.scale.ndim == 2:
-        expected_scale_shape = (rows, scale_cols)
-        if tuple(tensor.scale.shape) != expected_scale_shape:
-            raise ValueError(
-                f"{tensor_name} 2D scale has shape {tuple(tensor.scale.shape)}; "
-                f"expected {expected_scale_shape} for data shape {tuple(tensor.data.shape)}."
-            )
-    elif tensor.scale.ndim == 1:
-        padded_rows = _ceil_div(rows, MXFP8_SCALE_ROW_BLOCK) * MXFP8_SCALE_ROW_BLOCK
-        padded_scale_cols = _ceil_div(scale_cols, MXFP8_SCALE_COL_BLOCK) * MXFP8_SCALE_COL_BLOCK
-        expected_scale_elements = padded_rows * padded_scale_cols
-        if tensor.scale.numel() != expected_scale_elements:
-            raise ValueError(
-                f"{tensor_name} swizzled scale storage has {tensor.scale.numel()} elements; "
-                f"expected {expected_scale_elements} for data shape "
-                f"{tuple(tensor.data.shape)}."
-            )
-    else:
+    padded_rows = _ceil_div(rows, MXFP8_SCALE_ROW_BLOCK) * MXFP8_SCALE_ROW_BLOCK
+    padded_scale_cols = _ceil_div(scale_cols, MXFP8_SCALE_COL_BLOCK) * MXFP8_SCALE_COL_BLOCK
+    expected_scale_elements = padded_rows * padded_scale_cols
+    if tensor.scale.numel() != expected_scale_elements:
         raise ValueError(
-            f"{tensor_name} scale must be a 1D swizzled tensor or a 2D unswizzled "
-            f"tensor, got shape {tuple(tensor.scale.shape)}."
+            f"{tensor_name} swizzled scale storage has {tensor.scale.numel()} elements; "
+            f"expected {expected_scale_elements} for data shape "
+            f"{tuple(tensor.data.shape)}."
         )
 
 
@@ -140,7 +127,7 @@ class MXFP8Tensor:
     """MXFP8 tensor wrapper storing quantized data and E8M0 scale bytes."""
 
     data: torch.Tensor  # [M, K] fp8_e4m3fn
-    scale: torch.Tensor  # Backend layout; Triton consumers require 1D swizzled storage.
+    scale: torch.Tensor  # Backend-native 1D swizzled storage.
     backend: Optional[MXFP8Backend] = None  # quantization and GEMM backend
     # Keyword-only preserves the pre-existing third positional ``backend`` argument.
     # This metadata supports tensor-like conversion consumers such as Megatron
