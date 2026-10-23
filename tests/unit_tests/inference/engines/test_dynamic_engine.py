@@ -3783,10 +3783,16 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
                         assert usage_records[0][field] == final_payload["usage"][field]
                     if "prompt_tokens_details" in final_payload["usage"]:
-                        assert (
-                            usage_records[0]["prompt_tokens_details"]
-                            == final_payload["usage"]["prompt_tokens_details"]
-                        )
+                        final_cached = final_payload["usage"]["prompt_tokens_details"][
+                            "cached_tokens"
+                        ]
+                        stream_cached = usage_records[0]["prompt_tokens_details"][
+                            "cached_tokens"
+                        ]
+                        # The final-response oracle runs first and can warm more
+                        # prefix blocks for the otherwise identical stream.
+                        assert final_cached > 0
+                        assert stream_cached >= final_cached
 
                 endpoint_prompt = " ".join(f"t{token}" for token in prompts[0])
                 await assert_endpoint_stream_matches_final(
