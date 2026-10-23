@@ -4208,7 +4208,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             language_forwarded, with_kwargs=True
         )
 
-        def submit_and_drain(request_id, *, streaming):
+        def submit_and_drain(request_id, *, streaming, refit_epoch=None):
             params = SamplingParams(
                 num_tokens_to_generate=8,
                 termination_id=-1,
@@ -4227,6 +4227,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             )
             partial_history = []
             first_partial_live = False
+            refit_delivered = False
             sent = 0
             while not future.done():
                 engine.step_modern()
@@ -4243,7 +4244,23 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     if not partial_history:
                         first_partial_live = not future.done() and engine.has_unfinished_requests()
                     partial_history.extend(partial["new_tokens"])
+                    if refit_epoch is not None and not refit_delivered:
+                        vision_forwards = runtime["vision-forwards"]
+                        engine.socket_for_receiving_requests.recv_multipart.side_effect = [
+                            [
+                                msgpack.packb(
+                                    [Headers.SET_GENERATION_EPOCH.value, refit_epoch],
+                                    use_bin_type=True,
+                                )
+                            ],
+                            dynamic_engine.zmq.Again,
+                        ]
+                        assert engine.schedule_requests() == 1
+                        assert runtime["vision-forwards"] == vision_forwards + 1
+                        assert engine.get_request(request_id).policy_epoch[-1][1] == refit_epoch
+                        refit_delivered = True
                 sent = len(calls)
+            assert refit_delivered is (refit_epoch is not None)
             return future.result(), partial_history, first_partial_live
 
         try:
@@ -4252,11 +4269,15 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             engine.use_coordinator = True
             engine.is_mp_coordinator = True
             engine.socket_for_receiving_requests = mock.MagicMock()
-            streamed, history, first_partial_live = submit_and_drain(1, streaming=True)
+            engine.model_parallel_publisher_socket = mock.MagicMock()
+            streamed, history, first_partial_live = submit_and_drain(
+                1, streaming=True, refit_epoch=7
+            )
 
-            assert runtime["vision-forwards"] == 2
+            assert runtime["vision-forwards"] == 3
             assert runtime["language-forwards"] > 0
             assert runtime["vision-injections"] == 2
+            assert streamed.policy_epoch[-1][1] == 7
             assert first_partial_live
             assert history
             assert history == streamed.generated_tokens[: len(history)]
