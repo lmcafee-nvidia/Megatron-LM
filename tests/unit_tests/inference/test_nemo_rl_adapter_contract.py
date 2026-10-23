@@ -35,6 +35,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.resharding.refit import clear_all_caches
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.mlp import MLPSubmodules
@@ -298,6 +299,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             expert_model_parallel_size=1,
             expert_tensor_parallel_size=1,
         )
+        model_parallel_cuda_manual_seed(123)
 
     @classmethod
     def teardown_class(cls):
