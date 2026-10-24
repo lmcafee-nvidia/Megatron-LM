@@ -1449,6 +1449,7 @@ def _instrument_scenario_runtime(env, scenario, runtime):
         "mla": lambda name, module: name in {"FusedMLASelfAttention", "MLASelfAttention"},
         "moe": lambda name, module: name in {"MoELayer", "InferenceTopKRouter"},
         "parallel": lambda name, module: "ParallelLinear" in name
+        or "ParallelGroupedLinear" in name
         or name in {"ColumnParallelLinear", "RowParallelLinear"},
     }
     active_tags = set(scenario.signals) & watched_modules.keys()
@@ -1496,8 +1497,16 @@ def _instrument_scenario_runtime(env, scenario, runtime):
                         name = type(_module).__name__
                         weight = getattr(_module, "weight", None)
                         group = getattr(_module, "tp_group", None)
+                        if group is None:
+                            group = getattr(_module, "_tp_group", None)
                         size = torch.distributed.get_world_size(group) if group is not None else 1
-                        if weight is not None and "ColumnParallelLinear" in name:
+                        if "ColumnParallelGroupedLinear" in name:
+                            assert _module.explicit_expert_comm
+                            runtime["tp-column-partition-forwards"] += int(size > 1)
+                        elif "RowParallelGroupedLinear" in name:
+                            assert _module.explicit_expert_comm
+                            runtime["tp-row-partition-forwards"] += int(size > 1)
+                        elif weight is not None and "ColumnParallelLinear" in name:
                             output_size = getattr(
                                 _module, "output_size", getattr(_module, "out_features", None)
                             )
