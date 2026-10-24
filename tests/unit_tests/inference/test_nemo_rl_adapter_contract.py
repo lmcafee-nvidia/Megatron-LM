@@ -555,7 +555,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             {
                 "mla": True,
                 "transformer_impl": "transformer_engine",
-                "context_block_size_tokens": 64,
+                "context_block_size_tokens": 256,
                 "position_embedding_type": "rope",
             },
             {"adapter_sampling": {"temperature": 0.73, "top_k": 1, "top_p": 0.91}},
