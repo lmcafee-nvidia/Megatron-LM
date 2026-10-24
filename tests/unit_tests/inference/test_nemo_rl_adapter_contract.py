@@ -1232,9 +1232,9 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             refit_expected = []
             refit_states = []
             for version_seed in (901, 902):
-                refit_model.load_state_dict(base_state)
                 torch.manual_seed(version_seed)
-                with torch.no_grad():
+                with torch.inference_mode():
+                    refit_model.load_state_dict(base_state)
                     for parameter in refit_model.parameters():
                         parameter.add_(0.05 * torch.randn_like(parameter))
                 expected = await _drive_engine(
@@ -1263,7 +1263,8 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
                 or first.generated_log_probs != second.generated_log_probs
                 for first, second in zip(*refit_expected, strict=True)
             )
-            refit_model.load_state_dict(refit_states[0])
+            with torch.inference_mode():
+                refit_model.load_state_dict(refit_states[0])
             del refit_engine, base_state
 
         client = None
@@ -1358,7 +1359,8 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             assert engine.requests, "spanning request was not observed in flight"
             if refit_model is not None:
                 await adapter._sleep_engine()
-                refit_model.load_state_dict(refit_states[1])
+                with torch.inference_mode():
+                    refit_model.load_state_dict(refit_states[1])
                 adapter._reshard_into_inference_model()
                 await asyncio.to_thread(adapter.set_rollout_weight_version, 2)
                 await adapter._wake_engine()
