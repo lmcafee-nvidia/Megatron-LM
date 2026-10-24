@@ -859,14 +859,15 @@ class TestNVFP4MoELayer:
         assert not torch.equal(graph_output, before_refresh), "refresh did not reach the graph"
 
     @pytest.mark.parametrize("activation", _ACTIVATIONS)
-    def test_public_refit_refreshes_nvfp4_graph_in_place(self, activation):
+    @pytest.mark.parametrize("dispatcher", ["nccl", "nvls"])
+    def test_public_refit_refreshes_nvfp4_graph_in_place(self, dispatcher, activation):
         """A real public refit matches a fresh NVFP4 load without recapturing its graph."""
         from megatron.core.process_groups_config import ProcessGroupCollection
         from megatron.core.resharding.refit import clear_all_caches, swap_model_weights
 
-        source = self._make_layer("nccl", activation)
-        target = self._make_layer("nccl", activation)
-        fresh = self._make_layer("nccl", activation)
+        source = self._make_layer(dispatcher, activation)
+        target = self._make_layer(dispatcher, activation)
+        fresh = self._make_layer(dispatcher, activation)
         groups = ProcessGroupCollection.use_mpu_process_groups(
             ["tp", "pp", "ep", "dp", "expt_tp", "gtp_remat", "expt_gtp_remat"]
         )
@@ -877,7 +878,8 @@ class TestNVFP4MoELayer:
                 parameter.add_(0.25)
             fresh.load_state_dict(source.state_dict())
 
-        hidden = self._hidden_states(32, target.config.hidden_size)
+        local_tokens = 32 if dispatcher == "nccl" else 17 + torch.distributed.get_rank()
+        hidden = self._hidden_states(local_tokens, target.config.hidden_size)
 
         def _eager(layer):
             output, _ = layer(hidden.clone())
