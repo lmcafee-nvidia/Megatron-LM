@@ -671,10 +671,9 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             request_ids = active_request_ids()
             witness["model_request_ids"].append(request_ids)
             result = original_forward(*args, **kwargs)
-            if not engine.context.config.materialize_only_last_token_logits:
-                ctx = engine.context
-                shape = result.shape[1], ctx.padded_active_token_count, ctx.num_last_token_logits
-                witness.setdefault("all_logit_rows", []).append((request_ids, *shape))
+            ctx = engine.context
+            shape = result.shape[1], ctx.padded_active_token_count, ctx.num_last_token_logits
+            witness.setdefault("logit_rows", []).append((request_ids, *shape))
             return result
 
         model.forward = traced_forward
@@ -840,9 +839,10 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         assert adapter_ids.issubset(
             {request_id for step in witness["sampler_request_ids"] for request_id in step}
         )
-        if not engine.context.config.materialize_only_last_token_logits:
-            rows = [row[1:] for row in witness["all_logit_rows"] if adapter_ids & set(row[0])]
-            assert rows and all(actual == padded for actual, padded, _ in rows)
+        if not feature_config or not engine.context.config.materialize_only_last_token_logits:
+            rows = [row[1:] for row in witness["logit_rows"] if adapter_ids & set(row[0])]
+            expected_index = 2 if engine.context.config.materialize_only_last_token_logits else 1
+            assert rows and all(row[0] == row[expected_index] for row in rows)
             assert any(padded > selected for _, padded, selected in rows)
         assert engine.context.async_sched_step_count > 0
         if stresses_chunking:
