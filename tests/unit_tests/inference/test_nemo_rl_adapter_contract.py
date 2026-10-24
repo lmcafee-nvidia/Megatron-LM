@@ -1175,7 +1175,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         config = DynamicEngineTestConfig(
             num_requests=0,
             max_prompt_length=8,
-            max_sequence_length=16,
+            max_sequence_length=64,
             context_max_requests=8,
             context_max_tokens=64,
             sampling_backend="flashinfer",
@@ -1352,18 +1352,18 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
                     atol=0.05 if mxfp8 else 0,
                 )
             spanning_params = [adapter._build_sampling_params(greedy=True, stop_words=None)]
-            spanning_params[0].num_tokens_to_generate = 12
+            spanning_params[0].num_tokens_to_generate = 48
             spanning_task = asyncio.create_task(
                 adapter._generate_with_persistent_engine([prompts[0]], [None], spanning_params)
             )
-            for _ in range(200):
+            for _ in range(10_000):
                 if any(
                     len(engine.get_request(request_id).generated_tokens) >= 2
                     for request_id in engine.requests
                 ):
                     break
-                await asyncio.sleep(0)
-            assert engine.requests, "spanning request completed before epoch transition"
+                await asyncio.sleep(0.001)
+            assert engine.requests, "spanning request was not observed in flight"
             if refit_model is not None:
                 await adapter._sleep_engine()
                 refit_model.load_state_dict(refit_states[1])
@@ -1399,14 +1399,14 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
                     )
 
             cancel_params = [adapter._build_sampling_params(greedy=True, stop_words=None)]
-            cancel_params[0].num_tokens_to_generate = 12
+            cancel_params[0].num_tokens_to_generate = 48
             cancel_task = asyncio.create_task(
                 adapter._generate_with_persistent_engine([prompts[1]], [None], cancel_params)
             )
-            for _ in range(200):
+            for _ in range(10_000):
                 if engine.requests:
                     break
-                await asyncio.sleep(0)
+                await asyncio.sleep(0.001)
             cancelled_request_ids = set(engine.requests)
             assert cancelled_request_ids
             cancel_task.cancel()
@@ -1468,7 +1468,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         config = DynamicEngineTestConfig(
             num_requests=0,
             max_prompt_length=8,
-            max_sequence_length=24,
+            max_sequence_length=64,
             context_max_requests=8,
             context_max_tokens=64,
             sampling_backend="flashinfer",
@@ -1560,16 +1560,16 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             )
             spanning_id, spanning_future = client.add_request_with_id(
                 prompts[0],
-                sampling_params(12),
+                sampling_params(48),
                 offload_params={
                     gym_module.NG_CAPTURE_FIELD: spanning_admission.model_dump(mode="json")
                 },
             )
-            for _ in range(200):
+            for _ in range(10_000):
                 request = engine.requests.get(spanning_id)
                 if request is not None and len(request.record[-1].generated_tokens) >= 2:
                     break
-                await asyncio.sleep(0)
+                await asyncio.sleep(0.001)
             assert spanning_id in engine.requests
             await asyncio.to_thread(adapter.set_rollout_weight_version, 8)
             spanning_reply = await asyncio.wait_for(spanning_future, timeout=30)
