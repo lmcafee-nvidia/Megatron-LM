@@ -296,7 +296,7 @@ def test_flash_decode_dispatch_config_softmax_scale_replays(path, flash_version)
             seqlens_k=torch.tensor(lengths_k, device="cuda", dtype=torch.int32),
             block_table=torch.tensor([[0], [1]], device="cuda", dtype=torch.int32),
             max_seqlen_k=max(lengths_k),
-            softmax_offset=torch.linspace(-0.25, 0.25, heads, device="cuda"),
+            softmax_offset=torch.linspace(-0.25, 0.25, heads, device="cuda", dtype=torch.bfloat16),
         )
         if path == "prefill":
             tokens_per_request = 8
