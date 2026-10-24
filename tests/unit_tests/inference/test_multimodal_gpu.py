@@ -1468,26 +1468,22 @@ def test_real_media_executes_configured_language_implementation_or_parallel_path
     model_parallel, record_property
 ):
     topology = os.getenv("MCORE_MM_TOPOLOGY", "tp")
-    full_logits = topology in ("cp", "sp")
+    full_logits = topology == "sp"
     modality = "video" if topology == "cp" else "image"
     builder = _build_hybrid_model if topology == "hybrid_cp" else _build_te_parallel_model
     model = builder("attention" if topology == "hybrid_cp" else modality)
+    if topology in ("cp", "hybrid_cp"):
+        with pytest.raises(
+            NotImplementedError, match="VLM dynamic inference does not support context_parallel"
+        ):
+            _build_engine(modality, model=model)
+        return
     engine, wrapper = _build_engine(
         modality, model=model, materialize_only_last_token_logits=not full_logits
     )
     trace = _install_forward_trace(engine)
     prompt = [5, IMAGE_TOKEN_ID, 6, 7, 8] if modality == "video" else None
-    if topology in ("cp", "hybrid_cp"):
-        companion_target = model if topology == "hybrid_cp" else llava_model_module
-        companion_name = (
-            "_process_embedding_token_parallel"
-            if topology == "hybrid_cp"
-            else "split_to_context_parallel_ranks_dynamic_res"
-        )
-        companion_patch = mock.patch.object(
-            companion_target, companion_name, wraps=getattr(companion_target, companion_name)
-        )
-    elif topology == "sp":
+    if topology == "sp":
         companion_patch = mock.patch.object(
             llava_model_module.tensor_parallel,
             "scatter_to_sequence_parallel_region",
@@ -1534,29 +1530,27 @@ def test_real_media_executes_configured_language_implementation_or_parallel_path
             gathered, local, group=parallel_state.get_data_parallel_group()
         )
         assert len({float(value.item()) for value in gathered}) == Utils.world_size
-    assert torch.equal(step["mask"][:, : admission["mask"].shape[1]], admission["mask"])
+    assert torch.equal(step["mask"][0, : admission["mask"].numel()], admission["mask"])
     assert torch.equal(step["embeddings"], admission["embeddings"])
     expected_seq_len = step["input_ids"].shape[1] if full_logits else 1
     assert step["logits"].shape == (1, expected_seq_len, VOCAB_SIZE)
     assert len(finished.generated_tokens) == 1
-    if topology in ("cp", "sp"):
-        text_rows = step["mask"][:, : admission["tokens"].numel()].lt(0).squeeze(0)
+    if topology == "sp":
+        text_rows = step["mask"][0, : admission["tokens"].numel()].lt(0)
         local_logits = step["logits"][:, : admission["tokens"].numel()][:, text_rows].cuda()
         assert torch.isfinite(local_logits).all()
-        logit_group = (
-            model.language_model.cp_group if topology == "cp" else model.language_model.tp_group
-        )
+        logit_group = model.language_model.tp_group
         rank_logits = [torch.empty_like(local_logits) for _ in range(Utils.world_size)]
         torch.distributed.all_gather(rank_logits, local_logits, group=logit_group)
         stacked_logits = torch.stack(rank_logits)
         max_delta = (stacked_logits.float() - local_logits.float()).abs().max().item()
-        record_property("max_cp_logit_delta", max_delta)
+        record_property("max_parallel_logit_delta", max_delta)
         assert max_delta == 0.0, max_delta
         expected_argmax = local_logits.argmax(-1).expand(Utils.world_size, -1, -1)
         assert torch.equal(stacked_logits.argmax(-1), expected_argmax)
         local_token = torch.tensor(finished.generated_tokens, device="cuda")
         rank_tokens = [torch.empty_like(local_token) for _ in range(Utils.world_size)]
-        torch.distributed.all_gather(rank_tokens, local_token, group=model.language_model.cp_group)
+        torch.distributed.all_gather(rank_tokens, local_token, group=model.language_model.tp_group)
         assert all(torch.equal(token, local_token) for token in rank_tokens)
 
 

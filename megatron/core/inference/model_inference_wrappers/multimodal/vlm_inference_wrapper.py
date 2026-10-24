@@ -57,6 +57,16 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
                 "This parameter will be removed in `megatron-core` 0.13."
             )
 
+        if (
+            self.inference_context.is_dynamic_batching()
+            and getattr(self.config, "context_parallel_size", 1) > 1
+        ):
+            raise NotImplementedError(
+                "VLM dynamic inference does not support context_parallel_size > 1: "
+                "the paged-attention request metadata is global while LLaVA shards "
+                "the language sequence across context-parallel ranks."
+            )
+
         super().prep_model_for_inference()
 
         # For TP only model both is_pp_first_stage and _is_pp_last_stage returns True

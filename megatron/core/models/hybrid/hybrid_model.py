@@ -838,10 +838,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     self.output_layer.sequence_parallel = False
                     sequence_parallel_override = True
 
-                hidden_states = self._gather_context_parallel_hidden_states_for_inference(
-                    hidden_states, inference_context.padded_active_token_count
-                )
-
                 if inference_context.config.materialize_only_last_token_logits:
                     # Reshape [S, B, H] (with B=1) to [1, S, H] for logit extraction,
                     # then back to [S', B, H] for the output layer.

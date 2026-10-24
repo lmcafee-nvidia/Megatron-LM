@@ -72,29 +72,6 @@ class LanguageModule(MegatronModule):
             ),
         )
 
-    def _gather_context_parallel_hidden_states_for_inference(
-        self, hidden_states: Tensor, global_token_count: int
-    ) -> Tensor:
-        """Restore global zigzag order for dynamic inference."""
-        cp_group = self.pg_collection.cp
-        if cp_group is None or cp_group.size() == 1:
-            return hidden_states
-
-        local_seq_len = hidden_states.size(0)
-        if local_seq_len % 2:
-            raise RuntimeError("Context-parallel hidden states must contain two equal chunks.")
-        gathered = torch.empty(
-            (local_seq_len * cp_group.size(), *hidden_states.shape[1:]),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
-        torch.distributed.all_gather_into_tensor(
-            gathered, hidden_states.contiguous(), group=cp_group
-        )
-        chunks = gathered.view(cp_group.size(), 2, local_seq_len // 2, *hidden_states.shape[1:])
-        hidden_states = torch.cat((chunks[:, 0], chunks[:, 1].flip(0)), dim=0).flatten(0, 1)
-        return hidden_states[:global_token_count]
-
     def _setup_mtp_cuda_graphs(self):
         """Wrap `compute_mtp_single_step` with a CudaGraphManager.
 
