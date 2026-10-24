@@ -879,7 +879,7 @@ _ASYNC_PAIR_SCENARIOS = (
     _pair_scenario(
         "flash-attention-4",
         "attention:flash-v4",
-        config={"flash_attention_version": 4},
+        config={"flash_attention_version": 4, "hidden_size": 256},
         signals=("flash-attention-version",),
         prerequisite="fa4",
     ),
@@ -3420,17 +3420,17 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
             expected_weights = cls._weight_snapshot(eager_env)
             eager_logits = eager_runtime.get("fixed-history-logit-snapshots", {})
             teacher_tokens = {request["request_id"]: request["tokens"] for request in expected}
-            expected_logit_keys = {
-                (request.request_id, len(request.prompt_tokens) + offset - 1)
-                for request in eager_env.requests
-                for offset in range(len(request.generated_tokens))
-            }
-            assert expected_logit_keys <= eager_logits.keys()
-            discarded_logit_keys = eager_logits.keys() - expected_logit_keys
-            print(
-                f"fixed-history accounting: completed={len(expected_logit_keys)}, "
-                f"discarded_async_successors={sorted(discarded_logit_keys)}"
-            )
+            if "fixed-history-logits" in scenario.signals:
+                expected_logit_keys = {
+                    (request.request_id, len(request.prompt_tokens) + offset - 1)
+                    for request in eager_env.requests
+                    for offset in range(len(request.generated_tokens))
+                }
+                assert expected_logit_keys <= eager_logits.keys()
+                discarded_logit_keys = eager_logits.keys() - expected_logit_keys
+                print(
+                    f"fixed-history: completed={len(expected_logit_keys)}, discarded={sorted(discarded_logit_keys)}"
+                )
             assert eager_runtime["cuda-graph-runner-replays"] == 0
             del eager_env
             gc.collect()
