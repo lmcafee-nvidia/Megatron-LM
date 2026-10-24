@@ -124,7 +124,10 @@ class TestBatchInvariantMambaPrefixCaching:
             use_cpu_initialization=True,
             hidden_dropout=0.0,
             attention_dropout=0.0,
-            batch_invariant_mode=True,
+            # Mamba speculative decode is intentionally unsupported in
+            # batch-invariant mode. Real-refit Torch cases use the supported
+            # non-batch-invariant MTP path; the parity owners below retain BI.
+            batch_invariant_mode=not speculative,
             batch_invariant_backend="te_native",
             flash_attention_version=4 if HAVE_FA4 else 3,
             normalization="RMSNorm",
@@ -154,7 +157,7 @@ class TestBatchInvariantMambaPrefixCaching:
         target_core = build_model(target_seed)
         source_core = build_model(source_seed) if exercise_real_refit else None
         mamba_config = MambaInferenceStateConfig.from_model(target_core)
-        assert mamba_config.ssm_states_dtype == torch.float32
+        assert mamba_config.ssm_states_dtype == (torch.bfloat16 if speculative else torch.float32)
         model = Float16Module(cfg, target_core).cuda().eval()
         target_parameters = dict(model.named_parameters())
         source_model = None
@@ -485,7 +488,7 @@ class TestBatchInvariantMambaPrefixCaching:
         monkeypatch.setenv("NVTE_FLASH_ATTN", "1")
         monkeypatch.setenv("NVTE_FUSED_ATTN", "0")
         monkeypatch.setenv("NVTE_UNFUSED_ATTN", "0")
-        with set_batch_invariant_mode(True, backend="te_native"):
+        with set_batch_invariant_mode(False):
             outputs = self._run(
                 prefix=True,
                 graphs=True,
