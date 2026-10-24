@@ -594,9 +594,6 @@ def test_repeated_refit_matches_fresh_models_and_reuses_plan(src_tp: int, precis
         params_dtype=torch.bfloat16,
         bf16=True,
         fp8="hybrid" if precision == "fp8" else None,
-        # Tensorwise scaling is derived from the current step, so the fresh-model
-        # and refitted-model comparison is not confounded by unrelated delayed-
-        # scaling histories from their distinguishable initial weights.
         fp8_recipe="tensorwise" if precision == "fp8" else None,
         hidden_dropout=0.0,
         attention_dropout=0.0,
@@ -647,10 +644,7 @@ def test_repeated_refit_matches_fresh_models_and_reuses_plan(src_tp: int, precis
     source_outputs = [logits(model, src_pgs) for model in sources]
     references = [logits(model, dst_pgs) for model in fresh_targets]
     initial = logits(target, dst_pgs)
-    # TP2 and TP1 execute BF16 reductions in a different order. The measured
-    # cross-topology variation is one BF16 step (0.001953125); same-topology
-    # cases retain the tighter bound. Transfer correctness is independently
-    # exact below by comparing every destination parameter to its fresh TP1 load.
+    # TP2/TP1 variation measured one BF16 step; parameters are also compared exactly below.
     cross_topology_tolerance = 2e-3 if src_tp > 1 else 5e-4
     for oracle_index, (source_output, reference) in enumerate(zip(source_outputs, references)):
         source_oracle_max_abs = (source_output - reference).abs().max().item()
@@ -709,8 +703,6 @@ def test_repeated_refit_matches_fresh_models_and_reuses_plan(src_tp: int, precis
             torch.equal(param, reference_params[name]) for name, param in target.named_parameters()
         )
 
-    # Returning to A must return to A's exact greedy trajectory, while B/C proved
-    # that neither unchanged initialization nor a one-time copy can satisfy the test.
     assert torch.equal(observed[0].argmax(dim=-1), observed[-1].argmax(dim=-1))
     assert not torch.allclose(observed[0], observed[1], atol=1e-3, rtol=1e-3)
     assert not torch.allclose(observed[1], observed[2], atol=1e-3, rtol=1e-3)
@@ -728,7 +720,6 @@ def test_repeated_refit_matches_fresh_models_and_reuses_plan(src_tp: int, precis
 
 
 def test_structural_plan_cache_change_replans_and_executes_new_shape():
-    """A changed tensor shape must not execute a cached plan for the old shape."""
     Utils.initialize_model_parallel(tensor_model_parallel_size=1)
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
     source_pgs = _build_pg_collection(tp_size=1)
@@ -844,11 +835,6 @@ def test_refit_reshards_expert_tensor_parallel_weights_and_executes_them():
     reference = build(1701, reference_pgs, 1)
     source = build(1701, source_pgs, 2)
     target = build(1802, target_pgs, 1)
-    # A matching random seed does not define the same logical grouped-expert
-    # weights across different ETP layouts.  Start from the independently
-    # initialized ETP1 oracle and materialize those exact weights in ETP2, then
-    # clear the setup plan so the ETP2 -> ETP1 transfer below is planned and
-    # executed independently.
     source_expert_pointers = {
         name: param.data_ptr() for name, param in source.named_parameters() if ".experts." in name
     }
@@ -892,9 +878,7 @@ def test_refit_reshards_expert_tensor_parallel_weights_and_executes_them():
     setup_max_abs = (source_output - expected).abs().max().item()
     if dist.get_rank() == 0:
         print(f"REFIT_METRIC etp1_to_etp2_setup max_abs={setup_max_abs:.9g}")
-    # The identical logical weights execute with a different grouped-GEMM
-    # reduction topology under ETP2. H100 measured one BF16 quantum
-    # (0.001953125); keep exact greedy identity and a just-above-quantum bound.
+    # ETP2 grouped GEMM measured one BF16 quantum; retain exact greedy identity.
     assert torch.equal(source_output.argmax(dim=-1), expected.argmax(dim=-1))
     assert torch.allclose(source_output, expected, atol=2e-3, rtol=2e-3)
     assert not torch.allclose(initial, expected, atol=1e-3, rtol=1e-3)
@@ -1071,7 +1055,6 @@ def test_gtp_shards_execute_real_transfer_and_match_fresh_oracle(refit_backend: 
 
 
 def test_refit_executes_context_parallel_collectives_with_new_weights(monkeypatch):
-    """Refitted Mamba CP weights drive both real CP all-to-all directions."""
     world = dist.get_world_size()
     if world < 2 or world % 2:
         pytest.skip("Mamba context parallelism requires an even world of at least two ranks")
@@ -1091,7 +1074,6 @@ def test_refit_executes_context_parallel_collectives_with_new_weights(monkeypatc
             torch.manual_seed(seed)
             self.pg_collection = pg_collection
             self.config = types.SimpleNamespace(num_moe_experts=None)
-            # d_inner=8, nheads=4, ngroups=2, d_state=2, convolution width=3.
             self.conv_weight = torch.nn.Parameter(torch.randn(16, 1, 3, device=device))
             self.conv_bias = torch.nn.Parameter(torch.randn(16, device=device))
             self.dt_bias = torch.nn.Parameter(torch.randn(4, device=device))
@@ -1114,11 +1096,8 @@ def test_refit_executes_context_parallel_collectives_with_new_weights(monkeypatc
                 D_has_hdim=True,
             )
             redistributed = cp.pre_conv_ssm(local_sequence)
-            # z occupies four post-CP channels. Couple every vector weight into
-            # the value returned through the reverse CP collective.
             head_scale = (cp.get_dt_bias() + cp.get_A_log()).repeat_interleave(2)
             recurrent = cp.post_conv_ssm(redistributed[..., :4] * (cp.get_D() + head_scale))
-            # x/B/C occupy the next eight channels, exactly the sliced conv width.
             convolution = cp.conv1d(redistributed[..., 4:12].permute(1, 2, 0))
             return recurrent, convolution
 
