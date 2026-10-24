@@ -793,7 +793,7 @@ _ASYNC_PAIR_SCENARIOS = (
         config={
             "multi_latent_attention": True,
             "cache_mla_latents": True,
-            "context_block_size_tokens": 64,
+            "context_block_size_tokens": 256,
             "position_embedding_type": "rope",
         },
         signals=("mla",),
