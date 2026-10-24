@@ -793,7 +793,10 @@ _ASYNC_PAIR_SCENARIOS = (
         config={
             "multi_latent_attention": True,
             "cache_mla_latents": True,
-            "context_block_size_tokens": 256,
+            # FlashMLA decode requires 64-token blocks. Let the model select
+            # FA3/FA4 for paged prefill because FA2 requires 256-token blocks.
+            "context_block_size_tokens": 64,
+            "flash_attention_version": None,
             "position_embedding_type": "rope",
         },
         signals=("mla",),
