@@ -56,7 +56,7 @@ NEMO_RL_COMMIT = "b26733300f0f7f5421c43c8ba4cd9e37e5d5f65d"
 
 class _CoordinatorTokenizer:
     vocab_size = 100
-    eod = 99
+    eod, bos = 99, None
 
     def tokenize(self, prompt):
         return prompt if isinstance(prompt, list) else [int(token) for token in prompt.split()]
