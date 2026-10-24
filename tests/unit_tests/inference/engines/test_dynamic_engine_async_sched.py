@@ -45,6 +45,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     DynamicBatchControllerStepResult,
     TextGenerationController,
 )
+from megatron.core.resharding import swap_model_weights
 from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
@@ -793,8 +794,6 @@ _ASYNC_PAIR_SCENARIOS = (
         config={
             "multi_latent_attention": True,
             "cache_mla_latents": True,
-            # FlashMLA decode requires 64-token blocks. Let the model select
-            # FA3/FA4 for paged prefill because FA2 requires 256-token blocks.
             "context_block_size_tokens": 64,
             "flash_attention_version": None,
             "position_embedding_type": "rope",
@@ -1626,6 +1625,14 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         config.update(scenario.config)
         config["async_sched_mode"] = mode
         env = cls._build_test_env(_DynamicEngineTestConfig(**config))
+        refit_source = None
+        if "suspend-resume" in scenario.signals:
+            model = env.engine.controller.inference_wrapped_model.model
+            refit_env = cls._build_test_env(_DynamicEngineTestConfig(**config))
+            refit_source = refit_env.engine.controller.inference_wrapped_model.model
+            with torch.no_grad():
+                next(refit_source.parameters()).view(-1)[0].add_(1)
+            assert not torch.equal(next(refit_source.parameters()), next(model.parameters()))
         env.requests = _make_scenario_requests(
             env, scenario, stop_tokens=stop_tokens, termination_token=termination_token
         )
@@ -1746,11 +1753,13 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 memory_ptr = env.engine.context.memory_buffer.data_ptr()
                 pending_before_suspend = env.engine.controller._async_sched_forward.is_valid
                 runtime["pending-before-suspend"] += int(pending_before_suspend)
-                # Coordinator control messages bracket these calls with the stable
-                # lifecycle states; this constructor-only harness mirrors them.
+                # Mirror the coordinator's stable states around the real lifecycle methods.
                 env.engine.state = EngineState.PAUSED
                 env.engine.suspend()
                 env.engine.state = EngineState.SUSPENDED
+                swap_model_weights(refit_source, model, "nccl")
+                assert torch.equal(next(refit_source.parameters()), next(model.parameters()))
+                runtime["weight-refit"] += 1
                 runtime["pending-after-suspend"] += int(
                     env.engine.controller._async_sched_forward.is_valid
                 )
@@ -1840,6 +1849,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert context.static_kv_memory_pointers
         if "suspend-resume" in signals:
             assert runtime["suspend-resume"] == runtime["pending-before-suspend"] == 1
+            assert runtime["weight-refit"] == 1
             if "recompute" in signals:
                 assert runtime["pending-after-suspend"] == 0
                 assert runtime["pending-after-resume"] == 0

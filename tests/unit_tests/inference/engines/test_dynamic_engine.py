@@ -1084,8 +1084,6 @@ class DynamicEngineTestConfig:
     # a recurrent head has no KV to append, so the gate stays off. See
     # DynamicInferenceContext.enable_mtp_kv_cache.
     mtp_layer_pattern: str = "M"
-    # Required by transformer_config validation for inference-optimized MoE: fp32 routing
-    # avoids dtype conversions during decode.
     moe_router_dtype: Optional[str] = None
     position_embedding_type: Optional[str] = None
     use_flashinfer_fused_rope: Optional[bool] = None
@@ -1530,7 +1528,6 @@ class DynamicInferenceEngineTestBase:
         elif test_config.model_provider == "vlm":
             assert test_config.tensor_model_parallel_size == 1
             assert test_config.pipeline_model_parallel_size == 1
-            # RADIO forwards packed-sequence metadata, which requires TE attention.
             transformer_config = TransformerConfig(
                 params_dtype=torch.bfloat16,
                 num_layers=2,
@@ -3558,7 +3555,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     client.add_request_streaming(prompt, params)
                     for client, prompt, params in zip(clients, prompts, stream_params, strict=True)
                 ]
-                # Each independent client starts its local ID space at zero.
                 assert [stream.request_id for stream in streams] == [0, 0]
 
                 async def collect(stream, expect_logprobs):
@@ -3689,9 +3685,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 assert usage["total_tokens"] == sum(map(len, prompts)) + 36
                 assert usage["prompt_tokens_details"]["cached_tokens"] >= len(shared_prefix)
 
-                # Cross the actual Quart completion and chat boundaries with the
-                # live client. Each non-streaming response is the exact oracle for
-                # a second request reconstructed from SSE deltas.
+                # Cross live Quart completion/chat; each nonstream response is the SSE oracle.
                 quart = pytest.importorskip("quart")
                 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.chat_completions import (
                     bp as chat_completions_bp,
@@ -3789,8 +3783,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                             "cached_tokens"
                         ]
                         stream_cached = usage_records[0]["prompt_tokens_details"]["cached_tokens"]
-                        # The final-response oracle runs first and can warm more
-                        # prefix blocks for the otherwise identical stream.
+                        # The final-response oracle can warm blocks for the matching stream.
                         assert final_cached > 0
                         assert stream_cached >= final_cached
 
@@ -3858,8 +3851,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     prompts[0], high_level_params
                 )
                 sync_llm = high_level(MegatronLLM)
-                # The sync facade blocks its caller while scheduling the request
-                # on the real client loop, exactly as its production bridge does.
+                # The sync facade blocks while its bridge schedules on the client loop.
                 [sync_result] = await asyncio.to_thread(
                     sync_llm.generate,
                     string_prompt,
@@ -4004,9 +3996,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         decode_future = None
         pending = None
         if role == "decode":
-            # Signal readiness immediately before the backend posts irecvs. Rank
-            # zero leaves the barrier by posting the matching sends, matching the
-            # native coordinator's KV_TRANSFER_READY -> SEND_KV order.
+            # Match native KV_TRANSFER_READY -> SEND_KV ordering around the backend calls.
             if kv_transport_backend == "nccl":
                 engine._notify_kv_transfer_ready = lambda _rid, _cached: (
                     torch.distributed.barrier()
@@ -4026,8 +4016,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             assert pending.handle is not None
         else:
             if kv_transport_backend == "nccl":
-                # Paired with the decode readiness callback above. Both ranks then
-                # enter their production backend concurrently (isend versus irecv).
+                # Both ranks enter the production backend concurrently (isend versus irecv).
                 torch.distributed.barrier()
                 engine.push_handoff_kv(71, [decode_meta[0]])
                 assert engine.pending_kv_push_count == 1
