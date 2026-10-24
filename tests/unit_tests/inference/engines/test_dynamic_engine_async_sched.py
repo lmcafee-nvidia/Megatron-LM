@@ -901,7 +901,7 @@ _ASYNC_PARALLEL_SCENARIOS = (
         prerequisite="nvfp4",
     ),
     _nccl_moe_scenario(
-        "moe-ep2-tp2-sp-nccl",
+        "moe-ep2-tp2-sp-ddp2-edp2-nccl",
         "topology:tp",
         "topology:sp",
         "interaction:moe-tp-sp",
@@ -914,11 +914,13 @@ _ASYNC_PARALLEL_SCENARIOS = (
             "moe_router_score_function": "sigmoid",
             "inference_disable_triton_nvls_kernels": True,
         },
-        signals=("quantile-routing",),
+        sampling=({"temperature": 0.8, "top_k": 8},),
+        signals=("dp-offset", "quantile-routing", "sampled", "temperature-filter", "top-k-filter"),
+        parity="reproducible",
     ),
     _nccl_moe_scenario(
-        "moe-ep2-dp2-nccl",
-        "topology:dp",
+        "moe-ep2-ddp4-edp2-nccl",
+        "topology:dense-dp4-expert-dp2",
         "seed:offset-by-dp-rank",
         config={"expert_model_parallel_size": 2},
         sampling=({"temperature": 0.8, "top_k": 8},),
@@ -2632,9 +2634,12 @@ class TestAsyncSchedulePairwiseParallel(_AsyncPairwiseHarness):
             assert parallel_state.get_expert_model_parallel_world_size() == config.get(
                 "expert_model_parallel_size", 1
             )
-            if scenario.name == "tp2-pp2-sp-dp2":
+            if "tp2" in scenario.name:
                 assert parallel_state.get_data_parallel_world_size() == 2
-            if scenario.name == "moe-ep2-dp2-nccl":
+            if scenario.name == "moe-ep2-tp2-sp-ddp2-edp2-nccl":
+                assert parallel_state.get_expert_data_parallel_world_size() == 2
+            if scenario.name == "moe-ep2-ddp4-edp2-nccl":
+                assert parallel_state.get_data_parallel_world_size() == 4
                 assert parallel_state.get_expert_data_parallel_world_size() == 2
             for owned_scenario in owned_scenarios:
                 self._assert_scenario_pair(owned_scenario)

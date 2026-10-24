@@ -2968,7 +2968,6 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                     return _original(*args, **kwargs)
 
                 module.dispatch = traced_moe_dispatch
-
                 experts = module.experts
                 original_expert = experts.forward
 
@@ -2982,7 +2981,6 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                     return _original(*args, **kwargs)
 
                 experts.forward = traced_expert
-
                 inference_dispatcher = module._inference_token_dispatcher
                 original_combine = inference_dispatcher.token_combine
 

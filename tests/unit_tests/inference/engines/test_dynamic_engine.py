@@ -3350,7 +3350,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     )
     @torch.inference_mode()
     def test_moe_decode_after_local_kv_handoff_matches_uninterrupted_request(self):
-
         config = self._handoff_config()
 
         baseline = self._build_test_env(config)
