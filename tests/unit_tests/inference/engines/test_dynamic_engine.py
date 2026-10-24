@@ -3293,6 +3293,42 @@ def test_stop_word_checkpoint_boundary_preserves_result_alignment(
 
 class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
+    @staticmethod
+    def _handoff_config(**overrides):
+        return DynamicEngineTestConfig(
+            num_requests=1,
+            min_prompt_length=70,
+            max_prompt_length=70,
+            num_tokens_to_generate=4,
+            num_gap_steps=0,
+            context_buffer_size_gb=0.02,
+            context_block_size_tokens=64,
+            context_max_requests=4,
+            context_max_tokens=128,
+            enable_prefix_caching=True,
+            flash_attention_version=4 if torch.cuda.get_device_capability()[0] >= 10 else 3,
+            use_moe_layer_spec=True,
+            transformer_impl="inference_optimized",
+            top_k=1,
+            **overrides,
+        )
+
+    @staticmethod
+    def _run_to_completion(env):
+        completed = []
+        while env.engine.has_unfinished_requests():
+            completed.extend(env.engine.step_modern()["finished_requests"])
+        assert len(completed) == 1
+        return completed[0]
+
+    @staticmethod
+    def _count_expert_forwards(env, counts, phase):
+        for module in env.engine.controller.inference_wrapped_model.model.modules():
+            if type(module).__name__ == "InferenceGroupedMLP":
+                module.register_forward_hook(
+                    lambda _module, _inputs, _output: counts.__setitem__(phase, counts[phase] + 1)
+                )
+
     @classmethod
     def setup_class(cls):
         Utils.initialize_model_parallel(
@@ -3315,44 +3351,13 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @torch.inference_mode()
     def test_moe_decode_after_local_kv_handoff_matches_uninterrupted_request(self):
 
-        config = DynamicEngineTestConfig(
-            num_requests=1,
-            min_prompt_length=70,
-            max_prompt_length=70,
-            num_tokens_to_generate=4,
-            num_gap_steps=0,
-            context_buffer_size_gb=0.02,
-            context_block_size_tokens=64,
-            context_max_requests=4,
-            context_max_tokens=128,
-            enable_prefix_caching=True,
-            flash_attention_version=4 if torch.cuda.get_device_capability()[0] >= 10 else 3,
-            use_moe_layer_spec=True,
-            transformer_impl="inference_optimized",
-            top_k=1,
-        )
-
-        def run_to_completion(env):
-            completed = []
-            while env.engine.has_unfinished_requests():
-                completed.extend(env.engine.step_modern()["finished_requests"])
-            assert len(completed) == 1
-            return completed[0]
-
-        def count_expert_forwards(env, counts, phase):
-            for module in env.engine.controller.inference_wrapped_model.model.modules():
-                if type(module).__name__ == "InferenceGroupedMLP":
-
-                    def record(_module, _inputs, _output, *, _phase=phase):
-                        counts[_phase] += 1
-
-                    module.register_forward_hook(record)
+        config = self._handoff_config()
 
         baseline = self._build_test_env(config)
         baseline_request = baseline.requests[0]
         baseline_request.sampling_params.termination_id = -1
         baseline.engine._add_request(baseline_request)
-        expected = run_to_completion(baseline).generated_tokens
+        expected = self._run_to_completion(baseline).generated_tokens
         prompt = baseline_request.prompt_tokens.tolist()
         del baseline
         gc.collect()
@@ -3369,9 +3374,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         source.engine._kv_peer_metas = {"transport": "local-copy"}
         source.engine._pp_kv_peer_metas = [source.engine._kv_peer_metas]
         expert_counts = {"prefill": 0, "decode": 0}
-        count_expert_forwards(source, expert_counts, "prefill")
+        self._count_expert_forwards(source, expert_counts, "prefill")
         source.engine._add_request(source_request)
-        prefill_result = run_to_completion(source)
+        prefill_result = self._run_to_completion(source)
 
         handoff = prefill_result.disaggregated_params
         assert handoff is not None
@@ -3382,7 +3387,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert source.engine.pinned_handoff_block_count == 2
 
         destination = self._build_test_env(config, engine_cls=StateHandoffDynamicInferenceEngine)
-        count_expert_forwards(destination, expert_counts, "decode")
+        self._count_expert_forwards(destination, expert_counts, "decode")
         decode_only_steps = []
         original_forward = destination.engine.controller._dynamic_step_forward_logits
 
@@ -3431,7 +3436,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert destination.engine._admit_pending_kv_imports() == 1
         assert transfer.copies and destination.engine.context.num_prefill_requests == 0
 
-        decoded = run_to_completion(destination)
+        decoded = self._run_to_completion(destination)
         assert decoded.generated_tokens == expected
         assert future.done() and future.result().generated_tokens == expected
         assert decode_only_steps and all(decode_only_steps)
@@ -3451,46 +3456,13 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         if not torch.distributed.is_initialized() or torch.distributed.get_world_size() != 2:
             pytest.skip("native NCCL handoff witness requires exactly two ranks")
 
-        config = DynamicEngineTestConfig(
-            num_requests=1,
-            min_prompt_length=70,
-            max_prompt_length=70,
-            num_tokens_to_generate=4,
-            num_gap_steps=0,
-            context_buffer_size_gb=0.02,
-            context_block_size_tokens=64,
-            context_max_requests=4,
-            context_max_tokens=128,
-            enable_prefix_caching=True,
-            flash_attention_version=4 if torch.cuda.get_device_capability()[0] >= 10 else 3,
-            use_moe_layer_spec=True,
-            transformer_impl="inference_optimized",
-            kv_transport_backend="nccl",
-            top_k=1,
-            hidden_size=256,
-        )
-
-        def run_to_completion(env):
-            completed = []
-            while env.engine.has_unfinished_requests():
-                completed.extend(env.engine.step_modern()["finished_requests"])
-            assert len(completed) == 1
-            return completed[0]
-
-        def count_experts(env, counter):
-            for module in env.engine.controller.inference_wrapped_model.model.modules():
-                if type(module).__name__ == "InferenceGroupedMLP":
-                    module.register_forward_hook(
-                        lambda _module, _inputs, _output: counter.__setitem__(
-                            "count", counter["count"] + 1
-                        )
-                    )
+        config = self._handoff_config(kv_transport_backend="nccl", hidden_size=256)
 
         baseline = self._build_test_env(config)
         baseline_request = baseline.requests[0]
         baseline_request.sampling_params.termination_id = -1
         baseline.engine._add_request(baseline_request)
-        expected = run_to_completion(baseline).generated_tokens
+        expected = self._run_to_completion(baseline).generated_tokens
         prompt = baseline_request.prompt_tokens.tolist()
         del baseline
         gc.collect()
@@ -3506,7 +3478,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         )
         torch.distributed.barrier()  # Initialize the default NCCL communicator before P2P.
         expert_count = {"count": 0}
-        count_experts(env, expert_count)
+        self._count_expert_forwards(env, expert_count, "count")
         payload = [None]
         if rank == 0:
             request = env.requests[0]
@@ -3514,7 +3486,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             request.sampling_params.do_kv_handoff = True
             request.sampling_params.num_tokens_to_generate = 0
             env.engine._add_request(request)
-            prefill_result = run_to_completion(env)
+            prefill_result = self._run_to_completion(env)
             payload[0] = {
                 "request_id": prefill_result.request_id,
                 "block_ids": prefill_result.disaggregated_params["block_ids"],
@@ -3553,7 +3525,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             assert env.engine._poll_pending_kv_imports() == 1
             assert env.engine._admit_pending_kv_imports() == 1
             assert env.engine.context.num_prefill_requests == 0
-            decoded = run_to_completion(env)
+            decoded = self._run_to_completion(env)
             decoded_tokens = decoded.generated_tokens
             assert future.done() and future.result().generated_tokens == expected
             assert env.engine.pending_kv_import_count == 0

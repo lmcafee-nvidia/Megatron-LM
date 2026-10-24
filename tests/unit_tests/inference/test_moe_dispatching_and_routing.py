@@ -1022,7 +1022,27 @@ class TestNVLSAllGatherVDispatcher:
             original_token_dispatch = dispatcher.token_dispatch
             original_token_combine = dispatcher.token_combine
 
+            def fp64_expert_reference(hidden, probs, routing_map):
+                """Independent local-expert arithmetic, then the production EP sum."""
+                assert config.activation_func is squared_relu and not config.gated_linear_unit
+                valid = int(NCCLAllGatherDispatcher._valid_tokens().item())
+                hidden, probs, routing_map = hidden[:valid], probs[:valid], routing_map[:valid]
+                experts, local_experts = layer.experts, layer.experts.num_local_experts
+                local_route = routing_map - experts.ep_group.rank() * local_experts
+                selected = (local_route >= 0) & (local_route < local_experts)
+                weights = hidden.new_zeros((valid, local_experts), dtype=torch.float64)
+                weights.scatter_add_(
+                    1, local_route.clamp(0, local_experts - 1), probs.double() * selected
+                )
+                fc1 = torch.einsum("th,eih->tei", hidden.double(), experts._fc1_weight.double())
+                activated = torch.relu(fc1).square()
+                fc2 = torch.einsum("tei,ehi->teh", activated, experts._fc2_weight.double())
+                reference = (fc2 * weights.unsqueeze(-1)).sum(1)
+                torch.distributed.all_reduce(reference, group=experts.ep_group)
+                return reference
+
             def tracked_expert_forward(*args, **kwargs):
+                result = original_expert_forward(*args, **kwargs)
                 if InferenceMode.is_active():
                     evidence["expert"].append(
                         {
@@ -1030,7 +1050,11 @@ class TestNVLSAllGatherVDispatcher:
                             "route_rows": kwargs["routing_map"].shape[0],
                         }
                     )
-                return original_expert_forward(*args, **kwargs)
+                    if dispatcher_type == "nccl":
+                        evidence["fp64_reference"] = fp64_expert_reference(
+                            args[0], args[2], kwargs["routing_map"]
+                        )
+                return result
 
             def tracked_mcore_forward(*args, **kwargs):
                 evidence["expert_backend"].append("mcore")
@@ -1150,11 +1174,18 @@ class TestNVLSAllGatherVDispatcher:
         if config.batch_invariant_mode:
             torch.testing.assert_close(inference_output, training_output, atol=0, rtol=0)
         else:
-            lower = torch.nextafter(training_output, torch.full_like(training_output, -torch.inf))
-            upper = torch.nextafter(training_output, torch.full_like(training_output, torch.inf))
-            assert torch.all((lower <= inference_output) & (inference_output <= upper)), (
-                inference_output.float().sub(training_output.float()).abs().max().item()
-            )
+            counts = dispatcher._local_tokens_per_rank
+            start = sum(counts[: torch.distributed.get_rank()])
+            reference = evidence["fp64_reference"][start : start + hidden_states.shape[0]]
+            for name, output in (("training", training_output), ("inference", inference_output)):
+                if not reference.numel():
+                    continue
+                error = output.reshape_as(reference).double().sub(reference).abs()
+                reference_norm, reference_scale = reference.norm(), reference.abs().max()
+                relative_l2 = error.norm() / reference_norm if reference_norm else error.norm()
+                relative_linf = error.max() / reference_scale if reference_scale else error.max()
+                evidence[f"{name}_fp64_error"] = (relative_l2.item(), relative_linf.item())
+                assert max(relative_l2, relative_linf) <= 6 * 2**-8, evidence
         if synchronous_inference_output is not None:
             torch.testing.assert_close(
                 inference_output, synchronous_inference_output, atol=0, rtol=0
@@ -1402,18 +1433,16 @@ class TestNVLSAllGatherVDispatcher:
         if Utils.world_size < 2:
             pytest.skip("Empty-rank MXFP8 coverage requires expert parallelism.")
 
+        rank = torch.distributed.get_rank()
+        expected_total = sum(range(Utils.world_size))
         evidence = self.test_batch_invariant_moe_matches_training(
             "torch", None, True, False, base_local_tokens=0, collect_inference_evidence=True
         )
-        rank = torch.distributed.get_rank()
-        local_count = torch.tensor([rank], dtype=torch.int64, device="cuda")
-        all_counts = torch.empty(Utils.world_size, dtype=torch.int64, device="cuda")
-        torch.distributed.all_gather_into_tensor(all_counts, local_count)
 
-        assert all_counts[0].item() == 0 and all_counts.sum().item() > 0
+        assert expected_total > 0
         assert evidence["expert_backend"] == ["mcore"]
         assert evidence["dispatch"][0]["local_rows"] == rank
-        assert evidence["dispatch"][0]["valid_rows"] == all_counts.sum().item()
+        assert evidence["dispatch"][0]["valid_rows"] == expected_total
         assert evidence["combine"][0]["local_output_rows"] == rank
 
     @pytest.mark.parametrize(
@@ -1425,6 +1454,9 @@ class TestNVLSAllGatherVDispatcher:
         if Utils.world_size < 2:
             pytest.skip("Variable-work expert parallelism requires at least two ranks.")
 
+        rank = torch.distributed.get_rank()
+        expected_local_rows = base_local_tokens + rank
+        expected_total = Utils.world_size * base_local_tokens + sum(range(Utils.world_size))
         evidence = self.test_batch_invariant_moe_matches_training(
             backend,
             None,
@@ -1434,25 +1466,19 @@ class TestNVLSAllGatherVDispatcher:
             collect_inference_evidence=True,
             dispatcher_type=dispatcher_type,
         )
-        rank = torch.distributed.get_rank()
-        expected_local_rows = base_local_tokens + rank
-        local_counts = torch.tensor([expected_local_rows], dtype=torch.int64, device="cuda")
-        all_counts = torch.empty(Utils.world_size, dtype=torch.int64, device="cuda")
-        torch.distributed.all_gather_into_tensor(all_counts, local_counts)
 
-        assert all_counts[0].item() == base_local_tokens
-        assert all_counts.sum().item() > 0
+        assert expected_total > 0
         assert len(evidence["dispatch"]) == 1
         dispatch = evidence["dispatch"][0]
         assert dispatch["local_rows"] == expected_local_rows
         assert dispatch["local_route_rows"] == expected_local_rows
-        assert dispatch["valid_rows"] == all_counts.sum().item()
+        assert dispatch["valid_rows"] == expected_total
         assert dispatch["dispatched_rows"] >= dispatch["valid_rows"]
         assert dispatch["dispatched_route_rows"] == dispatch["dispatched_rows"]
         assert len(evidence["expert"]) == 1
         assert evidence["expert_backend"] == ["mcore" if backend == "torch" else "vllm"]
-        assert evidence["expert"][0]["input_rows"] >= all_counts.sum().item()
-        assert evidence["expert"][0]["route_rows"] >= all_counts.sum().item()
+        assert evidence["expert"][0]["input_rows"] >= expected_total
+        assert evidence["expert"][0]["route_rows"] >= expected_total
         assert evidence["combine"][0]["local_output_rows"] == expected_local_rows
 
     def test_nvls_cuda_graph_replay_masks_changed_zero_rank_work(self):
