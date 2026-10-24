@@ -196,6 +196,7 @@ class TestLifecycleGuards:
         runtime._engine = MagicMock()
         runtime._client = MagicMock()
         runtime._client.shutdown_coordinator.side_effect = RuntimeError("coordinator gone")
+        runtime._client.stop.side_effect = RuntimeError("client stop failed")
         client = runtime._client
 
         with pytest.raises(RuntimeError, match="coordinator gone"):

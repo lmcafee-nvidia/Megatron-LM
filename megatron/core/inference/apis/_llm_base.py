@@ -240,15 +240,22 @@ class _CoordinatorRuntime:
 
         # Happy path: client open -> graceful protocol shutdown.
         if self._client is not None:
+            client = self._client
+            first_error: Optional[BaseException] = None
             try:
-                try:
-                    self._client.shutdown_coordinator()
-                finally:
-                    # Closing local resources is mandatory even when the
-                    # coordinator has already disappeared.
-                    self._client.stop()
-            finally:
-                self._client = None
+                client.shutdown_coordinator()
+            except BaseException as exc:
+                first_error = exc
+            try:
+                # Closing local resources is mandatory even when the
+                # coordinator has already disappeared.
+                client.stop()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+            self._client = None
+            if first_error is not None:
+                raise first_error
             return
 
         # Partial-setup path: client never opened. If the coordinator
