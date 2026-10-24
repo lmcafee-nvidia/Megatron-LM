@@ -242,8 +242,7 @@ def _build_inference_mxfp8_env(test_case, config, *, quantize=True):
     model = env.engine.controller.inference_wrapped_model.model
     assert any(type(module).__name__.startswith("Inference") for module in model.modules())
     buffers = quantize_params_to_mxfp8(model.decoder, backend="triton") if quantize else None
-    if quantize:
-        assert buffers
+    assert not quantize or buffers
     return env
 
 
@@ -640,11 +639,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         }
 
         def active_request_ids():
-            return tuple(
-                int(request_id)
-                for request_id in engine.context.request_ids.tolist()
-                if request_id >= 0
-            )
+            return tuple(engine.context.request_ids[: engine.context.total_request_count].tolist())
 
         model = engine.controller.inference_wrapped_model.model
         mixer_calls = []
@@ -1190,6 +1185,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             logprobs_mode="raw_logprobs",
             kv_cache_management_mode=kv_cache_management_mode,
             fp8=mxfp8,
+            hidden_size=128 if mxfp8 else None,
             transformer_impl="inference_optimized" if mxfp8 else "local",
         )
         if mxfp8:
@@ -1205,7 +1201,6 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         generation_length = 3
         refit_expected = None
         refit_model = None
-        refit_states = None
         if kv_cache_management_mode == "recompute":
             source_config = copy.deepcopy(config)
             source_config.fp8 = False
@@ -1294,6 +1289,18 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
                 {"input_ids": padded, "input_lengths": torch.tensor([4, 5], device="cuda")}
             )
             lowered_prompts, media, params = adapter._prepare_data_for_generation(data, greedy=True)
+
+            async def direct_target_reference(first_request_id):
+                rng_state = engine.controller.sampling_rng.get_state()
+                references = await asyncio.gather(
+                    *(
+                        engine.add_request(first_request_id + index, *request)
+                        for index, request in enumerate(zip(lowered_prompts, params, strict=True))
+                    )
+                )
+                engine.controller.sampling_rng.set_state(rng_state)
+                return references
+
             replies = await asyncio.wait_for(
                 adapter._generate_with_persistent_engine(lowered_prompts, media, params), timeout=30
             )
@@ -1335,20 +1342,17 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
                     break
                 await asyncio.sleep(0.01)
             assert engine._generation_epoch == 1
+            expected_after_first_refit = refit_expected[0] if refit_expected else direct
+            if mxfp8:
+                expected_after_first_refit = await direct_target_reference(500)
             resumed_replies = await asyncio.wait_for(
                 adapter._generate_with_persistent_engine(lowered_prompts, media, params), timeout=30
             )
             resumed_output = adapter._parse_result_to_batched_data_dict(data, resumed_replies)
             assert all(reply.policy_epoch == [(0, 1)] for reply in resumed_replies)
-            expected_after_first_refit = refit_expected[0] if refit_expected else direct
             for actual, expected in zip(resumed_replies, expected_after_first_refit, strict=True):
                 assert actual.generated_tokens == expected.generated_tokens
-                torch.testing.assert_close(
-                    torch.tensor(actual.generated_log_probs),
-                    torch.tensor(expected.generated_log_probs),
-                    rtol=0.05 if mxfp8 else 0,
-                    atol=0.05 if mxfp8 else 0,
-                )
+                assert actual.generated_log_probs == expected.generated_log_probs
             spanning_params = [adapter._build_sampling_params(greedy=True, stop_words=None)]
             spanning_params[0].num_tokens_to_generate = 48
             spanning_task = asyncio.create_task(
@@ -1383,19 +1387,15 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             assert spanning_reply.policy_epoch[-1][0] > len(prompts[0])
 
             if refit_expected is not None:
+                final_expected = await direct_target_reference(600) if mxfp8 else refit_expected[1]
                 final_replies = await asyncio.wait_for(
                     adapter._generate_with_persistent_engine(lowered_prompts, media, params),
                     timeout=30,
                 )
                 assert all(reply.policy_epoch == [(0, 2)] for reply in final_replies)
-                for actual, expected in zip(final_replies, refit_expected[1], strict=True):
+                for actual, expected in zip(final_replies, final_expected, strict=True):
                     assert actual.generated_tokens == expected.generated_tokens
-                    torch.testing.assert_close(
-                        torch.tensor(actual.generated_log_probs),
-                        torch.tensor(expected.generated_log_probs),
-                        rtol=0.05 if mxfp8 else 0,
-                        atol=0.05 if mxfp8 else 0,
-                    )
+                    assert actual.generated_log_probs == expected.generated_log_probs
 
             cancel_params = [adapter._build_sampling_params(greedy=True, stop_words=None)]
             cancel_params[0].num_tokens_to_generate = 48
@@ -1825,8 +1825,6 @@ class TestNeMoRLAdapterParallelContract(DynamicInferenceEngineTestBase):
         engine.controller.tokenizer = _CoordinatorTokenizer()
         is_dp = topology["tp"] == topology["pp"] == topology["ep"] == 1
         prompts = [[3, 5, 7, 9], [3, 5, 7, 9]] if is_dp else [[3, 5, 7, 9], [2, 4, 6, 8, 10]]
-        # Keep EP baseline/adapter admission identical; heterogeneous batching is covered above.
-        prompts = prompts[:1] if topology["ep"] > 1 else prompts
         params = [
             SamplingParams(
                 temperature=0.7 if is_dp else 0,
@@ -1849,8 +1847,8 @@ class TestNeMoRLAdapterParallelContract(DynamicInferenceEngineTestBase):
                 )
             ],
         )
-        expected_by_dp = [None, None]
-        seeds_by_dp = [None, None]
+        direct_replies = [(reply.generated_tokens, reply.generated_log_probs) for reply in direct]
+        expected_by_dp, seeds_by_dp = [None, None], [None, None]
         if is_dp:
             await asyncio.to_thread(
                 torch.distributed.all_gather_object,
@@ -1865,28 +1863,28 @@ class TestNeMoRLAdapterParallelContract(DynamicInferenceEngineTestBase):
                 group=synchronization_group,
             )
             assert seeds_by_dp[1] == seeds_by_dp[0] + 1
-            engine.controller.sampling_rng.manual_seed(initial_seed)
-        adapter_forward_ids = []
-        model = engine.controller.inference_wrapped_model.model
+        engine.controller.sampling_rng.manual_seed(initial_seed)
+        adapter_forward_batches, model = [], engine.controller.inference_wrapped_model.model
         original_forward = model.forward
 
         def traced_forward(*args, **kwargs):
-            adapter_forward_ids.extend(
-                request_id for request_id in engine.context.request_ids.tolist() if request_id >= 0
+            adapter_forward_batches.append(
+                tuple(engine.context.request_ids[: engine.context.total_request_count].tolist())
             )
             return original_forward(*args, **kwargs)
 
         model.forward = traced_forward
-        moe_forward_calls = []
+        moe_forward_batches = []
         moe_hooks = [
             module.register_forward_hook(
-                lambda _module, _inputs, _output: moe_forward_calls.append(1)
+                lambda _module, _inputs, _output: moe_forward_batches.append(
+                    adapter_forward_batches[-1]
+                )
             )
             for module in model.modules()
             if type(module).__name__ == "MoELayer"
         ]
-        client = None
-        failure = None
+        client, failure = None, None
         try:
             coordinator_address = await engine.start_listening_to_data_parallel_coordinator(
                 hostname="127.0.0.1"
@@ -1921,17 +1919,15 @@ class TestNeMoRLAdapterParallelContract(DynamicInferenceEngineTestBase):
                         timeout=30,
                     )
                     output = adapter._parse_result_to_batched_data_dict(data, replies)
-                    expected_replies = (
-                        expected_by_dp
-                        if is_dp
-                        else [
-                            (reply.generated_tokens, reply.generated_log_probs) for reply in direct
-                        ]
-                    )
+                    expected_replies = expected_by_dp if is_dp else direct_replies
                     actual_replies = [
                         (reply.generated_tokens, reply.generated_log_probs) for reply in replies
                     ]
-                    assert sorted(actual_replies) == sorted(expected_replies)
+                    if is_dp:
+                        assert sorted(actual_replies) == sorted(expected_replies)
+                    else:
+                        assert actual_replies == expected_replies
+                    assert [reply.request_id for reply in replies] == list(range(len(prompts)))
                     for index, reply in enumerate(replies):
                         prompt_length = len(prompts[index])
                         assert (
@@ -1960,11 +1956,15 @@ class TestNeMoRLAdapterParallelContract(DynamicInferenceEngineTestBase):
                 await asyncio.to_thread(coordinator_process.join, 10)
                 assert not coordinator_process.is_alive()
                 client.stop()
-
         if failure is not None:
             raise failure
-        assert adapter_forward_ids
+        assert adapter_forward_batches
+        if topology["ep"] > 1:
+            adapter_ids = set(range(len(prompts)))
+            assert any(adapter_ids.issubset(batch) for batch in adapter_forward_batches)
         if uses_moe:
-            assert moe_hooks and moe_forward_calls
+            assert moe_hooks and moe_forward_batches
+            if topology["ep"] > 1:
+                assert any(adapter_ids.issubset(batch) for batch in moe_forward_batches)
         for hook in moe_hooks:
             hook.remove()
