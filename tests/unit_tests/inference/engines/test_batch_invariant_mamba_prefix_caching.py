@@ -108,6 +108,8 @@ class TestBatchInvariantMambaPrefixCaching:
         exercise_real_refit=True,
         target_seed=321,
         source_seed=654,
+        refit_callback=None,
+        epoch_payload_callback=None,
     ):
         model_parallel_cuda_manual_seed(321, inference_rng_tracker=True, force_reset_rng=True)
         torch.manual_seed(321)
@@ -298,7 +300,10 @@ class TestBatchInvariantMambaPrefixCaching:
                     # Old cached states must not be reused after a weight update.
                     engine.suspend()
                     pending_survived_suspend = engine.controller._async_sched_forward.is_valid
-                    swap_model_weights([source_model], [model], refit_method="nccl")
+                    if refit_callback is None:
+                        swap_model_weights([source_model], [model], refit_method="nccl")
+                    else:
+                        refit_callback(source_model, model)
                     assert all(
                         torch.equal(source_parameters[name], target_parameters[name])
                         for name in source_parameters
@@ -317,8 +322,13 @@ class TestBatchInvariantMambaPrefixCaching:
                     engine.is_mp_coordinator = True
                     engine.socket_for_receiving_requests = mock.Mock()
                     engine.model_parallel_publisher_socket = mock.Mock()
+                    epoch_payload = (
+                        msgpack.packb([Headers.SET_GENERATION_EPOCH.value, 1])
+                        if epoch_payload_callback is None
+                        else epoch_payload_callback(1)
+                    )
                     engine.socket_for_receiving_requests.recv_multipart.side_effect = [
-                        [msgpack.packb([Headers.SET_GENERATION_EPOCH.value, 1])],
+                        [epoch_payload],
                         dynamic_engine.zmq.Again,
                     ]
                     assert engine.schedule_requests() == 1
@@ -514,6 +524,47 @@ class TestBatchInvariantMambaPrefixCaching:
                             assert math.isnan(actual) and math.isnan(expected)
                         else:
                             assert actual == expected
+
+    @torch.inference_mode()
+    def test_rl_refit_boundary_owns_live_lifecycle(self, monkeypatch):
+        """The production RL refit and epoch adapters drive one live lifecycle."""
+        from types import SimpleNamespace
+
+        from megatron.core.inference.inference_client import InferenceClient
+        from megatron.rl import rl_utils
+        from megatron.rl.inference.megatron import MegatronLocal
+        from megatron.training.config import RLConfig
+
+        monkeypatch.setenv("MAMBA_DETERMINISTIC", "1")
+        monkeypatch.setenv("NVTE_FLASH_ATTN", "1")
+        monkeypatch.setenv("NVTE_FUSED_ATTN", "0")
+        monkeypatch.setenv("NVTE_UNFUSED_ATTN", "0")
+        config = RLConfig(refit_method="nccl", refit_execution_batch_bytes=4096)
+        args = SimpleNamespace(inference_shards=None, world_size=dist.get_world_size())
+        client = InferenceClient.__new__(InferenceClient)
+        client.socket = mock.Mock()
+        adapter = MegatronLocal(host="localhost", port=0)
+        adapter._client = client
+
+        def refit(source, target):
+            assert rl_utils.refit_inference_model([source], [target], args) == 1
+
+        def epoch_payload(epoch):
+            adapter.set_generation_epoch(epoch)
+            return client.socket.send.call_args.args[0]
+
+        with (
+            mock.patch.object(rl_utils, "get_run_config", return_value=mock.Mock(rl=config)),
+            set_batch_invariant_mode(False),
+        ):
+            self._run(
+                prefix=True,
+                graphs=True,
+                chunked=True,
+                kv_cache_management_mode=KVCacheManagementMode.OFFLOAD,
+                refit_callback=refit,
+                epoch_payload_callback=epoch_payload,
+            )
 
     @torch.inference_mode()
     def test_refit_executes_flashinfer_sampling(self, monkeypatch):
