@@ -904,6 +904,7 @@ class DynamicEngineTestConfig:
     tensor_model_parallel_size: int = 1
     pipeline_model_parallel_size: int = 1
     expert_model_parallel_size: int = 1
+    expert_tensor_parallel_size: int = 1
     # EP process groups can also exercise dense models; build MoE layers only
     # when a test explicitly owns that model behavior.
     use_moe_layer_spec: bool = False
@@ -1182,7 +1183,6 @@ class DynamicInferenceEngineTestBase:
         clear_nvte_env_vars()
         set_rounder(4)
 
-        # Random state.
         random.seed(test_config.random_seed)
         torch.manual_seed(test_config.random_seed)
         model_parallel_cuda_manual_seed(
@@ -1192,7 +1192,6 @@ class DynamicInferenceEngineTestBase:
             force_reset_rng=True,
         )
 
-        # Requests.
         requests = cls._build_requests(test_config)
         effective_cuda_graph_impl = test_config.cuda_graph_impl
         if effective_cuda_graph_impl is None:
@@ -1203,7 +1202,6 @@ class DynamicInferenceEngineTestBase:
             )
 
         if test_config.model_provider == "gpt":
-            # Transformer config.
             transformer_config_cls = (
                 MLATransformerConfig if test_config.multi_latent_attention else TransformerConfig
             )
@@ -1242,6 +1240,7 @@ class DynamicInferenceEngineTestBase:
                 tensor_model_parallel_size=test_config.tensor_model_parallel_size,
                 pipeline_model_parallel_size=test_config.pipeline_model_parallel_size,
                 expert_model_parallel_size=test_config.expert_model_parallel_size,
+                expert_tensor_parallel_size=test_config.expert_tensor_parallel_size,
                 num_moe_experts=(
                     max(2, test_config.expert_model_parallel_size)
                     if test_config.use_moe_layer_spec
@@ -1393,6 +1392,7 @@ class DynamicInferenceEngineTestBase:
                 tensor_model_parallel_size=test_config.tensor_model_parallel_size,
                 pipeline_model_parallel_size=pp_size,
                 expert_model_parallel_size=test_config.expert_model_parallel_size,
+                expert_tensor_parallel_size=test_config.expert_tensor_parallel_size,
                 num_moe_experts=(
                     max(2, test_config.expert_model_parallel_size)
                     if test_config.use_moe_layer_spec
