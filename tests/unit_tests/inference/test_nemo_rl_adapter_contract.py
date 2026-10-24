@@ -622,6 +622,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
                     num_attention_heads=8,
                     add_bias_linear=False,
                     normalization="RMSNorm",
+                    qk_layernorm=True,
                     multi_latent_attention=True,
                     q_lora_rank=128,
                     kv_lora_rank=512,
@@ -639,7 +640,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
                     dynamic_engine_tests,
                     "get_gpt_layer_with_transformer_engine_spec",
                     lambda num_experts=None: get_gpt_layer_with_transformer_engine_spec(
-                        num_experts=num_experts, multi_latent_attention=True
+                        num_experts=num_experts, qk_layernorm=True, multi_latent_attention=True
                     ),
                 ),
             ):
