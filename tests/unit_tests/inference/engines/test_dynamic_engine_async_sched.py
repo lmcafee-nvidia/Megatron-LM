@@ -1853,9 +1853,7 @@ def _assert_request_parity(
         if actual_routing is not None and expected_routing is not None and not exact_numerics:
             # Compare routes only while both stochastic modes have the same input history.
             shared_rows = len(actual_routing) - len(request.generated_tokens) + 1
-            for actual_token, expected_token in zip(
-                request.generated_tokens, reference["tokens"]
-            ):
+            for actual_token, expected_token in zip(request.generated_tokens, reference["tokens"]):
                 if actual_token != expected_token:
                     break
                 shared_rows += 1
@@ -2637,7 +2635,7 @@ class TestAsyncSchedulePairwiseParallel(_AsyncPairwiseHarness):
             if scenario.name == "tp2-pp2-sp-dp2":
                 assert parallel_state.get_data_parallel_world_size() == 2
             if scenario.name == "moe-ep2-dp2-nccl":
-                assert parallel_state.get_data_parallel_world_size() == 2
+                assert parallel_state.get_expert_data_parallel_world_size() == 2
             for owned_scenario in owned_scenarios:
                 self._assert_scenario_pair(owned_scenario)
         finally:
