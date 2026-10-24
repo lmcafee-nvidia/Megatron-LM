@@ -366,7 +366,7 @@ class TestMXFP8ReshardTransform:
         grouped_mlp.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.FLASHINFER
         grouped_mlp._concatenated_weights_built = False
         buffers = {}
-        for linear_name, shape in (("linear_fc1", (96, 128)), ("linear_fc2", (128, 96))):
+        for linear_name, shape in (("linear_fc1", (256, 256)), ("linear_fc2", (256, 256))):
             linear = Namespace()
             setattr(grouped_mlp, linear_name, linear)
             for expert_idx in range(grouped_mlp.num_local_experts):
@@ -378,9 +378,9 @@ class TestMXFP8ReshardTransform:
 
         InferenceGroupedMLP._build_concatenated_mxfp8_weights(grouped_mlp)
         grouped_mlp._concatenated_weights_built = True
-        hidden = torch.randn(4, 128, dtype=torch.bfloat16, device="cuda")
-        routes = torch.tensor([[0, 1], [1, 2], [2, 3], [3, 0]], dtype=torch.int64, device="cuda")
-        probs = torch.tensor([[0.75, 0.25]] * 4, dtype=torch.float32, device="cuda")
+        hidden = torch.randn(512, 256, dtype=torch.bfloat16, device="cuda")
+        routes = torch.arange(1024, device="cuda").reshape(512, 2).remainder(4)
+        probs = torch.tensor([[0.75, 0.25]] * 512, dtype=torch.float32, device="cuda")
 
         def run():
             return flashinfer_routed_mxfp8_moe(
@@ -389,7 +389,7 @@ class TestMXFP8ReshardTransform:
                 probs,
                 grouped_mlp._fc1_weight,
                 grouped_mlp._fc2_weight,
-                num_experts=grouped_mlp.num_local_experts,
+                num_experts=8,
                 local_expert_offset=0,
                 activation_type=6,
             )
