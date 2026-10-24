@@ -1608,6 +1608,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         runtime = Counter()
         if mode == AsyncScheduleMode.ASYNC:
             runtime["streaming-counter-steps"] = {}
+            runtime["streaming-live-request-ids"] = set()
             runtime["streaming-partial-steps"] = set()
             runtime["streaming-token-history"] = {}
             _instrument_scenario_runtime(env, scenario, runtime)
@@ -1677,6 +1678,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                         history = runtime["streaming-token-history"].setdefault(request_id, [])
                         history.extend(partial["new_tokens"])
                         request = env.engine.get_request(request_id)
+                        if request.status not in (Status.COMPLETED, Status.FAILED):
+                            runtime["streaming-live-request-ids"].add(request_id)
                         if request.sampling_params.return_log_probs:
                             assert len(partial["new_tokens"]) == len(partial["new_log_probs"])
                             assert len(partial["new_tokens"]) == len(partial["new_top_n_logprobs"])
@@ -1751,7 +1754,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             for request_id, history in histories.items():
                 final_tokens = env.requests[request_id].generated_tokens
                 assert history == final_tokens[: len(history)]
-                assert len(history) < len(final_tokens)
+                assert request_id in runtime["streaming-live-request-ids"]
             for signal in scenario.signals:
                 counter = _STREAMING_SIGNAL_COUNTERS.get(signal)
                 if counter is not None:
