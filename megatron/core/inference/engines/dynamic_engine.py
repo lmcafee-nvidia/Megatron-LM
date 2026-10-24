@@ -1376,9 +1376,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     "pipe_connection": dp_process_pipe,
                     "ready_event": coordinator_ready_event,
                     # Disaggregated engines register dynamically with their role.
-                    "data_parallel_size": (
-                        0 if disagg_config is not None else get_pg_size(self.pg_collection.dp)
-                    ),
+                    "data_parallel_size": 0 if disagg_config is not None else dp_size,
                     "tokenizer": self.controller.tokenizer,
                     "max_requests": self.context.max_requests,
                     "inference_coordinator_port": inference_coordinator_port,
@@ -1447,7 +1445,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         identity = disagg_config.identity if disagg_config is not None else f'mp-coord-{dp_rank}'
         if self.is_mp_coordinator:
-            # 1. Create dealer sockets where tp_rank = 0 and pp_rank = 0
+            # 1. Create a dealer socket on MP rank zero.
             #    These will receive requests from an InferenceCoordinator.
             self.socket_for_receiving_requests = self.zmq_context.socket(zmq.DEALER)
 
