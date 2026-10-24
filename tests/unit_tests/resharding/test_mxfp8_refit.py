@@ -362,7 +362,7 @@ class TestMXFP8ReshardTransform:
 
         torch.manual_seed(321)
         grouped_mlp = Namespace()
-        grouped_mlp.num_local_experts = 2
+        grouped_mlp.num_local_experts = 4
         grouped_mlp.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.FLASHINFER
         grouped_mlp._concatenated_weights_built = False
         buffers = {}
@@ -379,7 +379,7 @@ class TestMXFP8ReshardTransform:
         InferenceGroupedMLP._build_concatenated_mxfp8_weights(grouped_mlp)
         grouped_mlp._concatenated_weights_built = True
         hidden = torch.randn(4, 128, dtype=torch.bfloat16, device="cuda")
-        routes = torch.tensor([[0, 1]] * 4, dtype=torch.int64, device="cuda")
+        routes = torch.tensor([[0, 1], [1, 2], [2, 3], [3, 0]], dtype=torch.int64, device="cuda")
         probs = torch.tensor([[0.75, 0.25]] * 4, dtype=torch.float32, device="cuda")
 
         def run():
@@ -389,7 +389,7 @@ class TestMXFP8ReshardTransform:
                 probs,
                 grouped_mlp._fc1_weight,
                 grouped_mlp._fc2_weight,
-                num_experts=2,
+                num_experts=grouped_mlp.num_local_experts,
                 local_expert_offset=0,
                 activation_type=6,
             )
