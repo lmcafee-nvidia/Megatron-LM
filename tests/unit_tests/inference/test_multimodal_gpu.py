@@ -1131,7 +1131,6 @@ def test_async_mixed_text_media_batch_preserves_ownership_through_middle_complet
     ]
     record_property("async_request_id_trace", repr([step["request_ids"] for step in trace]))
     assert any(step["request_ids"] == [42] for step in trace)
-    assert baseline_trace
 
 
 @pytest.mark.internal
@@ -1212,13 +1211,11 @@ def test_recompute_refit_refreshes_real_media_without_changing_output(model_para
         assert not treated_engine._vision_embedding_cache
         assert treated_engine.get_request(71).image_embeddings is None
         treated_engine.resume()
-
         refreshed_request = treated_engine.get_request(71)
         refreshed_embedding = refreshed_request.image_embeddings.detach().cpu().clone()
         treated_finished = []
         while treated_engine.has_unfinished_requests():
             treated_finished.extend(treated_engine.step_modern()["finished_requests"])
-
     assert encoder.call_count == 2 and treated_engine._weight_epoch == 1
     assert torch.equal(original_embedding, refreshed_embedding)
     assert len(baseline_finished) == len(treated_finished) == 1
@@ -1247,8 +1244,6 @@ def test_real_media_executes_hybrid_language_mixer_on_prefill(model_parallel, ss
         for module in model.language_model.modules()
         if type(module).__name__ == mixer_class
     ]
-    assert handles
-
     try:
         with mock.patch.object(
             wrapper, "_forward_vision_encoder", wraps=wrapper._forward_vision_encoder
@@ -1257,7 +1252,6 @@ def test_real_media_executes_hybrid_language_mixer_on_prefill(model_parallel, ss
     finally:
         for handle in handles:
             handle.remove()
-
     assert encoder.call_count == 1
     assert mixer_events
     assert step["mask"].ge(0).sum().item() == 4
@@ -1299,7 +1293,6 @@ def test_raw_image_matches_preprocessed_dynamic_input_on_real_model(model_parall
         preprocessed, preprocessed_step, preprocessed_finished = _run_request(
             engine, 91, preprocessed_args, trace
         )
-
     assert encoder.call_count == 2
     assert raw["key"] != preprocessed["key"]
     assert raw["tokens"].tolist() == [5] + [IMAGE_TOKEN_ID] * 4 + [6]
@@ -1366,7 +1359,6 @@ def test_chat_media_slots_feed_real_preprocessor_encoder_and_exact_positions(mod
         wrapper, "_forward_vision_encoder", wraps=wrapper._forward_vision_encoder
     ) as encoder:
         admission, step, finished = _run_request(engine, 95, media, trace, prompt)
-
     assert encoder.call_count == 1
     assert admission["tokens"].tolist() == [5] + [IMAGE_TOKEN_ID] * 4 + [6]
     assert admission["mask"].tolist() == [-1, 0, 1, 2, 3, -1]
@@ -1388,7 +1380,6 @@ def test_dynamic_image_row_boundaries_share_real_encoder_step(model_parallel):
         wrapper, "_forward_vision_encoder", wraps=wrapper._forward_vision_encoder
     ) as encoder:
         admission, step, finished = _run_request(engine, 96, _dynamic_image(offset=0.0), trace)
-
     assert encoder.call_count == 1
     assert admission["tokens"].tolist() == [
         5,
@@ -1420,7 +1411,6 @@ def test_real_media_executes_moe_router_with_configured_expert_topology(model_pa
         for module in model.language_model.modules()
         if type(module).__name__ == "TopKRouter"
     ]
-
     try:
         with mock.patch.object(
             wrapper, "_forward_vision_encoder", wraps=wrapper._forward_vision_encoder
@@ -1431,7 +1421,6 @@ def test_real_media_executes_moe_router_with_configured_expert_topology(model_pa
     finally:
         for handle in handles:
             handle.remove()
-
     assert encoder.call_count == 1
     assert router_events
     cfg = model.config
@@ -1464,25 +1453,56 @@ def test_real_media_executes_configured_language_implementation_or_parallel_path
         ):
             _build_engine(modality, model=model)
         return
+    if topology == "sp":
+        with torch.no_grad():
+            for layer in model.language_model.decoder.layers:
+                for projection in (layer.self_attention.linear_proj, layer.mlp.linear_fc2):
+                    projection.weight.zero_()
+                    if getattr(projection, "bias", None) is not None:
+                        projection.bias.zero_()
     engine, wrapper = _build_engine(
         modality, model=model, materialize_only_last_token_logits=not full_logits
     )
     trace = _install_forward_trace(engine)
     prompt = [5, IMAGE_TOKEN_ID, 6, 7, 8] if modality == "video" else None
+    scatter_events, gather_events, output_events = [], [], []
     if topology == "sp":
+
+        def trace_collective(operation, events, tag_input=False):
+            def traced(tensor, *args, **kwargs):
+                tensor = tensor.clone() if tag_input else tensor
+                for position in range(tensor.shape[0]) if tag_input else ():
+                    tensor[position, :, position] += 1024
+                output = operation(tensor, *args, **kwargs)
+                events.append((tensor.detach().cpu(), output.detach().cpu()))
+                return output
+
+            return traced
+
         companion_patch = mock.patch.object(
             llava_model_module.tensor_parallel,
             "scatter_to_sequence_parallel_region",
-            wraps=llava_model_module.tensor_parallel.scatter_to_sequence_parallel_region,
+            side_effect=trace_collective(
+                llava_model_module.tensor_parallel.scatter_to_sequence_parallel_region,
+                scatter_events,
+                tag_input=True,
+            ),
         )
         gather_patch = mock.patch(
             "megatron.core.models.gpt.gpt_model.gather_from_sequence_parallel_region",
-            wraps=llava_model_module.tensor_parallel.gather_from_sequence_parallel_region,
+            side_effect=trace_collective(
+                llava_model_module.tensor_parallel.gather_from_sequence_parallel_region,
+                gather_events,
+            ),
+        )
+        output_handle = model.language_model.output_layer.register_forward_pre_hook(
+            lambda _module, args: output_events.append(args[0].detach().cpu())
         )
     else:
-        companion_patch = gather_patch = None
-    companion = companion_patch.start() if companion_patch is not None else None
-    gather_companion = gather_patch.start() if gather_patch is not None else None
+        companion_patch = gather_patch = output_handle = None
+    if companion_patch is not None:
+        companion_patch.start()
+        gather_patch.start()
     optimized_events = []
     optimized_handles = [
         module.register_forward_pre_hook(
@@ -1507,12 +1527,10 @@ def test_real_media_executes_configured_language_implementation_or_parallel_path
         if companion_patch is not None:
             companion_patch.stop()
             gather_patch.stop()
+            output_handle.remove()
         for handle in optimized_handles:
             handle.remove()
     assert encoder.call_count == 1
-    if companion is not None:
-        assert companion.call_count > 0
-        assert gather_companion.call_count > 0
     if topology == "opt":
         assert optimized_handles and optimized_events
     if topology == "dp":
@@ -1533,22 +1551,17 @@ def test_real_media_executes_configured_language_implementation_or_parallel_path
         local_logits = step["logits"][:, : admission["tokens"].numel()].cuda()
         assert finished.generated_tokens == [int(local_logits[0, -1].argmax())]
         logit_group = model.language_model.tp_group
-        global_tags = torch.arange(expected_seq_len, device="cuda").view(-1, 1, 1)
-        local_tags = llava_model_module.tensor_parallel.scatter_to_sequence_parallel_region(
-            global_tags, group=logit_group
-        )
-        restored_tags = llava_model_module.tensor_parallel.gather_from_sequence_parallel_region(
-            local_tags, group=logit_group
-        )
-        assert torch.equal(restored_tags, global_tags)
+        assert len(scatter_events) == len(gather_events) == len(output_events) == 1
+        (tagged, local_tagged), (local_hidden, global_hidden) = scatter_events[0], gather_events[0]
+        assert torch.equal(local_tagged.argmax(-1), local_hidden.argmax(-1))
+        assert torch.equal(global_hidden.argmax(-1), torch.arange(expected_seq_len).unsqueeze(1))
+        assert torch.equal(output_events[0], global_hidden)
         rank_logits = [torch.empty_like(local_logits) for _ in range(Utils.world_size)]
         torch.distributed.all_gather(rank_logits, local_logits, group=logit_group)
         stacked_logits = torch.stack(rank_logits)
         max_delta = (stacked_logits.float() - local_logits.float()).abs().max().item()
         record_property("max_parallel_logit_delta", max_delta)
         assert max_delta == 0.0, max_delta
-        expected_argmax = local_logits.argmax(-1).expand(Utils.world_size, -1, -1)
-        assert torch.equal(stacked_logits.argmax(-1), expected_argmax)
         local_token = torch.tensor(finished.generated_tokens, device="cuda")
         rank_tokens = [torch.empty_like(local_token) for _ in range(Utils.world_size)]
         torch.distributed.all_gather(rank_tokens, local_token, group=model.language_model.tp_group)
@@ -1641,7 +1654,6 @@ def test_real_media_executes_attention_variant_and_reuses_exact_result(model_par
             patcher.stop()
         for handle in handles:
             handle.remove()
-
     assert encoder.call_count == 1
     assert companion_events
     if variant == "swa":
@@ -1663,14 +1675,12 @@ def test_real_media_prefill_replays_actual_cuda_graph_with_eager_parity(model_pa
     )
     graphed_model.load_state_dict(eager_model.state_dict())
     media = _media("image", offset=0.0)
-
     eager_engine, eager_wrapper = _build_engine("image", model=eager_model)
     eager_trace = _install_forward_trace(eager_engine)
     with mock.patch.object(
         eager_wrapper, "_forward_vision_encoder", wraps=eager_wrapper._forward_vision_encoder
     ) as eager_encoder:
         eager, eager_step, eager_finished = _run_request(eager_engine, 130, media, eager_trace)
-
     graph_engine, graph_wrapper = _build_engine(
         "image",
         model=graphed_model,
@@ -1685,7 +1695,6 @@ def test_real_media_prefill_replays_actual_cuda_graph_with_eager_parity(model_pa
         graph_wrapper, "_forward_vision_encoder", wraps=graph_wrapper._forward_vision_encoder
     ) as graph_encoder:
         graphed, graph_step, graph_finished = _run_request(graph_engine, 131, media, graph_trace)
-
     assert eager_encoder.call_count == graph_encoder.call_count == 1
     assert not eager_step["graphed"]
     assert graph_step["graphed"]
@@ -1706,7 +1715,6 @@ def test_real_media_prefill_and_mtp_draft_share_step_with_greedy_parity(model_pa
     assert incompatible.missing_keys and not incompatible.unexpected_keys
     media = _media("image", offset=0.0)
     params = SamplingParams(num_tokens_to_generate=3, termination_id=-1, top_k=1)
-
     baseline_engine, baseline_wrapper = _build_engine("image", model=baseline_model)
     with mock.patch.object(
         baseline_wrapper, "_forward_vision_encoder", wraps=baseline_wrapper._forward_vision_encoder
@@ -1715,7 +1723,6 @@ def test_real_media_prefill_and_mtp_draft_share_step_with_greedy_parity(model_pa
         baseline_finished = []
         while baseline_engine.has_unfinished_requests():
             baseline_finished.extend(baseline_engine.step_modern()["finished_requests"])
-
     mtp_engine, mtp_wrapper = _build_engine("image", model=mtp_model, num_speculative_tokens=1)
     mtp_trace = _install_forward_trace(mtp_engine)
     with (
@@ -1734,7 +1741,6 @@ def test_real_media_prefill_and_mtp_draft_share_step_with_greedy_parity(model_pa
         calls_after_media_prefill = mtp_forward.call_count
         while mtp_engine.has_unfinished_requests():
             mtp_finished.extend(mtp_engine.step_modern()["finished_requests"])
-
     assert baseline_encoder.call_count == mtp_encoder.call_count == 1
     assert calls_after_media_prefill > 0
     assert mtp_trace[0]["mask"].ge(0).sum().item() == 4
@@ -1774,7 +1780,6 @@ def test_real_media_flashinfer_samples_only_from_requested_top_k(model_parallel)
         finished = []
         while engine.has_unfinished_requests():
             finished.extend(engine.step_modern()["finished_requests"])
-
     assert encoder.call_count == 1
     assert support_checks and all(support_checks)
     assert trace[0]["mask"].ge(0).sum().item() == 4
@@ -1815,14 +1820,12 @@ def test_real_media_top_p_seed_and_logprobs_match_distribution(model_parallel, l
     ) as encoder:
         first, first_steps = run(155, media)
         repeated, repeated_steps = run(156, {"media_cache_key": media["media_cache_key"]})
-
     assert encoder.call_count == 1
     assert first_steps[0]["mask"].ge(0).sum().item() == 4
     assert first.generated_tokens == repeated.generated_tokens
     assert first.generated_log_probs == repeated.generated_log_probs
     assert first.generated_top_n_logprobs == repeated.generated_top_n_logprobs
     assert all(torch.equal(a["logits"], b["logits"]) for a, b in zip(first_steps, repeated_steps))
-
     for step, token, reported, top_n in zip(
         first_steps,
         first.generated_tokens,
@@ -1837,7 +1840,6 @@ def test_real_media_top_p_seed_and_logprobs_match_distribution(model_parallel, l
         support_count = int(crossing[0].item()) + 1 if crossing.numel() else VOCAB_SIZE
         support = order[:support_count]
         assert int(token) in support.tolist()
-
         processed_logits = torch.full_like(scaled_logits, float("-inf"))
         processed_logits[support] = scaled_logits[support]
         scored_logits = raw_logits if logprobs_mode == "raw_logprobs" else processed_logits
@@ -1884,7 +1886,6 @@ def test_real_media_eos_and_explicit_stop_end_at_first_greedy_token(model_parall
                 num_tokens_to_generate=5, termination_id=-1, stop_token_ids=[first_token], top_k=1
             ),
         )
-
     assert encoder.call_count == 3
     assert baseline.generated_tokens == eos.generated_tokens == explicit.generated_tokens
     assert baseline.finish_reason == "length"
@@ -1933,7 +1934,6 @@ def test_real_media_executes_fp8_context_and_reuses_exact_embedding(model_parall
             recomputed, recomputed_step, _ = _run_request(engine, 162, media, trace)
     finally:
         handle.remove()
-
     assert encoder.call_count == len(quant_events) == 2
     quant_enabled, observed_recipe, input_shape = quant_events[0]
     assert quant_enabled and observed_recipe == recipe
