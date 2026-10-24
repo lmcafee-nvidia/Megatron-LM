@@ -9,6 +9,7 @@
 * ``vocab_parallel_cross_entropy``: the unfused path deterministic mode relies on.
 * ``ColumnParallelLinear`` / ``RowParallelLinear``: cuBLAS GEMMs under the pinned workspace,
   with and without apex ``fused_weight_gradient_mlp_cuda`` gradient-accumulation fusion.
+* local ``DotProductAttention`` with distinct MLA key and value channel widths.
 * ``ColumnParallelLinear`` with BF16 inputs and FP32 output: Transformer Engine
   ``general_gemm`` forward plus the corresponding input- and weight-gradient paths.
 * apex ``FusedLayerNorm`` (persistent and non-persistent) and ``FusedScaleMaskSoftmax``
@@ -35,6 +36,7 @@ from megatron.core.tensor_parallel.layers import (
     VocabParallelEmbedding,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import attention_mask_func
@@ -264,6 +266,33 @@ class TestTensorParallelLayers:
             module, (x,), replays=3, contention=True, what="column linear[bf16 input, fp32 output]"
         )
         assert outputs["out[0]"].dtype is torch.float32
+
+    def test_local_attention_distinct_kv_channels_replays(self):
+        """MLA supplies 96-channel Q/K and 64-channel V to the local attention core."""
+        seeded()
+        config = _config(
+            hidden_size=256,
+            num_attention_heads=4,
+            attention_dropout=0.0,
+            masked_softmax_fusion=False,
+        )
+        module = DotProductAttention(
+            config,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type="self",
+            softmax_scale=96**-0.5,
+            k_channels=96,
+            v_channels=64,
+        ).cuda()
+        query = torch.randn(32, 2, 4, 96, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        key = torch.randn(32, 2, 4, 96, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        value = torch.randn(32, 2, 4, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+        outputs, _ = assert_module_replays_bit_exact(
+            module, (query, key, value, None), replays=3, what="DotProductAttention[k=96,v=64]"
+        )
+        assert outputs["out"].shape == (32, 2, 256)
 
 
 # --- apex fused layer norm ------------------------------------------------------------------

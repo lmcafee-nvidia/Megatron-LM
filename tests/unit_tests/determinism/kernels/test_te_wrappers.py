@@ -946,6 +946,27 @@ def test_te_fused_mla_kv_rope_mxfp8_replays():
     )
 
 
+def test_mla_nonfused_absorption_preserves_projection_and_norm():
+    """Non-fused MLA absorption retains its separate norm and projection."""
+    from megatron.core.transformer.multi_latent_attention import MLASelfAttention
+
+    rank, heads, key_width, value_width = 8, 2, 6, 4
+    projection = torch.nn.Linear(rank, heads * (key_width + value_width), bias=False).cuda()
+    owner = SimpleNamespace(
+        config=SimpleNamespace(kv_lora_rank=rank, qk_head_dim=key_width, v_head_dim=value_width),
+        num_attention_heads_per_partition=heads,
+        linear_kv_up_proj=projection,
+        kv_layernorm=torch.nn.Identity(),
+    )
+    original_norm = owner.kv_layernorm
+    MLASelfAttention.prepare_for_absorption(owner)
+    assert owner.linear_kv_up_proj_linear is projection
+    assert owner.kv_layernorm is original_norm
+    assert owner.up_k_weight.shape == (heads, key_width, rank)
+    assert owner.up_v_weight.shape == (heads, value_width, rank)
+    assert not hasattr(owner, "linear_kv_up_proj")
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_te_quantile_balancing_histogram_replays(dtype):
     """Exercise the QB-capable TE dispatch, including its atomic histogram output."""

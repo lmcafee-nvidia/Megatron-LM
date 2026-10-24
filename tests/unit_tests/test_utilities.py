@@ -101,11 +101,19 @@ def _restore_torch_settings(settings):
     mode, warn_only = settings["deterministic"]
     torch.use_deterministic_algorithms(mode, warn_only=warn_only)
     torch.utils.deterministic.fill_uninitialized_memory = settings["fill_uninitialized_memory"]
-    (
+    current_cudnn = (
         torch.backends.cudnn.deterministic,
         torch.backends.cudnn.benchmark,
         torch.backends.cudnn.allow_tf32,
-    ) = settings["cudnn"]
+    )
+    # Newer PyTorch disables direct cuDNN flag mutation after a backend first uses
+    # bracketed flags. Avoid a forbidden assignment when there is nothing to restore.
+    if current_cudnn != settings["cudnn"]:
+        (
+            torch.backends.cudnn.deterministic,
+            torch.backends.cudnn.benchmark,
+            torch.backends.cudnn.allow_tf32,
+        ) = settings["cudnn"]
     (
         torch.backends.cuda.matmul.allow_tf32,
         torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
