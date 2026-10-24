@@ -540,7 +540,7 @@ class TestBatchInvariantMambaPrefixCaching:
         monkeypatch.setenv("NVTE_FUSED_ATTN", "0")
         monkeypatch.setenv("NVTE_UNFUSED_ATTN", "0")
         config = RLConfig(refit_method="nccl", refit_execution_batch_bytes=4096)
-        args = SimpleNamespace(inference_shards=None, world_size=dist.get_world_size())
+        args = SimpleNamespace(inference_shards=None, world_size=torch.distributed.get_world_size())
         client = InferenceClient.__new__(InferenceClient)
         client.socket = mock.Mock()
         adapter = MegatronLocal(host="localhost", port=0)
