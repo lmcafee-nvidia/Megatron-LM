@@ -62,6 +62,7 @@ if HAVE_TE:
         TENorm,
         TERowParallelGroupedLinear,
         TERowParallelLinear,
+        split_te_layernorm_column_parallel_linear,
         te_cross_entropy,
     )
 
@@ -539,6 +540,13 @@ class TestTEWrappers:
             contention=True,
             what=f"TELayerNormColumnParallelLinear[{normalization}]",
         )
+        if normalization == "RMSNorm" and not zero_centered_gamma:
+            norm, linear = split_te_layernorm_column_parallel_linear(module, config)
+            split = torch.nn.Sequential(norm, linear)
+            assert all(parameter.device == module.weight.device for parameter in split.parameters())
+            assert_module_replays_bit_exact(
+                split, (x,), replays=3, contention=True, what="split TE MLA up projection"
+            )
 
     @pytest.mark.parametrize("normalization", ["LayerNorm", "RMSNorm"])
     def test_te_norm_replays(self, normalization):

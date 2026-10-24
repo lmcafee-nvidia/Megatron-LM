@@ -1,12 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""GPU contracts for the pinned NeMo-RL Megatron generation adapter.
-
-The worker runtime supplies an immutable NeMo-RL source archive through
-``NEMO_RL_SOURCE``.  Keeping the consumer out of this repository avoids
-vendoring it while still exercising its production request and response code.
-"""
-
 import asyncio
 import copy
 import importlib
@@ -42,6 +35,7 @@ from megatron.core.resharding.refit import (
     swap_model_weights,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer import attention as attention_module
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.mlp import MLPSubmodules
@@ -61,8 +55,6 @@ NEMO_RL_COMMIT = "b26733300f0f7f5421c43c8ba4cd9e37e5d5f65d"
 
 
 class _CoordinatorTokenizer:
-    """Pickle-safe tokenizer surface needed by the spawned coordinator."""
-
     vocab_size = 100
     eod = 99
 
@@ -74,7 +66,6 @@ class _CoordinatorTokenizer:
 
 
 def _mount_nemo_rl_generation_packages(source):
-    """Mount real source packages without importing unrelated backends."""
     for name, relative_path in (
         ("nemo_rl.models.generation", "nemo_rl/models/generation"),
         ("nemo_rl.models.generation.megatron", "nemo_rl/models/generation/megatron"),
@@ -87,7 +78,6 @@ def _mount_nemo_rl_generation_packages(source):
 
 
 def _load_nemo_rl_adapter():
-    """Load the production adapter only from the worker's verified source tree."""
     source_value = os.environ.get("NEMO_RL_SOURCE")
     if source_value is None:
         pytest.skip("NEMO_RL_SOURCE is supplied by the NeMo-RL acceptance worker")
@@ -96,9 +86,6 @@ def _load_nemo_rl_adapter():
     sys.path.insert(0, str(source))
     try:
         data_module = importlib.import_module("nemo_rl.distributed.batched_data_dict")
-        # NeMo-RL's generation package eagerly imports every backend, including
-        # vLLM.  Mount the real source packages directly so this MCore-only
-        # contract does not require dependencies for unrelated backends.
         _mount_nemo_rl_generation_packages(source)
         worker_module = importlib.import_module(
             "nemo_rl.models.generation.megatron.megatron_worker"
@@ -111,7 +98,6 @@ def _load_nemo_rl_adapter():
 
 
 def _load_nemo_rl_token_capture():
-    """Load NeMo-RL's production stager and its pinned Gym wire models."""
     source_value = os.environ.get("NEMO_RL_SOURCE")
     if source_value is None:
         pytest.skip("NEMO_RL_SOURCE is supplied by the NeMo-RL acceptance worker")
@@ -154,10 +140,8 @@ def _protocol_adapter(mixin_cls, *, stop_token_ids=None, ignore_eos=False):
 
 @pytest.mark.internal
 def test_native_adapter_preserves_stop_tokens_and_finish_reason():
-    """The shared NeMo contract must survive native request and reply lowering."""
     BatchedDataDict, mixin_cls = _load_nemo_rl_adapter()
     adapter = _protocol_adapter(mixin_cls, stop_token_ids=[23, 17, 23])
-
     params = adapter._build_sampling_params(greedy=False, stop_words=None)
     assert params.stop_token_ids == [17, 23]
     data = BatchedDataDict(
@@ -180,9 +164,7 @@ def test_native_adapter_preserves_stop_tokens_and_finish_reason():
             finish_reason="stop",
         ),
     ]
-
     output = adapter._parse_result_to_batched_data_dict(data, replies)
-
     assert output["truncated"].tolist() == [True, False]
 
 
@@ -212,7 +194,6 @@ def test_native_adapter_preserves_stop_tokens_and_finish_reason():
     ids=["prompt-identity", "score-alignment"],
 )
 def test_native_adapter_rejects_misaligned_reply(reply, message):
-    """Malformed replies must fail instead of contaminating training tensors."""
     BatchedDataDict, mixin_cls = _load_nemo_rl_adapter()
     adapter = _protocol_adapter(mixin_cls)
     data = BatchedDataDict(
@@ -229,7 +210,6 @@ def test_native_adapter_rejects_misaligned_reply(reply, message):
 @pytest.mark.internal
 @pytest.mark.parametrize("result_count", [0, 2])
 def test_native_adapter_rejects_reply_count_mismatch(result_count):
-    """Missing or surplus replies must not shift or silently discard training rows."""
     BatchedDataDict, mixin_cls = _load_nemo_rl_adapter()
     adapter = _protocol_adapter(mixin_cls)
     data = BatchedDataDict(
@@ -247,22 +227,22 @@ def test_native_adapter_rejects_reply_count_mismatch(result_count):
 
 
 async def _drive_engine(engine, futures, witness=None):
-    """Run the real dynamic engine until all submitted requests complete."""
     step_count = 0
     while not all(future.done() for future in futures):
         with torch.inference_mode():
-            await engine.async_step()
+            step = await engine.async_step()
+        if witness is not None and step["cuda_graph_request_count"] is not None:
+            request_ids = tuple(map(int, step["active_request_ids"]))
+            graph_ids = witness["cuda_graph_request_ids"]
+            finished_ids = tuple(item.request_id for item in step["finished_requests"])
+            graph_ids.append(request_ids + finished_ids)
         step_count += 1
-        if witness is not None:
-            witness["chunked_prefill_steps"] += int(engine.context.chunked_prefill_request_id >= 0)
-            witness["cuda_graph_steps"] += int(engine.context.using_cuda_graph_this_step())
         assert step_count < 100, "dynamic engine did not drain the adapter requests"
         await asyncio.sleep(0)
     return await asyncio.gather(*futures)
 
 
 def _build_inference_mxfp8_env(test_case, config, *, quantize=True):
-    """Mirror the production consumer's inference spec and persistent MXFP8 setup."""
     config_class = dynamic_engine_tests.TransformerConfig
 
     def build_mxfp8_config(**kwargs):
@@ -287,8 +267,6 @@ def _build_inference_mxfp8_env(test_case, config, *, quantize=True):
 
 
 class _InProcessInferenceClient:
-    """Transport-only client that submits to the real engine in this process."""
-
     def __init__(self, engine, expected_requests, first_request_id, witness):
         self.engine = engine
         self.expected_requests = expected_requests
@@ -313,7 +291,8 @@ class _InProcessInferenceClient:
         future = self.engine.add_request(request_id, prompt, sampling_params)
         self.pending.append(future)
         if len(self.pending) == self.expected_requests:
-            self.driver = asyncio.create_task(_drive_engine(self.engine, self.pending))
+            drive = _drive_engine(self.engine, self.pending, self.witness)
+            self.driver = asyncio.create_task(drive)
         return request_id, future
 
     def abort_request(self, request_id):  # pragma: no cover - failure path assertion
@@ -321,8 +300,6 @@ class _InProcessInferenceClient:
 
 
 class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
-    """Direct MCore and NeMo-RL must agree on one real stressed generation step."""
-
     @classmethod
     def setup_class(cls):
         Utils.initialize_model_parallel(
@@ -342,7 +319,6 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
     @pytest.mark.internal
     @pytest.mark.parametrize("modality", ["image", "video"])
     def test_real_multimodal_adapter_runs_vision_and_language_models(self, modality, monkeypatch):
-        """Run consumer-prepared pixels through real LLaVA encoder and decoder weights."""
         monkeypatch.setenv("NVTE_FLASH_ATTN", "1")
         monkeypatch.setenv("NVTE_FUSED_ATTN", "0")
         monkeypatch.setenv("NVTE_UNFUSED_ATTN", "0")
@@ -353,7 +329,6 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             PackedTensor = importlib.import_module("nemo_rl.data.multimodal_utils").PackedTensor
         finally:
             sys.path.remove(str(source))
-
         hidden_size, patch_dim, image_size = 64, 14, 28
         language_config = TransformerConfig(
             num_layers=1,
@@ -436,7 +411,6 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         prompts, media, params = adapter._prepare_data_for_generation(data, greedy=True)
         assert prompts == [prompt] and set(media[0]) == {modality, "media_tokens_preexpanded"}
         assert params[0].return_prompt_tokens
-
         engine = object.__new__(DynamicInferenceEngine)
         engine.controller = SimpleNamespace(
             inference_wrapped_model=wrapper, tokenizer=SimpleNamespace(eod=127), pp_group=None
@@ -555,9 +529,10 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             {
                 "mla": True,
                 "transformer_impl": "transformer_engine",
-                "context_block_size_tokens": 256,
+                "context_block_size_tokens": 64,
                 "position_embedding_type": "rope",
             },
+            {"mla": True, "context_block_size_tokens": 64, "position_embedding_type": "rope"},
             {"adapter_sampling": {"temperature": 0.73, "top_k": 1, "top_p": 0.91}},
             {"logprobs_mode": "processed_logprobs"},
             {"position_embedding_type": "rope", "use_flashinfer_fused_rope": True},
@@ -576,23 +551,29 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             "sliding-window-sink",
             "cuda-graphs",
             "mtp",
-            "mla-latent-cache",
+            "mla-te-latent-cache",
+            "mla-local-latent-cache",
             "non-greedy-parameters",
             "processed-logprobs",
             "flashinfer-fused-rope",
         ],
     )
     async def test_direct_and_real_adapter_greedy_outputs_match(self, feature_config):
-        """Exercise request lowering, FlashInfer decode, and response packing together."""
         BatchedDataDict, mixin_cls = _load_nemo_rl_adapter()
         stresses_chunking = feature_config.get("enable_chunked_prefill", False)
         stresses_prefix = feature_config.get("enable_prefix_caching", False)
         adapter_sampling = feature_config.get("adapter_sampling")
         uses_mla = feature_config.get("mla", False)
         uses_mxfp8 = feature_config.get("mxfp8", False)
+        if uses_mla and not attention_module.HAVE_FMLA:
+            pytest.skip("dynamic latent-cache MLA requires FlashMLA")
         if stresses_prefix:
-            shared_prefix = [index % 89 + 1 for index in range(256)]
-            prompts = [shared_prefix + [3, 5], shared_prefix + [7, 9, 11, 13]]
+            prefix_len, suffix_lens = (256, (258, 260)) if stresses_chunking else (256, (2, 4))
+            shared_prefix = [index % 89 + 1 for index in range(prefix_len)]
+            prompts = [
+                shared_prefix + [(index + shift) % 89 + 1 for index in range(length)]
+                for shift, length in zip((0, 41), suffix_lens, strict=True)
+            ]
         else:
             prompts = [[3, 5, 7, 9], [2, 4, 6, 8, 10, 12]]
         config = DynamicEngineTestConfig(
@@ -604,6 +585,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             num_gap_steps=0,
             sampling_backend="flashinfer",
             async_sched_mode=AsyncScheduleMode.ASYNC,
+            flash_attention_version=4 if uses_mla else 2,
             return_log_probs=True,
             skip_prompt_log_probs=True,
             logprobs_mode=feature_config.get("logprobs_mode", "raw_logprobs"),
@@ -643,6 +625,16 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
                         num_experts=num_experts, qk_layernorm=True, multi_latent_attention=True
                     ),
                 ),
+                mock.patch.object(
+                    dynamic_engine_tests,
+                    "get_gpt_layer_local_spec",
+                    lambda num_experts=None: ModuleSpec(
+                        module=TransformerLayer,
+                        submodules=get_gpt_layer_local_submodules(
+                            num_experts=num_experts, qk_layernorm=True, multi_latent_attention=True
+                        ),
+                    ),
+                ),
             ):
                 env = self._build_test_env(config)
         elif uses_mxfp8:
@@ -650,8 +642,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         else:
             env = self._build_test_env(config)
         engine = env.engine
-        if uses_mla:
-            assert engine.context.cache_mla_latent
+        assert not uses_mla or engine.context.cache_mla_latent
         if uses_mxfp8:
             model_config = engine.controller.inference_wrapped_model.model.config
             assert "mxfp8" in str(model_config.fp8_recipe).lower()
@@ -660,9 +651,9 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             "adapter_submissions": [],
             "model_request_ids": [],
             "sampler_request_ids": [],
-            "chunked_prefill_steps": 0,
-            "cuda_graph_steps": 0,
-            "mtp_steps": 0,
+            "chunked_prefill_request_ids": [],
+            "cuda_graph_request_ids": [],
+            "mtp_request_ids": [],
         }
 
         def active_request_ids():
@@ -703,11 +694,10 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             original_mtp_step = engine.controller._run_async_sched_sample_mtp
 
             def traced_mtp_step(*args, **kwargs):
-                witness["mtp_steps"] += 1
+                witness["mtp_request_ids"].append(active_request_ids())
                 return original_mtp_step(*args, **kwargs)
 
             engine.controller._run_async_sched_sample_mtp = traced_mtp_step
-
         direct_params = [
             SamplingParams(
                 temperature=(adapter_sampling or {}).get("temperature", 0),
@@ -721,18 +711,37 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             )
             for _ in prompts
         ]
+        if stresses_chunking:
+            warm_params = copy.deepcopy(direct_params[0])
+            warm_params.num_tokens_to_generate = 1
+            await _drive_engine(engine, [engine.add_request(90, shared_prefix, warm_params)])
         direct_futures = [
             engine.add_request(request_id, prompt, params)
             for request_id, prompt, params in zip(
                 range(100, 100 + len(prompts)), prompts, direct_params, strict=True
             )
         ]
-        direct = await _drive_engine(engine, direct_futures, witness)
+        direct = await _drive_engine(engine, direct_futures)
+        if stresses_chunking:
+            assert torch.is_inference(engine.context.request_ids)
+            engine.reset()
+            await _drive_engine(
+                engine, [engine.add_request(190, shared_prefix, copy.deepcopy(warm_params))]
+            )
+        engine._prefill_tokens_skipped = 0
+        witness["mtp_request_ids"].clear()
+        original_schedule = engine.schedule_waiting_requests
+
+        def traced_schedule():
+            original_schedule()
+            if (request_id := engine.context.chunked_prefill_request_id) >= 0:
+                witness["chunked_prefill_request_ids"].append(int(request_id))
+
+        engine.schedule_waiting_requests = traced_schedule
         if uses_mla:
             for layer in engine.controller.inference_wrapped_model.model.decoder.layers:
                 assert layer.self_attention.kv_layernorm.weight.is_cuda
                 assert layer.self_attention.linear_kv_up_proj_linear.weight.is_cuda
-
         adapter = object.__new__(mixin_cls)
         adapter.cfg = {
             "generation": {
@@ -788,7 +797,6 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         )
         await adapter.inference_client.driver
         output = adapter._parse_result_to_batched_data_dict(data, adapter_requests)
-
         assert [entry["prompt"] for entry in witness["adapter_submissions"]] == [
             tuple(prompt) for prompt in prompts
         ]
@@ -823,7 +831,6 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
                     .eq(0)
                     .all()
                 )
-
         adapter_ids = {200, 201}
         assert adapter_ids.issubset(
             {request_id for step in witness["model_request_ids"] for request_id in step}
@@ -833,7 +840,8 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         )
         assert engine.context.async_sched_step_count > 0
         if stresses_chunking:
-            assert witness["chunked_prefill_steps"] > 0
+            assert witness["chunked_prefill_request_ids"]
+            assert set(witness["chunked_prefill_request_ids"]) <= adapter_ids
             assert engine._prefill_tokens_skipped > 0
         if stresses_prefix:
             allocator = engine.context.kv_block_allocator
@@ -847,9 +855,19 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             else:
                 assert allocator.kv_hash_to_block_id
         if feature_config.get("num_cuda_graphs") is not None:
-            assert witness["cuda_graph_steps"] > 0
+            graph_ids = {
+                request_id
+                for step_request_ids in witness["cuda_graph_request_ids"]
+                for request_id in step_request_ids
+            }
+            assert graph_ids and graph_ids <= adapter_ids
         if feature_config.get("num_speculative_tokens", 0):
-            assert witness["mtp_steps"] > 0
+            mtp_ids = {
+                request_id
+                for step_request_ids in witness["mtp_request_ids"]
+                for request_id in step_request_ids
+            }
+            assert mtp_ids and mtp_ids <= adapter_ids
         if mixer_name is not None:
             assert mixer_hooks and mixer_calls
         for hook in mixer_hooks:
@@ -859,7 +877,6 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
     @pytest.mark.internal
     @pytest.mark.asyncio
     async def test_real_adapter_joint_sampling_matches_analytic_distribution(self):
-        """Validate stochastic support and frequencies, not cross-RNG trajectories."""
         BatchedDataDict, mixin_cls = _load_nemo_rl_adapter()
         sample_count = 128
         prompt = [3, 5, 7, 9]
@@ -916,7 +933,6 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         replies = await adapter._generate_with_persistent_engine(lowered_prompts, media, params)
         await adapter.inference_client.driver
         output = adapter._parse_result_to_batched_data_dict(data, replies)
-
         assert len(observed) == 1
         step = observed[0]
         assert not step["no_top_k"] and not step["no_top_p"]
@@ -926,7 +942,6 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         torch.testing.assert_close(
             step["logits"], step["logits"][0].expand_as(step["logits"]), rtol=0, atol=0
         )
-
         raw_log_probs = torch.log_softmax(step["logits"][0], dim=-1)
         scaled_probs = torch.softmax(step["logits"][0] / 0.73, dim=-1)
         top_probs, top_tokens = scaled_probs.topk(4)
@@ -954,7 +969,6 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
     @pytest.mark.internal
     @pytest.mark.asyncio
     async def test_public_async_adapter_preserves_row_attribution(self):
-        """Exercise the public async rollout API consumed by NeMo-RL collectors."""
         BatchedDataDict, mixin_cls = _load_nemo_rl_adapter()
         engine = self._build_test_env(
             DynamicEngineTestConfig(
@@ -1005,7 +1019,6 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         completed = {}
         async for index, row in adapter.generate_async(data, greedy=True):
             completed[index] = row
-
         assert set(completed) == {0, 1}
         for index, expected in enumerate(direct):
             row = completed[index]
@@ -1023,7 +1036,6 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
     @pytest.mark.internal
     @pytest.mark.asyncio
     async def test_real_stop_and_length_finish_contracts(self):
-        """Prove EOS, explicit-token, string, and length stops on real decode steps."""
         BatchedDataDict, mixin_cls = _load_nemo_rl_adapter()
         engine = self._build_test_env(
             DynamicEngineTestConfig(
@@ -1110,7 +1122,6 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         assert all(reply.finish_reason == "stop" for reply in token_replies)
         assert token_output["generation_lengths"].tolist() == [1, 1]
         assert token_output["truncated"].tolist() == [False, False]
-
         string_replies, string_output = await run_adapter_case(
             stop_strings=[str(first_tokens[0])],
             row_stop_strings=[None, [str(first_tokens[1])]],
@@ -1119,7 +1130,6 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         assert all(reply.finish_reason == "stop" for reply in string_replies)
         assert string_output["generation_lengths"].tolist() == [1, 1]
         assert string_output["truncated"].tolist() == [False, False]
-
         eos_replies, eos_output = await run_adapter_case(
             selected_prompts=prompts[:1],
             ignore_eos=False,
@@ -1156,7 +1166,6 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
     async def test_real_client_coordinator_adapter_matches_direct(
         self, kv_cache_management_mode, mxfp8
     ):
-        """Cross the production client/coordinator boundary, not only request methods."""
         BatchedDataDict, mixin_cls = _load_nemo_rl_adapter()
         config = DynamicEngineTestConfig(
             num_requests=0,
@@ -1428,7 +1437,6 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
     @pytest.mark.internal
     @pytest.mark.asyncio
     async def test_real_token_capture_stages_exact_concurrent_versioned_payloads(self):
-        """Exercise MCore completion offload through NeMo-RL and Gym together."""
         _, mixin_cls = _load_nemo_rl_adapter()
         capture_module, gym_module, records_module = _load_nemo_rl_token_capture()
 
@@ -1587,8 +1595,8 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
 
 
 @pytest.mark.internal
-def test_real_noncolocated_consumer_refit_then_adapter_output():
-    """Transfer two weight versions across disjoint workers before packing output."""
+@pytest.mark.asyncio
+async def test_real_noncolocated_consumer_refit_then_adapter_output():
     if Utils.world_size != 4:
         pytest.skip("noncolocated source/destination contract requires four ranks")
 
@@ -1610,17 +1618,22 @@ def test_real_noncolocated_consumer_refit_then_adapter_output():
     source_pgs = build_inference_pg_collection(world_size=2, tp_size=1, rank_offset=0)
     target_pgs = build_inference_pg_collection(world_size=2, tp_size=1, rank_offset=2)
     config = TransformerConfig(
-        num_layers=1, hidden_size=64, num_attention_heads=4, use_cpu_initialization=False, bf16=True
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=2,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        attention_backend=AttnBackend.auto,
     )
     torch.manual_seed(1234)
     source_model = (
-        _build_gpt(config, 128, 8, source_pgs, parallel_output=False).cuda().eval()
+        _build_gpt(config, 128, 8, source_pgs, parallel_output=False).cuda().bfloat16().eval()
         if rank < 2
         else None
     )
     torch.manual_seed(1234)
     target_model = (
-        _build_gpt(config, 128, 8, target_pgs, parallel_output=False).cuda().eval()
+        _build_gpt(config, 128, 8, target_pgs, parallel_output=False).cuda().bfloat16().eval()
         if rank >= 2
         else None
     )
@@ -1632,14 +1645,28 @@ def test_real_noncolocated_consumer_refit_then_adapter_output():
     refitter = object.__new__(refit_cls)
     refitter.model = source_model if rank < 2 else target_model
     refitter.refit_execution_batch_bytes = None
-    # The destination PGC already records global ranks 2-3. NeMo-RL applies an
-    # offset only when its source and destination use independent rank worlds.
     refitter.refit_dst_rank_offset = 0
     with pytest.raises(RuntimeError, match="was not initialized"):
         refitter.swap_weights_via_reshard(is_source=rank < 2)
     refitter.refit_execution_batch_bytes = 1 << 20
     adapter = _protocol_adapter(mixin_cls, ignore_eos=True)
+    adapter.cfg["generation"]["max_new_tokens"] = 1
     data = BatchedDataDict({"input_ids": tokens.cpu(), "input_lengths": torch.tensor([4])})
+    if target_model is not None:
+        inference_config = dynamic_engine_tests.InferenceConfig(
+            max_sequence_length=8,
+            buffer_size_gb=0.01,
+            max_requests=1,
+            max_tokens=8,
+            sampling_backend="torch",
+            pg_collection=target_pgs,
+        )
+        context = dynamic_engine_tests.DynamicInferenceContext(config, inference_config)
+        wrapper = dynamic_engine_tests.GPTInferenceWrapper(target_model, context)
+        wrapper.model_is_pipeline_parallel = False
+        engine = DynamicInferenceEngine(
+            dynamic_engine_tests.TextGenerationController(wrapper, _CoordinatorTokenizer()), context
+        )
     previous_token = None
     refit_group = torch.distributed.new_group(backend="gloo")
     refitter.refit_pg = refit_group
@@ -1654,37 +1681,53 @@ def test_real_noncolocated_consumer_refit_then_adapter_output():
                     source_model, tokens, positions, attention_mask, source_pgs
                 )
             else:
-                direct_logits = torch.empty(1, 4, 128, device="cuda")
+                direct_logits = torch.empty(1, 4, 128, device="cuda", dtype=torch.bfloat16)
             torch.distributed.broadcast(direct_logits, src=0)
             assert refitter.swap_weights_via_reshard(is_source=rank < 2)
             torch.cuda.synchronize()
             if target_model is not None:
-                target_logits = _run_forward(
-                    target_model, tokens, positions, attention_mask, target_pgs
-                )
+                with torch.inference_mode():
+                    target_logits = target_model(
+                        tokens, positions, attention_mask, runtime_gather_output=True
+                    )
                 torch.testing.assert_close(target_logits, direct_logits, rtol=0, atol=0)
-                step = target_logits[0, -1].float()
-                token = int(step.argmax())
-                score = float(torch.log_softmax(step, dim=-1)[token])
-                output = adapter._parse_result_to_batched_data_dict(
-                    data,
-                    [
-                        SimpleNamespace(
-                            prompt_tokens=tokens[0],
-                            generated_tokens=[token],
-                            generated_log_probs=[score],
-                            finish_reason="length",
-                            policy_epoch=[(0, version)],
-                        )
-                    ],
+                if rank == 3:
+                    torch.distributed.barrier()
+                    continue
+                engine._generation_epoch = version
+                prompts, media, sampling_params = adapter._prepare_data_for_generation(
+                    data, greedy=True
                 )
-                assert output["output_ids"][0, 4].item() == token
-                assert output["logprobs"][0, 4].item() == score
+                direct = (
+                    await _drive_engine(
+                        engine, [engine.add_request(300 + version, prompts[0], sampling_params[0])]
+                    )
+                )[0]
+                witness = {"adapter_submissions": [], "cuda_graph_request_ids": []}
+                adapter.inference_client = _InProcessInferenceClient(
+                    engine, expected_requests=1, first_request_id=400 + version, witness=witness
+                )
+                with mock.patch.object(torch.distributed, "get_rank", return_value=0):
+                    replies = await adapter._generate_with_persistent_engine(
+                        prompts, media, sampling_params
+                    )
+                await adapter.inference_client.driver
+                output = adapter._parse_result_to_batched_data_dict(data, replies)
+                assert direct.generated_tokens == replies[0].generated_tokens
+                assert direct.generated_log_probs == replies[0].generated_log_probs
+                assert replies[0].policy_epoch == [(0, version)]
+                assert output["output_ids"][0, 4].item() == int(target_logits[0, -1].argmax())
+                assert output["logprobs"][0, 4].item() == direct.generated_log_probs[0]
+                assert witness["adapter_submissions"][0]["request_id"] == 400 + version
+                assert not engine.requests and not engine.has_unfinished_requests()
                 if previous_token is not None:
-                    assert token != previous_token or not torch.equal(
+                    assert output["output_ids"][0, 4].item() != previous_token or not torch.equal(
                         target_logits, previous_logits
                     )
-                previous_token, previous_logits = token, target_logits.clone()
+                previous_token, previous_logits = (
+                    output["output_ids"][0, 4].item(),
+                    target_logits.clone(),
+                )
             torch.distributed.barrier()
     finally:
         refitter.refit_copy_service.close()
@@ -1697,13 +1740,13 @@ def test_real_noncolocated_consumer_refit_then_adapter_output():
 
 @pytest.fixture
 def nemo_parallel(request, monkeypatch):
-    """Initialize one requested topology and a separate CPU synchronization group."""
     topology = request.param
     monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1")
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=topology["tp"],
         pipeline_model_parallel_size=topology["pp"],
         expert_model_parallel_size=topology["ep"],
+        expert_tensor_parallel_size=topology.get("etp", 1),
     )
     synchronization_group = torch.distributed.new_group(backend="gloo")
     try:
@@ -1716,8 +1759,6 @@ def nemo_parallel(request, monkeypatch):
 
 
 class TestNeMoRLAdapterParallelContract(DynamicInferenceEngineTestBase):
-    """Run the production adapter boundary on every supported two-rank axis."""
-
     @pytest.mark.internal
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -1730,6 +1771,18 @@ class TestNeMoRLAdapterParallelContract(DynamicInferenceEngineTestBase):
             ),
             pytest.param({"tp": 1, "pp": 2, "ep": 1}, id="pp2"),
             pytest.param({"tp": 1, "pp": 1, "ep": 2}, id="ep2-moe"),
+            pytest.param({"tp": 2, "pp": 1, "ep": 1, "etp": 2, "moe": True}, id="etp2-moe-local"),
+            pytest.param(
+                {
+                    "tp": 2,
+                    "pp": 1,
+                    "ep": 1,
+                    "etp": 2,
+                    "moe": True,
+                    "transformer_impl": "transformer_engine",
+                },
+                id="etp2-moe-te",
+            ),
             pytest.param({"tp": 1, "pp": 1, "ep": 1}, id="dp2"),
         ],
         indirect=True,
@@ -1739,6 +1792,7 @@ class TestNeMoRLAdapterParallelContract(DynamicInferenceEngineTestBase):
         topology, synchronization_group = nemo_parallel
         rank = torch.distributed.get_rank()
         assert torch.distributed.get_world_size() == 2
+        uses_moe = topology["ep"] > 1 or topology.get("moe", False)
         config = DynamicEngineTestConfig(
             num_requests=0,
             max_prompt_length=8,
@@ -1748,7 +1802,7 @@ class TestNeMoRLAdapterParallelContract(DynamicInferenceEngineTestBase):
             tensor_model_parallel_size=topology["tp"],
             pipeline_model_parallel_size=topology["pp"],
             expert_model_parallel_size=topology["ep"],
-            use_moe_layer_spec=topology["ep"] > 1,
+            use_moe_layer_spec=uses_moe,
             sequence_parallel=topology.get("sp", False),
             transformer_impl=topology.get("transformer_impl", "local"),
             sampling_backend="flashinfer",
@@ -1757,7 +1811,18 @@ class TestNeMoRLAdapterParallelContract(DynamicInferenceEngineTestBase):
             skip_prompt_log_probs=True,
             logprobs_mode="raw_logprobs",
         )
-        engine = self._build_test_env(config).engine
+        transformer_config = dynamic_engine_tests.TransformerConfig
+
+        def build_transformer_config(**kwargs):
+            kwargs.update(
+                expert_tensor_parallel_size=topology.get("etp", 1),
+                num_moe_experts=2 if uses_moe else kwargs["num_moe_experts"],
+                add_bias_linear=False if uses_moe else kwargs["add_bias_linear"],
+            )
+            return transformer_config(**kwargs)
+
+        with mock.patch.object(dynamic_engine_tests, "TransformerConfig", build_transformer_config):
+            engine = self._build_test_env(config).engine
         engine.controller.tokenizer = _CoordinatorTokenizer()
         is_dp = topology["tp"] == topology["pp"] == topology["ep"] == 1
         prompts = [[3, 5, 7, 9], [3, 5, 7, 9]] if is_dp else [[3, 5, 7, 9], [2, 4, 6, 8, 10]]
@@ -1900,7 +1965,7 @@ class TestNeMoRLAdapterParallelContract(DynamicInferenceEngineTestBase):
         if failure is not None:
             raise failure
         assert adapter_forward_ids
-        if topology["ep"] > 1:
+        if uses_moe:
             assert moe_hooks and moe_forward_calls
         for hook in moe_hooks:
             hook.remove()

@@ -20,6 +20,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer import multi_latent_attention as mla_module
 from megatron.core.transformer.attention import Attention, SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.utils import is_te_min_version, unwrap_model
@@ -92,7 +93,6 @@ class TestParallelAttention:
 
         self.parallel_attention.cuda()
 
-        # [sequence length, batch size, hidden size]
         hidden_states = torch.ones(
             (sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size),
             dtype=torch.bfloat16,
@@ -924,7 +924,6 @@ class TestFlashDecodeAndPrefillSoftcap:
     leaves the other three passing, so each site is driven independently here.
     """
 
-    # site -> (is_decode_only, (use_fa4, use_fa3), patched kernel, returns a tuple)
     _SITES = {
         "prefill_fa4": (False, (True, False), "flash_attn4_varlen_func", True),
         "prefill_fa2": (False, (False, False), "flash_attn_varlen_func", False),
@@ -947,8 +946,6 @@ class TestFlashDecodeAndPrefillSoftcap:
         attn.training = False  # the function asserts this before dispatching
         attn._resolve_flash_version.return_value = flash_version
 
-        # (num_requests * tokens_per_request, 1, heads, head_dim), which both branches accept:
-        # prefill squeezes dim 1, decode reshapes on seqlens_k.shape[0] requests.
         q = torch.zeros(2, 1, 4, 8)
         kv = torch.zeros(2, 4, 8)
         out = torch.zeros(2, 4, 8) if not is_decode_only else torch.zeros(2, 1, 4, 8)
@@ -983,12 +980,6 @@ class TestFlashDecodeAndPrefillSoftcap:
 
 
 class TestFlashMLASoftcapRejected:
-    """FlashMLA has no softcap support, so the combination must fail rather than half-apply.
-
-    Without this the cap would be applied in prefill, which shares the non-MLA path, and
-    silently dropped in decode, inside a single forward.
-    """
-
     def test_mla_decode_rejects_a_configured_cap(self):
         from megatron.core.transformer.transformer_config import MLATransformerConfig
 
@@ -1016,3 +1007,8 @@ class TestFlashMLASoftcapRejected:
                 block_table=torch.zeros(2, 4, dtype=torch.int32),
                 is_decode_only=True,
             )
+
+    def test_missing_flash_mla_has_an_explicit_error(self, monkeypatch):
+        monkeypatch.setattr(mla_module, "HAVE_FMLA", False)
+        with pytest.raises(RuntimeError, match="requires the optional FlashMLA package"):
+            mla_module._require_flash_mla()
