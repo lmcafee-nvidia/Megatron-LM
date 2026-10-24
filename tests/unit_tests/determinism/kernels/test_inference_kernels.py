@@ -181,23 +181,23 @@ def test_batch_invariant_swiglu_matches_training():
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("clamp_scale", [None, 8.0], ids=["unclamped", "clamped"])
-def test_batch_invariant_squared_relu_matches_training(clamp_scale):
-    """Exercise the FP32 intermediates the training squared-ReLU fusion rounds only once."""
+@pytest.mark.parametrize("fused", [False, True], ids=["unfused", "fused"])
+@pytest.mark.parametrize("scale", [None, 8.0], ids=["unclamped", "clamped"])
+def test_batch_invariant_squared_relu_matches_training(scale, fused):
     from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
     from megatron.core.inference.moe.batch_invariant import squared_relu_with_probs
 
     seeded()
     rows, ffn = 512, 768
-    # Centred on zero so both sides of the ReLU are exercised.
     x = torch.randn(rows, ffn, device="cuda", dtype=torch.bfloat16)
-    # FP32 probabilities, as moe_router_dtype=fp32 delivers them.
     probs = torch.rand(rows, device="cuda")
     perm = torch.arange(rows, device="cuda", dtype=torch.int32)
     used = _dev_scalar(rows)
-
-    expected = weighted_squared_relu_impl(x.clone(), probs[:, None], clamp_scale)
-    actual = squared_relu_with_probs(x.clone(), perm, used, probs, clamp_scale)
+    activation = x if scale is None else (scale * torch.tanh(x.float() / scale)).to(x.dtype)
+    expected = (torch.pow(torch.relu(activation), 2) * probs[:, None]).to(x.dtype)
+    if fused:
+        expected = weighted_squared_relu_impl(x.clone(), probs[:, None], scale)
+    actual = squared_relu_with_probs(x, perm, used, probs, scale, fused_weighted=fused)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
