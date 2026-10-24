@@ -1206,10 +1206,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             source_config.fp8 = False
             refit_engine = self._build_test_env(source_config).engine
             refit_model = refit_engine.controller.inference_wrapped_model.model
-            base_state = {
-                name: value.detach().cpu().clone()
-                for name, value in refit_model.state_dict().items()
-            }
+            base_state = copy.deepcopy(refit_model.state_dict())
             if mxfp8:
                 inference_model = engine.controller.inference_wrapped_model.model
                 prepare_swap_model_weights(refit_model, inference_model)
@@ -1260,12 +1257,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
                     ],
                 )
                 refit_expected.append(expected)
-                refit_states.append(
-                    {
-                        name: value.detach().cpu().clone()
-                        for name, value in refit_model.state_dict().items()
-                    }
-                )
+                refit_states.append(copy.deepcopy(refit_model.state_dict()))
             assert any(
                 first.generated_tokens != second.generated_tokens
                 or first.generated_log_probs != second.generated_log_probs
