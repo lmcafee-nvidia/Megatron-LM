@@ -1825,6 +1825,8 @@ class TestNeMoRLAdapterParallelContract(DynamicInferenceEngineTestBase):
         engine.controller.tokenizer = _CoordinatorTokenizer()
         is_dp = topology["tp"] == topology["pp"] == topology["ep"] == 1
         prompts = [[3, 5, 7, 9], [3, 5, 7, 9]] if is_dp else [[3, 5, 7, 9], [2, 4, 6, 8, 10]]
+        # Keep EP baseline/adapter admission identical; heterogeneous batching is covered above.
+        prompts = prompts[:1] if topology["ep"] > 1 else prompts
         params = [
             SamplingParams(
                 temperature=0.7 if is_dp else 0,
@@ -1883,7 +1885,6 @@ class TestNeMoRLAdapterParallelContract(DynamicInferenceEngineTestBase):
             for module in model.modules()
             if type(module).__name__ == "MoELayer"
         ]
-
         client = None
         failure = None
         try:
@@ -1945,7 +1946,6 @@ class TestNeMoRLAdapterParallelContract(DynamicInferenceEngineTestBase):
                         )
                 except BaseException as error:
                     failure = error
-
             await asyncio.to_thread(torch.distributed.barrier, group=synchronization_group)
         finally:
             if rank == 0 and client is not None:
