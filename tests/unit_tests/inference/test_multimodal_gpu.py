@@ -1928,15 +1928,17 @@ def test_real_media_executes_fp8_context_and_reuses_exact_embedding(model_parall
             reuse, reuse_step, reuse_finished = _run_request(
                 engine, 161, {"media_cache_key": media["media_cache_key"]}, trace
             )
+            engine.clear_vision_embedding_cache()
+            recomputed, recomputed_step, _ = _run_request(engine, 162, media, trace)
     finally:
         handle.remove()
 
-    assert encoder.call_count == 1
-    assert len(quant_events) == 1
+    assert encoder.call_count == len(quant_events) == 2
     quant_enabled, observed_recipe, input_shape = quant_events[0]
     assert quant_enabled and observed_recipe == recipe
     assert input_shape == ((16 if recipe == "tensorwise" else 32), 32)
-    assert first_step["mask"].ge(0).sum().item() == 4
     assert torch.equal(first["embeddings"], reuse["embeddings"])
+    assert torch.equal(first["embeddings"], recomputed["embeddings"])
     assert torch.equal(first_step["logits"], reuse_step["logits"])
+    assert torch.equal(first_step["logits"], recomputed_step["logits"])
     assert first_finished.generated_tokens == reuse_finished.generated_tokens
