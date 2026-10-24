@@ -1037,7 +1037,8 @@ class TestNVLSAllGatherVDispatcher:
                 fc1 = torch.einsum("th,eih->tei", hidden.double(), experts._fc1_weight.double())
                 activated = torch.relu(fc1).square()
                 fc2 = torch.einsum("tei,ehi->teh", activated, experts._fc2_weight.double())
-                reference = (fc2 * weights.unsqueeze(-1)).sum(1)
+                contributions = fc2 * weights.unsqueeze(-1)
+                reference = torch.stack((contributions.sum(1), contributions.abs().sum(1)))
                 torch.distributed.all_reduce(reference, group=experts.ep_group)
                 return reference
 
@@ -1176,14 +1177,17 @@ class TestNVLSAllGatherVDispatcher:
         else:
             counts = dispatcher._local_tokens_per_rank
             start = sum(counts[: torch.distributed.get_rank()])
-            reference = evidence["fp64_reference"][start : start + hidden_states.shape[0]]
+            rows = slice(start, start + hidden_states.shape[0])
+            reference, cancellation_scale = (value[rows] for value in evidence["fp64_reference"])
             for name, output in (("training", training_output), ("inference", inference_output)):
                 if not reference.numel():
                     continue
                 error = output.reshape_as(reference).double().sub(reference).abs()
                 reference_norm, reference_scale = reference.norm(), reference.abs().max()
-                relative_l2 = error.norm() / reference_norm if reference_norm else error.norm()
-                relative_linf = error.max() / reference_scale if reference_scale else error.max()
+                cancellation_norm = cancellation_scale.norm()
+                assert reference_norm or cancellation_norm or not error.any()
+                relative_l2 = error.norm() / (reference_norm or cancellation_norm or 1)
+                relative_linf = error.max() / (reference_scale or cancellation_scale.max() or 1)
                 evidence[f"{name}_fp64_error"] = (relative_l2.item(), relative_linf.item())
                 assert max(relative_l2, relative_linf) <= 6 * 2**-8, evidence
         if synchronous_inference_output is not None:
