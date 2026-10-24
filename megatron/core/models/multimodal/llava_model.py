@@ -1874,7 +1874,9 @@ class LLaVAModel(MegatronModule):
         Callers provide ``combined_embeddings`` in batch-first
         ``[batch, sequence, hidden]`` layout. This method owns the conversion
         to the language model's sequence-first layout and any SP/CP sharding
-        when configured. Bypasses the vision encoder and ``_preprocess_data``.
+        when configured. Dynamic VLM callers reject CP before reaching this
+        method until their paged-attention metadata supports CP-local ownership.
+        Bypasses the vision encoder and ``_preprocess_data``.
 
         Args:
             combined_embeddings: [batch, seq_len, hidden] or None on non-first PP stages.

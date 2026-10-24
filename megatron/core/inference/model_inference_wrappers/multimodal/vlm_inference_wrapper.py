@@ -523,8 +523,9 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
 
                     final_embedding[image_positions] = image_embeddings_flat[image_indices]
 
-            # LLaVAModel.forward_lm_only handles the batch->sequence transpose
-            # (and SP/CP sharding when configured).
+            # LLaVAModel.forward_lm_only handles the batch->sequence transpose and SP
+            # sharding. Dynamic CP is rejected by prep_model_for_inference above because
+            # its paged-attention metadata does not yet have CP-local ownership.
         else:
             final_embedding = None
 

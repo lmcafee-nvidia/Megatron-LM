@@ -1536,9 +1536,9 @@ def test_real_media_executes_configured_language_implementation_or_parallel_path
     assert step["logits"].shape == (1, expected_seq_len, VOCAB_SIZE)
     assert len(finished.generated_tokens) == 1
     if topology == "sp":
-        text_rows = step["mask"][0, : admission["tokens"].numel()].lt(0)
-        local_logits = step["logits"][:, : admission["tokens"].numel()][:, text_rows].cuda()
+        local_logits = step["logits"][:, : admission["tokens"].numel()].cuda()
         assert torch.isfinite(local_logits).all()
+        assert finished.generated_tokens == [int(local_logits[0, -1].argmax())]
         logit_group = model.language_model.tp_group
         rank_logits = [torch.empty_like(local_logits) for _ in range(Utils.world_size)]
         torch.distributed.all_gather(rank_logits, local_logits, group=logit_group)
