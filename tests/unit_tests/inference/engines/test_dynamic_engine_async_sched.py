@@ -1716,11 +1716,16 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 memory_ptr = env.engine.context.memory_buffer.data_ptr()
                 pending_before_suspend = env.engine.controller._async_sched_forward.is_valid
                 runtime["pending-before-suspend"] += int(pending_before_suspend)
+                # Coordinator control messages bracket these calls with the stable
+                # lifecycle states; this constructor-only harness mirrors them.
+                env.engine.state = EngineState.PAUSED
                 env.engine.suspend()
+                env.engine.state = EngineState.SUSPENDED
                 runtime["pending-after-suspend"] += int(
                     env.engine.controller._async_sched_forward.is_valid
                 )
                 env.engine.resume()
+                env.engine.state = EngineState.RUNNING
                 for request_id in env.engine.resume_request_ids:
                     env.requests[request_id] = env.engine.get_request(request_id)
                 runtime["pending-after-resume"] += int(
