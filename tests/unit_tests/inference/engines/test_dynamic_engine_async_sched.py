@@ -1513,7 +1513,13 @@ def _instrument_scenario_runtime(env, scenario, runtime):
                             runtime["tp-column-partition-forwards"] += int(
                                 size > 1
                                 and output_size is not None
-                                and weight.shape[0] * size == output_size
+                                and (
+                                    weight.shape[0] * size == output_size
+                                    or (
+                                        getattr(weight, "tensor_model_parallel", False)
+                                        and getattr(weight, "partition_dim", None) == 0
+                                    )
+                                )
                             )
                         elif weight is not None and "RowParallelLinear" in name:
                             input_size = getattr(
@@ -1522,7 +1528,13 @@ def _instrument_scenario_runtime(env, scenario, runtime):
                             runtime["tp-row-partition-forwards"] += int(
                                 size > 1
                                 and input_size is not None
-                                and weight.shape[1] * size == input_size
+                                and (
+                                    weight.shape[1] * size == input_size
+                                    or (
+                                        getattr(weight, "tensor_model_parallel", False)
+                                        and getattr(weight, "partition_dim", None) == 1
+                                    )
+                                )
                             )
 
                 module.register_forward_pre_hook(record_module)
