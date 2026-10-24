@@ -152,6 +152,18 @@ def _reply(tokens, scores, reason, prompt=None):
     )
 
 
+def _assert_exact_scores(actual, expected):
+    torch.testing.assert_close(actual, torch.tensor(expected), rtol=0, atol=0)
+
+
+async def _wait_for_epoch(engine, epoch):
+    for _ in range(100):
+        if engine._generation_epoch == epoch:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"generation epoch did not reach {epoch}")
+
+
 @pytest.mark.internal
 def test_native_adapter_preserves_stop_tokens_and_finish_reason():
     BatchedDataDict, mixin_cls = _load_nemo_rl_adapter()
@@ -815,11 +827,9 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             )
             assert output["output_ids"][index, prompt_length + actual_length :].eq(0).all()
             assert output["logprobs"][index, prompt_length + actual_length :].eq(0).all()
-            torch.testing.assert_close(
+            _assert_exact_scores(
                 output["logprobs"][index, prompt_length : prompt_length + actual_length],
-                torch.tensor(expected.generated_log_probs),
-                rtol=0,
-                atol=0,
+                expected.generated_log_probs,
             )
             if feature_config.get("logprobs_mode") == "processed_logprobs":
                 assert (
@@ -1030,11 +1040,8 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             row = completed[index]
             start = len(prompts[index])
             assert row["output_ids"][0, start : start + 3].tolist() == (expected.generated_tokens)
-            torch.testing.assert_close(
-                row["logprobs"][0, start : start + 3],
-                torch.tensor(expected.generated_log_probs),
-                rtol=0,
-                atol=0,
+            _assert_exact_scores(
+                row["logprobs"][0, start : start + 3], expected.generated_log_probs
             )
         assert engine.context.async_sched_step_count > 0
         assert not engine.requests and not engine.has_unfinished_requests()
@@ -1153,11 +1160,8 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         assert length_output["truncated"].tolist() == [True]
         for output in (token_output, string_output, eos_output, length_output):
             assert int(output["output_ids"][0, len(prompts[0])]) == first_tokens[0]
-            torch.testing.assert_close(
-                output["logprobs"][0, len(prompts[0])],
-                torch.tensor(direct[0].generated_log_probs[0]),
-                rtol=0,
-                atol=0,
+            _assert_exact_scores(
+                output["logprobs"][0, len(prompts[0])], direct[0].generated_log_probs[0]
             )
         assert not engine.requests and not engine.has_unfinished_requests()
 
@@ -1198,9 +1202,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             engine = self._build_test_env(config).engine
         engine.controller.tokenizer = _CoordinatorTokenizer()
         prompts = [[3, 5, 7, 9], [2, 4, 6, 8, 10]]
-        generation_length = 3
-        refit_expected = None
-        refit_model = None
+        generation_length, refit_expected, refit_model = 3, None, None
         if kv_cache_management_mode == "recompute":
             source_config = copy.deepcopy(config)
             source_config.fp8 = False
@@ -1279,11 +1281,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             adapter._token_capture_enabled = True
             adapter._inference_loop = asyncio.get_running_loop()
             await asyncio.to_thread(adapter.set_rollout_weight_version, 0)
-            for _ in range(100):
-                if engine._generation_epoch == 0:
-                    break
-                await asyncio.sleep(0.01)
-            assert engine._generation_epoch == 0
+            await _wait_for_epoch(engine, 0)
             padded = torch.tensor([prompts[0] + [0], prompts[1]], dtype=torch.long, device="cuda")
             data = BatchedDataDict(
                 {"input_ids": padded, "input_lengths": torch.tensor([4, 5], device="cuda")}
@@ -1301,6 +1299,22 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
                 engine.controller.sampling_rng.set_state(rng_state)
                 return references
 
+            def assert_mxfp8_refit_content():
+                if not mxfp8:
+                    return
+                from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+                params, matched = dict(refit_model.named_parameters()), 0
+                for module_name, module in adapter.inference_model.decoder.named_modules():
+                    for name, dst in vars(module).items():
+                        if not isinstance(dst, MXFP8Tensor):
+                            continue
+                        key = f"decoder.{module_name}.{name}".replace("..", ".")
+                        src = MXFP8Tensor.from_bf16(params[key].to(dst.device), backend=dst.backend)
+                        assert torch.equal(dst.data, src.data) and torch.equal(dst.scale, src.scale)
+                        matched += 1
+                assert matched
+
             replies = await asyncio.wait_for(
                 adapter._generate_with_persistent_engine(lowered_prompts, media, params), timeout=30
             )
@@ -1311,11 +1325,9 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
                 assert output["output_ids"][
                     index, prompt_length : prompt_length + generation_length
                 ].tolist() == (expected.generated_tokens)
-                torch.testing.assert_close(
+                _assert_exact_scores(
                     output["logprobs"][index, prompt_length : prompt_length + generation_length],
-                    torch.tensor(expected.generated_log_probs),
-                    rtol=0,
-                    atol=0,
+                    expected.generated_log_probs,
                 )
             weight_epoch = engine._weight_epoch
             adapter.dynamic_inference_engine = engine
@@ -1333,15 +1345,12 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
                 adapter.should_disable_forward_pre_hook = False
                 adapter.move_model = lambda model, device, **_kwargs: model.to(device)
                 adapter._reshard_into_inference_model()
+                assert_mxfp8_refit_content()
             await asyncio.to_thread(adapter.set_rollout_weight_version, 1)
             await adapter._wake_engine()
             assert engine.state == EngineState.RUNNING
             assert engine._weight_epoch == weight_epoch + 1
-            for _ in range(100):
-                if engine._generation_epoch == 1:
-                    break
-                await asyncio.sleep(0.01)
-            assert engine._generation_epoch == 1
+            await _wait_for_epoch(engine, 1)
             expected_after_first_refit = refit_expected[0] if refit_expected else direct
             if mxfp8:
                 expected_after_first_refit = await direct_target_reference(500)
@@ -1371,16 +1380,13 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
                 with torch.inference_mode():
                     refit_model.load_state_dict(refit_states[1])
                 adapter._reshard_into_inference_model()
+                assert_mxfp8_refit_content()
                 await asyncio.to_thread(adapter.set_rollout_weight_version, 2)
                 await adapter._wake_engine()
                 assert engine._weight_epoch == weight_epoch + 2
             else:
                 await asyncio.to_thread(adapter.set_rollout_weight_version, 2)
-            for _ in range(100):
-                if engine._generation_epoch == 2:
-                    break
-                await asyncio.sleep(0.01)
-            assert engine._generation_epoch == 2
+            await _wait_for_epoch(engine, 2)
             spanning_reply = (await asyncio.wait_for(spanning_task, timeout=30))[0]
             assert spanning_reply.policy_epoch[0] == (0, 1)
             assert spanning_reply.policy_epoch[-1][1] == 2
@@ -1513,11 +1519,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             adapter._token_capture_enabled = True
             adapter._inference_loop = asyncio.get_running_loop()
             await asyncio.to_thread(adapter.set_rollout_weight_version, 7)
-            for _ in range(100):
-                if engine._generation_epoch == 7:
-                    break
-                await asyncio.sleep(0.01)
-            assert engine._generation_epoch == 7
+            await _wait_for_epoch(engine, 7)
 
             futures = []
             for index, prompt in enumerate(prompts, 1):
@@ -1934,11 +1936,9 @@ class TestNeMoRLAdapterParallelContract(DynamicInferenceEngineTestBase):
                             output["output_ids"][index, prompt_length : prompt_length + 3].tolist()
                             == reply.generated_tokens
                         )
-                        torch.testing.assert_close(
+                        _assert_exact_scores(
                             output["logprobs"][index, prompt_length : prompt_length + 3],
-                            torch.tensor(reply.generated_log_probs),
-                            rtol=0,
-                            atol=0,
+                            reply.generated_log_probs,
                         )
                 except BaseException as error:
                     failure = error
