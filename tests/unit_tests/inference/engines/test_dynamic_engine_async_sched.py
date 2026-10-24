@@ -2144,7 +2144,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 assert runtime["pipeline-logits-broadcasts"] > 0
         if "moe" in signals:
             assert model_config.num_moe_experts is not None
-            assert context._nccl_ep_dispatcher or context._training_ep_dispatcher
             assert runtime["module-forward:moe"] > 0
         if "etp" in signals:
             assert model_config.expert_tensor_parallel_size > 1

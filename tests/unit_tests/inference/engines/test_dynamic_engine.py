@@ -3949,7 +3949,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             top_k=1,
             enable_prefix_caching=True,
             kv_transport_backend=kv_transport_backend,
-            context_block_size_tokens=4,
+            context_block_size_tokens=256,
             context_max_requests=4,
             context_max_tokens=32,
         )
