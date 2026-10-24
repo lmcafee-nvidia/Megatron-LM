@@ -728,6 +728,10 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             )
         ]
         direct = await _drive_engine(engine, direct_futures, witness)
+        if uses_mla:
+            for layer in engine.controller.inference_wrapped_model.model.decoder.layers:
+                assert layer.self_attention.kv_layernorm.weight.is_cuda
+                assert layer.self_attention.linear_kv_up_proj_linear.weight.is_cuda
 
         adapter = object.__new__(mixin_cls)
         adapter.cfg = {
