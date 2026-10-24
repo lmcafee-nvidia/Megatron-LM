@@ -94,7 +94,12 @@ def _load_nemo_rl_adapter():
         sys.path.remove(str(source))
     assert Path(worker_module.__file__).resolve().is_relative_to(source)
     assert Path(data_module.__file__).resolve().is_relative_to(source)
-    return data_module.BatchedDataDict, worker_module.MegatronGenerationMixin
+    adapter_cls = type(
+        "_TestMegatronPolicyAdapter",
+        (worker_module.MegatronGenerationMixin, worker_module.MegatronGenerationRefitMixin),
+        {},
+    )
+    return data_module.BatchedDataDict, adapter_cls
 
 
 def _load_nemo_rl_token_capture():
