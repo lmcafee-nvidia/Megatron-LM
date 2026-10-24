@@ -2844,7 +2844,6 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
 
     @staticmethod
     def _case_config(case, *, enable_prefix_caching):
-        """Build a small real-engine configuration for one capability row."""
         block_size = 256  # FlashAttention paged KV blocks must be divisible by 256.
         prompt_length = 2 * block_size + 5
         feature = case["feature"]
@@ -2864,6 +2863,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             pipeline_model_parallel_size=case.get("pp", 1),
             expert_model_parallel_size=case.get("ep", 1),
             use_moe_layer_spec=feature == "moe",
+            transformer_impl="inference_optimized" if feature == "moe" else "local",
             model_provider=case.get("model_provider", "gpt"),
             ssm_mixer=case.get("ssm_mixer", "mamba"),
             enable_prefix_caching=enable_prefix_caching,

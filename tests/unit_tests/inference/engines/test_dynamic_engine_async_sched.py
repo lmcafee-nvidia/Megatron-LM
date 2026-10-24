@@ -472,6 +472,9 @@ _BASE_PAIR_CONFIG = {
     "sampling_backend": "torch",
     "top_k": 1,
 }
+_OPTIMIZED_MOE_CONFIG = {"use_moe_layer_spec": True, "transformer_impl": "inference_optimized"}
+_NCCL_MOE_CONFIG = {**_OPTIMIZED_MOE_CONFIG, "inference_moe_token_dispatcher_type": "nccl"}
+_NCCL_MOE_SIGNALS = ("inference-optimized", "moe", "nccl-dispatch", "parallel")
 
 
 def _pair_scenario(name, *pairs, **kwargs):
@@ -710,8 +713,7 @@ _ASYNC_PAIR_SCENARIOS = (
         "attention:flashmla",
         "implementation:inference-optimized",
         config={
-            "use_moe_layer_spec": True,
-            "transformer_impl": "inference_optimized",
+            **_OPTIMIZED_MOE_CONFIG,
             "multi_latent_attention": True,
             "hidden_size": 256,
             "context_block_size_tokens": 64,
@@ -741,8 +743,7 @@ _ASYNC_PAIR_SCENARIOS = (
         "model:moe",
         "implementation:flashinfer-bf16",
         config={
-            "use_moe_layer_spec": True,
-            "transformer_impl": "inference_optimized",
+            **_OPTIMIZED_MOE_CONFIG,
             "inference_grouped_gemm_backend": "flashinfer",
             "moe_latent_size": 16,
             "moe_use_norm_before_up_proj": True,
@@ -761,9 +762,10 @@ _ASYNC_PAIR_SCENARIOS = (
             "fp8": True,
             "hidden_size": 128,
         },
-        signals=("fp8", "reference-moe", "transformer-engine"),
+        signals=("fp8", "fp8-reference", "reference-moe", "transformer-engine"),
         prerequisite="fp8",
         atol=5.0e-3,
+        parity="reproducible",
     ),
     _pair_scenario(
         "transformer-engine",
@@ -787,8 +789,7 @@ _ASYNC_PAIR_SCENARIOS = (
         atol=5.0e-3,
         parity="reproducible",
     ),
-    # Four heads of width 64 exercise FlashInfer's supported fused-RoPE kernel.
-    # Width 16 crosses half-head boundaries in its vectorized NeoX rotation.
+    # Width 64 is supported; width 16 crosses half-head boundaries in vectorized NeoX rotation.
     _pair_scenario(
         "flashinfer-fused-rope",
         "kernel:flashinfer-fused-rope",
@@ -836,8 +837,7 @@ _ASYNC_SUSPEND_RESUME_SCENARIOS = (
         "kv:offload",
         "lifecycle:suspend-resume",
         config={
-            "use_moe_layer_spec": True,
-            "transformer_impl": "inference_optimized",
+            **_OPTIMIZED_MOE_CONFIG,
             "kv_cache_management_mode": "offload",
             "static_kv_memory_pointers": False,
         },
@@ -849,8 +849,7 @@ _ASYNC_SUSPEND_RESUME_SCENARIOS = (
         "kv:recompute",
         "lifecycle:suspend-resume",
         config={
-            "use_moe_layer_spec": True,
-            "transformer_impl": "inference_optimized",
+            **_OPTIMIZED_MOE_CONFIG,
             "kv_cache_management_mode": "recompute",
             "static_kv_memory_pointers": False,
         },
@@ -882,10 +881,8 @@ _ASYNC_PARALLEL_SCENARIOS = (
         "dispatcher:nccl",
         "interaction:moe-ep-ordering",
         config={
+            **_NCCL_MOE_CONFIG,
             "expert_model_parallel_size": 2,
-            "use_moe_layer_spec": True,
-            "inference_moe_token_dispatcher_type": "nccl",
-            "transformer_impl": "inference_optimized",
             "moe_enable_routing_replay": True,
             "return_log_probs": True,
             "materialize_only_last_token_logits": False,
@@ -908,14 +905,11 @@ _ASYNC_PARALLEL_SCENARIOS = (
                 "top_n_logprobs": 4,
             },
         ),
-        signals=(
-            "inference-optimized",
+        signals=_NCCL_MOE_SIGNALS
+        + (
             "full-logits",
             "logprobs",
             "metadata-compaction",
-            "moe",
-            "nccl-dispatch",
-            "parallel",
             "sampled",
             "request-seed",
             "routing-reconstruction",
@@ -933,15 +927,13 @@ _ASYNC_PARALLEL_SCENARIOS = (
         "topology:ep",
         "dispatcher:nccl",
         config={
+            **_NCCL_MOE_CONFIG,
             "expert_model_parallel_size": 2,
-            "use_moe_layer_spec": True,
-            "transformer_impl": "inference_optimized",
             "inference_grouped_gemm_backend": "flashinfer",
             "inference_moe_nvfp4_recipe": "per_token",
-            "inference_moe_token_dispatcher_type": "nccl",
             "hidden_size": 256,
         },
-        signals=("inference-optimized", "moe", "nccl-dispatch", "parallel"),
+        signals=_NCCL_MOE_SIGNALS,
         prerequisite="nvfp4",
     ),
     _pair_scenario(
@@ -953,18 +945,16 @@ _ASYNC_PARALLEL_SCENARIOS = (
         "dispatcher:nccl",
         "interaction:moe-tp-sp",
         config={
+            **_NCCL_MOE_CONFIG,
             "tensor_model_parallel_size": 2,
             "expert_model_parallel_size": 2,
             "sequence_parallel": True,
-            "use_moe_layer_spec": True,
-            "inference_moe_token_dispatcher_type": "nccl",
-            "transformer_impl": "inference_optimized",
             "moe_router_topk": 1,
             "moe_router_load_balancing_type": "quantile_balancing",
             "moe_router_score_function": "sigmoid",
             "inference_disable_triton_nvls_kernels": True,
         },
-        signals=("inference-optimized", "moe", "nccl-dispatch", "parallel", "quantile-routing"),
+        signals=_NCCL_MOE_SIGNALS + ("quantile-routing",),
     ),
     _pair_scenario(
         "moe-ep2-dp2-nccl",
@@ -973,23 +963,9 @@ _ASYNC_PARALLEL_SCENARIOS = (
         "topology:dp",
         "seed:offset-by-dp-rank",
         "dispatcher:nccl",
-        config={
-            "expert_model_parallel_size": 2,
-            "use_moe_layer_spec": True,
-            "inference_moe_token_dispatcher_type": "nccl",
-            "transformer_impl": "inference_optimized",
-        },
+        config={**_NCCL_MOE_CONFIG, "expert_model_parallel_size": 2},
         sampling=({"temperature": 0.8, "top_k": 8},),
-        signals=(
-            "dp-offset",
-            "inference-optimized",
-            "moe",
-            "nccl-dispatch",
-            "parallel",
-            "sampled",
-            "temperature-filter",
-            "top-k-filter",
-        ),
+        signals=_NCCL_MOE_SIGNALS + ("dp-offset", "sampled", "temperature-filter", "top-k-filter"),
         parity="reproducible",
     ),
     _pair_scenario(
@@ -999,21 +975,8 @@ _ASYNC_PARALLEL_SCENARIOS = (
         "dispatcher:nccl",
         "speculation:mtp-depth-one",
         "interaction:moe-mtp-accept-rewind",
-        config={
-            "expert_model_parallel_size": 2,
-            "use_moe_layer_spec": True,
-            "inference_moe_token_dispatcher_type": "nccl",
-            "transformer_impl": "inference_optimized",
-            "num_speculative_tokens": 1,
-        },
-        signals=(
-            "inference-optimized",
-            "moe",
-            "mtp",
-            "mtp-accept-rewind",
-            "nccl-dispatch",
-            "parallel",
-        ),
+        config={**_NCCL_MOE_CONFIG, "expert_model_parallel_size": 2, "num_speculative_tokens": 1},
+        signals=_NCCL_MOE_SIGNALS + ("mtp", "mtp-accept-rewind"),
     ),
     _pair_scenario(
         "moe-ep2-pp2-nccl",
@@ -1023,13 +986,11 @@ _ASYNC_PARALLEL_SCENARIOS = (
         "dispatcher:nccl",
         "interaction:moe-pp",
         config={
+            **_NCCL_MOE_CONFIG,
             "pipeline_model_parallel_size": 2,
             "expert_model_parallel_size": 2,
-            "use_moe_layer_spec": True,
-            "inference_moe_token_dispatcher_type": "nccl",
-            "transformer_impl": "inference_optimized",
         },
-        signals=("inference-optimized", "moe", "nccl-dispatch", "parallel"),
+        signals=_NCCL_MOE_SIGNALS,
     ),
     _pair_scenario(
         "hybrid-gdn-moe-ep2-nccl",
@@ -1038,23 +999,13 @@ _ASYNC_PARALLEL_SCENARIOS = (
         "dispatcher:nccl",
         "interaction:gdn-moe-state-compaction",
         config={
+            **_NCCL_MOE_CONFIG,
             "model_provider": "hybrid",
             "ssm_mixer": "gdn",
             "expert_model_parallel_size": 2,
-            "use_moe_layer_spec": True,
-            "inference_moe_token_dispatcher_type": "nccl",
-            "transformer_impl": "inference_optimized",
             "moe_num_hash_layers": 1,
         },
-        signals=(
-            "hybrid",
-            "hash-routing",
-            "inference-optimized",
-            "metadata-compaction",
-            "moe",
-            "nccl-dispatch",
-            "parallel",
-        ),
+        signals=_NCCL_MOE_SIGNALS + ("hybrid", "hash-routing", "metadata-compaction"),
         prerequisite="gdn",
         atol=5.0e-3,
     ),
@@ -1066,23 +1017,13 @@ _ASYNC_PARALLEL_SCENARIOS = (
         "attention:swa-alternating",
         "attention:learnable-sink",
         config={
+            **_NCCL_MOE_CONFIG,
             "expert_model_parallel_size": 2,
-            "use_moe_layer_spec": True,
-            "inference_moe_token_dispatcher_type": "nccl",
-            "transformer_impl": "inference_optimized",
             "window_size": (4, 0),
             "window_attn_skip_freq": 2,
             "softmax_type": "learnable",
         },
-        signals=(
-            "inference-optimized",
-            "moe",
-            "moe-attention",
-            "nccl-dispatch",
-            "parallel",
-            "softmax-sink",
-            "swa-alternating",
-        ),
+        signals=_NCCL_MOE_SIGNALS + ("moe-attention", "softmax-sink", "swa-alternating"),
     ),
     _pair_scenario(
         "moe-ep2-chunked-nccl",
@@ -1092,14 +1033,12 @@ _ASYNC_PARALLEL_SCENARIOS = (
         "prefill:chunked",
         "interaction:continuous-batching",
         config={
+            **_NCCL_MOE_CONFIG,
             "expert_model_parallel_size": 2,
-            "use_moe_layer_spec": True,
-            "inference_moe_token_dispatcher_type": "nccl",
-            "transformer_impl": "inference_optimized",
             "enable_chunked_prefill": True,
             "context_max_tokens": 8,
         },
-        signals=("chunked", "inference-optimized", "moe", "nccl-dispatch", "parallel"),
+        signals=("chunked",) + _NCCL_MOE_SIGNALS,
     ),
     _pair_scenario(
         "optimized-tp2-sp",
@@ -1417,6 +1356,30 @@ def _instrument_nccl_dispatch_runtime(module, runtime):
 
     dispatcher.token_dispatch = traced_dispatch
     dispatcher.token_combine = traced_combine
+
+
+def _fp8_expert_reference(module, inputs):
+    hidden, counts, probs = inputs[:3]
+    assert not module.config.gated_linear_unit and not module.config.moe_apply_probs_on_input
+    outputs = []
+    splits = counts.tolist()
+    for expert, (expert_input, expert_probs) in enumerate(
+        zip(torch.split(hidden, splits), torch.split(probs, splits))
+    ):
+        fc1, fc2 = module.linear_fc1, module.linear_fc2
+        bias1 = getattr(fc1, f"bias{expert}", None)
+        bias2 = getattr(fc2, f"bias{expert}", None)
+        expert_probs = expert_probs.float().unsqueeze(-1)
+        intermediate = torch.nn.functional.linear(
+            expert_input.float(),
+            getattr(fc1, f"weight{expert}").float(),
+            None if bias1 is None else bias1.float(),
+        )
+        intermediate = module.config.activation_func(intermediate) * expert_probs
+        weight2 = getattr(fc2, f"weight{expert}").float()
+        output = torch.nn.functional.linear(intermediate, weight2)
+        outputs.append(output if bias2 is None else output + bias2.float() * expert_probs)
+    return torch.cat(outputs)
 
 
 def _instrument_scenario_runtime(env, scenario, runtime):
@@ -1754,6 +1717,31 @@ def _instrument_scenario_runtime(env, scenario, runtime):
                 runtime["quantile-route-forwards"] += 1
 
             module.register_forward_hook(record_quantile_route, with_kwargs=True)
+        if class_name == "TopKRouter" and "fp8-reference" in scenario.signals:
+            route_state = {}
+            original_gating = module.gating
+
+            def traced_router_gating(input_, _state=route_state, _original=original_gating):
+                logits = _original(input_)
+                _state["logits"] = logits.detach()
+                return logits
+
+            def record_route(router, _inputs, output, _state=route_state):
+                assert router.score_function == "softmax"
+                assert (
+                    not router.config.moe_router_pre_softmax and not router.config.moe_router_fusion
+                )
+                logits = _state.pop("logits").view(-1, router.num_experts)
+                scores, indices = torch.topk(logits, router.topk, dim=1, sorted=False)
+                selected = torch.softmax(scores, dim=-1, dtype=torch.float32).type_as(logits)
+                expected_probs = torch.zeros_like(logits).scatter(1, indices, selected)
+                expected_map = torch.zeros_like(logits, dtype=torch.bool).scatter(1, indices, True)
+                torch.testing.assert_close(output[0], expected_probs, rtol=0, atol=0)
+                assert torch.equal(output[1], expected_map)
+                runtime["routing-oracle"] += 1
+
+            module.gating = traced_router_gating
+            module.register_forward_hook(record_route)
         if class_name == "MoELayer" and "latent-moe" in scenario.signals:
 
             def record_latent_projection(_module, _inputs, _output):
@@ -1778,6 +1766,21 @@ def _instrument_scenario_runtime(env, scenario, runtime):
                 runtime["reference-moe-input-probs"] += int(
                     _module.config.moe_apply_probs_on_input and bool((inputs[2] != 1).any())
                 )
+                if "fp8-reference" in scenario.signals:
+                    actual = _output[0].float()
+                    reference = _fp8_expert_reference(_module, inputs)
+                    assert torch.isfinite(actual).all() and torch.isfinite(reference).all()
+                    relative_l2 = torch.linalg.vector_norm(
+                        actual - reference
+                    ) / torch.linalg.vector_norm(reference)
+                    cosine = torch.nn.functional.cosine_similarity(
+                        actual.flatten(), reference.flatten(), dim=0
+                    )
+                    runtime["fp8-expert-reference"] += 1
+                    assert relative_l2 <= 0.075 and cosine >= 0.997, (
+                        relative_l2.item(),
+                        cosine.item(),
+                    )
 
             module.register_forward_hook(record_reference_expert)
         for tag in active_tags:
@@ -2302,6 +2305,9 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["fp8-context-forwards"] > 0
             assert runtime["fp8-quantized-forwards"] > 0
             assert runtime["fp8-recipe-forwards"] > 0
+        if "fp8-reference" in signals:
+            assert runtime["fp8-expert-reference"] > 0
+            assert runtime["routing-oracle"] > 0
         if "fused-rope" in signals:
             assert context.use_flashinfer_fused_rope
             assert model_config.hidden_size // model_config.num_attention_heads == 64
@@ -2461,16 +2467,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 assert any(step > boundary for step in expert_steps)
         if "reference-moe" in signals:
             assert model_config.num_moe_experts == 2
-            layer_steps = {
-                key[1]
-                for key, count in runtime.items()
-                if isinstance(key, tuple) and key[0] == "reference-moe-layer-step" and count > 0
-            }
-            expert_steps = {
-                key[1]
-                for key, count in runtime.items()
-                if isinstance(key, tuple) and key[0] == "reference-moe-expert-step" and count > 0
-            }
+            layer_steps = observed_steps("reference-moe-layer-step")
+            expert_steps = observed_steps("reference-moe-expert-step")
             assert layer_steps == expert_steps
             expert_class = (
                 "TEGroupedMLP"
@@ -2642,11 +2640,18 @@ class TestAsyncSchedulePairwiseParallel(_AsyncPairwiseHarness):
                             "track_generated_token_events": True,
                         },
                         sampling=(
-                            tuple({**params, **output.sampling[0]} for params in scenario.sampling)
+                            tuple(
+                                {**params, **output.sampling[0], "seed": None}
+                                for params in scenario.sampling
+                            )
                             if output.sampling
                             else scenario.sampling
                         ),
-                        signals=scenario.signals + output.signals + ("events",),
+                        signals=tuple(
+                            signal
+                            for signal in scenario.signals + output.signals + ("events",)
+                            if not output.sampling or signal != "request-seed"
+                        ),
                     )
                 )
         config = scenario.config
@@ -2688,7 +2693,6 @@ def _controller_with_pending_logits():
 
 
 def test_async_reset_clears_pending_logits():
-    """Engine reset cannot expose logits produced for the previous request batch."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.context = SimpleNamespace(reset=mock.Mock())
     engine.controller = _controller_with_pending_logits()
@@ -2722,7 +2726,6 @@ def test_async_reset_clears_pending_logits():
     ],
 )
 def test_async_suspend_pending_logits_lifecycle(mode, preserve_pending):
-    """Only recomputation invalidates a forward result pending across suspend."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.controller = _controller_with_pending_logits()
     engine.context = SimpleNamespace(
@@ -2762,7 +2765,6 @@ def test_async_suspend_pending_logits_lifecycle(mode, preserve_pending):
     ],
 )
 def test_async_compaction_preserves_all_request_metadata(survivor_idxs, expected_token_rows):
-    """Middle-row completion compacts every metadata field into survivor order."""
     controller = TextGenerationController.__new__(TextGenerationController)
     controller.num_speculative_tokens = 1
     controller._enable_cuda_graph = False
@@ -2806,7 +2808,6 @@ def test_async_compaction_preserves_all_request_metadata(survivor_idxs, expected
 
 
 def test_post_process_enforces_per_request_logprob_policy():
-    """Post-processing must honor opt-outs and require requested logprobs."""
     requests = []
     for request_id, return_log_probs in enumerate((True, False)):
         request = DynamicInferenceRequest(

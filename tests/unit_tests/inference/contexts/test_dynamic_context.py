@@ -33,7 +33,6 @@ from tests.unit_tests.test_utilities import Utils
 
 @pytest.fixture(scope="module", autouse=True)
 def select_local_cuda_device():
-    """Bind each torchrun process before a module-level test initializes CUDA or Triton."""
     if torch.cuda.is_available():
         torch.cuda.set_device(Utils.local_rank % torch.cuda.device_count())
 
@@ -58,7 +57,6 @@ def rounder_override(n):
 def test_is_decode_only_uses_current_execution_snapshot(
     using_cuda_graph, num_prefill_requests, padded_prefill_requests, expected
 ):
-    """Decode-only classification follows the eager or CUDA graph execution state."""
     context = DynamicInferenceContext.__new__(DynamicInferenceContext)
     context._using_cuda_graph_this_step = using_cuda_graph
     context.num_prefill_requests = num_prefill_requests
@@ -72,7 +70,6 @@ def test_is_decode_only_uses_current_execution_snapshot(
 
 @pytest.mark.parametrize("using_cuda_graph", [False, True])
 def test_is_decode_only_is_false_during_the_mtp_commit_pass(using_cuda_graph):
-    """The commit pass is a varlen forward, so it overrides a decode-only request count."""
     context = DynamicInferenceContext.__new__(DynamicInferenceContext)
     context._using_cuda_graph_this_step = using_cuda_graph
     # Request counts that would otherwise classify this step as decode-only.
@@ -114,7 +111,6 @@ def _processed_rows_context(sampling_and_counts, num_sampled=None):
 
 
 def _context_with_real_token_count(real_token_count: int) -> DynamicInferenceContext:
-    """A bare context whose GPU view only holds the real-token-count scalar."""
     context = DynamicInferenceContext.__new__(DynamicInferenceContext)
     context.gpu_view = SimpleNamespace(
         real_token_count=torch.tensor([real_token_count], dtype=torch.int32, device="cuda")

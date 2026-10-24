@@ -3471,6 +3471,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             transformer_impl="inference_optimized",
             kv_transport_backend="nccl",
             top_k=1,
+            hidden_size=256,
         )
 
         def run_to_completion(env):
