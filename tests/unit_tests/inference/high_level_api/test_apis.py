@@ -4,7 +4,7 @@
 
 import asyncio
 import concurrent.futures
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -203,6 +203,34 @@ class TestLifecycleGuards:
 
         client.stop.assert_called_once_with()
         assert runtime._client is None
+
+    @pytest.mark.asyncio
+    async def test_engine_transition_failure_still_tears_down_runtime(self):
+        llm = _make_worker_instance(MegatronAsyncLLM)
+        llm._is_primary_rank = True
+        llm._coord_runtime = MagicMock()
+        llm._coord_runtime.teardown = AsyncMock()
+        llm._engine.state = base_mod.EngineState.RUNNING
+        llm._engine.wait_until = AsyncMock(side_effect=RuntimeError("transition failed"))
+
+        with pytest.raises(RuntimeError, match="transition failed"):
+            await llm._shutdown_impl()
+        llm._coord_runtime.teardown.assert_awaited_once_with()
+
+    @pytest.mark.parametrize("cls", [MegatronLLM, MegatronAsyncLLM])
+    def test_shutdown_setup_failure_is_stable_and_cleans_up(self, cls):
+        llm = _make_worker_instance(cls)
+        llm._coord_runtime = MagicMock()
+        llm._loop_manager = MagicMock()
+        llm._stop_frontend_if_started = MagicMock(side_effect=RuntimeError("frontend failed"))
+        llm._loop_manager.submit.side_effect = RuntimeError("submit failed")
+        shutdown = llm.shutdown if cls is MegatronLLM else lambda: asyncio.run(llm.shutdown())
+
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="frontend failed"):
+                shutdown()
+        llm._coord_runtime.teardown_now.assert_called_once_with()
+        llm._loop_manager.stop.assert_called_once_with()
 
     @pytest.mark.asyncio
     async def test_concurrent_async_shutdown_callers_wait_for_same_teardown(self):
