@@ -1692,10 +1692,13 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # Reset tensor-related metadata.
         self.reset_metadata()
 
+    @torch.inference_mode()
     def reinitialize_inference_state_buffers(self):
         """Restore large tensors (KV cache, Mamba states) after a suspend.
 
         Called by the engine during `resume()`. Initial allocation is in `initialize_all_tensors()`.
+        This method owns inference mode because the public engine caller does not, while the
+        restored bookkeeping tensors may have been allocated as inference tensors.
         """
         if self.is_tensor_state_allocated:
             return
