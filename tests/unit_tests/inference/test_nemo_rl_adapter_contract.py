@@ -521,7 +521,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             },
             {"mla": True, "context_block_size_tokens": 64, "position_embedding_type": "rope"},
             {"adapter_sampling": {"temperature": 0.73, "top_k": 1, "top_p": 0.91}},
-            {"logprobs_mode": "processed_logprobs"},
+            {"logprobs_mode": "processed_logprobs", "materialize_only_last_token_logits": False},
             dict(hidden_size=256, position_embedding_type="rope", use_flashinfer_fused_rope=True),
             {"position_embedding_type": "rope", "use_flashinfer_fused_rope": True},
         ],
@@ -668,8 +668,14 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         original_forward = model.forward
 
         def traced_forward(*args, **kwargs):
-            witness["model_request_ids"].append(active_request_ids())
-            return original_forward(*args, **kwargs)
+            request_ids = active_request_ids()
+            witness["model_request_ids"].append(request_ids)
+            result = original_forward(*args, **kwargs)
+            if not engine.context.config.materialize_only_last_token_logits:
+                ctx = engine.context
+                shape = result.shape[1], ctx.padded_active_token_count, ctx.num_last_token_logits
+                witness.setdefault("all_logit_rows", []).append((request_ids, *shape))
+            return result
 
         model.forward = traced_forward
         sampler = engine.controller._sampling
@@ -817,26 +823,16 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             actual_length = int(output["generation_lengths"][index])
             assert actual_length == generation_length
             assert output["output_ids"][index, :prompt_length].tolist() == prompts[index]
-            assert (
-                output["output_ids"][index, prompt_length : prompt_length + actual_length].tolist()
-                == expected.generated_tokens
-            )
-            assert torch.equal(
-                output["unpadded_sequence_lengths"][index],
-                output["generation_lengths"][index] + prompt_length,
-            )
-            assert output["output_ids"][index, prompt_length + actual_length :].eq(0).all()
-            assert output["logprobs"][index, prompt_length + actual_length :].eq(0).all()
-            _assert_exact_scores(
-                output["logprobs"][index, prompt_length : prompt_length + actual_length],
-                expected.generated_log_probs,
-            )
+            end = prompt_length + actual_length
+            actual_tokens = output["output_ids"][index, prompt_length:end]
+            assert actual_tokens.tolist() == expected.generated_tokens
+            assert output["unpadded_sequence_lengths"][index].item() == end
+            assert output["output_ids"][index, end:].eq(0).all()
+            assert output["logprobs"][index, end:].eq(0).all()
+            actual_scores = output["logprobs"][index, prompt_length:end]
+            _assert_exact_scores(actual_scores, expected.generated_log_probs)
             if feature_config.get("logprobs_mode") == "processed_logprobs":
-                assert (
-                    output["logprobs"][index, prompt_length : prompt_length + actual_length]
-                    .eq(0)
-                    .all()
-                )
+                assert actual_scores.eq(0).all()
         adapter_ids = {200, 201}
         assert adapter_ids.issubset(
             {request_id for step in witness["model_request_ids"] for request_id in step}
@@ -844,6 +840,10 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         assert adapter_ids.issubset(
             {request_id for step in witness["sampler_request_ids"] for request_id in step}
         )
+        if not engine.context.config.materialize_only_last_token_logits:
+            rows = [row[1:] for row in witness["all_logit_rows"] if adapter_ids & set(row[0])]
+            assert rows and all(actual == padded for actual, padded, _ in rows)
+            assert any(padded > selected for _, padded, selected in rows)
         assert engine.context.async_sched_step_count > 0
         if stresses_chunking:
             assert witness["chunked_prefill_request_ids"]
