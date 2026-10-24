@@ -1928,8 +1928,13 @@ class LLaVAModel(MegatronModule):
                 and inference_context.is_dynamic_batching()
             ):
                 # The block table and token-to-cache maps describe the global packed
-                # stream. Reassemble the real CP shards before QKV/cache insertion;
-                # remove only LLaVA's divisibility padding afterward.
+                # stream. Undo SP before CP because _process_embedding_token_parallel
+                # applies those shards in the opposite order. Reapply SP after restoring
+                # the scheduler-global stream so the LM keeps its configured TP layout.
+                if self.sequence_parallel_lm:
+                    combined_embeddings = tensor_parallel.gather_from_sequence_parallel_region(
+                        combined_embeddings, group=self.pg_collection.tp
+                    )
                 combined_embeddings = _gather_zigzag_context_parallel_tokens(
                     combined_embeddings, self.pg_collection.cp
                 )[:dynamic_sequence_length]
@@ -1942,6 +1947,10 @@ class LLaVAModel(MegatronModule):
                 if combined_embeddings.shape[0] != dynamic_sequence_length:
                     raise RuntimeError("Context-parallel reconstruction changed dynamic token rows")
                 replicated_context_parallel = True
+                if self.sequence_parallel_lm:
+                    combined_embeddings = tensor_parallel.scatter_to_sequence_parallel_region(
+                        combined_embeddings, group=self.pg_collection.tp
+                    )
 
         try:
             from megatron.core.models.mamba.mamba_model import MambaModel

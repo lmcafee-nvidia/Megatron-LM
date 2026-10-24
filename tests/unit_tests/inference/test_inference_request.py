@@ -171,13 +171,9 @@ def test_preprocessed_video_timing_metadata_round_trip():
 
 
 @pytest.mark.parametrize(
-    "timing_override",
-    [
-        pytest.param({"video_frame_indices": [[4, 8]]}, id="frame-indices"),
-        pytest.param({"video_fps": [30.0]}, id="fps"),
-    ],
+    ("field", "value"), [("video_frame_indices", [[4, 8]]), ("video_fps", [30.0])]
 )
-def test_preprocessed_video_timing_metadata_participates_in_cache_identity(timing_override):
+def test_preprocessed_video_timing_metadata_participates_in_cache_identity(field, value):
     base_video = {
         "imgs": torch.ones(2, 3, 2, 2),
         "imgs_sizes": torch.tensor([[2, 2], [2, 2]]),
@@ -185,10 +181,9 @@ def test_preprocessed_video_timing_metadata_participates_in_cache_identity(timin
         "video_frame_indices": [[3, 7]],
         "video_fps": [29.97],
     }
-    changed_video = {**base_video, **timing_override}
-
     base_key = serialize_multimodal_data({"video": base_video})["media_cache_key"]
-    changed_key = serialize_multimodal_data({"video": changed_video})["media_cache_key"]
+    base_video[field] = value
+    changed_key = serialize_multimodal_data({"video": base_video})["media_cache_key"]
 
     assert base_key != changed_key
 

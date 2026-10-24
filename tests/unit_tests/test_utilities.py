@@ -98,7 +98,6 @@ def _snapshot_torch_settings():
 
 
 def _restore_torch_settings(settings):
-    # PyTorch's internal test utilities freeze bare backend flag mutation at import time.
     with torch.backends.__allow_nonbracketed_mutation():
         mode, warn_only = settings["deterministic"]
         torch.use_deterministic_algorithms(mode, warn_only=warn_only)

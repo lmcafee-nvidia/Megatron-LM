@@ -88,13 +88,13 @@ def model_parallel():
     DynamicInferenceContext.REQUEST_ROUNDER = 1
     topology = os.getenv("MCORE_MM_TOPOLOGY", "tp")
     init_kwargs = {}
-    tp_size = Utils.world_size if topology in ("tp", "sp") else 1
+    tp_size = 2 if topology == "cp_sp" else Utils.world_size if topology in ("tp", "sp") else 1
     if topology == "ep":
         init_kwargs["expert_model_parallel_size"] = Utils.world_size
     elif topology == "etp":
         init_kwargs["expert_tensor_parallel_size"] = Utils.world_size
-    elif topology in ("cp", "hybrid_cp"):
-        init_kwargs["context_parallel_size"] = Utils.world_size
+    elif topology in ("cp", "cp_sp", "hybrid_cp"):
+        init_kwargs["context_parallel_size"] = 2 if topology == "cp_sp" else Utils.world_size
     Utils.initialize_model_parallel(tp_size, 1, **init_kwargs)
     torch.manual_seed(123)
     model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
@@ -345,7 +345,7 @@ def _build_te_parallel_model(modality):
         pipeline_dtype=torch.bfloat16,
         tensor_model_parallel_size=parallel_state.get_tensor_model_parallel_world_size(),
         context_parallel_size=parallel_state.get_context_parallel_world_size(),
-        sequence_parallel=topology == "sp",
+        sequence_parallel=topology in ("sp", "cp_sp"),
         use_cpu_initialization=True,
         transformer_impl="inference_optimized" if optimized else "transformer_engine",
         normalization="RMSNorm" if optimized else "LayerNorm",
@@ -383,7 +383,7 @@ def _build_te_parallel_model(modality):
         image_token_index=-200,
         dynamic_resolution=(modality == "video"),
         class_token_len=0 if modality == "video" else None,
-        language_position_embedding_type="rope" if topology == "cp" else "learned_absolute",
+        language_position_embedding_type="rope" if topology.endswith("cp") else "learned_absolute",
     ).cuda()
     model.bfloat16()
     model.eval()
@@ -568,6 +568,21 @@ def _greedy_token(step, full_logits=False):
     return int(step["logits"][0, row].argmax())
 
 
+def _same(first, first_step, first_finished, reuse, reuse_step, reuse_finished):
+    assert torch.equal(first["embeddings"], reuse["embeddings"])
+    assert torch.equal(first_step["embeddings"], reuse_step["embeddings"])
+    assert torch.equal(first_step["logits"], reuse_step["logits"])
+    assert first_finished.generated_tokens == reuse_finished.generated_tokens
+
+
+def _assert_step(admission, step, finished):
+    assert step["mask"].ge(0).sum().item() == 4
+    assert torch.equal(step["embeddings"], admission["embeddings"])
+    assert step["logits"].shape == (1, 1, VOCAB_SIZE)
+    assert torch.isfinite(step["logits"]).all()
+    assert finished.generated_tokens == [_greedy_token(step)]
+
+
 def _install_forward_trace(engine):
     trace, original_forward = [], engine.controller._dynamic_step_forward_logits
 
@@ -747,12 +762,9 @@ def test_real_encoder_cache_reuse_matches_uncached_and_separates_distinct_media(
     assert first["key"] == reuse["key"] != distinct["key"]
     assert torch.equal(first["tokens"], reuse["tokens"])
     assert torch.equal(first["mask"], reuse["mask"])
-    assert torch.equal(first["embeddings"], reuse["embeddings"])
+    _same(first, first_step, first_finished, reuse, reuse_step, reuse_finished)
     assert torch.equal(first_step["input_ids"], reuse_step["input_ids"])
     assert torch.equal(first_step["mask"], reuse_step["mask"])
-    assert torch.equal(first_step["embeddings"], reuse_step["embeddings"])
-    assert torch.equal(first_step["logits"], reuse_step["logits"])
-    assert first_finished.generated_tokens == reuse_finished.generated_tokens
     assert torch.equal(first["tokens"], distinct["tokens"])
     assert torch.equal(first["mask"], distinct["mask"])
     assert not torch.equal(first["embeddings"], distinct["embeddings"])
@@ -763,9 +775,7 @@ def test_real_encoder_cache_reuse_matches_uncached_and_separates_distinct_media(
         assert raw["key"] != tensor["key"]
         assert torch.equal(raw["tokens"], tensor["tokens"])
         assert torch.equal(raw["mask"], tensor["mask"])
-        assert torch.equal(raw["embeddings"], tensor["embeddings"])
-        assert torch.equal(raw_step["logits"], tensor_step["logits"])
-        assert raw_finished.generated_tokens == tensor_finished.generated_tokens
+        _same(raw, raw_step, raw_finished, tensor, tensor_step, tensor_finished)
 
 
 @pytest.mark.parametrize(
@@ -808,9 +818,7 @@ def test_native_vision_family_real_encoder_reuse_and_distinct_media(
         "KimiViTModel",
     }
     assert first["mask"].ge(0).sum().item() == expected_embeddings
-    assert torch.equal(first["embeddings"], reuse["embeddings"])
-    assert torch.equal(first_step["logits"], reuse_step["logits"])
-    assert first_finished.generated_tokens == reuse_finished.generated_tokens
+    _same(first, first_step, first_finished, reuse, reuse_step, reuse_finished)
     assert not torch.equal(first["embeddings"], distinct["embeddings"])
     assert not torch.equal(first_step["logits"], distinct_step["logits"])
     assert len(distinct_finished.generated_tokens) == 1
@@ -845,9 +853,7 @@ def test_mrope_contract_and_static_tile_tags(model_parallel):
     assert first["mask"][first["mask"] >= 0].tolist() == list(range(10))
     assert torch.equal(first["embeddings"][:6], distinct["embeddings"][:6])
     assert not torch.equal(first["embeddings"][6:], distinct["embeddings"][6:])
-    assert torch.equal(first["embeddings"], reuse["embeddings"])
-    assert torch.equal(first_step["logits"], reuse_step["logits"])
-    assert first_finished.generated_tokens == reuse_finished.generated_tokens
+    _same(first, first_step, first_finished, reuse, reuse_step, reuse_finished)
     assert not torch.equal(first_step["logits"], distinct_step["logits"])
     assert len(distinct_finished.generated_tokens) == 1
 
@@ -882,9 +888,7 @@ def test_temporal_tubelet_encoder_reuse_and_exact_media_rows(
     assert hasattr(model.vision_model, "video_embedder") is separate_video_embedder
     assert first["mask"].ge(0).sum().item() == 4
     assert first["mask"][first["mask"] >= 0].tolist() == list(range(4))
-    assert torch.equal(first["embeddings"], reuse["embeddings"])
-    assert torch.equal(first_step["logits"], reuse_step["logits"])
-    assert first_finished.generated_tokens == reuse_finished.generated_tokens
+    _same(first, first_step, first_finished, reuse, reuse_step, reuse_finished)
     assert not torch.equal(first["embeddings"], distinct["embeddings"])
     assert not torch.equal(first_step["logits"], distinct_step["logits"])
     assert len(distinct_finished.generated_tokens) == 1
@@ -919,9 +923,7 @@ def test_nemotron_omni_real_pixel_shuffle_encoder_reuse_and_prompt_ownership(
     assert first["mask"][first["mask"] >= 0].tolist() == list(range(expected_embeddings))
     if modality == "video":
         assert first["tokens"].numel() > expected_embeddings + 2
-    assert torch.equal(first["embeddings"], reuse["embeddings"])
-    assert torch.equal(first_step["logits"], reuse_step["logits"])
-    assert first_finished.generated_tokens == reuse_finished.generated_tokens
+    _same(first, first_step, first_finished, reuse, reuse_step, reuse_finished)
     assert not torch.equal(first["embeddings"], distinct["embeddings"])
     assert not torch.equal(first_step["logits"], distinct_step["logits"])
     assert len(distinct_finished.generated_tokens) == 1
@@ -944,7 +946,7 @@ def test_multiple_videos_preexpanded_equivalence_and_real_cache_eviction(model_p
         preexpanded_media = {**first_media, "media_tokens_preexpanded": True}
         preexpanded_prompt = compact["tokens"].clone()
         preexpanded_prompt[compact["mask"] >= 0] = wrapper.get_preexpanded_media_token_id("video")
-        preexpanded, preexpanded_step, preexpanded_finished = _run_request(
+        expanded, expanded_step, expanded_finished = _run_request(
             engine, 21, preexpanded_media, trace, preexpanded_prompt.tolist()
         )
         entry_size = engine._vision_cache_entry_nbytes(
@@ -957,17 +959,13 @@ def test_multiple_videos_preexpanded_equivalence_and_real_cache_eviction(model_p
             engine, 23, first_media, trace, compact_prompt
         )
     assert encoder.call_count == 4
-    assert torch.equal(preexpanded["tokens"], preexpanded_prompt)
-    assert torch.equal(compact["mask"], preexpanded["mask"])
+    assert torch.equal(expanded["tokens"], preexpanded_prompt)
+    assert torch.equal(compact["mask"], expanded["mask"])
     assert torch.equal(
-        compact["tokens"][compact["mask"] < 0], preexpanded["tokens"][preexpanded["mask"] < 0]
+        compact["tokens"][compact["mask"] < 0], expanded["tokens"][expanded["mask"] < 0]
     )
-    assert torch.equal(compact["embeddings"], preexpanded["embeddings"])
-    assert torch.equal(compact_step["logits"], preexpanded_step["logits"])
-    assert compact_finished.generated_tokens == preexpanded_finished.generated_tokens
-    assert torch.equal(compact["embeddings"], replay["embeddings"])
-    assert torch.equal(compact_step["logits"], replay_step["logits"])
-    assert compact_finished.generated_tokens == replay_finished.generated_tokens
+    _same(compact, compact_step, compact_finished, expanded, expanded_step, expanded_finished)
+    _same(compact, compact_step, compact_finished, replay, replay_step, replay_finished)
 
 
 def test_expanded_media_prefix_stitching_matches_compact_real_model(model_parallel):
@@ -996,9 +994,7 @@ def test_expanded_media_prefix_stitching_matches_compact_real_model(model_parall
     normalized_stitched_tokens = stitched["tokens"].clone()
     normalized_stitched_tokens[stitched["mask"] >= 0] = IMAGE_TOKEN_ID
     assert torch.equal(compact["tokens"], normalized_stitched_tokens)
-    assert torch.equal(compact["embeddings"], stitched["embeddings"])
-    assert torch.equal(compact_step["logits"], stitched_step["logits"])
-    assert compact_finished.generated_tokens == stitched_finished.generated_tokens
+    _same(compact, compact_step, compact_finished, stitched, stitched_step, stitched_finished)
 
 
 @pytest.mark.parametrize(
@@ -1218,11 +1214,7 @@ def test_real_media_executes_hybrid_language_mixer_on_prefill(model_parallel, ss
             handle.remove()
     assert encoder.call_count == 1
     assert mixer_events
-    assert step["mask"].ge(0).sum().item() == 4
-    assert torch.equal(step["embeddings"], admission["embeddings"])
-    assert step["logits"].shape == (1, 1, VOCAB_SIZE)
-    assert torch.isfinite(step["logits"]).all()
-    assert finished.generated_tokens == [_greedy_token(step)]
+    _assert_step(admission, step, finished)
 
 
 def test_raw_image_matches_preprocessed_dynamic_input_on_real_model(model_parallel):
@@ -1259,9 +1251,7 @@ def test_raw_image_matches_preprocessed_dynamic_input_on_real_model(model_parall
     assert raw["tokens"].tolist() == [5] + [IMAGE_TOKEN_ID] * 4 + [6]
     assert torch.equal(raw["tokens"], preprocessed["tokens"])
     assert torch.equal(raw["mask"], preprocessed["mask"])
-    assert torch.equal(raw["embeddings"], preprocessed["embeddings"])
-    assert torch.equal(raw_step["logits"], preprocessed_step["logits"])
-    assert raw_finished.generated_tokens == preprocessed_finished.generated_tokens
+    _same(raw, raw_step, raw_finished, preprocessed, preprocessed_step, preprocessed_finished)
 
 
 def test_chat_media_slots_feed_real_preprocessor_encoder_and_exact_positions(model_parallel):
@@ -1319,10 +1309,7 @@ def test_chat_media_slots_feed_real_preprocessor_encoder_and_exact_positions(mod
     assert encoder.call_count == 1
     assert admission["tokens"].tolist() == [5] + [IMAGE_TOKEN_ID] * 4 + [6]
     assert admission["mask"].tolist() == [-1, 0, 1, 2, 3, -1]
-    assert torch.equal(step["embeddings"], admission["embeddings"])
-    assert step["logits"].shape == (1, 1, VOCAB_SIZE)
-    assert torch.isfinite(step["logits"]).all()
-    assert finished.generated_tokens == [_greedy_token(step)]
+    _assert_step(admission, step, finished)
 
 
 def test_dynamic_image_row_boundaries_share_real_encoder_step(model_parallel):
@@ -1339,10 +1326,7 @@ def test_dynamic_image_row_boundaries_share_real_encoder_step(model_parallel):
         IMAGE_TOKEN_ID
     ] * 2 + [8, 6]
     assert admission["mask"].tolist() == [-1, 0, 1, -1, 2, 3, -1, -1]
-    assert torch.equal(step["embeddings"], admission["embeddings"])
-    assert step["logits"].shape == (1, 1, VOCAB_SIZE)
-    assert torch.isfinite(step["logits"]).all()
-    assert finished.generated_tokens == [_greedy_token(step)]
+    _assert_step(admission, step, finished)
 
 
 def test_real_media_executes_moe_router_with_configured_expert_topology(model_parallel):
@@ -1370,35 +1354,37 @@ def test_real_media_executes_moe_router_with_configured_expert_topology(model_pa
     cfg = model.config
     assert cfg.expert_model_parallel_size == parallel_state.get_expert_model_parallel_world_size()
     assert cfg.expert_tensor_parallel_size == parallel_state.get_expert_tensor_parallel_world_size()
-    assert step["mask"].ge(0).sum().item() == 4
-    assert torch.equal(step["embeddings"], admission["embeddings"])
-    assert step["logits"].shape == (1, 1, VOCAB_SIZE)
+    _assert_step(admission, step, finished)
     local_logits = step["logits"].cuda().flatten()
     rank_logits = local_logits.new_empty(Utils.world_size * VOCAB_SIZE)
     torch.distributed.all_gather_into_tensor(rank_logits, local_logits)
     rank_logits = rank_logits.view(Utils.world_size, -1)
     assert torch.all(torch.isfinite(rank_logits) & (rank_logits == rank_logits[:1]))
-    assert finished.generated_tokens == [_greedy_token(step)]
 
 
 def test_real_media_executes_configured_language_implementation_or_parallel_path(
     model_parallel, record_property
 ):
     topology = os.getenv("MCORE_MM_TOPOLOGY", "tp")
-    full_logits = topology in ("sp", "cp")
-    modality = "video" if topology == "cp" else "image"
+    full_logits = topology in ("sp", "cp", "cp_sp")
+    modality = "video" if topology in ("cp", "cp_sp") else "image"
     builder = _build_hybrid_model if topology == "hybrid_cp" else _build_te_parallel_model
     model = builder("attention" if topology == "hybrid_cp" else modality)
     reference = None
     prompt = [5, IMAGE_TOKEN_ID, 6, 7, 8] if modality == "video" else None
-    if topology in ("cp", "hybrid_cp"):
+    if topology in ("cp", "cp_sp", "hybrid_cp"):
         reference_engine, _ = _build_engine(
             modality, model=model, materialize_only_last_token_logits=not full_logits
         )
         reference_trace = _install_forward_trace(reference_engine)
 
         def unsharded_input(combined, labels, loss_mask, packed):
-            return combined.transpose(1, 0).contiguous(), labels, loss_mask, packed
+            combined = combined.transpose(1, 0).contiguous()
+            if topology == "cp_sp":
+                combined = llava_model_module.tensor_parallel.scatter_to_sequence_parallel_region(
+                    combined, group=model.pg_collection.tp
+                )
+            return combined, labels, loss_mask, packed
 
         with (
             mock.patch.object(
@@ -1425,6 +1411,7 @@ def test_real_media_executes_configured_language_implementation_or_parallel_path
     )
     trace = _install_forward_trace(engine)
     scatter_events, gather_events, output_events, cp_events = [], [], [], []
+    output_gather_patch = output_gather_mock = None
     if topology == "sp":
 
         def trace_collective(operation, events, tag_input=False):
@@ -1457,7 +1444,7 @@ def test_real_media_executes_configured_language_implementation_or_parallel_path
         output_handle = model.language_model.output_layer.register_forward_pre_hook(
             lambda _module, args: output_events.append(args[0].detach().cpu())
         )
-    elif topology in ("cp", "hybrid_cp"):
+    elif topology in ("cp", "cp_sp", "hybrid_cp"):
         original_process = model._process_embedding_token_parallel
         original_gather = llava_model_module._gather_zigzag_context_parallel_tokens
 
@@ -1469,7 +1456,7 @@ def test_real_media_executes_configured_language_implementation_or_parallel_path
 
         def traced_gather(local_tokens, group):
             output = original_gather(local_tokens, group)
-            cp_events[-1].append(output.detach().cpu())
+            cp_events[-1].extend((local_tokens.detach().cpu(), output.detach().cpu()))
             return output
 
         companion_patch = mock.patch.object(
@@ -1478,12 +1465,19 @@ def test_real_media_executes_configured_language_implementation_or_parallel_path
         gather_patch = mock.patch.object(
             llava_model_module, "_gather_zigzag_context_parallel_tokens", side_effect=traced_gather
         )
+        if topology == "cp_sp":
+            output_gather_patch = mock.patch(
+                "megatron.core.models.gpt.gpt_model.gather_from_sequence_parallel_region",
+                wraps=llava_model_module.tensor_parallel.gather_from_sequence_parallel_region,
+            )
         output_handle = None
     else:
-        companion_patch = gather_patch = output_handle = None
+        companion_patch = gather_patch = output_gather_patch = output_handle = None
     if companion_patch is not None:
         companion_patch.start()
         gather_patch.start()
+        if output_gather_patch is not None:
+            output_gather_mock = output_gather_patch.start()
     optimized_events = []
     optimized_handles = [
         module.register_forward_pre_hook(
@@ -1499,7 +1493,7 @@ def test_real_media_executes_configured_language_implementation_or_parallel_path
             media_offset = (
                 0.5 * parallel_state.get_data_parallel_rank() if topology == "dp" else 0.0
             )
-            generation_length = 2 if topology in ("cp", "hybrid_cp") else 1
+            generation_length = 2 if topology in ("cp", "cp_sp", "hybrid_cp") else 1
             admission, step, finished = _run_request(
                 engine, 110, _media(modality, offset=media_offset), trace, prompt, generation_length
             )
@@ -1507,6 +1501,8 @@ def test_real_media_executes_configured_language_implementation_or_parallel_path
         if companion_patch is not None:
             companion_patch.stop()
             gather_patch.stop()
+            if output_gather_patch is not None:
+                output_gather_patch.stop()
             if output_handle is not None:
                 output_handle.remove()
         for handle in optimized_handles:
@@ -1533,7 +1529,10 @@ def test_real_media_executes_configured_language_implementation_or_parallel_path
         assert finished.generated_tokens == [int(local_logits[0, -1].argmax())]
         logit_group = model.language_model.tp_group
         assert len(scatter_events) == len(gather_events) == len(output_events) == 1
-        (tagged, local_tagged), (local_hidden, global_hidden) = scatter_events[0], gather_events[0]
+        (tagged, local_tagged), (local_hidden, global_hidden) = (
+            scatter_events[0],
+            gather_events[0],
+        )
         assert torch.equal(local_tagged.argmax(-1), local_hidden.argmax(-1))
         assert torch.equal(global_hidden.argmax(-1), torch.arange(expected_seq_len).unsqueeze(1))
         assert torch.equal(output_events[0], global_hidden)
@@ -1547,28 +1546,42 @@ def test_real_media_executes_configured_language_implementation_or_parallel_path
         rank_tokens = [torch.empty_like(local_token) for _ in range(Utils.world_size)]
         torch.distributed.all_gather(rank_tokens, local_token, group=model.language_model.tp_group)
         assert all(torch.equal(token, local_token) for token in rank_tokens)
-    elif topology in ("cp", "hybrid_cp"):
+    elif topology in ("cp", "cp_sp", "hybrid_cp"):
         reference_admission, reference_step, reference_finished = reference
         assert torch.equal(admission["tokens"], reference_admission["tokens"])
         assert torch.equal(admission["mask"], reference_admission["mask"])
-        assert torch.equal(admission["embeddings"], reference_admission["embeddings"])
-        assert torch.equal(step["logits"], reference_step["logits"])
-        assert finished.generated_tokens == reference_finished.generated_tokens
+        _same(admission, step, finished, reference_admission, reference_step, reference_finished)
         cp_group = model.pg_collection.cp
         assert len(cp_events) == len(trace) == len(reference_trace)
         assert len(trace) > 1
-        for event, actual_step, expected_step in zip(cp_events, trace, reference_trace):
-            full, local, padded_tokens, gathered = event
+        if topology == "cp_sp":
+            assert cp_group.size() == model.pg_collection.tp.size() == 2
+            assert len(output_gather_mock.call_args_list) == len(cp_events)
+            assert any(x[-1].shape[0] > x[2] for x in cp_events)
+        for index, (event, actual_step, expected_step) in enumerate(
+            zip(cp_events, trace, reference_trace)
+        ):
+            full, local, padded_tokens, cp_local, gathered = event
             assert full.shape[1] == padded_tokens
             expected_global = torch.zeros_like(gathered)
             expected_global[:padded_tokens] = full.transpose(0, 1)
             assert torch.equal(gathered, expected_global)
             chunks = expected_global.view(2 * cp_group.size(), -1, *expected_global.shape[1:])
             rank = cp_group.rank()
-            expected_local = torch.cat((chunks[rank], chunks[-rank - 1]))
+            expected_cp_local = torch.cat((chunks[rank], chunks[-rank - 1]))
+            expected_local = (
+                expected_cp_local.chunk(2)[model.pg_collection.tp.rank()]
+                if topology == "cp_sp"
+                else expected_cp_local
+            )
             assert torch.equal(local, expected_local)
+            assert torch.equal(cp_local, expected_cp_local)
             assert torch.equal(actual_step["logits"], expected_step["logits"])
             assert torch.isfinite(actual_step["logits"]).all()
+            if topology == "cp_sp":
+                assert (
+                    output_gather_mock.call_args_list[index].args[0].shape[0] * 2 == padded_tokens
+                )
         max_delta = 0.0
         for traced_step in trace:
             local_logits = traced_step["logits"].cuda()
@@ -1687,11 +1700,8 @@ def test_real_media_executes_attention_variant_and_reuses_exact_result(model_par
     if variant == "swa":
         assert all(window == (4, 0) for window, _ in companion_events)
     assert first_step["mask"].ge(0).sum().item() == 4
-    assert torch.equal(first["embeddings"], reuse["embeddings"])
-    assert torch.equal(first_step["embeddings"], reuse_step["embeddings"])
-    assert torch.equal(first_step["logits"], reuse_step["logits"])
+    _same(first, first_step, first_finished, reuse, reuse_step, reuse_finished)
     assert torch.isfinite(first_step["logits"]).all()
-    assert first_finished.generated_tokens == reuse_finished.generated_tokens
 
 
 def test_real_media_prefill_replays_actual_cuda_graph_with_eager_parity(model_parallel):
@@ -1722,9 +1732,7 @@ def test_real_media_prefill_replays_actual_cuda_graph_with_eager_parity(model_pa
     assert graph_step["graphed"]
     assert torch.equal(eager["tokens"], graphed["tokens"])
     assert torch.equal(eager["mask"], graphed["mask"])
-    assert torch.equal(eager["embeddings"], graphed["embeddings"])
-    assert torch.equal(eager_step["logits"], graph_step["logits"])
-    assert eager_finished.generated_tokens == graph_finished.generated_tokens
+    _same(eager, eager_step, eager_finished, graphed, graph_step, graph_finished)
 
 
 def test_real_media_prefill_and_mtp_draft_share_step_with_greedy_parity(model_parallel):
@@ -1938,8 +1946,6 @@ def test_real_media_executes_fp8_context_and_reuses_exact_embedding(model_parall
     quant_enabled, observed_recipe, input_shape = quant_events[0]
     assert quant_enabled and observed_recipe == recipe
     assert input_shape == ((16 if recipe == "tensorwise" else 32), 32)
-    assert torch.equal(first["embeddings"], reuse["embeddings"])
+    _same(first, first_step, first_finished, reuse, reuse_step, reuse_finished)
     assert torch.equal(first["embeddings"], recomputed["embeddings"])
-    assert torch.equal(first_step["logits"], reuse_step["logits"])
     assert torch.equal(first_step["logits"], recomputed_step["logits"])
-    assert first_finished.generated_tokens == reuse_finished.generated_tokens
