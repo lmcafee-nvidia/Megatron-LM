@@ -248,6 +248,7 @@ def test_batch_invariant_inference_activations_replay():
 @pytest.mark.skipif(not hasattr(torch, "float8_e8m0fnu"), reason="needs torch float8 e8m0 dtype")
 def test_mxfp8_quantize_replays():
     from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize
+    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor, get_mxfp8_scale_bytes
 
     seeded()
     x = torch.randn(16384, 8192, device="cuda", dtype=torch.bfloat16)
@@ -256,10 +257,11 @@ def test_mxfp8_quantize_replays():
 
     def fn(x):
         data, scale = mxfp8_quantize(x)
-        return data.view(torch.uint8), scale.view(torch.uint8)
+        tensor = MXFP8Tensor(data=data, scale=scale, backend="triton")
+        return data.view(torch.uint8), scale.view(torch.uint8), get_mxfp8_scale_bytes(tensor)
 
     assert_replays_bit_exact(fn, (x,), backward=False, what="mxfp8_quantize")
-    data, scale = fn(x)
+    data, scale, _ = fn(x)
     assert scale[0].item() == 0  # E8M0 byte zero is the finite 2**-127 scale.
     assert torch.count_nonzero(data[0, :32]) == 32
     assert torch.count_nonzero(data[1, :32]) == 0
