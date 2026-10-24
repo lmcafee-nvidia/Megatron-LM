@@ -4893,10 +4893,11 @@ class DynamicInferenceEngine(AbstractEngine):
                     if matches.numel() > 0:
                         assert matches.numel() == 1
                         idx = int(matches[0].item())
-                        self.context.request_output_lengths[idx] = (
-                            self.context.request_kv_length_offsets[idx]
-                            + self.context.request_query_lengths[idx]
-                        )
+                        with torch.inference_mode():
+                            self.context.request_output_lengths[idx] = (
+                                self.context.request_kv_length_offsets[idx]
+                                + self.context.request_query_lengths[idx]
+                            )
                     if not self._is_disaggregated_role("prefill"):
                         self._notify_request_aborted(request_id, source_safe=True)
             elif header == Headers.SET_GENERATION_EPOCH:
