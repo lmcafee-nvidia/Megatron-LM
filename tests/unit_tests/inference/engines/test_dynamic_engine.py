@@ -883,7 +883,6 @@ def mock_forward(input_ids, position_ids, attention_mask, *args, **kwargs):
 
 @dataclass
 class DynamicEngineTestConfig:
-    """Test configuration args."""
 
     random_seed = 123
     vocab_size = 100
@@ -1133,8 +1132,6 @@ class DynamicInferenceEngineTestBase:
         requests: List[DynamicInferenceRequest],
         mamba_inference_state_config: Optional[MambaInferenceStateConfig] = None,
     ):
-        """The inference context manages the KV cache and other inference state."""
-
         # Inference context.
         context = DynamicInferenceContext(
             model_config=transformer_config,
@@ -3317,7 +3314,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     )
     @torch.inference_mode()
     def test_moe_decode_after_local_kv_handoff_matches_uninterrupted_request(self):
-        """Transferred prompt KV resumes directly into a real optimized MoE decode."""
 
         config = DynamicEngineTestConfig(
             num_requests=1,
@@ -3583,7 +3579,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         "inference_cuda_graph_scope", [InferenceCudaGraphScope.layer, InferenceCudaGraphScope.block]
     )
     def test_simple(self, model_provider, num_cuda_graphs, inference_cuda_graph_scope) -> None:
-        """Simple test that runs without errors, and validates output."""
         skip_if_mamba_sequence_packing_not_available(model_provider)
         num_tokens_to_generate = 16
 
@@ -3730,7 +3725,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     )
     @torch.inference_mode()
     def test_token_overflow_transient(self) -> None:
-        """Test token overflow."""
         test_config = DynamicEngineTestConfig(
             num_requests=2,
             min_prompt_length=512,
@@ -3754,7 +3748,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         "legacy tests."
     )
     def test_token_overflow_nontransient(self) -> None:
-        """Test token overflow (non-transient)."""
         test_config = DynamicEngineTestConfig(context_max_tokens=8)
         env = self._build_test_env(test_config)
         try:
@@ -3770,7 +3763,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     )
     @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     def test_block_overflow(self, model_provider: str) -> None:
-        """Test block overflow."""
         skip_if_mamba_sequence_packing_not_available(model_provider)
         env = self._build_test_env(DynamicEngineTestConfig(model_provider=model_provider))
         context = env.engine.context
@@ -3788,7 +3780,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     def test_block_overflow_insufficient_kv_cache(self) -> None:
-        """Test that a request fails when KV cache blocks cannot fit the request's sequence."""
         # Use a large max_sequence_length with a small buffer so that the total
         # block count is smaller than what a single max-length request needs.
         # With num_tokens_total=8192 and prompt_length=4, the request needs
@@ -4169,7 +4160,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     )
     @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     def test_multi_add(self, model_provider: str) -> None:
-        """Test adding multiple requests simultaneously."""
         skip_if_mamba_sequence_packing_not_available(model_provider)
         self._run_test(num_gap_steps=0, model_provider=model_provider)
 
@@ -4213,7 +4203,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     )
     @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     def test_fixed_output_lengths(self, model_provider: str) -> None:
-        """Test generating a fixed number of output tokens."""
         skip_if_mamba_sequence_packing_not_available(model_provider)
         self._run_test(use_fixed_output_lengths=True, model_provider=model_provider)
 
@@ -4223,7 +4212,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     )
     @pytest.mark.parametrize("use_non_decode", [False, True])
     def test_cuda_graph_token_counts(self, use_non_decode: bool) -> None:
-        """Test initialization of `cuda_graph_token_counts` in dynamic context."""
 
         # Exponential-decay graph distribution (halve from max down to tp_size). Pinned
         # explicitly below: the production default is HYBRID, which spaces the
@@ -4283,7 +4271,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     @torch.inference_mode()
     def test_generate_function(self, model_provider: str) -> None:
-        """Test the generate function that processes multiple prompts at once."""
         skip_if_mamba_sequence_packing_not_available(model_provider)
 
         # Set up test environment
@@ -4750,7 +4737,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     )
     @torch.inference_mode()
     def test_return_log_probs(self):
-        """Verify that log probs are returned and computed correctly."""
         # Returning log probs requires materializing the full prompt logits or
         # explicitly disabling prompt logits.
         with pytest.raises(AssertionError):
@@ -5007,7 +4993,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     def test_num_tokens_total(self):
-        """Simple test, but using num_tokens_total instead of num_tokens_to_generate."""
         # Run test.
         env = self._run_test(
             num_tokens_to_generate=None, num_tokens_total=20, use_fixed_output_lengths=True
@@ -5023,7 +5008,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         "legacy tests."
     )
     def test_events(self):
-        """Test events."""
         env = self._run_test(
             num_requests=16,
             max_prompt_length=10,
@@ -5963,7 +5947,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.parametrize("max_requests", [None, 4])
     @torch.inference_mode()
     def test_max_requests(self, max_requests: int | None):
-        """Test max requests."""
         env = self._run_test(
             context_max_requests=max_requests, num_tokens_to_generate=16, num_gap_steps=1
         )
@@ -5994,7 +5977,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.parametrize("kv_cache_management_mode", ["persist", "offload", "recompute"])
     @torch.inference_mode()
     def test_suspend_resume_cycle(self, kv_cache_management_mode, static_kv_memory_pointers):
-        """Full suspend -> resume cycle with memory, data, and address checks."""
         needs_tms = static_kv_memory_pointers and kv_cache_management_mode != "persist"
 
         test_config = DynamicEngineTestConfig(

@@ -62,6 +62,7 @@ if HAVE_TE:
         TENorm,
         TERowParallelGroupedLinear,
         TERowParallelLinear,
+        split_te_layernorm_column_parallel_linear,
         te_cross_entropy,
     )
 
@@ -518,7 +519,9 @@ class TestTEWrappers:
     def test_te_layernorm_column_parallel_linear_replays(self, normalization, zero_centered_gamma):
         seeded()
         config = _config(
-            normalization=normalization, layernorm_zero_centered_gamma=zero_centered_gamma
+            normalization=normalization,
+            layernorm_zero_centered_gamma=zero_centered_gamma,
+            use_cpu_initialization=True,
         )
         module = TELayerNormColumnParallelLinear(
             HIDDEN,
@@ -539,6 +542,8 @@ class TestTEWrappers:
             contention=True,
             what=f"TELayerNormColumnParallelLinear[{normalization}]",
         )
+        split_norm, split_linear = split_te_layernorm_column_parallel_linear(module, config)
+        assert split_norm.weight.is_cuda and split_linear.weight.is_cuda
 
     @pytest.mark.parametrize("normalization", ["LayerNorm", "RMSNorm"])
     def test_te_norm_replays(self, normalization):

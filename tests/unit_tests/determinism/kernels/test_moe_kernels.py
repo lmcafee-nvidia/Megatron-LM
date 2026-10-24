@@ -18,9 +18,11 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+import megatron.core.transformer.moe.batch_invariant as b
 from megatron.core import parallel_state
 from megatron.core.activations import squared_relu
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_spec,
@@ -40,7 +42,7 @@ from megatron.core.transformer.moe.experts import (
 )
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.ops.virtual_expert_triton import VirtualExpertPlannerWorkspace
-from megatron.core.transformer.moe.router import TopKRouter
+from megatron.core.transformer.moe.router import InferenceTopKRouter, TopKRouter
 from megatron.core.transformer.moe.token_dispatcher import _VirtualExpertHybridEPManager
 from megatron.core.transformer.moe.virtual_expert_load_balancer import (
     VirtualExpertLoadBalancer,
@@ -67,6 +69,16 @@ HAVE_TE_ROUTER = HAVE_TE and is_te_min_version("2.7.0")
 from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP, HAVE_DEEP_EP_V2
 
 NUM_TOKENS, HIDDEN, NUM_EXPERTS, TOPK = 16384, 2048, 64, 8
+
+
+class _InInferenceMode(torch.nn.Module):
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+
+    def forward(self, *args, **kwargs):
+        with InferenceMode.active():
+            return self.module(*args, **kwargs)
 
 
 # --- virtual-expert planning ----------------------------------------------------------------
@@ -831,6 +843,11 @@ class TestMoEModules:
         Utils.initialize_model_parallel(expert_model_parallel_size=ep)
         model_parallel_cuda_manual_seed(123)
 
+    def test_empty_inverse_permutation_map_replays(self):
+        idx = torch.empty(0, dtype=torch.long, device="cuda")
+        inverse = b.build_inverse_permutation_map(idx.reshape(0, 4).bool(), idx, idx, 0)
+        assert inverse.shape == (2, 0, 0) and inverse.dtype == torch.long
+
     @pytest.mark.parametrize("dispatcher", ["allgather", "alltoall"])
     @pytest.mark.parametrize("balancing", ["aux_loss", "seq_aux_loss"])
     @pytest.mark.parametrize("per_token_loss", [False, True])
@@ -932,11 +949,15 @@ class TestMoEModules:
             moe_num_hash_layers=int(hash_routing),
             hash_moe_vocab_size=128 if hash_routing else None,
         )
-        router = TopKRouter(
+        router_cls = InferenceTopKRouter if balancing == "sinkhorn" else TopKRouter
+        router = router_cls(
             config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
         ).cuda()
         router.set_layer_number(0)
-        hidden = torch.randn(2048, 4, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        if balancing == "sinkhorn":
+            router = _InInferenceMode(router.eval())
+        shape = (8192, 1, 1024) if balancing == "sinkhorn" else (2048, 4, 1024)
+        hidden = torch.randn(*shape, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         inputs = (hidden,)
         if expert_bias:
             padding_mask = torch.arange(8192, device="cuda").reshape(2048, 4) % 3 == 0
@@ -1092,21 +1113,11 @@ class TestMoEModules:
     def test_inference_nvfp4_moe_layer_replays(self, gated):
         """Inference MoELayer through FlashInfer per-token NVFP4 squared-ReLU or SwiGLU experts."""
         from megatron.core.inference.moe.flashinfer_nvfp4 import HAVE_FLASHINFER_ROUTED_NVFP4
-        from megatron.core.inference.utils import InferenceMode
         from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
         from megatron.core.transformer.moe.token_dispatcher_inference import NCCLAllGatherDispatcher
 
         if not HAVE_FLASHINFER_ROUTED_NVFP4 or torch.cuda.get_device_capability()[0] < 10:
             pytest.skip("per-token NVFP4 MoE needs FlashInfer >= 0.7.0 and Blackwell")
-
-        class _InInferenceMode(torch.nn.Module):
-            def __init__(self, module):
-                super().__init__()
-                self.module = module
-
-            def forward(self, hidden):
-                with InferenceMode.active():
-                    return self.module(hidden)
 
         self._init(ep=1)
         seeded()
@@ -1137,6 +1148,8 @@ class TestMoEModules:
         layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
         hidden = torch.randn(512, 1, 1024, device="cuda", dtype=torch.bfloat16)
         with torch.no_grad(), deterministic_algorithms(True):
+            _InInferenceMode(layer)(hidden)
+            layer.experts.refresh_cache()
             assert_module_replays_bit_exact(
                 _InInferenceMode(layer),
                 (hidden,),
