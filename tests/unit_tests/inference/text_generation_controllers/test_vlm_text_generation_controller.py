@@ -107,12 +107,14 @@ def test_vlm_dynamic_forward_sanitizes_preexpanded_media_sentinel():
 
 @pytest.mark.internal
 @pytest.mark.parametrize("is_video", [False, True])
-def test_vlm_vision_forward_casts_images_and_passes_tensor_input_ids(is_video):
+@pytest.mark.parametrize("tile_tags", [None, [[11, 12, 13, 14, 15, 16]]])
+def test_vlm_vision_forward_casts_images_and_passes_tensor_input_ids(is_video, tile_tags):
     module = SimpleNamespace(
         image_token_index=-200,
         vision_model=SimpleNamespace(config=SimpleNamespace(params_dtype=torch.bfloat16)),
         dynamic_resolution=False,
         add_decoder=True,
+        _tile_tags=tile_tags,
     )
 
     class WrappedVisionModel:
@@ -138,7 +140,12 @@ def test_vlm_vision_forward_casts_images_and_passes_tensor_input_ids(is_video):
     args, _ = model.call_args
     assert args[0].dtype == torch.bfloat16
     assert isinstance(args[1], torch.Tensor)
-    assert args[1].shape == (1, 0)
+    expected_input_ids = (
+        torch.empty((1, 0), dtype=torch.long)
+        if tile_tags is None
+        else torch.tensor([[module.image_token_index]])
+    )
+    assert torch.equal(args[1].cpu(), expected_input_ids)
     assert args[1].device == args[0].device
     assert module.add_decoder is True
     assert output.dtype == torch.bfloat16
@@ -479,7 +486,7 @@ class TestVLMTextGenerationController:
 
         language_config.language_model_type = "dummy"
         vision_config.vision_model_type = "clip"
-        self.model = LLaVAModel(
+        self.llava_model = LLaVAModel(
             language_transformer_config=language_config,
             language_transformer_layer_spec=ModuleSpec(
                 module=TransformerLayer, submodules=language_layer_submodules
@@ -495,8 +502,8 @@ class TestVLMTextGenerationController:
             img_w=self.img_w,
             patch_dim=14,
         ).cuda()
-        self.image_token_index = self.model.image_token_index
-        self.model = Float16Module(self.model.config, self.model)
+        self.image_token_index = self.llava_model.image_token_index
+        self.model = Float16Module(self.llava_model.config, self.llava_model)
 
         inference_context = StaticInferenceContext(max_batch_size=8, max_sequence_length=2560)
 
@@ -558,9 +565,19 @@ class TestVLMTextGenerationController:
             active_requests[request_id] = inference_request
             all_prompt_tokens[request_id] = copy.deepcopy(prompt_tokens)
 
-        requests = self.text_generation_controller.generate_all_output_tokens_static_batch(
-            active_requests
+        projection_events = []
+        handle = self.llava_model.vision_projection.register_forward_hook(
+            lambda _module, _args, output: projection_events.append(tuple(output.shape))
         )
+        try:
+            requests = self.text_generation_controller.generate_all_output_tokens_static_batch(
+                active_requests
+            )
+        finally:
+            handle.remove()
+
+        assert self.llava_model.img_seq_len == 577
+        assert projection_events == [(577, 1, self.language_hidden_size)]
 
         for request_id, request in requests.items():
             assert (

@@ -839,28 +839,29 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 config=self.config,
             )
 
-        if (
-            in_inference_mode
-            and inference_context is not None
-            and inference_context.config.materialize_only_last_token_logits
-        ):
+        if in_inference_mode and inference_context is not None:
             if inference_context.is_static_batching():
-                hidden_states = hidden_states[-1:, :, :]
+                if inference_context.config.materialize_only_last_token_logits:
+                    hidden_states = hidden_states[-1:, :, :]
             else:
                 if self.output_layer.sequence_parallel:
-                    # Perform the sequence parallel gather here instead of after the output layer
-                    # because we need to slice the last token logits from the full view of the
-                    # packed logits across all requests.
+                    # Dynamic request bookkeeping uses the global packed-token view. Restore it
+                    # before either returning all logits or selecting request-final positions.
                     hidden_states = gather_from_sequence_parallel_region(
                         hidden_states, group=self.pg_collection.tp
                     )
                     self.output_layer.sequence_parallel = False
                     sequence_parallel_override = True
 
-                # Reshape [S, B, H] (with B=1) to [1, S, H] for logit extraction,
-                # then back to [S’, B, H] for the output layer.
-                reshaped = hidden_states.squeeze(1).unsqueeze(0)
-                hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
+                hidden_states = self._gather_context_parallel_hidden_states_for_inference(
+                    hidden_states, inference_context.padded_active_token_count
+                )
+
+                if inference_context.config.materialize_only_last_token_logits:
+                    # Reshape [S, B, H] (with B=1) to [1, S, H] for logit extraction,
+                    # then back to [S’, B, H] for the output layer.
+                    reshaped = hidden_states.squeeze(1).unsqueeze(0)
+                    hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
 
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
@@ -885,11 +886,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
 
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:
-            assert (
-                in_inference_mode
-                and inference_context.is_dynamic_batching()
-                and inference_context.config.materialize_only_last_token_logits
-            )
+            assert in_inference_mode and inference_context.is_dynamic_batching()
             self.output_layer.sequence_parallel = True
 
         if has_config_logger_enabled(self.config):

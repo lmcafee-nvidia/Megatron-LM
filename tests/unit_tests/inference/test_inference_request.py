@@ -170,6 +170,29 @@ def test_preprocessed_video_timing_metadata_round_trip():
     assert resolved["video_fps"] == [29.97]
 
 
+@pytest.mark.parametrize(
+    "timing_override",
+    [
+        pytest.param({"video_frame_indices": [[4, 8]]}, id="frame-indices"),
+        pytest.param({"video_fps": [30.0]}, id="fps"),
+    ],
+)
+def test_preprocessed_video_timing_metadata_participates_in_cache_identity(timing_override):
+    base_video = {
+        "imgs": torch.ones(2, 3, 2, 2),
+        "imgs_sizes": torch.tensor([[2, 2], [2, 2]]),
+        "num_frames": torch.tensor([2]),
+        "video_frame_indices": [[3, 7]],
+        "video_fps": [29.97],
+    }
+    changed_video = {**base_video, **timing_override}
+
+    base_key = serialize_multimodal_data({"video": base_video})["media_cache_key"]
+    changed_key = serialize_multimodal_data({"video": changed_video})["media_cache_key"]
+
+    assert base_key != changed_key
+
+
 def test_gym_style_compact_multimodal_request_omits_preexpanded_flag():
     wire = serialize_multimodal_data(
         {"image": {"imgs": torch.ones(1, 2, 4), "imgs_sizes": torch.tensor([[2, 2]])}}

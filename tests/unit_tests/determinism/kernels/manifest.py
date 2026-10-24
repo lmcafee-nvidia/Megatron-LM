@@ -156,8 +156,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Attention._apply_output_gate is replayed in test_fused_activations.py. "
         "Packed SelfAttention dispatch through RoPE and TE attention is replayed with runtime "
         "CP1/CP2/CP4, including input/parameter gradients and CP-state restoration, in "
-        "test_runtime_cp_attention.py. The dynamic-inference flash_decode_and_prefill "
-        "dispatch (FA2 prefill/decode) is replayed there with a config-driven softmax_scale.",
+        "test_runtime_cp_attention.py. Dynamic FA2/FA4 prefill/decode dispatch is replayed "
+        "there with a config-driven softmax scale and per-head sink.",
     ),
     KernelEntry(
         name="fused_vocab_parallel_cross_entropy",
@@ -314,11 +314,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
             K + "test_te_wrappers.py",
             C + "test_fp8_determinism.py",
             K + "test_runtime_cp_attention.py",
+            "tests/unit_tests/inference/test_multimodal_gpu.py",
         ),
         kind="te-wrapper",
         notes="TE Linear / LayerNormLinear / Norm / GroupedLinear / DotProductAttention / fused RoPE replayed standalone; "
         "FP8/FP4 recipes in the model-level suite. Runtime CP binding and restoration are "
         "replayed through packed SelfAttention in test_runtime_cp_attention.py. "
+        "The lazy MLA latent-cache TE split inherits CUDA/eval state and replays exact reuse. "
         "QB-capable TE routing replays probabilities, gradients, and atomic histograms.",
     ),
     KernelEntry(

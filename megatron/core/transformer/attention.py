@@ -1138,6 +1138,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             softcap = self.config.attn_logit_softcapping
             softcap_kwargs = {} if softcap is None else {"softcap": softcap}
             if use_fa4:
+                # FA4 applies sinks in-kernel; its inference path may not return LSE.
                 output_total, softmax_lse = flash_attn4_varlen_func(
                     q,
                     k,
@@ -1151,6 +1152,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                     causal=True,
                     window_size=window_size,
                     num_splits=0 if not self.batch_invariant_mode else 1,
+                    learnable_sink=softmax_offset,
                     **softcap_kwargs,
                 )
             elif use_fa3:
@@ -1206,7 +1208,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 else:
                     output_total = fa2_ret
                     softmax_lse = None
-            if need_lse:
+            if need_lse and not use_fa4:
                 # output_total: (total_q, H, D); softmax_lse: (H, total_q)
                 output_total = self._apply_sink_softmax_correction_varlen(
                     output_total, softmax_lse, softmax_offset
@@ -1281,6 +1283,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             else:
                 if use_fa4:
                     softmax_scale = self.get_softmax_scale(q)
+                    # FA4 applies sinks in-kernel; its inference path may not return LSE.
                     # Reshape q from (B, S, H, D) to (B*S, H, D) for varlen interface
                     q_varlen = q.reshape(-1, q.shape[-2], q.shape[-1])
                     decode_softcap = self.config.attn_logit_softcapping
@@ -1298,9 +1301,10 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         causal=True,
                         window_size=window_size,
                         num_splits=0 if not self.batch_invariant_mode else 1,
+                        learnable_sink=softmax_offset,
                         **softcap_kwargs,
                     )
-                    if need_lse:
+                    if need_lse and not use_fa4:
                         # output_total: (B*S, H, D); softmax_lse: (H, B*S)
                         output_total = self._apply_sink_softmax_correction_varlen(
                             output_total, softmax_lse, softmax_offset

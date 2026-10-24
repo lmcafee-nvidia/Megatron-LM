@@ -62,6 +62,7 @@ if HAVE_TE:
         TENorm,
         TERowParallelGroupedLinear,
         TERowParallelLinear,
+        split_te_layernorm_column_parallel_linear,
         te_cross_entropy,
     )
 
@@ -539,6 +540,11 @@ class TestTEWrappers:
             contention=True,
             what=f"TELayerNormColumnParallelLinear[{normalization}]",
         )
+        module.eval()
+        config.use_cpu_initialization = True
+        norm, linear = split_te_layernorm_column_parallel_linear(module, config)
+        assert norm.weight.is_cuda and not norm.training
+        assert linear.weight.is_cuda and not linear.training
 
     @pytest.mark.parametrize("normalization", ["LayerNorm", "RMSNorm"])
     def test_te_norm_replays(self, normalization):

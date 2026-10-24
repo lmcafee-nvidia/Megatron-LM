@@ -232,15 +232,18 @@ def test_packed_attention_runtime_cp_replays(build_cp_size, fused_rope, monkeypa
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and flash-attn")
 @pytest.mark.parametrize("path", ["prefill", "decode"])
-def test_flash_decode_dispatch_config_softmax_scale_replays(path):
-    """The dynamic-inference attention dispatch honors config.softmax_scale deterministically."""
+@pytest.mark.parametrize("flash_version", [2, 4])
+def test_flash_decode_dispatch_config_softmax_scale_replays(path, flash_version):
+    """Dynamic flash attention honors config scale and sink deterministically."""
     from megatron.core.transformer import attention as attention_module
 
-    if (
+    if flash_version == 4 and not attention_module.HAVE_FA4:
+        pytest.skip("requires flash-attn 4")
+    if flash_version == 2 and (
         attention_module.flash_attn_varlen_func is None
         or attention_module.flash_attn_with_kvcache is None
     ):
-        pytest.skip("requires flash-attn")
+        pytest.skip("requires flash-attn 2")
 
     from megatron.core.models.gpt.gpt_layer_specs import (
         get_gpt_layer_with_transformer_engine_submodules,
@@ -266,7 +269,7 @@ def test_flash_decode_dispatch_config_softmax_scale_replays(path):
             hidden_dropout=0.0,
             add_bias_linear=False,
             softmax_scale=0.25,  # Not 1/sqrt(head_dim): the choice must be observable.
-            flash_attention_version=2,  # Pin FA2 so every environment replays the same kernel.
+            flash_attention_version=flash_version,
         )
         submodules = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
         module = SelfAttention(
@@ -293,6 +296,7 @@ def test_flash_decode_dispatch_config_softmax_scale_replays(path):
             seqlens_k=torch.tensor(lengths_k, device="cuda", dtype=torch.int32),
             block_table=torch.tensor([[0], [1]], device="cuda", dtype=torch.int32),
             max_seqlen_k=max(lengths_k),
+            softmax_offset=torch.linspace(-0.25, 0.25, heads, device="cuda"),
         )
         if path == "prefill":
             tokens_per_request = 8
@@ -327,7 +331,7 @@ def test_flash_decode_dispatch_config_softmax_scale_replays(path):
             replays=3,
             backward=False,
             contention=True,
-            what=f"flash_decode_and_prefill[{path}, config softmax_scale]",
+            what=f"flash_decode_and_prefill[FA{flash_version}, {path}, config scale/sink]",
         )
         assert torch.isfinite(scaled[0]["out"]).all()
 
