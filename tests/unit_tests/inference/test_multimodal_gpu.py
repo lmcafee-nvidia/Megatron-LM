@@ -1435,7 +1435,6 @@ def test_real_media_executes_moe_router_with_configured_expert_topology(model_pa
         for module in model.language_model.modules()
         if type(module).__name__ == "TopKRouter"
     ]
-    assert handles
 
     try:
         with mock.patch.object(
@@ -1450,16 +1449,18 @@ def test_real_media_executes_moe_router_with_configured_expert_topology(model_pa
 
     assert encoder.call_count == 1
     assert router_events
-    assert model.config.expert_model_parallel_size == (
-        parallel_state.get_expert_model_parallel_world_size()
-    )
-    assert model.config.expert_tensor_parallel_size == (
-        parallel_state.get_expert_tensor_parallel_world_size()
-    )
+    cfg = model.config
+    assert cfg.expert_model_parallel_size == parallel_state.get_expert_model_parallel_world_size()
+    assert cfg.expert_tensor_parallel_size == parallel_state.get_expert_tensor_parallel_world_size()
     assert step["mask"].ge(0).sum().item() == 4
     assert torch.equal(step["embeddings"], admission["embeddings"])
     assert step["logits"].shape == (1, 1, VOCAB_SIZE)
-    assert len(finished.generated_tokens) == 1
+    local_logits = step["logits"].cuda().flatten()
+    rank_logits = local_logits.new_empty(Utils.world_size * VOCAB_SIZE)
+    torch.distributed.all_gather_into_tensor(rank_logits, local_logits)
+    rank_logits = rank_logits.view(Utils.world_size, -1)
+    assert torch.all(torch.isfinite(rank_logits) & (rank_logits == rank_logits[:1]))
+    assert finished.generated_tokens == [int(step["logits"][0, -1].argmax())]
 
 
 @pytest.mark.internal
@@ -1534,10 +1535,10 @@ def test_real_media_executes_configured_language_implementation_or_parallel_path
     assert torch.equal(step["embeddings"], admission["embeddings"])
     expected_seq_len = step["input_ids"].shape[1] if full_logits else 1
     assert step["logits"].shape == (1, expected_seq_len, VOCAB_SIZE)
-    assert len(finished.generated_tokens) == 1
+    assert torch.isfinite(step["logits"]).all()
+    assert finished.generated_tokens == [int(step["logits"][0, -1].argmax())]
     if topology == "sp":
         local_logits = step["logits"][:, : admission["tokens"].numel()].cuda()
-        assert torch.isfinite(local_logits).all()
         assert finished.generated_tokens == [int(local_logits[0, -1].argmax())]
         logit_group = model.language_model.tp_group
         rank_logits = [torch.empty_like(local_logits) for _ in range(Utils.world_size)]

@@ -101,8 +101,7 @@ class KernelEntry:
 # Test-file prefixes used below.
 K = "tests/unit_tests/determinism/kernels/"
 C = "tests/unit_tests/determinism/correctness/"
-I = "tests/unit_tests/inference/"
-MM = I + "test_multimodal_gpu.py"
+MM = "tests/unit_tests/inference/test_multimodal_gpu.py"
 
 KERNELS: Tuple[KernelEntry, ...] = (
     # ---------------------------------------------------------------- fused elementwise (jit_fuser / torch.compile)
