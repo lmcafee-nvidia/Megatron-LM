@@ -288,14 +288,12 @@ class TestPrefixCachingCudaGraphs:
 
         with replay_context:
             if batch_structure in ("prefill", "decode"):
-                # Add all 4 requests before first step.
                 for i, prompt in enumerate(prompts):
                     engine._add_request(self._make_request(i, prompt))
                 while engine.has_unfinished_requests():
                     _step_and_log()
 
             elif batch_structure == "mixed":
-                # Add req 0+1 first, step until both are decoding, then add 2+3.
                 for i in [0, 1]:
                     engine._add_request(self._make_request(i, prompts[i]))
                 reqs_added = False

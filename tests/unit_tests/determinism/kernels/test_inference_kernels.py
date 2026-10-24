@@ -792,13 +792,11 @@ def test_mxfp8_swiglu_moe_replays():
     def run(x):
         return mcore_fused_moe(x, probs, fc1, fc2, ActivationType.SWIGLU, 1, 0, valid, routes)
 
-    # One route per token also makes the non-batch-invariant atomic combine exact.
     assert_replays_bit_exact(run, (x,), replays=3, backward=False, what="MXFP8 SwiGLU MoE")
 
 
 @pytest.mark.launch_on_gb200
 def test_mxfp8_topk2_moe_eager_matches_cuda_graph():
-    """Isolate eager/replay parity for the squared-ReLU top-k2 operator path."""
     from megatron.core.inference.moe.fused_moe import (
         HAVE_SCALED_GMM,
         ActivationType,

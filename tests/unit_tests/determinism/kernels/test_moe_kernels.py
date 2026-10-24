@@ -959,7 +959,6 @@ class TestMoEModules:
         )
 
     def test_inference_topk1_router_preserves_route_axis(self):
-        """The optimized inference router always returns dense [tokens, topk] tensors."""
         from megatron.core.inference.utils import InferenceMode
         from megatron.core.transformer.moe.router import InferenceTopKRouter
 

@@ -807,13 +807,16 @@ _ASYNC_PAIR_SCENARIOS = (
         config={"transformer_impl": "inference_optimized"},
         signals=("inference-optimized",),
     ),
-    _pair_scenario(
-        "fp8-transformer-engine",
-        "precision:fp8",
-        config={"fp8": True, "hidden_size": 128},
-        signals=("fp8",),
-        prerequisite="fp8",
-        atol=5.0e-3,
+    *(
+        _pair_scenario(
+            "fp8-transformer-engine" + (f"-{recipe}" if recipe != "tensorwise" else ""),
+            f"precision:fp8-{recipe}",
+            config={"fp8": True, "fp8_recipe": recipe, "hidden_size": 128},
+            signals=("fp8", "fixed-history-logits"),
+            prerequisite="fp8",
+            atol=0.0,
+        )
+        for recipe in ("tensorwise", "delayed", "blockwise")
     ),
     _pair_scenario(
         "mxfp8-inference-optimized-moe",
@@ -829,9 +832,9 @@ _ASYNC_PAIR_SCENARIOS = (
             "use_moe_layer_spec": True,
             "transformer_impl": "inference_optimized",
         },
-        signals=("inference-optimized", "moe", "mxfp8", "mxfp8-logits"),
+        signals=("inference-optimized", "moe", "mxfp8", "fixed-history-logits"),
         prerequisite="mxfp8",
-        atol=5.0e-3,
+        atol=0.0,
         graph_parity="reproducible",
     ),
     _pair_scenario(
@@ -846,10 +849,11 @@ _ASYNC_PAIR_SCENARIOS = (
             "transformer_impl": "inference_optimized",
             "moe_router_topk": 1,
             "moe_router_pre_softmax": True,
+            "fp8_output_proj": True,
         },
-        signals=("inference-optimized", "moe", "mxfp8", "mxfp8-logits"),
+        signals=("inference-optimized", "moe", "mxfp8", "fixed-history-logits"),
         prerequisite="mxfp8",
-        atol=5.0e-3,
+        atol=0.0,
         graph_parity="reproducible",
     ),
     # Four heads of width 64 exercise FlashInfer's supported fused-RoPE kernel.
@@ -960,7 +964,8 @@ _CUDA_GRAPH_DIFFERENTIAL_SCENARIOS = (
     tuple(
         scenario
         for scenario in _ASYNC_PAIR_SCENARIOS
-        if scenario.name
+        if scenario.name.startswith("fp8-transformer-engine")
+        or scenario.name
         in {
             "prefix-lru-chunked",
             "prefix-ref-zero",
@@ -990,7 +995,6 @@ _CUDA_GRAPH_DIFFERENTIAL_SCENARIOS = (
             "hybrid-gdp",
             "transformer-engine",
             "inference-optimized",
-            "fp8-transformer-engine",
             "mxfp8-inference-optimized-moe",
             "mxfp8-inference-topk1",
             "flashinfer-fused-rope",
@@ -1053,19 +1057,18 @@ _ASYNC_PARALLEL_SCENARIOS = (
         signals=("inference-optimized", "moe", "nvls-dispatch", "parallel"),
     ),
     _pair_scenario(
-        "moe-ep2-etp2-nccl",
+        "moe-ep2-etp2-local-allgather",
         "model:moe",
         "topology:ep",
         "topology:etp",
-        "dispatcher:nccl",
+        "dispatcher:allgather",
         config={
             "expert_model_parallel_size": 2,
             "expert_tensor_parallel_size": 2,
             "num_moe_experts": 4,
             "use_moe_layer_spec": True,
-            "inference_moe_token_dispatcher_type": "nccl",
         },
-        signals=("etp", "moe", "nccl-dispatch", "parallel"),
+        signals=("etp", "moe", "parallel"),
     ),
     _pair_scenario(
         "optimized-tp2-sp",
@@ -1122,6 +1125,11 @@ def _check_scenario_prerequisite(scenario):
         available, reason = check_fp8_support()
         if not available:
             pytest.skip(reason)
+        if (
+            scenario.config.get("fp8_recipe") == "blockwise"
+            and torch.cuda.get_device_capability()[0] != 9
+        ):
+            pytest.skip("FP8 blockwise scaling is supported only on Hopper")
     elif scenario.prerequisite == "torch-memory-saver":
         pytest.importorskip("torch_memory_saver")
     elif scenario.prerequisite == "mxfp8":
@@ -1416,7 +1424,6 @@ def _instrument_nccl_dispatch_runtime(module, runtime):
 
 
 def _instrument_cuda_graph_replays(model, context, runtime):
-    """Observe real runner calls and the live inputs associated with each replayed step."""
     for manager in (module for module in model.modules() if isinstance(module, CudaGraphManager)):
         owner = getattr(getattr(manager, "func", None), "__name__", "forward")
         for runner in manager.cudagraph_runners:
@@ -1424,19 +1431,18 @@ def _instrument_cuda_graph_replays(model, context, runtime):
                 continue
             original_replay = runner.replay_graph_capture
             base_module = runner.base_module
-            replayed_module_names = tuple(
-                sorted(
-                    {
-                        type(module).__name__
-                        for module in (
-                            base_module.modules()
-                            if hasattr(base_module, "modules")
-                            else (base_module,)
-                        )
-                    }
-                )
+            replayed_modules = tuple(
+                base_module.modules() if hasattr(base_module, "modules") else (base_module,)
             )
-            fp8_runtime_enabled = bool(runner.fp8_runtime_enabled)
+            replayed_module_names = tuple(
+                sorted({type(module).__name__ for module in replayed_modules})
+            )
+            fp8_runtime_enabled = bool(runner.fp8_enabled)
+            # Inference omits output_processor, so an owning forward runner must invoke its head.
+            owns_mxfp8_head = (
+                any(module is getattr(model, "output_layer", None) for module in replayed_modules)
+                and type(getattr(runner, "fp8_recipe", None)).__name__ == "MXFP8BlockScaling"
+            )
 
             def traced_replay(
                 is_first_microbatch,
@@ -1446,6 +1452,7 @@ def _instrument_cuda_graph_replays(model, context, runtime):
                 _runner=runner,
                 _module_names=replayed_module_names,
                 _fp8_runtime_enabled=fp8_runtime_enabled,
+                _owns_mxfp8_head=owns_mxfp8_head,
                 _owner=owner,
             ):
                 if runtime["cuda-graph-capture-active"]:
@@ -1457,6 +1464,9 @@ def _instrument_cuda_graph_replays(model, context, runtime):
                 step_key = ("cuda-graph-replay-step", context.step_count, *dimension)
                 runtime["cuda-graph-runner-replays"] += 1
                 runtime["cuda-graph-fp8-replays"] += int(_fp8_runtime_enabled)
+                runtime["cuda-graph-mxfp8-head-replays"] += int(
+                    _owns_mxfp8_head and _owner == "forward" and "output_processor" not in kwargs
+                )
                 runtime["cuda-graph-real-token-scalar-matches"] += int(
                     int(context.gpu_view.real_token_count.item()) == real.token_count
                 )
@@ -1497,7 +1507,7 @@ def _instrument_cuda_graph_replays(model, context, runtime):
             runtime[("cuda-graph-warmup-steps", runner.num_warmup_steps)] += 1
 
 
-def _instrument_scenario_runtime(env, scenario, runtime):
+def _instrument_scenario_runtime(env, scenario, runtime, teacher_tokens=None):
     """Record production calls and state transitions used as pairwise evidence."""
     controller = env.engine.controller
     context = env.engine.context
@@ -1578,6 +1588,7 @@ def _instrument_scenario_runtime(env, scenario, runtime):
     original_forward = controller._dynamic_step_forward_logits
 
     def traced_forward(*args, **kwargs):
+        replays_before = runtime["cuda-graph-runner-replays"]
         real_dimensions = context.batch_dimensions
         if context.prefix_cache_hits > 0:
             runtime[("prefix-hit-forward-step", context.step_count)] += 1
@@ -1637,11 +1648,25 @@ def _instrument_scenario_runtime(env, scenario, runtime):
             result = original_forward(*args, **kwargs)
         runtime["model-forward"] += 1
         runtime[f"logits-dtype:{controller._all_logits_cuda.dtype}"] += 1
-        if "mxfp8-logits" in scenario.signals:
+        if "fixed-history-logits" in scenario.signals and not runtime["cuda-graph-capture-active"]:
             active_count = context.total_request_count - context.paused_request_count
-            runtime.setdefault("mxfp8-logit-snapshots", []).append(
-                controller._all_logits_cuda[:, :active_count, :].detach().float().cpu().clone()
-            )
+            active_slice = slice(context.paused_request_count, context.total_request_count)
+            request_ids = context.request_ids[active_slice].tolist()
+            last_idxs = context.gpu_view.active_request_last_token_idxs[:active_count].long()
+            positions = args[1][0, last_idxs].tolist()
+            input_tokens = args[0][0, last_idxs].tolist()
+            logits = controller._all_logits_cuda[0, :active_count].detach().float().cpu()
+            blocks = context.gpu_view.token_to_block_idx[last_idxs].long()
+            offsets = context.gpu_view.token_to_local_position_within_kv_block[last_idxs].long()
+            last_kv = context.memory_buffer[:, :, blocks, offsets].detach().float().cpu()
+            replayed = runtime["cuda-graph-runner-replays"] > replays_before
+            snapshots = runtime.setdefault("fixed-history-logit-snapshots", {})
+            for i, (request_id, position, input_token, row) in enumerate(
+                zip(request_ids, positions, input_tokens, logits)
+            ):
+                key = (request_id, position)
+                assert key not in snapshots, f"duplicate fixed-history logit row {key}"
+                snapshots[key] = (input_token, replayed, row.clone(), last_kv[:, :, i])
         if context.config.materialize_only_last_token_logits:
             runtime["last-logits-forward"] += 1
         else:
@@ -1717,7 +1742,19 @@ def _instrument_scenario_runtime(env, scenario, runtime):
                             torch_sampling, "fill_request_seed_noise", new=traced_seed_noise
                         )
                     )
-                return original_sample_kernel(*args, **kwargs)
+                sampled = original_sample_kernel(*args, **kwargs)
+                if "fixed-history-logits" in scenario.signals:
+                    active_slice = slice(context.paused_request_count, context.total_request_count)
+                    request_ids = context.request_ids[active_slice].tolist()
+                    if teacher_tokens is not None:
+                        forced = [
+                            teacher_tokens[request_id][runtime[("teacher-token-index", request_id)]]
+                            for request_id in request_ids
+                        ]
+                        sampled[:active_count].copy_(sampled.new_tensor(forced))
+                    for request_id in request_ids:
+                        runtime[("teacher-token-index", request_id)] += 1
+                return sampled
 
         if sampling_class == "FlashInferSampling":
             from megatron.core.inference.sampling import flashinfer_sampling
@@ -1764,7 +1801,9 @@ def _instrument_scenario_runtime(env, scenario, runtime):
                             "top_p_sampling_from_probs",
                             "top_k_top_p_sampling_from_logits",
                         }:
-                            top_p = kernel_args[-1]
+                            top_p = kernel_args[
+                                2 if name == "top_k_top_p_sampling_from_logits" else 1
+                            ]
                             nucleus_probabilities = sorted_probabilities * keep
                             nucleus_probabilities /= nucleus_probabilities.sum(dim=-1, keepdim=True)
                             keep &= (
@@ -1893,6 +1932,7 @@ def _instrument_scenario_runtime(env, scenario, runtime):
         ),
         "mla": lambda name, module: name == "MLASelfAttention",
         "moe": lambda name, module: name in {"MoELayer", "InferenceTopKRouter"},
+        "mxfp8": lambda name, module: name == "TELMHeadColumnParallelLinear",
         "parallel": (
             lambda name, module: "ParallelLinear" in name
             or name in {"ColumnParallelLinear", "RowParallelLinear"}
@@ -1915,7 +1955,11 @@ def _instrument_scenario_runtime(env, scenario, runtime):
 
                 def record_module(_module, _inputs, _tag=tag):
                     runtime[f"module-forward:{_tag}"] += 1
-                    if _tag == "fp8":
+                    if _tag == "mxfp8":
+                        runtime["mxfp8-head-capture-forwards"] += int(
+                            runtime["cuda-graph-capture-active"] > 0
+                        )
+                    elif _tag == "fp8":
                         fp8_enabled = FP8GlobalStateManager.is_fp8_enabled()
                         runtime["fp8-context-forwards"] += int(fp8_enabled)
                         runtime["fp8-recipe-forwards"] += int(
@@ -1965,6 +2009,7 @@ def _snapshot_requests(requests):
     for request in requests:
         snapshots.append(
             {
+                "request_id": request.request_id,
                 "tokens": list(request.generated_tokens),
                 "status": request.status,
                 "prompt_logprobs": _as_float_list(request.prompt_log_probs),
@@ -2001,6 +2046,7 @@ def _assert_request_parity(
 ):
     assert len(actual_requests) == len(expected)
     for request, reference in zip(actual_requests, expected):
+        assert request.request_id == reference["request_id"]
         assert request.status == reference["status"] == Status.COMPLETED
         assert len(request.generated_tokens) == len(reference["tokens"])
         prompt_logprobs = _as_float_list(request.prompt_log_probs) or []
@@ -2029,11 +2075,45 @@ def _assert_request_parity(
             assert [event.type for event in request.events] == reference["events"]
 
 
+def _assert_fixed_history_logit_parity(actual, expected, atol):
+    assert actual.keys() == expected.keys()
+    failures = []
+    for key in sorted(expected):
+        input_token, replayed, logits, last_kv = actual[key]
+        expected_input, _, expected_logits, expected_kv = expected[key]
+        assert input_token == expected_input
+        assert replayed, f"fixed-history comparison at {key} did not replay a CUDA graph"
+        assert torch.isfinite(logits).all() and torch.isfinite(expected_logits).all()
+        assert torch.isfinite(last_kv).all() and torch.isfinite(expected_kv).all()
+        top2 = expected_logits.topk(2)
+        actual_top2 = logits.topk(2)
+        margin = float((top2.values[0] - top2.values[1]).item())
+        max_diff = float((logits - expected_logits).abs().max().item())
+        kv_diff = float((last_kv - expected_kv).abs().max().item())
+        print(
+            f"request/position {key}: max_abs={max_diff:.8g}, eager_margin={margin:.8g}, "
+            f"replay_margin={float((actual_top2.values[0] - actual_top2.values[1]).item()):.8g}, "
+            f"last_kv_max_abs={kv_diff:.8g}"
+        )
+        actual_top1, expected_top1 = logits.argmax().item(), expected_logits.argmax().item()
+        if actual_top1 != expected_top1 or max_diff > atol or kv_diff > atol:
+            failures.append((key, max_diff, kv_diff, margin, actual_top1, expected_top1))
+    assert not failures, failures
+
+
 class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
     """Shared real-engine runner for the async pair owners."""
 
     @classmethod
-    def _run_scenario_mode(cls, scenario, mode, stop_tokens=None, termination_token=None):
+    def _run_scenario_mode(
+        cls,
+        scenario,
+        mode,
+        stop_tokens=None,
+        termination_token=None,
+        teacher_tokens=None,
+        force_graph_eager=False,
+    ):
         RouterReplay.clear_global_router_replay_instances()
         config = dict(_BASE_PAIR_CONFIG)
         config.update(scenario.config)
@@ -2051,7 +2131,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         model = env.engine.controller.inference_wrapped_model.model
         runtime = Counter()
         if mode == AsyncScheduleMode.ASYNC:
-            _instrument_scenario_runtime(env, scenario, runtime)
+            _instrument_scenario_runtime(env, scenario, runtime, teacher_tokens)
         if env.config.defer_cuda_graph_creation:
             env.engine.create_cuda_graphs()
             cold_pool_rebinds = runtime["cuda-graph-pool-rebinds"]
@@ -2071,16 +2151,20 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     isinstance(key, tuple)
                     and key[0] in ("cuda-graph-warmup-steps", "flash-attention-version")
                 )
+                or (isinstance(key, str) and key.startswith(("nccl-", "fp8-", "mxfp8-")))
             }
             runtime.clear()
             runtime.update(capture_evidence)
             runtime["cuda-graph-cold-pool-rebinds"] = cold_pool_rebinds
+        if force_graph_eager:
+            for module in model.modules():
+                module._should_call_local_cudagraph = lambda *_args, **_kwargs: False
+            if hasattr(model, "_mtp_cudagraph_manager"):
+                mtp_forward = model.compute_mtp_single_step
+                model.compute_mtp_single_step = lambda *args, **kwargs: mtp_forward(
+                    *args, **(kwargs | {"eager": True})
+                )
         if "disagg-handoff" in scenario.signals:
-            # Deterministic transferred KV contents make eager and replay compare
-            # the same valid imported state without constructing a transport.
-            # The production setup method sets this role after registering the
-            # transport. This witness starts after transfer completion, but must
-            # retain the real decode scheduling and admission behavior.
             env.engine._kv_transfer_role = "decode"
             env.engine.context.memory_buffer.zero_()
 
@@ -2138,10 +2222,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                         future=env.engine._loop.create_future(),
                         resume_tokens=[resume_token],
                     )
-                    # Follow the production completion path: the import stays queued
-                    # until the async no-overlap admission point has consumed any
-                    # pending forward. Calling the private finalizer here would add a
-                    # request that has no row in those pending logits.
                     env.engine._pending_kv_imports.append(pending)
                     runtime["max_pending_kv_imports"] = max(
                         runtime["max_pending_kv_imports"], env.engine.pending_kv_import_count
@@ -2379,9 +2459,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     and all(runner.fwd_graph is not None for runner in rebuilt_runners)
                 )
 
-            # Both treatments run one identical request after the graph treatment's
-            # idle rebuild. This proves the rebuilt graph is replayable rather than
-            # crediting runner construction alone.
             probe_id = len(env.requests)
             prompt = torch.arange(5, dtype=torch.int64, device="cuda") + 71
             sampling_params = SamplingParams(num_tokens_to_generate=3, termination_id=-1, top_k=1)
@@ -2551,10 +2628,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["weight-refit-mutations"] == runtime["suspend-resume"]
             assert runtime["weight-refit-values-changed"] == runtime["suspend-resume"]
             assert env.engine._weight_epoch == runtime["suspend-resume"]
-            # A cycle happens after each wave is admitted. Resume updates every
-            # live request object in place, while requests completed before a
-            # later cycle retain the epoch in which they finished. The final
-            # request set must therefore account for every completed epoch.
             expected_salts = {f"w{epoch}" for epoch in range(1, runtime["suspend-resume"] + 1)}
             assert {request.block_hash_salt for request in env.requests} == expected_salts
         if "dp-offset" in signals:
@@ -2642,9 +2715,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 if isinstance(key, tuple) and key[0] == "cuda-graph-output-pointer" and count > 0
             }
             assert graph_output_pointers
-            # Runner outputs are persistent aliases. The controller must copy
-            # final logits to its graph-stable consumer buffer rather than retain
-            # a layer runner's output alias across subsequent replays.
             assert controller._all_logits_cuda.data_ptr() not in graph_output_pointers
         if "graph-decode-config" in signals:
             assert not context.use_cuda_graphs_for_non_decode_steps
@@ -2709,8 +2779,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert context.config.cuda_graph_max_tokens == 16
             assert max(token_count for token_count, _, _ in executed_graph_dimensions) == 16
             assert runtime["cuda-graph-prefill-forwards"] > 0
-            # The first request wave exceeds the configured graph ceiling. Its
-            # production model forward must run without any runner replay.
             oversized_steps = {
                 (step, token_count, prefill_count, decode_count)
                 for key, count in runtime.items()
@@ -2865,13 +2933,10 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             )
         if "fp8" in signals:
             assert model_config.fp8 is not None
-            assert runtime["module-forward:fp8"] > 0 or runtime["cuda-graph-fp8-replays"] > 0
-            if runtime["module-forward:fp8"] > 0:
-                assert runtime["fp8-context-forwards"] > 0
-                assert runtime["fp8-quantized-forwards"] > 0
-                assert runtime["fp8-recipe-forwards"] > 0
-            else:
-                assert runtime["cuda-graph-fp8-replays"] > 0
+            assert runtime["fp8-context-forwards"] > 0
+            assert runtime["fp8-quantized-forwards"] > 0
+            assert runtime["fp8-recipe-forwards"] > 0
+            assert runtime["cuda-graph-fp8-replays"] > 0
         if "mxfp8" in signals:
             from megatron.core.fp8_utils import get_fp8_align_size
             from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
@@ -2907,6 +2972,12 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert all(module._uses_mxfp8_weights for module in experts)
             assert all(isinstance(module._fc1_weight, MXFP8Tensor) for module in experts)
             assert all(isinstance(module._fc2_weight, MXFP8Tensor) for module in experts)
+            if scenario.config.get("fp8_output_proj"):
+                assert type(controller.inference_wrapped_model.model.output_layer).__name__ == (
+                    "TELMHeadColumnParallelLinear"
+                )
+                assert runtime["mxfp8-head-capture-forwards"] > 0
+                assert runtime["cuda-graph-mxfp8-head-replays"] > 0
         if "routing-replay" in signals:
             assert model_config.moe_enable_routing_replay
             assert context.moe_routing_metadata is not None
@@ -3054,9 +3125,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     and model_config.transformer_impl != "inference_optimized"
                 ):
                     if "cuda-graph" in signals:
-                        # Python collective wrappers execute during capture, not replay.
-                        # Replaying the owning ParallelLinear graph plus the eager
-                        # distributed differential is the runtime collective oracle.
                         assert any("ParallelLinear" in name for name in replayed_module_names)
                     else:
                         assert (
@@ -3070,10 +3138,19 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         if "etp" in signals:
             assert model_config.expert_tensor_parallel_size == 2
             assert parallel_state.get_expert_tensor_parallel_world_size() == 2
+            dispatchers = {
+                type(module.token_dispatcher).__name__
+                for module in controller.inference_wrapped_model.model.modules()
+                if type(module).__name__ == "MoELayer"
+            }
+            assert dispatchers == {"MoEAllGatherTokenDispatcher"}
+            assert "cuda-graph" not in signals or "MoELayer" in replayed_module_names
         if "moe" in signals:
             assert model_config.num_moe_experts is not None
             if model_config.expert_model_parallel_size > 1:
-                if "nvls-dispatch" in signals:
+                if "etp" in signals:
+                    assert runtime["module-forward:moe"] > 0 or "MoELayer" in replayed_module_names
+                elif "nvls-dispatch" in signals:
                     assert context._nvls_dispatcher
                     if "cuda-graph" in signals:
                         assert "InferenceGroupedMLP" in replayed_module_names
@@ -3081,9 +3158,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                         assert runtime["module-forward:moe"] > 0
                 else:
                     assert context._nccl_ep_dispatcher
-                    # Inference MoE may dispatch through split execution helpers that
-                    # bypass nn.Module forward hooks. The live dispatcher calls below
-                    # are the feature-owning runtime boundary.
                     assert runtime["nccl-token-dispatches"] > 0
             else:
                 if "cuda-graph" in signals:
@@ -3099,6 +3173,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["nccl-combine-before-dispatch"] == 0
             assert runtime["nccl-dispatch-inflight"] == 0
             if "cuda-graph" in signals:
+                assert "MoELayer" in replayed_module_names
                 nondecode_steps = {
                     key[1]
                     for key, count in runtime.items()
@@ -3267,8 +3342,6 @@ class TestAsyncSchedulePairwise(_AsyncPairwiseHarness):
     not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
 )
 class TestCudaGraphDifferential(_AsyncPairwiseHarness):
-    """Hold each companion fixed while comparing eager execution with real graph replay."""
-
     @classmethod
     def setup_class(cls):
         Utils.initialize_model_parallel()
@@ -3304,9 +3377,6 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
         snapshot = {
             name: parameter.detach().cpu().clone() for name, parameter in model.named_parameters()
         }
-        # MCore MXFP8 conversion replaces expert parameters with lightweight
-        # storage objects, so named_parameters() no longer sees them. Include
-        # their quantized payload and block scales in the identical-weight oracle.
         for module_name, module in model.named_modules():
             for weight_name in ("_fc1_weight", "_fc2_weight"):
                 weight = getattr(module, weight_name, None)
@@ -3318,8 +3388,8 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
 
     @classmethod
     def _assert_graph_pair(cls, scenario):
-        eager_scenario = cls._with_graphs(scenario, False)
         graph_scenario = cls._with_graphs(scenario, True)
+        eager_scenario = graph_scenario
         stop_tokens = None
         termination_token = None
         try:
@@ -3339,27 +3409,39 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
                 gc.collect()
                 delete_cuda_graphs()
                 torch.cuda.empty_cache()
-
             eager_env, eager_runtime = cls._run_scenario_mode(
                 eager_scenario,
                 AsyncScheduleMode.ASYNC,
                 stop_tokens=stop_tokens,
                 termination_token=termination_token,
+                force_graph_eager=True,
             )
             expected = _snapshot_requests(eager_env.requests)
             expected_weights = cls._weight_snapshot(eager_env)
-            eager_logits = eager_runtime.get("mxfp8-logit-snapshots", [])
+            eager_logits = eager_runtime.get("fixed-history-logit-snapshots", {})
+            teacher_tokens = {request["request_id"]: request["tokens"] for request in expected}
+            expected_logit_keys = {
+                (request.request_id, len(request.prompt_tokens) + offset - 1)
+                for request in eager_env.requests
+                for offset in range(len(request.generated_tokens))
+            }
+            assert expected_logit_keys <= eager_logits.keys()
+            discarded_logit_keys = eager_logits.keys() - expected_logit_keys
+            print(
+                f"fixed-history accounting: completed={len(expected_logit_keys)}, "
+                f"discarded_async_successors={sorted(discarded_logit_keys)}"
+            )
             assert eager_runtime["cuda-graph-runner-replays"] == 0
             del eager_env
             gc.collect()
             delete_cuda_graphs()
             torch.cuda.empty_cache()
-
             graph_env, graph_runtime = cls._run_scenario_mode(
                 graph_scenario,
                 AsyncScheduleMode.ASYNC,
                 stop_tokens=stop_tokens,
                 termination_token=termination_token,
+                teacher_tokens=teacher_tokens,
             )
             actual_weights = cls._weight_snapshot(graph_env)
             assert expected_weights.keys() == actual_weights.keys()
@@ -3368,26 +3450,21 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
                 for name in expected_weights
             )
             graph_parity = scenario.graph_parity or scenario.parity
-            if "mxfp8-logits" in scenario.signals:
-                graph_logits = graph_runtime.get("mxfp8-logit-snapshots", [])
+            graph_logits = {}
+            if "fixed-history-logits" in scenario.signals:
+                graph_logits = graph_runtime.get("fixed-history-logit-snapshots", {})
                 assert eager_logits and graph_logits
-                assert eager_logits[0].shape == graph_logits[0].shape
-                max_abs_diff = float((eager_logits[0] - graph_logits[0]).abs().max().item())
-                print(f"first-step eager/replay MXFP8 logits max abs diff: {max_abs_diff:.8g}")
-                torch.testing.assert_close(
-                    graph_logits[0], eager_logits[0], rtol=0, atol=scenario.atol
-                )
+                assert graph_logits.keys() == expected_logit_keys | discarded_logit_keys
             _assert_request_parity(
                 graph_env.requests,
                 expected,
                 scenario.atol,
-                exact_numerics=graph_parity == "exact",
-                exact_top_n=graph_parity == "exact" and scenario.exact_top_n,
+                exact_numerics=graph_parity == "exact" and not eager_logits,
+                exact_top_n=graph_parity == "exact" and scenario.exact_top_n and not eager_logits,
             )
             cls._assert_runtime_signals(
                 graph_env, graph_scenario, graph_runtime, stop_tokens, termination_token
             )
-
             live_inputs = [
                 key[1:]
                 for key, count in graph_runtime.items()
@@ -3398,9 +3475,9 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
             for padded, _real, request_ids, input_ids in live_inputs:
                 inputs_by_shape_and_requests.setdefault((padded, request_ids), set()).add(input_ids)
             assert any(len(inputs) > 1 for inputs in inputs_by_shape_and_requests.values())
-
-            if graph_parity != "exact":
+            if graph_parity != "exact" or eager_logits:
                 graph_expected = _snapshot_requests(graph_env.requests)
+                graph_requests = graph_env.requests
                 del graph_env
                 gc.collect()
                 delete_cuda_graphs()
@@ -3410,20 +3487,27 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
                     AsyncScheduleMode.ASYNC,
                     stop_tokens=stop_tokens,
                     termination_token=termination_token,
+                    teacher_tokens=teacher_tokens,
                 )
-                repeat_exact = "mxfp8-logits" not in scenario.signals
+                repeat_exact = "fixed-history-logits" not in scenario.signals
                 if not repeat_exact:
-                    repeat_logits = repeat_runtime.get("mxfp8-logit-snapshots", [])
-                    assert repeat_logits and repeat_logits[0].shape == graph_logits[0].shape
-                    torch.testing.assert_close(
-                        repeat_logits[0], graph_logits[0], rtol=0, atol=scenario.atol
+                    repeat_logits = repeat_runtime.get("fixed-history-logit-snapshots", {})
+                    _assert_fixed_history_logit_parity(repeat_logits, graph_logits, 0.0)
+                    _assert_fixed_history_logit_parity(repeat_logits, eager_logits, scenario.atol)
+                    _assert_fixed_history_logit_parity(graph_logits, eager_logits, scenario.atol)
+                    _assert_request_parity(
+                        graph_requests,
+                        expected,
+                        scenario.atol,
+                        exact_numerics=True,
+                        exact_top_n=graph_parity == "exact" and scenario.exact_top_n,
                     )
                 _assert_request_parity(
                     repeat_env.requests,
-                    graph_expected,
+                    expected if eager_logits else graph_expected,
                     scenario.atol,
-                    exact_numerics=repeat_exact,
-                    exact_top_n=repeat_exact,
+                    exact_numerics=repeat_exact or bool(eager_logits),
+                    exact_top_n=repeat_exact or bool(eager_logits),
                 )
                 cls._assert_runtime_signals(
                     repeat_env, graph_scenario, repeat_runtime, stop_tokens, termination_token
@@ -3526,7 +3610,6 @@ def test_async_reset_clears_pending_logits():
     engine._loop = None
     engine._vision_embedding_cache = {}
     engine._vision_embedding_cache_bytes = 0
-
     with (
         mock.patch(
             "megatron.core.inference.engines.dynamic_engine.torch.distributed.get_rank",
@@ -3538,7 +3621,6 @@ def test_async_reset_clears_pending_logits():
         ),
     ):
         engine.reset()
-
     assert not engine.controller._async_sched_forward.is_valid
     assert engine.controller._async_sched_forward.token_row_indices is None
 
@@ -3568,13 +3650,11 @@ def test_async_suspend_pending_logits_lifecycle(mode, preserve_pending):
     engine.use_coordinator = False
     engine._vision_embedding_cache = {}
     engine._vision_embedding_cache_bytes = 0
-
     with (
         mock.patch.object(DynamicInferenceEngine, "suspend_resume_ctx", return_value=nullcontext()),
         mock.patch("megatron.core.inference.engines.dynamic_engine.InferenceMode.unset_active"),
     ):
         engine.suspend()
-
     assert engine.controller._async_sched_forward.is_valid is preserve_pending
     if preserve_pending:
         assert torch.equal(

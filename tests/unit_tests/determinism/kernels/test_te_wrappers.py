@@ -947,7 +947,6 @@ def test_te_fused_mla_kv_rope_mxfp8_replays():
 
 
 def test_mla_nonfused_absorption_preserves_projection_and_norm():
-    """Non-fused MLA absorption retains its separate norm and projection."""
     from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 
     rank, heads, key_width, value_width = 8, 2, 6, 4

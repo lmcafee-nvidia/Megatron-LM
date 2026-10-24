@@ -268,7 +268,6 @@ class TestTensorParallelLayers:
         assert outputs["out[0]"].dtype is torch.float32
 
     def test_local_attention_distinct_kv_channels_replays(self):
-        """MLA supplies 96-channel Q/K and 64-channel V to the local attention core."""
         seeded()
         config = _config(
             hidden_size=256,

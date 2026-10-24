@@ -934,6 +934,7 @@ class DynamicEngineTestConfig:
     cuda_graph_warmup_steps: int = 3
     fp8: bool = False
     fp8_recipe: str = "tensorwise"
+    fp8_output_proj: bool = False
     zero_model_parameters: bool = False
     hidden_size: Optional[int] = None
     model_provider: str = "gpt"
@@ -964,7 +965,6 @@ class DynamicEngineTestConfig:
     inference_cuda_graph_scope: InferenceCudaGraphScope = InferenceCudaGraphScope.block
     cuda_graph_impl: Optional[str] = None
     force_build_cuda_graphs: bool = False
-    # Allow a runtime-witness harness to install hooks before cold capture.
     defer_cuda_graph_creation: bool = False
     transformer_impl: str = "local"
     inference_moe_token_dispatcher_type: str = "nccl"
@@ -1232,9 +1232,6 @@ class DynamicInferenceEngineTestBase:
             ):
                 from megatron.core.quantization.quant_config import RecipeConfig
 
-                # InferenceGroupedMLP consumes MCore MXFP8Tensor expert weights, while
-                # the surrounding TE attention remains BF16. Mirror the supported
-                # production precision policy instead of converting dense TE weights.
                 quant_recipe = RecipeConfig.from_config_dict(
                     {
                         "configs": {
@@ -1331,6 +1328,7 @@ class DynamicInferenceEngineTestBase:
                 and not (test_config.transformer_impl == "inference_optimized"),
                 fp8="hybrid" if test_config.fp8 else None,
                 fp8_recipe=test_config.fp8_recipe if test_config.fp8 else None,
+                fp8_output_proj=test_config.fp8_output_proj,
                 fp8_param=test_config.fp8 and test_config.fp8_recipe == "mxfp8",
                 quant_recipe=quant_recipe,
                 inference_sampling_seed=test_config.random_seed,
@@ -1413,8 +1411,6 @@ class DynamicInferenceEngineTestBase:
                     ),
                 ).cuda()
             else:
-                # The differential supplies already-projected image embeddings,
-                # so only the production LLaVA language path is materialized.
                 transformer_config.language_model_type = "dummy"
                 language_submodules = get_gpt_layer_local_submodules()
                 language_spec = ModuleSpec(module=TransformerLayer, submodules=language_submodules)
@@ -1540,9 +1536,6 @@ class DynamicInferenceEngineTestBase:
             from megatron.core.inference.quantization.utils import _has_mxfp8_storage
 
         for param in model.parameters():
-            # Preserve only TE's MXFP8 parameter wrappers until the production
-            # converter below materializes MCore storage. Dense BF16 parameters
-            # must still honor params_dtype (including RMSNorm weights).
             if not (is_mxfp8_scenario and _has_mxfp8_storage(param)):
                 param.data = param.data.to(transformer_config.params_dtype)
             if test_config.zero_model_parameters:
@@ -1597,9 +1590,6 @@ class DynamicInferenceEngineTestBase:
 
         delete_cuda_graphs()
 
-        # Inference engine. Pairwise CUDA-graph tests defer only the constructor's
-        # cold capture, then invoke the unchanged production method after installing
-        # runtime witnesses.
         if test_config.defer_cuda_graph_creation:
             with mock.patch.object(
                 test_config.engine_cls, "create_cuda_graphs", autospec=True, return_value=None
