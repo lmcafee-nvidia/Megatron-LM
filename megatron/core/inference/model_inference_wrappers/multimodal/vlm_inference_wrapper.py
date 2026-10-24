@@ -57,14 +57,14 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
                 "This parameter will be removed in `megatron-core` 0.13."
             )
 
-        if (
-            self.inference_context.is_dynamic_batching()
-            and getattr(self.config, "context_parallel_size", 1) > 1
-        ):
+        module = get_attr_wrapped_model(
+            self.model, "position_embedding_type", return_model_obj=True
+        )
+        if module.position_embedding_type == "mrope":
             raise NotImplementedError(
-                "VLM dynamic inference does not support context_parallel_size > 1: "
-                "the paged-attention request metadata is global while LLaVA shards "
-                "the language sequence across context-parallel ranks."
+                "LLaVA inference does not support mRoPE: media expansion produces scalar token "
+                "positions, but MultimodalRotaryEmbedding requires three-axis temporal/height/width "
+                "position IDs."
             )
 
         super().prep_model_for_inference()
@@ -523,9 +523,8 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
 
                     final_embedding[image_positions] = image_embeddings_flat[image_indices]
 
-            # LLaVAModel.forward_lm_only handles the batch->sequence transpose and SP
-            # sharding. Dynamic CP is rejected by prep_model_for_inference above because
-            # its paged-attention metadata does not yet have CP-local ownership.
+            # LLaVAModel.forward_lm_only handles the batch->sequence transpose and
+            # configured SP/CP communication.
         else:
             final_embedding = None
 

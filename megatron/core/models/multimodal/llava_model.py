@@ -63,6 +63,31 @@ VIDEO_TOKEN = "<video>"
 SOUND_TOKEN = "<so_embedding>"
 
 
+def _gather_zigzag_context_parallel_tokens(local_tokens, cp_group):
+    """Restore global sequence order from equal two-chunk CP zigzag shards."""
+    cp_size = cp_group.size()
+    if cp_size == 1:
+        return local_tokens
+    if local_tokens.shape[0] % 2:
+        raise RuntimeError(
+            "A context-parallel zigzag shard must contain two equal sequence chunks, got "
+            f"shape {tuple(local_tokens.shape)}"
+        )
+
+    gathered = torch.empty(
+        (cp_size * local_tokens.shape[0], *local_tokens.shape[1:]),
+        dtype=local_tokens.dtype,
+        device=local_tokens.device,
+    )
+    torch.distributed.all_gather_into_tensor(gathered, local_tokens, group=cp_group)
+    shards = gathered.view(cp_size, 2, local_tokens.shape[0] // 2, *local_tokens.shape[1:])
+    chunks = [None] * (2 * cp_size)
+    for rank in range(cp_size):
+        chunks[rank] = shards[rank, 0]
+        chunks[2 * cp_size - rank - 1] = shards[rank, 1]
+    return torch.cat(chunks, dim=0)
+
+
 # Note: This is under development and may be missing features.
 class LLaVAModel(MegatronModule):
     """LLaVA multi-modal model.
@@ -1873,9 +1898,11 @@ class LLaVAModel(MegatronModule):
 
         Callers provide ``combined_embeddings`` in batch-first
         ``[batch, sequence, hidden]`` layout. This method owns the conversion
-        to the language model's sequence-first layout and any SP/CP sharding
-        when configured. Dynamic VLM callers reject CP before reaching this
-        method until their paged-attention metadata supports CP-local ownership.
+        to the language model's sequence-first layout and any SP/CP communication.
+        Dynamic paged attention has one global packed-token ledger, so CP inputs
+        rendezvous back into global zigzag order before every rank executes the
+        same replicated LM/cache path. This preserves CP launch compatibility,
+        not CP-sharded attention or KV-cache memory scaling.
         Bypasses the vision encoder and ``_preprocess_data``.
 
         Args:
@@ -1886,13 +1913,35 @@ class LLaVAModel(MegatronModule):
             runtime_gather_output: Whether to gather output across TP ranks.
             packed_seq_params: Packed sequence parameters.
         """
+        replicated_context_parallel = False
         if combined_embeddings is not None:
+            dynamic_sequence_length = combined_embeddings.shape[1]
             if self.context_parallel_lm == 1:
                 combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
             if self.context_parallel_lm > 1 or self.sequence_parallel_lm:
                 combined_embeddings, _, _, _ = self._process_embedding_token_parallel(
                     combined_embeddings, None, None, packed_seq_params
                 )
+            if (
+                self.context_parallel_lm > 1
+                and inference_context is not None
+                and inference_context.is_dynamic_batching()
+            ):
+                # The block table and token-to-cache maps describe the global packed
+                # stream. Reassemble the real CP shards before QKV/cache insertion;
+                # remove only LLaVA's divisibility padding afterward.
+                combined_embeddings = _gather_zigzag_context_parallel_tokens(
+                    combined_embeddings, self.pg_collection.cp
+                )[:dynamic_sequence_length]
+                if dynamic_sequence_length != inference_context.padded_active_token_count:
+                    raise RuntimeError(
+                        "Dynamic VLM input rows must match the scheduler's padded active token "
+                        f"count ({dynamic_sequence_length} != "
+                        f"{inference_context.padded_active_token_count})"
+                    )
+                if combined_embeddings.shape[0] != dynamic_sequence_length:
+                    raise RuntimeError("Context-parallel reconstruction changed dynamic token rows")
+                replicated_context_parallel = True
 
         try:
             from megatron.core.models.mamba.mamba_model import MambaModel
@@ -1912,7 +1961,7 @@ class LLaVAModel(MegatronModule):
                 runtime_gather_output=runtime_gather_output,
             )
         else:
-            output = self.language_model(
+            language_model_kwargs = dict(
                 input_ids=None,
                 position_ids=None,
                 attention_mask=attention_mask,
@@ -1922,6 +1971,11 @@ class LLaVAModel(MegatronModule):
                 runtime_gather_output=runtime_gather_output,
                 packed_seq_params=packed_seq_params,
             )
+            if isinstance(self.language_model, (GPTModel, HybridModel)):
+                language_model_kwargs["context_parallel_input_is_replicated"] = (
+                    replicated_context_parallel
+                )
+            output = self.language_model(**language_model_kwargs)
 
         return output
 

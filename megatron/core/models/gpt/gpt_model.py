@@ -367,6 +367,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         inference_context: BaseInferenceContext = None,
         packed_seq_params: PackedSeqParams = None,
         padding_mask: Optional[Tensor] = None,
+        context_parallel_input_is_replicated: bool = False,
     ):
         """Preprocesses inputs for the transformer decoder.
 
@@ -449,23 +450,35 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                     inference_context, self.decoder, decoder_input, self.config, packed_seq_params
                 )
-                rotary_pos_emb = self.rotary_pos_emb(
-                    rotary_seq_len,
-                    packed_seq=packed_seq_params is not None
-                    and packed_seq_params.qkv_format == 'thd',
-                    cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
-                )
+                if context_parallel_input_is_replicated:
+                    rotary_seq_len //= self.config.context_parallel_size
+                    rotary_pos_emb = self.rotary_pos_emb.get_emb(rotary_seq_len)
+                else:
+                    rotary_pos_emb = self.rotary_pos_emb(
+                        rotary_seq_len,
+                        packed_seq=packed_seq_params is not None
+                        and packed_seq_params.qkv_format == 'thd',
+                        cp_group=(
+                            packed_seq_params.cp_group if packed_seq_params is not None else None
+                        ),
+                    )
         elif self.position_embedding_type == 'yarn':
             if not InferenceMode.is_active() or not self.config.flash_decode:
                 rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                     inference_context, self.decoder, decoder_input, self.config, packed_seq_params
                 )
-                rotary_pos_emb, _ = self.rotary_pos_emb(
-                    rotary_seq_len,
-                    packed_seq=packed_seq_params is not None
-                    and packed_seq_params.qkv_format == 'thd',
-                    cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
-                )
+                if context_parallel_input_is_replicated:
+                    rotary_seq_len //= self.config.context_parallel_size
+                    rotary_pos_emb, _ = self.rotary_pos_emb.get_emb(rotary_seq_len)
+                else:
+                    rotary_pos_emb, _ = self.rotary_pos_emb(
+                        rotary_seq_len,
+                        packed_seq=packed_seq_params is not None
+                        and packed_seq_params.qkv_format == 'thd',
+                        cp_group=(
+                            packed_seq_params.cp_group if packed_seq_params is not None else None
+                        ),
+                    )
             else:
                 raise NotImplementedError(
                     "Flash decoding uses precomputed cos and sin for RoPE, not implemented in "
@@ -623,6 +636,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         padding_mask: Optional[Tensor] = None,
         output_processor: Optional[Callable[..., Any]] = None,
         output_processor_context: Optional[Any] = None,
+        context_parallel_input_is_replicated: bool = False,
     ) -> Any:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -656,6 +670,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             inference_context=inference_context,
             packed_seq_params=packed_seq_params,
             padding_mask=padding_mask,
+            context_parallel_input_is_replicated=context_parallel_input_is_replicated,
         )
 
         (

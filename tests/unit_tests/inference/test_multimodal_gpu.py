@@ -73,8 +73,11 @@ from tests.unit_tests.inference.engines.ssm_test_helpers import (
 )
 from tests.unit_tests.test_utilities import Utils
 
-IMAGE_TOKEN_ID = 126
-VOCAB_SIZE = 128
+IMAGE_TOKEN_ID, VOCAB_SIZE = 126, 128
+pytestmark = [
+    pytest.mark.internal,
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required"),
+]
 
 
 @pytest.fixture
@@ -196,8 +199,6 @@ def _build_model(
 
 
 def _attach_omni_encoder_api(model):
-    """Expose LLaVA's real encoder/projector path through Omni's model protocol."""
-
     def encode_images(self, images, imgs_sizes, vision_packed_seq_params, num_frames):
         old_add_decoder = self.add_decoder
         self.add_decoder = False
@@ -382,6 +383,7 @@ def _build_te_parallel_model(modality):
         image_token_index=-200,
         dynamic_resolution=(modality == "video"),
         class_token_len=0 if modality == "video" else None,
+        language_position_embedding_type="rope" if topology == "cp" else "learned_absolute",
     ).cuda()
     model.bfloat16()
     model.eval()
@@ -555,9 +557,19 @@ def _build_engine(modality, model=None, wrapper_cls=VLMInferenceWrapper, **confi
     return engine, wrapper
 
 
+def _encoder_patch(wrapper):
+    return mock.patch.object(
+        wrapper, "_forward_vision_encoder", wraps=wrapper._forward_vision_encoder
+    )
+
+
+def _greedy_token(step, full_logits=False):
+    row = int(step["logit_indices"][0]) if full_logits else -1
+    return int(step["logits"][0, row].argmax())
+
+
 def _install_forward_trace(engine):
-    trace = []
-    original_forward = engine.controller._dynamic_step_forward_logits
+    trace, original_forward = [], engine.controller._dynamic_step_forward_logits
 
     def traced_forward(input_ids, position_ids):
         active_slice = slice(
@@ -568,6 +580,7 @@ def _install_forward_trace(engine):
         kv_offsets = engine.context.request_kv_length_offsets[active_slice].tolist()
         mask = engine.context.current_image_token_mask()
         embeddings = engine.context.current_image_embeddings()
+        logit_indices = engine.context.speculative_required_logit_indices().detach().cpu().clone()
         original_forward(input_ids, position_ids)
         trace.append(
             {
@@ -578,6 +591,7 @@ def _install_forward_trace(engine):
                 "mask": None if mask is None else mask.detach().cpu().clone(),
                 "embeddings": (None if embeddings is None else embeddings.detach().cpu().clone()),
                 "logits": engine.controller._all_logits_cuda.detach().cpu().clone(),
+                "logit_indices": logit_indices,
                 "graphed": engine.context.using_cuda_graph_this_step(),
             }
         )
@@ -612,8 +626,8 @@ def _media(modality, offset):
     return fields
 
 
-def _run_request(engine, request_id, media, trace, prompt=None):
-    params = SamplingParams(num_tokens_to_generate=1, termination_id=-1, temperature=1.0, top_k=1)
+def _run_request(engine, request_id, media, trace, prompt=None, num_tokens=1):
+    params = SamplingParams(num_tokens_to_generate=num_tokens, termination_id=-1, top_k=1)
     engine.add_request(
         request_id=request_id,
         prompt=prompt or [5, IMAGE_TOKEN_ID, 6],
@@ -678,19 +692,14 @@ def _dynamic_image(offset):
     return fields
 
 
-@pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("modality", ["image", "video"])
 def test_real_encoder_cache_reuse_matches_uncached_and_separates_distinct_media(
     model_parallel, modality, tmp_path
 ):
     engine, wrapper = _build_engine(modality)
     trace = _install_forward_trace(engine)
-    first_media = _media(modality, offset=0.0)
-    distinct_media = _media(modality, offset=0.5)
-    with mock.patch.object(
-        wrapper, "_forward_vision_encoder", wraps=wrapper._forward_vision_encoder
-    ) as encoder:
+    first_media, distinct_media = _media(modality, 0.0), _media(modality, 0.5)
+    with _encoder_patch(wrapper) as encoder:
         first, first_step, first_finished = _run_request(engine, 10, first_media, trace)
         reuse, reuse_step, reuse_finished = _run_request(
             engine, 11, {"media_cache_key": first_media["media_cache_key"]}, trace
@@ -759,8 +768,6 @@ def test_real_encoder_cache_reuse_matches_uncached_and_separates_distinct_media(
         assert raw_finished.generated_tokens == tensor_finished.generated_tokens
 
 
-@pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize(
     ("vision_model_type", "dynamic", "expected_embeddings"),
     [
@@ -784,9 +791,7 @@ def test_native_vision_family_real_encoder_reuse_and_distinct_media(
     media_factory = _dynamic_image if dynamic else lambda offset: _media("image", offset)
     first_media = media_factory(0.0)
     distinct_media = media_factory(0.5)
-    with mock.patch.object(
-        wrapper, "_forward_vision_encoder", wraps=wrapper._forward_vision_encoder
-    ) as encoder:
+    with _encoder_patch(wrapper) as encoder:
         first, first_step, first_finished = _run_request(engine, 170, first_media, trace)
         reuse, reuse_step, reuse_finished = _run_request(
             engine, 171, {"media_cache_key": first_media["media_cache_key"]}, trace
@@ -811,21 +816,21 @@ def test_native_vision_family_real_encoder_reuse_and_distinct_media(
     assert len(distinct_finished.generated_tokens) == 1
 
 
-@pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_static_tile_tags_execute_with_real_encoder_and_cache_reuse(model_parallel):
+def test_mrope_contract_and_static_tile_tags(model_parallel):
     tile_tags = [[11, 12, 13, 14, 15, 16]]
     with pytest.raises(ValueError, match="Tile tags require"):
         _build_model("image", tile_tags=tile_tags)
+    mrope_model = _build_model(
+        "image", language_position_embedding_type="mrope", mrope_section=[8, 12, 12]
+    )
+    with pytest.raises(NotImplementedError, match="three-axis temporal/height/width"):
+        _build_engine("image", model=mrope_model)
     model = _build_model("image", tile_tags=tile_tags, language_position_embedding_type="rope")
     engine, wrapper = _build_engine("image", model=model)
     trace = _install_forward_trace(engine)
-    first_media = _media("image", offset=0.0)
-    distinct_media = _media("image", offset=0.5)
+    first_media, distinct_media = _media("image", 0.0), _media("image", 0.5)
     with (
-        mock.patch.object(
-            wrapper, "_forward_vision_encoder", wraps=wrapper._forward_vision_encoder
-        ) as encoder,
+        _encoder_patch(wrapper) as encoder,
         mock.patch.object(model, "_apply_tile_tagging", wraps=model._apply_tile_tagging) as tagger,
     ):
         first, first_step, first_finished = _run_request(engine, 175, first_media, trace)
@@ -847,8 +852,6 @@ def test_static_tile_tags_execute_with_real_encoder_and_cache_reuse(model_parall
     assert len(distinct_finished.generated_tokens) == 1
 
 
-@pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("separate_video_embedder", [False, True])
 def test_temporal_tubelet_encoder_reuse_and_exact_media_rows(
     model_parallel, separate_video_embedder
@@ -858,12 +861,9 @@ def test_temporal_tubelet_encoder_reuse_and_exact_media_rows(
     )
     engine, wrapper = _build_engine("video", model=model)
     trace = _install_forward_trace(engine)
-    first_media = _media("video", offset=0.0)
-    distinct_media = _media("video", offset=0.5)
+    first_media, distinct_media = _media("video", 0.0), _media("video", 0.5)
     with (
-        mock.patch.object(
-            wrapper, "_forward_vision_encoder", wraps=wrapper._forward_vision_encoder
-        ) as encoder,
+        _encoder_patch(wrapper) as encoder,
         mock.patch.object(
             model.vision_model,
             "_apply_temporal_grouping",
@@ -890,8 +890,6 @@ def test_temporal_tubelet_encoder_reuse_and_exact_media_rows(
     assert len(distinct_finished.generated_tokens) == 1
 
 
-@pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize(("modality", "expected_embeddings"), [("image", 1), ("video", 2)])
 def test_nemotron_omni_real_pixel_shuffle_encoder_reuse_and_prompt_ownership(
     model_parallel, modality, expected_embeddings
@@ -906,9 +904,7 @@ def test_nemotron_omni_real_pixel_shuffle_encoder_reuse_and_prompt_ownership(
     )
     first_media = media_factory(0.0)
     distinct_media = media_factory(0.5)
-    with mock.patch.object(
-        wrapper, "_forward_vision_encoder", wraps=wrapper._forward_vision_encoder
-    ) as encoder:
+    with _encoder_patch(wrapper) as encoder:
         first, first_step, first_finished = _run_request(engine, 180, first_media, trace)
         reuse, reuse_step, reuse_finished = _run_request(
             engine, 181, {"media_cache_key": first_media["media_cache_key"]}, trace
@@ -931,17 +927,13 @@ def test_nemotron_omni_real_pixel_shuffle_encoder_reuse_and_prompt_ownership(
     assert len(distinct_finished.generated_tokens) == 1
 
 
-@pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_multiple_videos_preexpanded_equivalence_and_real_cache_eviction(model_parallel):
     engine, wrapper = _build_engine("video")
     trace = _install_forward_trace(engine)
     compact_prompt = [5, IMAGE_TOKEN_ID, 6, IMAGE_TOKEN_ID, 7]
     first_media = _multiple_videos(0.0)
     distinct_media = _multiple_videos(0.5)
-    with mock.patch.object(
-        wrapper, "_forward_vision_encoder", wraps=wrapper._forward_vision_encoder
-    ) as encoder:
+    with _encoder_patch(wrapper) as encoder:
         compact, compact_step, compact_finished = _run_request(
             engine, 20, first_media, trace, compact_prompt
         )
@@ -978,8 +970,6 @@ def test_multiple_videos_preexpanded_equivalence_and_real_cache_eviction(model_p
     assert compact_finished.generated_tokens == replay_finished.generated_tokens
 
 
-@pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_expanded_media_prefix_stitching_matches_compact_real_model(model_parallel):
     engine, wrapper = _build_engine("image")
     trace = _install_forward_trace(engine)
@@ -989,9 +979,7 @@ def test_expanded_media_prefix_stitching_matches_compact_real_model(model_parall
         [5] + [wrapper.get_preexpanded_media_token_id("image")] * 4 + [6, 7, IMAGE_TOKEN_ID, 8]
     )
     stitching = {PREFIX_MEDIA_COUNT_FIELD: 1, PREFIX_EXPANDED_TOKEN_COUNT_FIELD: 6}
-    with mock.patch.object(
-        wrapper, "_forward_vision_encoder", wraps=wrapper._forward_vision_encoder
-    ) as encoder:
+    with _encoder_patch(wrapper) as encoder:
         compact, compact_step, compact_finished = _run_request(
             engine, 24, media, trace, compact_prompt
         )
@@ -1013,8 +1001,6 @@ def test_expanded_media_prefix_stitching_matches_compact_real_model(model_parall
     assert compact_finished.generated_tokens == stitched_finished.generated_tokens
 
 
-@pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize(
     ("prompt", "expected_offsets", "expected_query_lengths"),
     [
@@ -1029,9 +1015,7 @@ def test_chunk_boundaries_inside_media_match_unchunked_real_model(
     baseline_engine, baseline_wrapper = _build_engine("video", model=model)
     baseline_trace = _install_forward_trace(baseline_engine)
     media = _media("video", offset=0.0)
-    with mock.patch.object(
-        baseline_wrapper, "_forward_vision_encoder", wraps=baseline_wrapper._forward_vision_encoder
-    ) as baseline_encoder:
+    with _encoder_patch(baseline_wrapper) as baseline_encoder:
         baseline, baseline_step, baseline_finished = _run_request(
             baseline_engine, 30, media, baseline_trace, prompt
         )
@@ -1040,9 +1024,7 @@ def test_chunk_boundaries_inside_media_match_unchunked_real_model(
     )
     chunk_trace = _install_forward_trace(chunk_engine)
     params = SamplingParams(num_tokens_to_generate=1, termination_id=-1, temperature=1.0, top_k=1)
-    with mock.patch.object(
-        chunk_wrapper, "_forward_vision_encoder", wraps=chunk_wrapper._forward_vision_encoder
-    ) as chunk_encoder:
+    with _encoder_patch(chunk_wrapper) as chunk_encoder:
         chunk_engine.add_request(request_id=31, prompt=prompt, sampling_params=params, **media)
         chunk_admitted = chunk_engine.get_request(31)
         chunk_finished = []
@@ -1061,25 +1043,20 @@ def test_chunk_boundaries_inside_media_match_unchunked_real_model(
     assert chunk_finished[0].generated_tokens == baseline_finished.generated_tokens
 
 
-@pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_async_mixed_text_media_batch_preserves_ownership_through_middle_completion(
     model_parallel, record_property
 ):
     model = _build_model("image")
     engine, wrapper = _build_engine("image", model=model)
     trace = _install_forward_trace(engine)
-    first_media = _media("image", offset=0.0)
-    second_media = _media("image", offset=0.5)
+    first_media, second_media = _media("image", 0.0), _media("image", 0.5)
     params = {
         request_id: SamplingParams(
             num_tokens_to_generate=count, termination_id=-1, temperature=1.0, top_k=1
         )
         for request_id, count in ((40, 1), (41, 2), (42, 3))
     }
-    with mock.patch.object(
-        wrapper, "_forward_vision_encoder", wraps=wrapper._forward_vision_encoder
-    ) as encoder:
+    with _encoder_patch(wrapper) as encoder:
         engine.add_request(40, [5, IMAGE_TOKEN_ID, 6], params[40], **first_media)
         first_embedding = engine.get_request(40).image_embeddings.detach().cpu().clone()
         engine.add_request(41, [8, 9, 10], params[41])
@@ -1133,18 +1110,13 @@ def test_async_mixed_text_media_batch_preserves_ownership_through_middle_complet
     assert any(step["request_ids"] == [42] for step in trace)
 
 
-@pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_real_media_prefix_cache_reuses_only_matching_text_and_media(
     model_parallel, record_property
 ):
     engine, wrapper = _build_engine("image", enable_prefix_caching=True)
     trace = _install_forward_trace(engine)
-    first_media = _media("image", offset=0.0)
-    distinct_media = _media("image", offset=0.5)
-    with mock.patch.object(
-        wrapper, "_forward_vision_encoder", wraps=wrapper._forward_vision_encoder
-    ) as encoder:
+    first_media, distinct_media = _media("image", 0.0), _media("image", 0.5)
+    with _encoder_patch(wrapper) as encoder:
         first, first_step, first_finished = _run_request(engine, 60, first_media, trace)
         skipped_after_first = engine._prefill_tokens_skipped
         different_text, _, _ = _run_request(
@@ -1176,8 +1148,6 @@ def test_real_media_prefix_cache_reuses_only_matching_text_and_media(
     assert matching_finished.generated_tokens == first_finished.generated_tokens
 
 
-@pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_recompute_refit_refreshes_real_media_without_changing_output(model_parallel):
     model = _build_model("image")
     media = _media("image", offset=0.0)
@@ -1195,9 +1165,7 @@ def test_recompute_refit_refreshes_real_media_without_changing_output(model_para
         "image", model=model, kv_cache_management_mode="recompute", static_kv_memory_pointers=False
     )
     treated_trace = _install_forward_trace(treated_engine)
-    with mock.patch.object(
-        treated_wrapper, "_forward_vision_encoder", wraps=treated_wrapper._forward_vision_encoder
-    ) as encoder:
+    with _encoder_patch(treated_wrapper) as encoder:
         treated_engine.add_request(
             71,
             [5, IMAGE_TOKEN_ID, 6],
@@ -1223,8 +1191,6 @@ def test_recompute_refit_refreshes_real_media_without_changing_output(model_para
     assert any(step["kv_offsets"] == [0] for step in treated_trace)
 
 
-@pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("ssm_mixer", ["mamba", "gdn", "gdp"])
 def test_real_media_executes_hybrid_language_mixer_on_prefill(model_parallel, ssm_mixer):
     if ssm_mixer == "gdn" and not HAVE_FLA:
@@ -1245,9 +1211,7 @@ def test_real_media_executes_hybrid_language_mixer_on_prefill(model_parallel, ss
         if type(module).__name__ == mixer_class
     ]
     try:
-        with mock.patch.object(
-            wrapper, "_forward_vision_encoder", wraps=wrapper._forward_vision_encoder
-        ) as encoder:
+        with _encoder_patch(wrapper) as encoder:
             admission, step, finished = _run_request(engine, 80, _media("image", offset=0.0), trace)
     finally:
         for handle in handles:
@@ -1257,11 +1221,10 @@ def test_real_media_executes_hybrid_language_mixer_on_prefill(model_parallel, ss
     assert step["mask"].ge(0).sum().item() == 4
     assert torch.equal(step["embeddings"], admission["embeddings"])
     assert step["logits"].shape == (1, 1, VOCAB_SIZE)
-    assert len(finished.generated_tokens) == 1
+    assert torch.isfinite(step["logits"]).all()
+    assert finished.generated_tokens == [_greedy_token(step)]
 
 
-@pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_raw_image_matches_preprocessed_dynamic_input_on_real_model(model_parallel):
     image = Image.new("RGB", (8, 8))
     image.putdata([(x * 16, y * 16, (x + y) * 8) for y in range(8) for x in range(8)])
@@ -1286,9 +1249,7 @@ def test_raw_image_matches_preprocessed_dynamic_input_on_real_model(model_parall
     model = _build_model("video")
     engine, wrapper = _build_engine("video", model=model)
     trace = _install_forward_trace(engine)
-    with mock.patch.object(
-        wrapper, "_forward_vision_encoder", wraps=wrapper._forward_vision_encoder
-    ) as encoder:
+    with _encoder_patch(wrapper) as encoder:
         raw, raw_step, raw_finished = _run_request(engine, 90, raw_args, trace)
         preprocessed, preprocessed_step, preprocessed_finished = _run_request(
             engine, 91, preprocessed_args, trace
@@ -1303,8 +1264,6 @@ def test_raw_image_matches_preprocessed_dynamic_input_on_real_model(model_parall
     assert raw_finished.generated_tokens == preprocessed_finished.generated_tokens
 
 
-@pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_chat_media_slots_feed_real_preprocessor_encoder_and_exact_positions(model_parallel):
     image = Image.new("RGB", (8, 8), color=(32, 96, 160))
     payload = io.BytesIO()
@@ -1355,20 +1314,17 @@ def test_chat_media_slots_feed_real_preprocessor_encoder_and_exact_positions(mod
     )
     engine, wrapper = _build_engine("video")
     trace = _install_forward_trace(engine)
-    with mock.patch.object(
-        wrapper, "_forward_vision_encoder", wraps=wrapper._forward_vision_encoder
-    ) as encoder:
+    with _encoder_patch(wrapper) as encoder:
         admission, step, finished = _run_request(engine, 95, media, trace, prompt)
     assert encoder.call_count == 1
     assert admission["tokens"].tolist() == [5] + [IMAGE_TOKEN_ID] * 4 + [6]
     assert admission["mask"].tolist() == [-1, 0, 1, 2, 3, -1]
     assert torch.equal(step["embeddings"], admission["embeddings"])
     assert step["logits"].shape == (1, 1, VOCAB_SIZE)
-    assert len(finished.generated_tokens) == 1
+    assert torch.isfinite(step["logits"]).all()
+    assert finished.generated_tokens == [_greedy_token(step)]
 
 
-@pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_dynamic_image_row_boundaries_share_real_encoder_step(model_parallel):
     model = _build_model("video")
     image_config = ImageProcessingConfig(
@@ -1376,29 +1332,19 @@ def test_dynamic_image_row_boundaries_share_real_encoder_step(model_parallel):
     )
     engine, wrapper = _build_engine("image", model=model, image_preprocessing_config=image_config)
     trace = _install_forward_trace(engine)
-    with mock.patch.object(
-        wrapper, "_forward_vision_encoder", wraps=wrapper._forward_vision_encoder
-    ) as encoder:
+    with _encoder_patch(wrapper) as encoder:
         admission, step, finished = _run_request(engine, 96, _dynamic_image(offset=0.0), trace)
     assert encoder.call_count == 1
-    assert admission["tokens"].tolist() == [
-        5,
-        IMAGE_TOKEN_ID,
-        IMAGE_TOKEN_ID,
-        7,
-        IMAGE_TOKEN_ID,
-        IMAGE_TOKEN_ID,
-        8,
-        6,
-    ]
+    assert admission["tokens"].tolist() == [5] + [IMAGE_TOKEN_ID] * 2 + [7] + [
+        IMAGE_TOKEN_ID
+    ] * 2 + [8, 6]
     assert admission["mask"].tolist() == [-1, 0, 1, -1, 2, 3, -1, -1]
     assert torch.equal(step["embeddings"], admission["embeddings"])
     assert step["logits"].shape == (1, 1, VOCAB_SIZE)
-    assert len(finished.generated_tokens) == 1
+    assert torch.isfinite(step["logits"]).all()
+    assert finished.generated_tokens == [_greedy_token(step)]
 
 
-@pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_real_media_executes_moe_router_with_configured_expert_topology(model_parallel):
     model = _build_moe_model()
     engine, wrapper = _build_engine("image", model=model)
@@ -1412,9 +1358,7 @@ def test_real_media_executes_moe_router_with_configured_expert_topology(model_pa
         if type(module).__name__ == "TopKRouter"
     ]
     try:
-        with mock.patch.object(
-            wrapper, "_forward_vision_encoder", wraps=wrapper._forward_vision_encoder
-        ) as encoder:
+        with _encoder_patch(wrapper) as encoder:
             admission, step, finished = _run_request(
                 engine, 100, _media("image", offset=0.0), trace
             )
@@ -1434,25 +1378,41 @@ def test_real_media_executes_moe_router_with_configured_expert_topology(model_pa
     torch.distributed.all_gather_into_tensor(rank_logits, local_logits)
     rank_logits = rank_logits.view(Utils.world_size, -1)
     assert torch.all(torch.isfinite(rank_logits) & (rank_logits == rank_logits[:1]))
-    assert finished.generated_tokens == [int(step["logits"][0, -1].argmax())]
+    assert finished.generated_tokens == [_greedy_token(step)]
 
 
-@pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_real_media_executes_configured_language_implementation_or_parallel_path(
     model_parallel, record_property
 ):
     topology = os.getenv("MCORE_MM_TOPOLOGY", "tp")
-    full_logits = topology == "sp"
+    full_logits = topology in ("sp", "cp")
     modality = "video" if topology == "cp" else "image"
     builder = _build_hybrid_model if topology == "hybrid_cp" else _build_te_parallel_model
     model = builder("attention" if topology == "hybrid_cp" else modality)
+    reference = None
+    prompt = [5, IMAGE_TOKEN_ID, 6, 7, 8] if modality == "video" else None
     if topology in ("cp", "hybrid_cp"):
-        with pytest.raises(
-            NotImplementedError, match="VLM dynamic inference does not support context_parallel"
+        reference_engine, _ = _build_engine(
+            modality, model=model, materialize_only_last_token_logits=not full_logits
+        )
+        reference_trace = _install_forward_trace(reference_engine)
+
+        def unsharded_input(combined, labels, loss_mask, packed):
+            return combined.transpose(1, 0).contiguous(), labels, loss_mask, packed
+
+        with (
+            mock.patch.object(
+                model, "_process_embedding_token_parallel", side_effect=unsharded_input
+            ),
+            mock.patch.object(
+                llava_model_module,
+                "_gather_zigzag_context_parallel_tokens",
+                side_effect=lambda tokens, _group: tokens,
+            ),
         ):
-            _build_engine(modality, model=model)
-        return
+            reference = _run_request(
+                reference_engine, 109, _media(modality, offset=0.0), reference_trace, prompt, 2
+            )
     if topology == "sp":
         with torch.no_grad():
             for layer in model.language_model.decoder.layers:
@@ -1464,8 +1424,7 @@ def test_real_media_executes_configured_language_implementation_or_parallel_path
         modality, model=model, materialize_only_last_token_logits=not full_logits
     )
     trace = _install_forward_trace(engine)
-    prompt = [5, IMAGE_TOKEN_ID, 6, 7, 8] if modality == "video" else None
-    scatter_events, gather_events, output_events = [], [], []
+    scatter_events, gather_events, output_events, cp_events = [], [], [], []
     if topology == "sp":
 
         def trace_collective(operation, events, tag_input=False):
@@ -1498,6 +1457,28 @@ def test_real_media_executes_configured_language_implementation_or_parallel_path
         output_handle = model.language_model.output_layer.register_forward_pre_hook(
             lambda _module, args: output_events.append(args[0].detach().cpu())
         )
+    elif topology in ("cp", "hybrid_cp"):
+        original_process = model._process_embedding_token_parallel
+        original_gather = llava_model_module._gather_zigzag_context_parallel_tokens
+
+        def traced_process(combined, labels, loss_mask, packed):
+            output = original_process(combined, labels, loss_mask, packed)
+            padded_tokens = engine.context.padded_active_token_count
+            cp_events.append([combined.cpu(), output[0].cpu(), padded_tokens])
+            return output
+
+        def traced_gather(local_tokens, group):
+            output = original_gather(local_tokens, group)
+            cp_events[-1].append(output.detach().cpu())
+            return output
+
+        companion_patch = mock.patch.object(
+            model, "_process_embedding_token_parallel", side_effect=traced_process
+        )
+        gather_patch = mock.patch.object(
+            llava_model_module, "_gather_zigzag_context_parallel_tokens", side_effect=traced_gather
+        )
+        output_handle = None
     else:
         companion_patch = gather_patch = output_handle = None
     if companion_patch is not None:
@@ -1514,20 +1495,20 @@ def test_real_media_executes_configured_language_implementation_or_parallel_path
         in ("InferenceColumnParallelLinear", "InferenceLayerNormColumnParallelLinear")
     ]
     try:
-        with mock.patch.object(
-            wrapper, "_forward_vision_encoder", wraps=wrapper._forward_vision_encoder
-        ) as encoder:
+        with _encoder_patch(wrapper) as encoder:
             media_offset = (
                 0.5 * parallel_state.get_data_parallel_rank() if topology == "dp" else 0.0
             )
+            generation_length = 2 if topology in ("cp", "hybrid_cp") else 1
             admission, step, finished = _run_request(
-                engine, 110, _media(modality, offset=media_offset), trace, prompt
+                engine, 110, _media(modality, offset=media_offset), trace, prompt, generation_length
             )
     finally:
         if companion_patch is not None:
             companion_patch.stop()
             gather_patch.stop()
-            output_handle.remove()
+            if output_handle is not None:
+                output_handle.remove()
         for handle in optimized_handles:
             handle.remove()
     assert encoder.call_count == 1
@@ -1546,7 +1527,7 @@ def test_real_media_executes_configured_language_implementation_or_parallel_path
     expected_seq_len = step["input_ids"].shape[1] if full_logits else 1
     assert step["logits"].shape == (1, expected_seq_len, VOCAB_SIZE)
     assert torch.isfinite(step["logits"]).all()
-    assert finished.generated_tokens == [int(step["logits"][0, -1].argmax())]
+    assert finished.generated_tokens[0] == _greedy_token(step, full_logits)
     if topology == "sp":
         local_logits = step["logits"][:, : admission["tokens"].numel()].cuda()
         assert finished.generated_tokens == [int(local_logits[0, -1].argmax())]
@@ -1566,13 +1547,60 @@ def test_real_media_executes_configured_language_implementation_or_parallel_path
         rank_tokens = [torch.empty_like(local_token) for _ in range(Utils.world_size)]
         torch.distributed.all_gather(rank_tokens, local_token, group=model.language_model.tp_group)
         assert all(torch.equal(token, local_token) for token in rank_tokens)
+    elif topology in ("cp", "hybrid_cp"):
+        reference_admission, reference_step, reference_finished = reference
+        assert torch.equal(admission["tokens"], reference_admission["tokens"])
+        assert torch.equal(admission["mask"], reference_admission["mask"])
+        assert torch.equal(admission["embeddings"], reference_admission["embeddings"])
+        assert torch.equal(step["logits"], reference_step["logits"])
+        assert finished.generated_tokens == reference_finished.generated_tokens
+        cp_group = model.pg_collection.cp
+        assert len(cp_events) == len(trace) == len(reference_trace)
+        assert len(trace) > 1
+        for event, actual_step, expected_step in zip(cp_events, trace, reference_trace):
+            full, local, padded_tokens, gathered = event
+            assert full.shape[1] == padded_tokens
+            expected_global = torch.zeros_like(gathered)
+            expected_global[:padded_tokens] = full.transpose(0, 1)
+            assert torch.equal(gathered, expected_global)
+            chunks = expected_global.view(2 * cp_group.size(), -1, *expected_global.shape[1:])
+            rank = cp_group.rank()
+            expected_local = torch.cat((chunks[rank], chunks[-rank - 1]))
+            assert torch.equal(local, expected_local)
+            assert torch.equal(actual_step["logits"], expected_step["logits"])
+            assert torch.isfinite(actual_step["logits"]).all()
+        max_delta = 0.0
+        for traced_step in trace:
+            local_logits = traced_step["logits"].cuda()
+            rank_logits = [torch.empty_like(local_logits) for _ in range(cp_group.size())]
+            torch.distributed.all_gather(rank_logits, local_logits, group=cp_group)
+            delta = (torch.stack(rank_logits).float() - local_logits.float()).abs().max().item()
+            max_delta = max(max_delta, delta)
+        record_property("max_parallel_logit_delta", max_delta)
+        assert max_delta == 0.0
+        assert finished.generated_tokens == [
+            _greedy_token(item, full_logits) for item in trace[:-1]
+        ]
+        local_token = torch.tensor(finished.generated_tokens, device="cuda")
+        rank_tokens = [torch.empty_like(local_token) for _ in range(cp_group.size())]
+        torch.distributed.all_gather(rank_tokens, local_token, group=cp_group)
+        assert all(torch.equal(token, local_token) for token in rank_tokens)
 
 
-@pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("variant", ["swa", "sink", "mla", "mla_unfused"])
 def test_real_media_executes_attention_variant_and_reuses_exact_result(model_parallel, variant):
     model = _build_attention_variant_model(variant)
+    unfused_attention = next(
+        (
+            module
+            for module in model.language_model.modules()
+            if type(module).__name__ == "MLASelfAttention"
+        ),
+        None,
+    )
+    original_unfused_projection = (
+        unfused_attention.linear_kv_up_proj if variant == "mla_unfused" else None
+    )
     block_size_tokens = 64 if variant.startswith("mla") else 4
     engine, wrapper = _build_engine("image", model=model, block_size_tokens=block_size_tokens)
     trace = _install_forward_trace(engine)
@@ -1636,9 +1664,7 @@ def test_real_media_executes_attention_variant_and_reuses_exact_result(model_par
     for patcher in patchers:
         patcher.start()
     try:
-        with mock.patch.object(
-            wrapper, "_forward_vision_encoder", wraps=wrapper._forward_vision_encoder
-        ) as encoder:
+        with _encoder_patch(wrapper) as encoder:
             first, first_step, first_finished = _run_request(
                 engine, 120, media, trace, [5, IMAGE_TOKEN_ID, 6, 7, 8, 9]
             )
@@ -1656,6 +1682,8 @@ def test_real_media_executes_attention_variant_and_reuses_exact_result(model_par
             handle.remove()
     assert encoder.call_count == 1
     assert companion_events
+    if variant == "mla_unfused":
+        assert unfused_attention.linear_kv_up_proj_linear is original_unfused_projection
     if variant == "swa":
         assert all(window == (4, 0) for window, _ in companion_events)
     assert first_step["mask"].ge(0).sum().item() == 4
@@ -1666,8 +1694,6 @@ def test_real_media_executes_attention_variant_and_reuses_exact_result(model_par
     assert first_finished.generated_tokens == reuse_finished.generated_tokens
 
 
-@pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_real_media_prefill_replays_actual_cuda_graph_with_eager_parity(model_parallel):
     eager_model = _build_model("image")
     graphed_model = _build_model(
@@ -1677,9 +1703,7 @@ def test_real_media_prefill_replays_actual_cuda_graph_with_eager_parity(model_pa
     media = _media("image", offset=0.0)
     eager_engine, eager_wrapper = _build_engine("image", model=eager_model)
     eager_trace = _install_forward_trace(eager_engine)
-    with mock.patch.object(
-        eager_wrapper, "_forward_vision_encoder", wraps=eager_wrapper._forward_vision_encoder
-    ) as eager_encoder:
+    with _encoder_patch(eager_wrapper) as eager_encoder:
         eager, eager_step, eager_finished = _run_request(eager_engine, 130, media, eager_trace)
     graph_engine, graph_wrapper = _build_engine(
         "image",
@@ -1691,9 +1715,7 @@ def test_real_media_prefill_replays_actual_cuda_graph_with_eager_parity(model_pa
         cuda_graph_max_tokens=16,
     )
     graph_trace = _install_forward_trace(graph_engine)
-    with mock.patch.object(
-        graph_wrapper, "_forward_vision_encoder", wraps=graph_wrapper._forward_vision_encoder
-    ) as graph_encoder:
+    with _encoder_patch(graph_wrapper) as graph_encoder:
         graphed, graph_step, graph_finished = _run_request(graph_engine, 131, media, graph_trace)
     assert eager_encoder.call_count == graph_encoder.call_count == 1
     assert not eager_step["graphed"]
@@ -1705,8 +1727,6 @@ def test_real_media_prefill_replays_actual_cuda_graph_with_eager_parity(model_pa
     assert eager_finished.generated_tokens == graph_finished.generated_tokens
 
 
-@pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_real_media_prefill_and_mtp_draft_share_step_with_greedy_parity(model_parallel):
     skip_if_sequence_packing_not_available("mamba")
     baseline_model = _build_hybrid_model("mamba")
@@ -1716,9 +1736,7 @@ def test_real_media_prefill_and_mtp_draft_share_step_with_greedy_parity(model_pa
     media = _media("image", offset=0.0)
     params = SamplingParams(num_tokens_to_generate=3, termination_id=-1, top_k=1)
     baseline_engine, baseline_wrapper = _build_engine("image", model=baseline_model)
-    with mock.patch.object(
-        baseline_wrapper, "_forward_vision_encoder", wraps=baseline_wrapper._forward_vision_encoder
-    ) as baseline_encoder:
+    with _encoder_patch(baseline_wrapper) as baseline_encoder:
         baseline_engine.add_request(140, [5, IMAGE_TOKEN_ID, 6], params, **media)
         baseline_finished = []
         while baseline_engine.has_unfinished_requests():
@@ -1726,9 +1744,7 @@ def test_real_media_prefill_and_mtp_draft_share_step_with_greedy_parity(model_pa
     mtp_engine, mtp_wrapper = _build_engine("image", model=mtp_model, num_speculative_tokens=1)
     mtp_trace = _install_forward_trace(mtp_engine)
     with (
-        mock.patch.object(
-            mtp_wrapper, "_forward_vision_encoder", wraps=mtp_wrapper._forward_vision_encoder
-        ) as mtp_encoder,
+        _encoder_patch(mtp_wrapper) as mtp_encoder,
         mock.patch.object(
             mtp_model.language_model,
             "compute_mtp_single_step",
@@ -1749,8 +1765,6 @@ def test_real_media_prefill_and_mtp_draft_share_step_with_greedy_parity(model_pa
     assert mtp_finished[0].generated_tokens == baseline_finished[0].generated_tokens
 
 
-@pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_real_media_flashinfer_samples_only_from_requested_top_k(model_parallel):
     pytest.importorskip("flashinfer")
     from megatron.core.inference.sampling import flashinfer_sampling
@@ -1769,9 +1783,7 @@ def test_real_media_flashinfer_samples_only_from_requested_top_k(model_parallel)
         return sampled
 
     with (
-        mock.patch.object(
-            wrapper, "_forward_vision_encoder", wraps=wrapper._forward_vision_encoder
-        ) as encoder,
+        _encoder_patch(wrapper) as encoder,
         mock.patch.object(
             flashinfer_sampling.flashinfer.sampling, "top_k_sampling_from_probs", new=checked_top_k
         ),
@@ -1787,8 +1799,6 @@ def test_real_media_flashinfer_samples_only_from_requested_top_k(model_parallel)
     assert len(finished[0].generated_tokens) == 3
 
 
-@pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("logprobs_mode", ["raw_logprobs", "processed_logprobs"])
 def test_real_media_top_p_seed_and_logprobs_match_distribution(model_parallel, logprobs_mode):
     engine, wrapper = _build_engine("image", logprobs_mode=logprobs_mode)
@@ -1815,9 +1825,7 @@ def test_real_media_top_p_seed_and_logprobs_match_distribution(model_parallel, l
         assert len(finished) == 1 and len(steps) == len(finished[0].generated_tokens) + 1
         return finished[0], steps
 
-    with mock.patch.object(
-        wrapper, "_forward_vision_encoder", wraps=wrapper._forward_vision_encoder
-    ) as encoder:
+    with _encoder_patch(wrapper) as encoder:
         first, first_steps = run(155, media)
         repeated, repeated_steps = run(156, {"media_cache_key": media["media_cache_key"]})
     assert encoder.call_count == 1
@@ -1852,8 +1860,6 @@ def test_real_media_top_p_seed_and_logprobs_match_distribution(model_parallel, l
             assert value == pytest.approx(float(expected[int(token_id)]), abs=1e-6)
 
 
-@pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_real_media_eos_and_explicit_stop_end_at_first_greedy_token(model_parallel):
     engine, wrapper = _build_engine("image")
     trace = _install_forward_trace(engine)
@@ -1870,9 +1876,7 @@ def test_real_media_eos_and_explicit_stop_end_at_first_greedy_token(model_parall
         assert len(finished) == 1
         return finished[0], embedding, trace[trace_start:]
 
-    with mock.patch.object(
-        wrapper, "_forward_vision_encoder", wraps=wrapper._forward_vision_encoder
-    ) as encoder:
+    with _encoder_patch(wrapper) as encoder:
         baseline, baseline_embedding, baseline_steps = run(
             157, SamplingParams(num_tokens_to_generate=1, termination_id=-1, top_k=1)
         )
@@ -1900,8 +1904,6 @@ def test_real_media_eos_and_explicit_stop_end_at_first_greedy_token(model_parall
     assert torch.equal(baseline_steps[0]["logits"], explicit_steps[0]["logits"])
 
 
-@pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("recipe", ["tensorwise", "mxfp8"])
 def test_real_media_executes_fp8_context_and_reuses_exact_embedding(model_parallel, recipe):
     if recipe == "mxfp8" and torch.cuda.get_device_capability()[0] < 10:
@@ -1923,9 +1925,7 @@ def test_real_media_executes_fp8_context_and_reuses_exact_embedding(model_parall
         )
     )
     try:
-        with mock.patch.object(
-            wrapper, "_forward_vision_encoder", wraps=wrapper._forward_vision_encoder
-        ) as encoder:
+        with _encoder_patch(wrapper) as encoder:
             first, first_step, first_finished = _run_request(engine, 160, media, trace)
             reuse, reuse_step, reuse_finished = _run_request(
                 engine, 161, {"media_cache_key": media["media_cache_key"]}, trace

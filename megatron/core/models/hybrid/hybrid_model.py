@@ -556,6 +556,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         padding_mask: Optional[Tensor] = None,
         compute_mtp_loss: bool = True,
         cp_batch: ContextParallelBatch | None = None,
+        context_parallel_input_is_replicated: bool = False,
     ) -> Tensor:
         """Forward function of the Hybrid model. This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -665,19 +666,29 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                 inference_context, self.decoder, decoder_input, self.config, packed_seq_params
             )
-            rotary_pos_emb = self.rotary_pos_emb(
-                rotary_seq_len,
-                packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
-            )
+            if context_parallel_input_is_replicated:
+                rotary_seq_len //= self.config.context_parallel_size
+                rotary_pos_emb = self.rotary_pos_emb.get_emb(rotary_seq_len)
+            else:
+                rotary_pos_emb = self.rotary_pos_emb(
+                    rotary_seq_len,
+                    packed_seq=packed_seq_params is not None
+                    and packed_seq_params.qkv_format == 'thd',
+                )
         elif self.position_embedding_type == 'yarn':
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                 inference_context, self.decoder, decoder_input, self.config, packed_seq_params
             )
             # YarnRotaryEmbedding.forward returns (emb, mscale); discard mscale here
-            rotary_pos_emb, _ = self.rotary_pos_emb(
-                rotary_seq_len,
-                packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
-            )
+            if context_parallel_input_is_replicated:
+                rotary_seq_len //= self.config.context_parallel_size
+                rotary_pos_emb, _ = self.rotary_pos_emb.get_emb(rotary_seq_len)
+            else:
+                rotary_pos_emb, _ = self.rotary_pos_emb(
+                    rotary_seq_len,
+                    packed_seq=packed_seq_params is not None
+                    and packed_seq_params.qkv_format == 'thd',
+                )
 
         # Wrap decoder_input to allow the decoder (HybridStack) to delete the
         # reference held by this caller function, enabling early garbage collection
