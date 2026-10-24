@@ -4,7 +4,7 @@
 
 import asyncio
 import concurrent.futures
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, PropertyMock
 
 import pytest
 
@@ -226,9 +226,13 @@ class TestLifecycleGuards:
         llm._loop_manager.submit.side_effect = RuntimeError("submit failed")
         shutdown = llm.shutdown if cls is MegatronLLM else lambda: asyncio.run(llm.shutdown())
 
-        for _ in range(2):
-            with pytest.raises(RuntimeError, match="frontend failed"):
-                shutdown()
+        with pytest.raises(RuntimeError, match="frontend failed"):
+            shutdown()
+        type(llm._loop_manager).loop = PropertyMock(
+            side_effect=AssertionError("stopped loop reused")
+        )
+        with pytest.raises(RuntimeError, match="frontend failed"):
+            shutdown()
         llm._coord_runtime.teardown_now.assert_called_once_with()
         llm._loop_manager.stop.assert_called_once_with()
 
@@ -393,6 +397,10 @@ class TestLifecycleGuards:
         sync_llm._shutdown_complete_future = concurrent.futures.Future()
         sync_llm._shutdown_complete_future.set_result(None)
         sync_llm._loop_manager = MagicMock()
+        type(sync_llm._loop_manager).loop = PropertyMock(
+            side_effect=AssertionError("stopped loop reused")
+        )
+        sync_llm.shutdown()
         sync_llm.wait_for_shutdown()
         sync_llm._loop_manager.run_sync.assert_not_called()
 
