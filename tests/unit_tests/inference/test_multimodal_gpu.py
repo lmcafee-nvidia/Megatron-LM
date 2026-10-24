@@ -916,7 +916,6 @@ def test_nemotron_omni_real_pixel_shuffle_encoder_reuse_and_prompt_ownership(
         distinct, distinct_step, distinct_finished = _run_request(
             engine, 182, distinct_media, trace
         )
-
     assert encoder.call_count == 2
     assert model._pixel_shuffle
     assert first["mask"].ge(0).sum().item() == expected_embeddings
@@ -965,7 +964,6 @@ def test_multiple_videos_preexpanded_equivalence_and_real_cache_eviction(model_p
         replay, replay_step, replay_finished = _run_request(
             engine, 23, first_media, trace, compact_prompt
         )
-
     assert encoder.call_count == 4
     assert torch.equal(preexpanded["tokens"], preexpanded_prompt)
     assert torch.equal(compact["mask"], preexpanded["mask"])
@@ -1004,7 +1002,6 @@ def test_expanded_media_prefix_stitching_matches_compact_real_model(model_parall
             trace,
             stitched_prompt,
         )
-
     assert encoder.call_count == 1
     assert compact["mask"].tolist() == [-1, 0, 1, 2, 3, -1, -1, 4, 5, 6, 7, -1]
     assert torch.equal(compact["mask"], stitched["mask"])
@@ -1032,14 +1029,12 @@ def test_chunk_boundaries_inside_media_match_unchunked_real_model(
     baseline_engine, baseline_wrapper = _build_engine("video", model=model)
     baseline_trace = _install_forward_trace(baseline_engine)
     media = _media("video", offset=0.0)
-
     with mock.patch.object(
         baseline_wrapper, "_forward_vision_encoder", wraps=baseline_wrapper._forward_vision_encoder
     ) as baseline_encoder:
         baseline, baseline_step, baseline_finished = _run_request(
             baseline_engine, 30, media, baseline_trace, prompt
         )
-
     chunk_engine, chunk_wrapper = _build_engine(
         "video", model=model, enable_chunked_prefill=True, max_tokens=4
     )
@@ -1053,7 +1048,6 @@ def test_chunk_boundaries_inside_media_match_unchunked_real_model(
         chunk_finished = []
         while chunk_engine.has_unfinished_requests():
             chunk_finished.extend(chunk_engine.step_modern()["finished_requests"])
-
     request_steps = [step for step in chunk_trace if step["request_ids"] == [31]]
     assert baseline_encoder.call_count == chunk_encoder.call_count == 1
     assert [step["kv_offsets"] for step in request_steps] == expected_offsets
@@ -1091,7 +1085,6 @@ def test_async_mixed_text_media_batch_preserves_ownership_through_middle_complet
         engine.add_request(41, [8, 9, 10], params[41])
         engine.add_request(42, [5, IMAGE_TOKEN_ID, 6], params[42], **second_media)
         second_embedding = engine.get_request(42).image_embeddings.detach().cpu().clone()
-
         batched_finished = []
         finish_steps = {}
         step_index = 0
@@ -1100,7 +1093,6 @@ def test_async_mixed_text_media_batch_preserves_ownership_through_middle_complet
                 batched_finished.append(request)
                 finish_steps[request.request_id] = step_index
             step_index += 1
-
     first_step = trace[0]
     assert encoder.call_count == 2
     assert first_step["request_ids"] == [40, 41, 42]
@@ -1112,7 +1104,6 @@ def test_async_mixed_text_media_batch_preserves_ownership_through_middle_complet
     assert torch.equal(first_step["embeddings"], expected_embeddings)
     assert engine.context.async_sched_step_count > 0
     assert finish_steps[40] < finish_steps[41] < finish_steps[42]
-
     baseline_engine, _ = _build_engine("image", model=model)
     baseline_trace = _install_forward_trace(baseline_engine)
     baseline_finished = {}
@@ -1133,7 +1124,6 @@ def test_async_mixed_text_media_batch_preserves_ownership_through_middle_complet
         while baseline_engine.has_unfinished_requests():
             for request in baseline_engine.step_modern()["finished_requests"]:
                 baseline_finished[request_id] = request.generated_tokens
-
     assert [request.generated_tokens for request in batched_finished] == [
         baseline_finished[50],
         baseline_finished[51],
@@ -1153,13 +1143,11 @@ def test_real_media_prefix_cache_reuses_only_matching_text_and_media(
     trace = _install_forward_trace(engine)
     first_media = _media("image", offset=0.0)
     distinct_media = _media("image", offset=0.5)
-
     with mock.patch.object(
         wrapper, "_forward_vision_encoder", wraps=wrapper._forward_vision_encoder
     ) as encoder:
         first, first_step, first_finished = _run_request(engine, 60, first_media, trace)
         skipped_after_first = engine._prefill_tokens_skipped
-
         different_text, _, _ = _run_request(
             engine,
             61,
@@ -1174,7 +1162,6 @@ def test_real_media_prefix_cache_reuses_only_matching_text_and_media(
         skipped_after_match = engine._prefill_tokens_skipped
         distinct, _, _ = _run_request(engine, 63, distinct_media, trace)
         skipped_after_distinct = engine._prefill_tokens_skipped
-
     assert encoder.call_count == 2
     assert skipped_after_first == skipped_after_different_text == 0
     assert skipped_after_match == 4
@@ -1195,7 +1182,6 @@ def test_real_media_prefix_cache_reuses_only_matching_text_and_media(
 def test_recompute_refit_refreshes_real_media_without_changing_output(model_parallel):
     model = _build_model("image")
     media = _media("image", offset=0.0)
-
     baseline_engine, _ = _build_engine("image", model=model)
     baseline_engine.add_request(
         70,
@@ -1222,7 +1208,6 @@ def test_recompute_refit_refreshes_real_media_without_changing_output(model_para
         original_embedding = treated_engine.get_request(71).image_embeddings.detach().cpu().clone()
         first_result = treated_engine.step_modern()
         assert not first_result["finished_requests"]
-
         treated_engine.suspend()
         assert not treated_engine._vision_embedding_cache
         assert treated_engine.get_request(71).image_embeddings is None
@@ -1490,9 +1475,14 @@ def test_real_media_executes_configured_language_implementation_or_parallel_path
             "scatter_to_sequence_parallel_region",
             wraps=llava_model_module.tensor_parallel.scatter_to_sequence_parallel_region,
         )
+        gather_patch = mock.patch(
+            "megatron.core.models.gpt.gpt_model.gather_from_sequence_parallel_region",
+            wraps=llava_model_module.tensor_parallel.gather_from_sequence_parallel_region,
+        )
     else:
-        companion_patch = None
+        companion_patch = gather_patch = None
     companion = companion_patch.start() if companion_patch is not None else None
+    gather_companion = gather_patch.start() if gather_patch is not None else None
     optimized_events = []
     optimized_handles = [
         module.register_forward_pre_hook(
@@ -1516,11 +1506,13 @@ def test_real_media_executes_configured_language_implementation_or_parallel_path
     finally:
         if companion_patch is not None:
             companion_patch.stop()
+            gather_patch.stop()
         for handle in optimized_handles:
             handle.remove()
     assert encoder.call_count == 1
     if companion is not None:
         assert companion.call_count > 0
+        assert gather_companion.call_count > 0
     if topology == "opt":
         assert optimized_handles and optimized_events
     if topology == "dp":
@@ -1541,6 +1533,14 @@ def test_real_media_executes_configured_language_implementation_or_parallel_path
         local_logits = step["logits"][:, : admission["tokens"].numel()].cuda()
         assert finished.generated_tokens == [int(local_logits[0, -1].argmax())]
         logit_group = model.language_model.tp_group
+        global_tags = torch.arange(expected_seq_len, device="cuda").view(-1, 1, 1)
+        local_tags = llava_model_module.tensor_parallel.scatter_to_sequence_parallel_region(
+            global_tags, group=logit_group
+        )
+        restored_tags = llava_model_module.tensor_parallel.gather_from_sequence_parallel_region(
+            local_tags, group=logit_group
+        )
+        assert torch.equal(restored_tags, global_tags)
         rank_logits = [torch.empty_like(local_logits) for _ in range(Utils.world_size)]
         torch.distributed.all_gather(rank_logits, local_logits, group=logit_group)
         stacked_logits = torch.stack(rank_logits)
