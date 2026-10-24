@@ -474,11 +474,17 @@ _BASE_PAIR_CONFIG = {
 }
 _OPTIMIZED_MOE_CONFIG = {"use_moe_layer_spec": True, "transformer_impl": "inference_optimized"}
 _NCCL_MOE_CONFIG = {**_OPTIMIZED_MOE_CONFIG, "inference_moe_token_dispatcher_type": "nccl"}
-_NCCL_MOE_SIGNALS = ("inference-optimized", "moe", "nccl-dispatch", "parallel")
+_NCCL_SIGNALS = ("inference-optimized", "moe", "nccl-dispatch", "parallel")
 
 
 def _pair_scenario(name, *pairs, **kwargs):
     return _AsyncPairScenario(name=name, pairs=pairs, **kwargs)
+
+
+def _nccl_moe_scenario(name, *pairs, config=None, signals=(), **kwargs):
+    prefixes = ("model:moe", "topology:ep", "dispatcher:nccl")
+    kwargs.update(config={**_NCCL_MOE_CONFIG, **(config or {})}, signals=_NCCL_SIGNALS + signals)
+    return _pair_scenario(name, *prefixes, *pairs, **kwargs)
 
 
 _ASYNC_PAIR_SCENARIOS = (
@@ -789,9 +795,9 @@ _ASYNC_PAIR_SCENARIOS = (
         atol=5.0e-3,
         parity="reproducible",
     ),
-    # Width 64 is supported; width 16 crosses half-head boundaries in vectorized NeoX rotation.
     _pair_scenario(
         "flashinfer-fused-rope",
+        # Width 64 is supported; width 16 crosses half-head boundaries in vectorized NeoX rotation.
         "kernel:flashinfer-fused-rope",
         config={
             "hidden_size": 256,
@@ -818,43 +824,20 @@ _ASYNC_PAIR_SCENARIOS = (
     ),
 )
 
-_ASYNC_SUSPEND_RESUME_SCENARIOS = (
+_ASYNC_SUSPEND_RESUME_SCENARIOS = tuple(
     _pair_scenario(
-        "offload-suspend-resume",
-        "kv:offload",
-        config={"kv_cache_management_mode": "offload", "static_kv_memory_pointers": False},
-        signals=("offload", "suspend-resume"),
-    ),
-    _pair_scenario(
-        "recompute-suspend-resume",
-        "kv:recompute",
-        config={"kv_cache_management_mode": "recompute", "static_kv_memory_pointers": False},
-        signals=("recompute", "suspend-resume"),
-    ),
-    _pair_scenario(
-        "moe-offload-suspend-resume",
-        "model:moe",
-        "kv:offload",
-        "lifecycle:suspend-resume",
+        f"{'moe-' if moe else ''}{mode}-suspend-resume",
+        *(("model:moe", "lifecycle:suspend-resume") if moe else ()),
+        f"kv:{mode}",
         config={
-            **_OPTIMIZED_MOE_CONFIG,
-            "kv_cache_management_mode": "offload",
+            **(_OPTIMIZED_MOE_CONFIG if moe else {}),
+            "kv_cache_management_mode": mode,
             "static_kv_memory_pointers": False,
         },
-        signals=("ep1-moe", "inference-optimized", "offload", "suspend-resume"),
-    ),
-    _pair_scenario(
-        "moe-recompute-suspend-resume",
-        "model:moe",
-        "kv:recompute",
-        "lifecycle:suspend-resume",
-        config={
-            **_OPTIMIZED_MOE_CONFIG,
-            "kv_cache_management_mode": "recompute",
-            "static_kv_memory_pointers": False,
-        },
-        signals=("ep1-moe", "inference-optimized", "recompute", "suspend-resume"),
-    ),
+        signals=(("ep1-moe", "inference-optimized") if moe else ()) + (mode, "suspend-resume"),
+    )
+    for moe in (False, True)
+    for mode in ("offload", "recompute")
 )
 
 _ASYNC_PARALLEL_SCENARIOS = (
@@ -874,14 +857,10 @@ _ASYNC_PARALLEL_SCENARIOS = (
         signals=("dp-offset", "parallel", "sampled", "temperature-filter", "top-k-filter"),
         parity="reproducible",
     ),
-    _pair_scenario(
+    _nccl_moe_scenario(
         "moe-ep2-nccl",
-        "model:moe",
-        "topology:ep",
-        "dispatcher:nccl",
         "interaction:moe-ep-ordering",
         config={
-            **_NCCL_MOE_CONFIG,
             "expert_model_parallel_size": 2,
             "moe_enable_routing_replay": True,
             "return_log_probs": True,
@@ -905,8 +884,7 @@ _ASYNC_PARALLEL_SCENARIOS = (
                 "top_n_logprobs": 4,
             },
         ),
-        signals=_NCCL_MOE_SIGNALS
-        + (
+        signals=(
             "full-logits",
             "logprobs",
             "metadata-compaction",
@@ -920,32 +898,23 @@ _ASYNC_PARALLEL_SCENARIOS = (
         ),
         parity="reproducible",
     ),
-    _pair_scenario(
+    _nccl_moe_scenario(
         "moe-ep2-nvfp4-nccl",
-        "model:moe",
         "precision:nvfp4",
-        "topology:ep",
-        "dispatcher:nccl",
         config={
-            **_NCCL_MOE_CONFIG,
             "expert_model_parallel_size": 2,
             "inference_grouped_gemm_backend": "flashinfer",
             "inference_moe_nvfp4_recipe": "per_token",
             "hidden_size": 256,
         },
-        signals=_NCCL_MOE_SIGNALS,
         prerequisite="nvfp4",
     ),
-    _pair_scenario(
+    _nccl_moe_scenario(
         "moe-ep2-tp2-sp-nccl",
-        "model:moe",
-        "topology:ep",
         "topology:tp",
         "topology:sp",
-        "dispatcher:nccl",
         "interaction:moe-tp-sp",
         config={
-            **_NCCL_MOE_CONFIG,
             "tensor_model_parallel_size": 2,
             "expert_model_parallel_size": 2,
             "sequence_parallel": True,
@@ -954,43 +923,29 @@ _ASYNC_PARALLEL_SCENARIOS = (
             "moe_router_score_function": "sigmoid",
             "inference_disable_triton_nvls_kernels": True,
         },
-        signals=_NCCL_MOE_SIGNALS + ("quantile-routing",),
+        signals=("quantile-routing",),
     ),
-    _pair_scenario(
+    _nccl_moe_scenario(
         "moe-ep2-dp2-nccl",
-        "model:moe",
-        "topology:ep",
         "topology:dp",
         "seed:offset-by-dp-rank",
-        "dispatcher:nccl",
-        config={**_NCCL_MOE_CONFIG, "expert_model_parallel_size": 2},
+        config={"expert_model_parallel_size": 2},
         sampling=({"temperature": 0.8, "top_k": 8},),
-        signals=_NCCL_MOE_SIGNALS + ("dp-offset", "sampled", "temperature-filter", "top-k-filter"),
+        signals=("dp-offset", "sampled", "temperature-filter", "top-k-filter"),
         parity="reproducible",
     ),
-    _pair_scenario(
+    _nccl_moe_scenario(
         "moe-ep2-mtp-nccl",
-        "model:moe",
-        "topology:ep",
-        "dispatcher:nccl",
         "speculation:mtp-depth-one",
         "interaction:moe-mtp-accept-rewind",
-        config={**_NCCL_MOE_CONFIG, "expert_model_parallel_size": 2, "num_speculative_tokens": 1},
-        signals=_NCCL_MOE_SIGNALS + ("mtp", "mtp-accept-rewind"),
+        config={"expert_model_parallel_size": 2, "num_speculative_tokens": 1},
+        signals=("mtp", "mtp-accept-rewind"),
     ),
-    _pair_scenario(
+    _nccl_moe_scenario(
         "moe-ep2-pp2-nccl",
-        "model:moe",
-        "topology:ep",
         "topology:pp",
-        "dispatcher:nccl",
         "interaction:moe-pp",
-        config={
-            **_NCCL_MOE_CONFIG,
-            "pipeline_model_parallel_size": 2,
-            "expert_model_parallel_size": 2,
-        },
-        signals=_NCCL_MOE_SIGNALS,
+        config={"pipeline_model_parallel_size": 2, "expert_model_parallel_size": 2},
     ),
     _pair_scenario(
         "hybrid-gdn-moe-ep2-nccl",
@@ -1005,40 +960,32 @@ _ASYNC_PARALLEL_SCENARIOS = (
             "expert_model_parallel_size": 2,
             "moe_num_hash_layers": 1,
         },
-        signals=_NCCL_MOE_SIGNALS + ("hybrid", "hash-routing", "metadata-compaction"),
+        signals=_NCCL_SIGNALS + ("hybrid", "hash-routing", "metadata-compaction"),
         prerequisite="gdn",
         atol=5.0e-3,
     ),
-    _pair_scenario(
+    _nccl_moe_scenario(
         "moe-ep2-swa-sink-nccl",
-        "model:moe",
-        "topology:ep",
-        "dispatcher:nccl",
         "attention:swa-alternating",
         "attention:learnable-sink",
         config={
-            **_NCCL_MOE_CONFIG,
             "expert_model_parallel_size": 2,
             "window_size": (4, 0),
             "window_attn_skip_freq": 2,
             "softmax_type": "learnable",
         },
-        signals=_NCCL_MOE_SIGNALS + ("moe-attention", "softmax-sink", "swa-alternating"),
+        signals=("moe-attention", "softmax-sink", "swa-alternating"),
     ),
-    _pair_scenario(
+    _nccl_moe_scenario(
         "moe-ep2-chunked-nccl",
-        "model:moe",
-        "topology:ep",
-        "dispatcher:nccl",
         "prefill:chunked",
         "interaction:continuous-batching",
         config={
-            **_NCCL_MOE_CONFIG,
             "expert_model_parallel_size": 2,
             "enable_chunked_prefill": True,
             "context_max_tokens": 8,
         },
-        signals=("chunked",) + _NCCL_MOE_SIGNALS,
+        signals=("chunked",),
     ),
     _pair_scenario(
         "optimized-tp2-sp",
@@ -1363,6 +1310,7 @@ def _fp8_expert_reference(module, inputs):
     assert not module.config.gated_linear_unit and not module.config.moe_apply_probs_on_input
     outputs = []
     splits = counts.tolist()
+    assert hidden.ndim == 2 and probs.ndim == 1 and sum(splits) == hidden.shape[0] == probs.shape[0]
     for expert, (expert_input, expert_probs) in enumerate(
         zip(torch.split(hidden, splits), torch.split(probs, splits))
     ):
@@ -1770,13 +1718,21 @@ def _instrument_scenario_runtime(env, scenario, runtime):
                     actual = _output[0].float()
                     reference = _fp8_expert_reference(_module, inputs)
                     assert torch.isfinite(actual).all() and torch.isfinite(reference).all()
-                    relative_l2 = torch.linalg.vector_norm(
-                        actual - reference
-                    ) / torch.linalg.vector_norm(reference)
-                    cosine = torch.nn.functional.cosine_similarity(
-                        actual.flatten(), reference.flatten(), dim=0
+                    error_norm = torch.linalg.vector_norm(actual - reference)
+                    reference_norm = torch.linalg.vector_norm(reference)
+                    assert reference_norm != 0 or error_norm == 0
+                    relative_l2 = error_norm / reference_norm if reference_norm else error_norm
+                    cosine = (
+                        actual.new_tensor(1.0)
+                        if not reference_norm
+                        else (torch.cosine_similarity(actual.flatten(), reference.flatten(), dim=0))
                     )
                     runtime["fp8-expert-reference"] += 1
+                    runtime["fp8-reference-max-relative-l2"] = max(
+                        runtime["fp8-reference-max-relative-l2"], relative_l2.item()
+                    )
+                    key = "fp8-reference-min-cosine"
+                    runtime[key] = min(runtime[key] or 1.0, cosine.item())
                     assert relative_l2 <= 0.075 and cosine >= 0.997, (
                         relative_l2.item(),
                         cosine.item(),
@@ -2308,6 +2264,12 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         if "fp8-reference" in signals:
             assert runtime["fp8-expert-reference"] > 0
             assert runtime["routing-oracle"] > 0
+            keys = (
+                "fp8-expert-reference",
+                "fp8-reference-max-relative-l2",
+                "fp8-reference-min-cosine",
+            )
+            print("FP8_EXPERT_REFERENCE", {key: runtime[key] for key in keys})
         if "fused-rope" in signals:
             assert context.use_flashinfer_fused_rope
             assert model_config.hidden_size // model_config.num_attention_heads == 64

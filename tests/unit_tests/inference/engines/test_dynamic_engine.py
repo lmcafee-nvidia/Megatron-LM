@@ -1298,10 +1298,10 @@ class DynamicInferenceEngineTestBase:
                 **(
                     {
                         "q_lora_rank": 64,
-                        "kv_lora_rank": 64,
-                        "qk_head_dim": 32,
-                        "qk_pos_emb_head_dim": 32,
-                        "v_head_dim": 64,
+                        "kv_lora_rank": 512,
+                        "qk_head_dim": 128,
+                        "qk_pos_emb_head_dim": 64,
+                        "v_head_dim": 128,
                         "rope_type": "rope",
                         "cache_mla_latents": True,
                     }

@@ -3051,11 +3051,11 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         context = engine.context
         allocator = context.kv_block_allocator
         engine.controller.tokenizer.detokenize = lambda tokens, **_: f"tok_{tokens[0]}"
+        model = engine.controller.inference_wrapped_model.model
         if case["feature"] == "fused-rope":
             # The shared test model is CPU-initialized, while FlashInfer requires
             # its cos/sin cache on CUDA. Establish that kernel precondition here;
             # lazy cache migration is owned by the separate fused-RoPE fix.
-            model = engine.controller.inference_wrapped_model.model
             model.rotary_pos_emb.inv_freq = model.rotary_pos_emb.inv_freq.cuda()
             model.rotary_pos_emb_cache.clear()
             assert model.config.hidden_size // model.config.num_attention_heads == 64

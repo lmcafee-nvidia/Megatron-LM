@@ -148,19 +148,18 @@ def test_flashinfer_bf16_gelu_layer_matches_training_reference(activation_func, 
         config = _make_bounded_mxfp8_config(
             fp8=None,
             fp8_param=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
             activation_func=activation_func,
             inference_flashinfer_mxfp8_token_capacity=None,
             inference_moe_token_dispatcher_type="nccl",
             expert_model_parallel_size=1,
             moe_router_topk=1,
-            moe_router_pre_softmax=True,
             moe_router_score_function="softmax",
-            moe_router_enable_expert_bias=False,
-            moe_aux_loss_coeff=0.0,
+            moe_router_pre_softmax=True,
         )
         InferenceAllGatherDispatcherBase.allocate_valid_tokens_tensor()
         layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
-        assert layer.experts._mcore_activation_type is None
 
         flashinfer_calls = []
         original_flashinfer = layer.experts._flashinfer_forward
@@ -170,16 +169,23 @@ def test_flashinfer_bf16_gelu_layer_matches_training_reference(activation_func, 
             return original_flashinfer(hidden, routing_map, probs)
 
         layer.experts._flashinfer_forward = tracked_flashinfer
-        hidden = torch.randn(7, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        hidden = torch.randn(64, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16)
         reference, _ = layer(hidden.clone())
         with InferenceMode.active():
             output, _ = layer(hidden.clone())
-
+        assert layer.experts._mcore_activation_type is None
+        assert torch.isfinite(output).all() and torch.isfinite(reference).all()
         assert flashinfer_calls == [(hidden.shape[0], hidden.shape[0])]
-        error = (output.float() - reference.float()).abs()
+        reference_float = reference.float()
+        error = (output.float() - reference_float).abs()
+        reference_norm, reference_scale = reference_float.norm(), reference_float.abs().max()
+        assert reference_scale > 0 or not error.any()
+        relative_l2 = error.norm().div(reference_norm) if reference_norm else error.norm()
+        relative_linf = error.max().div(reference_scale) if reference_scale else error.max()
         record_property("max_abs_error", error.max().item())
-        record_property("relative_l2_error", error.norm().div(reference.float().norm()).item())
-        torch.testing.assert_close(output, reference, atol=5e-2, rtol=5e-2)
+        record_property("relative_l2_error", relative_l2.item())
+        record_property("relative_linf_error", relative_linf.item())
+        assert max(relative_l2, relative_linf) <= 3 * 2**-8, (relative_l2, relative_linf)
     finally:
         Utils.destroy_model_parallel()
 

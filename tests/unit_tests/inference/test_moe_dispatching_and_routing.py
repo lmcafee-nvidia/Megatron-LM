@@ -877,7 +877,8 @@ class TestNVLSAllGatherVDispatcher:
         if dispatcher_type == "nvls" and Utils.world_size & (Utils.world_size - 1):
             pytest.skip("NVLS Triton symmetric-memory barrier requires power-of-two EP size.")
         if (
-            inference_grouped_gemm_backend == "torch"
+            dispatcher_type == "nvls"
+            and inference_grouped_gemm_backend == "torch"
             and not mxfp8_swiglu
             and not HAVE_DEEPGEMM_BF16
         ):
@@ -922,8 +923,6 @@ class TestNVLSAllGatherVDispatcher:
             moe_shared_expert_intermediate_size=64 if shared_expert_overlap else None,
             moe_shared_expert_overlap=shared_expert_overlap,
             activation_func_tanh_clamp_scale=activation_clamp_scale,
-            # Match the fused inference op; the unfused training form rounds the square
-            # (and clamp) to BF16 one operation earlier.
             use_fused_weighted_squared_relu=True,
             gated_linear_unit=use_swiglu,
             activation_func=(torch.nn.functional.silu if use_swiglu else squared_relu),
@@ -984,6 +983,23 @@ class TestNVLSAllGatherVDispatcher:
         else:
             layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
 
+        routes = []
+
+        def record_route(router, _inputs, output):
+            probs, routing = output
+            if routing.dtype == torch.bool:
+                dense_probs = probs.reshape(-1, router.num_experts)
+                dense_map = routing.reshape_as(dense_probs)
+            else:
+                routing = routing.reshape(-1, router.topk).long()
+                probs = probs.reshape_as(routing)
+                shape = (routing.shape[0], router.num_experts)
+                dense_probs = probs.new_zeros(shape).scatter(1, routing, probs)
+                dense_map = dense_probs.new_zeros(shape, dtype=torch.bool).scatter(1, routing, True)
+            routes.append((dense_probs.detach().clone(), dense_map.detach().clone()))
+
+        routers = (training_layer.router, layer.router) if mxfp8_swiglu else (layer.router,)
+        route_handles = [router.register_forward_hook(record_route) for router in routers]
         evidence = None
         original_expert_forward = None
         original_mcore_forward = None
@@ -1091,9 +1107,8 @@ class TestNVLSAllGatherVDispatcher:
             hidden_states = torch.randn(
                 local_tokens, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16
             )
-        # Non-invariant vLLM/TE accumulation differed by at most 1.22e-4 on H100 and GB200.
         backend = "te_native" if mxfp8_swiglu or inference_grouped_gemm_backend == "vllm" else None
-        synchronous_inference_output, atol = None, 0 if config.batch_invariant_mode else 2e-4
+        synchronous_inference_output = None
         try:
             with torch.no_grad(), set_batch_invariant_mode(config.batch_invariant_mode, backend):
                 if mxfp8_swiglu:
@@ -1116,6 +1131,8 @@ class TestNVLSAllGatherVDispatcher:
                     with InferenceMode.active():
                         inference_output, _ = layer(hidden_states.clone())
         finally:
+            for handle in route_handles:
+                handle.remove()
             if collect_inference_evidence:
                 layer.experts.forward = original_expert_forward
                 layer.experts._mcore_fused_moe_forward = original_mcore_forward
@@ -1124,8 +1141,20 @@ class TestNVLSAllGatherVDispatcher:
                     layer.shared_experts.forward = original_shared_forward
                 dispatcher.token_dispatch = original_token_dispatch
                 dispatcher.token_combine = original_token_combine
-
-        torch.testing.assert_close(inference_output, training_output, atol=atol, rtol=0)
+        assert len(routes) == 2 + int(shared_expert_overlap)
+        route_rtol = 8 * torch.finfo(torch.float32).eps * (not config.batch_invariant_mode)
+        for probs, routing_map in routes[1:]:
+            torch.testing.assert_close(probs, routes[0][0], atol=0, rtol=route_rtol)
+            assert torch.equal(routing_map, routes[0][1])
+        assert torch.isfinite(training_output).all() and torch.isfinite(inference_output).all()
+        if config.batch_invariant_mode:
+            torch.testing.assert_close(inference_output, training_output, atol=0, rtol=0)
+        else:
+            lower = torch.nextafter(training_output, torch.full_like(training_output, -torch.inf))
+            upper = torch.nextafter(training_output, torch.full_like(training_output, torch.inf))
+            assert torch.all((lower <= inference_output) & (inference_output <= upper)), (
+                inference_output.float().sub(training_output.float()).abs().max().item()
+            )
         if synchronous_inference_output is not None:
             torch.testing.assert_close(
                 inference_output, synchronous_inference_output, atol=0, rtol=0
@@ -1388,16 +1417,16 @@ class TestNVLSAllGatherVDispatcher:
         assert evidence["combine"][0]["local_output_rows"] == rank
 
     @pytest.mark.parametrize(
-        "dispatcher_type,base_local_tokens",
-        [("nvls", 0), ("nccl", 0), ("nccl", 1)],
-        ids=["nvls-empty", "nccl-empty", "nccl-positive"],
+        ("backend", "dispatcher_type", "base_local_tokens"),
+        [("vllm", "nvls", 0), ("vllm", "nccl", 0), ("vllm", "nccl", 1), ("torch", "nccl", 0)],
+        ids=["nvls-empty", "nccl-empty", "nccl-positive", "mcore-nccl-empty"],
     )
-    def test_vllm_moe_with_variable_ep_work(self, dispatcher_type, base_local_tokens):
+    def test_moe_with_variable_ep_work(self, backend, dispatcher_type, base_local_tokens):
         if Utils.world_size < 2:
             pytest.skip("Variable-work expert parallelism requires at least two ranks.")
 
         evidence = self.test_batch_invariant_moe_matches_training(
-            "vllm",
+            backend,
             None,
             False,
             False,
@@ -1421,7 +1450,7 @@ class TestNVLSAllGatherVDispatcher:
         assert dispatch["dispatched_rows"] >= dispatch["valid_rows"]
         assert dispatch["dispatched_route_rows"] == dispatch["dispatched_rows"]
         assert len(evidence["expert"]) == 1
-        assert evidence["expert_backend"] == ["vllm"]
+        assert evidence["expert_backend"] == ["mcore" if backend == "torch" else "vllm"]
         assert evidence["expert"][0]["input_rows"] >= all_counts.sum().item()
         assert evidence["expert"][0]["route_rows"] >= all_counts.sum().item()
         assert evidence["combine"][0]["local_output_rows"] == expected_local_rows
