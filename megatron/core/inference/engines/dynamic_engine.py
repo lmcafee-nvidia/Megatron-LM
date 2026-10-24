@@ -1290,10 +1290,12 @@ class DynamicInferenceEngine(AbstractEngine):
         Note that this method must be called on all ranks, as it uses blocking torch broadcasts.
 
         The setup involves two primary roles within each data-parallel group:
-        1.  **MP Coordinator (TP_rank=0, PP_rank=0)**: This rank connects directly
+        1.  **MP Coordinator (MP_rank=0)**: This rank connects directly
             to the central coordinator via a ZMQ `DEALER` socket. It receives
             requests and uses a ZMQ `PUB` (publisher) socket to broadcast them
-            to all other ranks within its model-parallel (MP) group.
+            to all other ranks within its model-parallel (MP) group. For expert
+            parallel models, the MP group includes the EP axis so every expert
+            rank executes the same request.
         2.  **MP Workers (all other ranks)**: These ranks use ZMQ `SUB` (subscriber)
             sockets to listen for requests broadcast by their local MP Coordinator.
 
@@ -1340,22 +1342,20 @@ class DynamicInferenceEngine(AbstractEngine):
         self.zmq_sockets = []  # keep track of all sockets created by this engine
 
         # Get world info.
-        dp_group = self.pg_collection.dp
+        expert_parallel = get_pg_size(self.pg_collection.ep) > 1
+        dp_group = self.pg_collection.expt_dp if expert_parallel else self.pg_collection.dp
         dp_src = get_pg_src_rank(dp_group)
-        dp_size = get_pg_size(self.pg_collection.dp)
-        dp_rank = get_pg_rank(self.pg_collection.dp)
+        dp_size = get_pg_size(dp_group)
+        dp_rank = get_pg_rank(dp_group)
 
-        mp_group = self.pg_collection.mp
+        mp_group = self.pg_collection.tp_ep_pp if expert_parallel else self.pg_collection.mp
         mp_src = get_pg_src_rank(mp_group)
         mp_size = get_pg_size(mp_group)
         mp_rank = get_pg_rank(mp_group)
         dp_replica_mp_request_broadcast = RankedPubSub(
             b"DynamicInferenceEngine.mp_request_broadcast:"
         )
-        tp_rank = get_pg_rank(self.pg_collection.tp)
-        pp_rank = get_pg_rank(self.pg_collection.pp)
-
-        self.is_mp_coordinator = tp_rank == 0 and pp_rank == 0
+        self.is_mp_coordinator = mp_rank == 0
         self.is_dp_coordinator = (dp_rank == 0) and self.is_mp_coordinator
 
         local_ip = hostname or socket.gethostname()
