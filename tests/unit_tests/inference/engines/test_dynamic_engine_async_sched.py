@@ -1654,8 +1654,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             for key in watched_counters:
                 if runtime[key] > before[key]:
                     counter_steps.setdefault(key, set()).add(step_id)
-            if runtime.pop("resumed-step-pending", 0):
-                counter_steps.setdefault("suspend-resume", set()).add(step_id)
             if env.engine._spec_steps > spec_steps_before:
                 counter_steps.setdefault("mtp", set()).add(step_id)
             if env.engine._prefill_tokens_skipped > prefix_skipped_before:
@@ -1680,6 +1678,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                         request = env.engine.get_request(request_id)
                         if request.status not in (Status.COMPLETED, Status.FAILED):
                             runtime["streaming-live-request-ids"].add(request_id)
+                            if request_id in runtime.get("suspend-resume-request-ids", ()):
+                                runtime["suspend-resume-streamed-request-ids"].add(request_id)
                         if request.sampling_params.return_log_probs:
                             assert len(partial["new_tokens"]) == len(partial["new_log_probs"])
                             assert len(partial["new_tokens"]) == len(partial["new_top_n_logprobs"])
@@ -1717,6 +1717,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             )
             step()
             if wave_idx == 0 and "suspend-resume" in scenario.signals:
+                runtime["suspend-resume-request-ids"] = set(env.engine.requests)
                 memory_ptr = env.engine.context.memory_buffer.data_ptr()
                 pending_before_suspend = env.engine.controller._async_sched_forward.is_valid
                 runtime["pending-before-suspend"] += int(pending_before_suspend)
@@ -1736,7 +1737,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     env.engine.controller._async_sched_forward.is_valid
                 )
                 runtime["suspend-resume"] += 1
-                runtime["resumed-step-pending"] = 1
                 runtime["static-pointer-preserved"] += int(
                     env.engine.context.memory_buffer.data_ptr() == memory_ptr
                 )
@@ -1764,7 +1764,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             if "prefix-hit" in scenario.signals:
                 assert partial_steps & runtime["streaming-counter-steps"]["prefix-hit"]
             if "suspend-resume" in scenario.signals:
-                assert partial_steps & runtime["streaming-counter-steps"]["suspend-resume"]
+                assert runtime["suspend-resume-streamed-request-ids"]
         return env, runtime
 
     @staticmethod
