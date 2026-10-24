@@ -138,6 +138,15 @@ def _protocol_adapter(mixin_cls, *, stop_token_ids=None, ignore_eos=False):
     return adapter
 
 
+def _reply(tokens, scores, reason, prompt=None):
+    return SimpleNamespace(
+        prompt_tokens=prompt,
+        generated_tokens=tokens,
+        generated_log_probs=scores,
+        finish_reason=reason,
+    )
+
+
 @pytest.mark.internal
 def test_native_adapter_preserves_stop_tokens_and_finish_reason():
     BatchedDataDict, mixin_cls = _load_nemo_rl_adapter()
@@ -150,20 +159,7 @@ def test_native_adapter_preserves_stop_tokens_and_finish_reason():
             "input_lengths": torch.tensor([2, 1], dtype=torch.long),
         }
     )
-    replies = [
-        SimpleNamespace(
-            prompt_tokens=None,
-            generated_tokens=[7, 8, 9],
-            generated_log_probs=[-0.7, -0.8, -0.9],
-            finish_reason="length",
-        ),
-        SimpleNamespace(
-            prompt_tokens=None,
-            generated_tokens=[17],
-            generated_log_probs=[-0.2],
-            finish_reason="stop",
-        ),
-    ]
+    replies = [_reply([7, 8, 9], [-0.7, -0.8, -0.9], "length"), _reply([17], [-0.2], "stop")]
     output = adapter._parse_result_to_batched_data_dict(data, replies)
     assert output["truncated"].tolist() == [True, False]
 
@@ -172,24 +168,8 @@ def test_native_adapter_preserves_stop_tokens_and_finish_reason():
 @pytest.mark.parametrize(
     ("reply", "message"),
     [
-        (
-            SimpleNamespace(
-                prompt_tokens=[8, 8],
-                generated_tokens=[7],
-                generated_log_probs=[-0.7],
-                finish_reason="stop",
-            ),
-            "prompt tokens do not match",
-        ),
-        (
-            SimpleNamespace(
-                prompt_tokens=None,
-                generated_tokens=[7, 8],
-                generated_log_probs=[-0.7],
-                finish_reason="length",
-            ),
-            "generated token/logprob lengths do not match",
-        ),
+        (_reply([7], [-0.7], "stop", [8, 8]), "prompt tokens do not match"),
+        (_reply([7, 8], [-0.7], "length"), "generated token/logprob lengths do not match"),
     ],
     ids=["prompt-identity", "score-alignment"],
 )
@@ -202,7 +182,6 @@ def test_native_adapter_rejects_misaligned_reply(reply, message):
             "input_lengths": torch.tensor([2], dtype=torch.long),
         }
     )
-
     with pytest.raises(RuntimeError, match=message):
         adapter._parse_result_to_batched_data_dict(data, [reply])
 
@@ -218,10 +197,7 @@ def test_native_adapter_rejects_reply_count_mismatch(result_count):
             "input_lengths": torch.tensor([2], dtype=torch.long),
         }
     )
-    reply = SimpleNamespace(
-        prompt_tokens=None, generated_tokens=[7], generated_log_probs=[-0.7], finish_reason="stop"
-    )
-
+    reply = _reply([7], [-0.7], "stop")
     with pytest.raises(RuntimeError, match="reply count does not match"):
         adapter._parse_result_to_batched_data_dict(data, [reply] * result_count)
 
@@ -466,12 +442,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         assert vision_calls == [modality]
         assert torch.equal(direct_request.image_embeddings, adapter_request.image_embeddings)
         assert (adapter_token, adapter_score) == (direct_token, direct_score)
-        reply = SimpleNamespace(
-            prompt_tokens=adapter_request.prompt_tokens,
-            generated_tokens=[adapter_token],
-            generated_log_probs=[adapter_score],
-            finish_reason="length",
-        )
+        reply = _reply([adapter_token], [adapter_score], "length", adapter_request.prompt_tokens)
         output = adapter._parse_result_to_batched_data_dict(data, [reply])
         assert output["output_ids"][0, len(prompt)].item() == direct_token
         assert output["logprobs"][0, len(prompt)].item() == direct_score
@@ -535,6 +506,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             {"mla": True, "context_block_size_tokens": 64, "position_embedding_type": "rope"},
             {"adapter_sampling": {"temperature": 0.73, "top_k": 1, "top_p": 0.91}},
             {"logprobs_mode": "processed_logprobs"},
+            dict(hidden_size=256, position_embedding_type="rope", use_flashinfer_fused_rope=True),
             {"position_embedding_type": "rope", "use_flashinfer_fused_rope": True},
         ],
         ids=[
@@ -556,9 +528,10 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             "non-greedy-parameters",
             "processed-logprobs",
             "flashinfer-fused-rope",
+            "flashinfer-fused-rope-small-head-fallback",
         ],
     )
-    async def test_direct_and_real_adapter_greedy_outputs_match(self, feature_config):
+    async def test_direct_and_real_adapter_greedy_outputs_match(self, feature_config, monkeypatch):
         BatchedDataDict, mixin_cls = _load_nemo_rl_adapter()
         stresses_chunking = feature_config.get("enable_chunked_prefill", False)
         stresses_prefix = feature_config.get("enable_prefix_caching", False)
@@ -585,7 +558,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             num_gap_steps=0,
             sampling_backend="flashinfer",
             async_sched_mode=AsyncScheduleMode.ASYNC,
-            flash_attention_version=4 if uses_mla else 2,
+            flash_attention_version=None if uses_mla else 2,
             return_log_probs=True,
             skip_prompt_log_probs=True,
             logprobs_mode=feature_config.get("logprobs_mode", "raw_logprobs"),
@@ -631,7 +604,10 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
                     lambda num_experts=None: ModuleSpec(
                         module=TransformerLayer,
                         submodules=get_gpt_layer_local_submodules(
-                            num_experts=num_experts, qk_layernorm=True, multi_latent_attention=True
+                            num_experts=num_experts,
+                            qk_layernorm=True,
+                            multi_latent_attention=True,
+                            normalization="RMSNorm",
                         ),
                     ),
                 ),
@@ -654,6 +630,8 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             "chunked_prefill_request_ids": [],
             "cuda_graph_request_ids": [],
             "mtp_request_ids": [],
+            "flash_mla_request_ids": [],
+            "fused_rope_request_ids": [],
         }
 
         def active_request_ids():
@@ -690,6 +668,22 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             return original_sample_kernel(*args, **kwargs)
 
         sampler.sample_kernel = traced_sample_kernel
+        if feature_config.get("use_flashinfer_fused_rope"):
+            original_fused_rope = engine.context.apply_fused_qk_rotary_emb
+
+            def traced_fused_rope(*args, **kwargs):
+                witness["fused_rope_request_ids"].append(active_request_ids())
+                return original_fused_rope(*args, **kwargs)
+
+            engine.context.apply_fused_qk_rotary_emb = traced_fused_rope
+        if uses_mla:
+            original_flash_mla = attention_module.flash_mla_with_kvcache
+
+            def traced_flash_mla(*args, **kwargs):
+                witness["flash_mla_request_ids"].append(active_request_ids())
+                return original_flash_mla(*args, **kwargs)
+
+            monkeypatch.setattr(attention_module, "flash_mla_with_kvcache", traced_flash_mla)
         if feature_config.get("num_speculative_tokens", 0):
             original_mtp_step = engine.controller._run_async_sched_sample_mtp
 
@@ -730,6 +724,8 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             )
         engine._prefill_tokens_skipped = 0
         witness["mtp_request_ids"].clear()
+        witness["flash_mla_request_ids"].clear()
+        witness["fused_rope_request_ids"].clear()
         original_schedule = engine.schedule_waiting_requests
 
         def traced_schedule():
@@ -868,6 +864,16 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
                 for request_id in step_request_ids
             }
             assert mtp_ids and mtp_ids <= adapter_ids
+        if uses_mla:
+            mla_ids = {
+                request_id for step in witness["flash_mla_request_ids"] for request_id in step
+            }
+            assert mla_ids and mla_ids <= adapter_ids
+        if feature_config.get("use_flashinfer_fused_rope"):
+            rope_ids = {
+                request_id for step in witness["fused_rope_request_ids"] for request_id in step
+            }
+            assert rope_ids and rope_ids <= adapter_ids
         if mixer_name is not None:
             assert mixer_hooks and mixer_calls
         for hook in mixer_hooks:
@@ -1139,7 +1145,6 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         assert eos_replies[0].finish_reason == "stop"
         assert eos_output["generation_lengths"].tolist() == [1]
         assert eos_output["truncated"].tolist() == [False]
-
         length_replies, length_output = await run_adapter_case(
             selected_prompts=prompts[:1], ignore_eos=True, eod=first_tokens[0], first_request_id=740
         )
@@ -1296,7 +1301,6 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             )
             output = adapter._parse_result_to_batched_data_dict(data, replies)
             assert all(reply.policy_epoch == [(0, 0)] for reply in replies)
-
             for index, expected in enumerate(direct):
                 prompt_length = len(prompts[index])
                 assert output["output_ids"][
@@ -1308,7 +1312,6 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
                     rtol=0,
                     atol=0,
                 )
-
             weight_epoch = engine._weight_epoch
             adapter.dynamic_inference_engine = engine
             await adapter._sleep_engine()
@@ -1329,13 +1332,11 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             await adapter._wake_engine()
             assert engine.state == EngineState.RUNNING
             assert engine._weight_epoch == weight_epoch + 1
-
             for _ in range(100):
                 if engine._generation_epoch == 1:
                     break
                 await asyncio.sleep(0.01)
             assert engine._generation_epoch == 1
-
             resumed_replies = await asyncio.wait_for(
                 adapter._generate_with_persistent_engine(lowered_prompts, media, params), timeout=30
             )
@@ -1350,7 +1351,6 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
                     rtol=0.05 if mxfp8 else 0,
                     atol=0.05 if mxfp8 else 0,
                 )
-
             spanning_params = [adapter._build_sampling_params(greedy=True, stop_words=None)]
             spanning_params[0].num_tokens_to_generate = 12
             spanning_task = asyncio.create_task(
