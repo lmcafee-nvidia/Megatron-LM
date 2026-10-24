@@ -941,7 +941,7 @@ _STREAMING_SIGNAL_COUNTERS = {
     "moe": "module-forward:moe",
     "nccl-dispatch": "nccl-token-dispatches",
     "parallel": "module-forward:parallel",
-    "etp": "module-forward:parallel",
+    "etp": "tp-column-partition-forwards",
     "processed-logprobs": "log-probs-kernel",
     "softmax-sink": "sink-correction-calls",
     "swa-all": "swa-kernel-calls",
