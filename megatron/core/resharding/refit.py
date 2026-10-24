@@ -332,9 +332,9 @@ def _setup_mxfp8_transform_on_plan(plan, target_model) -> None:
       2. Derives the converted parameter set from those buffers.
       3. Attaches an ``MXFP8ReshardTransform`` to ``plan.transform``.
 
-    Idempotent for one destination object. If an equivalent replacement model
-    reuses the plan, its persistent buffers replace the auto-created transform.
-    Explicit caller transforms are never replaced.
+    Idempotent per destination object. Equivalent replacement models can reuse
+    the plan, and returning to a previous target restores its persistent-buffer
+    transform. Explicit caller transforms are never replaced.
     """
     if target_model is None:
         return
@@ -345,6 +345,11 @@ def _setup_mxfp8_transform_on_plan(plan, target_model) -> None:
     if auto_target_ref is None and plan.transform is not None:
         return
     if auto_target_ref is not None and auto_target_ref() is core:
+        return
+    cached_transform = plan._auto_transforms.get(core)
+    if cached_transform is not None:
+        plan.transform = cached_transform
+        plan._auto_transform_target_ref = ref(core)
         return
     if not _needs_mxfp8_conversion(target_model):
         if auto_target_ref is not None:
@@ -371,6 +376,7 @@ def _setup_mxfp8_transform_on_plan(plan, target_model) -> None:
         buffer_key_prefix="decoder.",
         backend=backend,
     )
+    plan._auto_transforms[core] = plan.transform
     plan._auto_transform_target_ref = ref(core)
 
 

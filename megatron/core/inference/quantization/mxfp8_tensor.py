@@ -196,7 +196,12 @@ class MXFP8Tensor:
         ):
             mcore_mxfp8_quantize_into(value, self.data, self.scale)
         else:
-            quantized = MXFP8Tensor.from_bf16(value, backend=self.backend)
+            if self.backend == "flashinfer" and self.scale.ndim == 2:
+                quantized = MXFP8Tensor.from_bf16(
+                    value, backend=self.backend, scale_layout="linear"
+                )
+            else:
+                quantized = MXFP8Tensor.from_bf16(value, backend=self.backend)
             self.data.copy_(quantized.data)
             self.scale.view(torch.uint8).copy_(quantized.scale.view(torch.uint8))
         if self.dtype is None:
@@ -215,7 +220,14 @@ class MXFP8Tensor:
         return self.quantize_(value)
 
     @classmethod
-    def from_bf16(cls, x: torch.Tensor, group_size: int = 32, backend: MXFP8Backend = "flashinfer"):
+    def from_bf16(
+        cls,
+        x: torch.Tensor,
+        group_size: int = 32,
+        backend: MXFP8Backend = "flashinfer",
+        *,
+        scale_layout: Literal["swizzled", "linear"] = "swizzled",
+    ):
         """Quantize a floating-point CUDA tensor to MXFP8.
 
         The historical method name is retained for compatibility. The Triton
@@ -227,17 +239,30 @@ class MXFP8Tensor:
             group_size: MXFP8 group size (default 32).
             backend: 'triton' (fused quantize + swizzle Triton kernel) or
                      'flashinfer' (single fused FlashInfer CUDA kernel).
+            scale_layout: FlashInfer scale layout. ``linear`` retains the native
+                          logical ``[M, K / 32]`` layout; the default preserves
+                          the historical 1D 128x4-swizzled representation.
         """
         assert x.is_cuda and x.dim() == 2
         assert x.shape[-1] % group_size == 0
         if backend == "flashinfer":
             assert HAVE_FLASHINFER, "FlashInfer not available"
-            data, scale = flashinfer_mxfp8_quantize(x)
+            if scale_layout == "linear":
+                data, scale = flashinfer_mxfp8_quantize(x, is_sf_swizzled_layout=False)
+                scale = scale.view(x.shape[0], x.shape[1] // group_size)
+            elif scale_layout == "swizzled":
+                # Avoid passing the newer layout keyword on the default path so
+                # supported older FlashInfer releases retain compatibility.
+                data, scale = flashinfer_mxfp8_quantize(x)
+            else:
+                raise ValueError(f"Unknown MXFP8 scale layout: {scale_layout!r}.")
             if scale.dtype == torch.float8_e8m0fnu:
                 scale = scale.view(torch.uint8)
             elif scale.dtype != torch.uint8:
                 raise TypeError(f"FlashInfer MXFP8 scales must be uint8 bytes, got {scale.dtype}.")
         elif backend == "triton":
+            if scale_layout != "swizzled":
+                raise ValueError("The Triton MXFP8 backend supports only swizzled scales.")
             data, scale = mcore_mxfp8_quantize(x)
             scale = ensure_mxfp8_scale_dtype(scale)
         else:

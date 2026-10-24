@@ -106,9 +106,12 @@ class TestBatchInvariantMambaPrefixCaching:
         kv_cache_management_mode=KVCacheManagementMode.PERSIST,
         sampling_backend="torch",
         exercise_real_refit=True,
+        target_seed=321,
+        source_seed=654,
     ):
         model_parallel_cuda_manual_seed(321, inference_rng_tracker=True, force_reset_rng=True)
         torch.manual_seed(321)
+        speculative = exercise_real_refit and sampling_backend == "torch"
         cfg = TransformerConfig(
             num_layers=3,
             hidden_size=128,
@@ -130,6 +133,7 @@ class TestBatchInvariantMambaPrefixCaching:
             attention_backend=AttnBackend.flash,
             cuda_graph_impl="local" if graphs else "none",
             inference_rng_tracker=True,
+            mtp_num_layers=1 if speculative else None,
         )
 
         def build_model(seed):
@@ -139,7 +143,7 @@ class TestBatchInvariantMambaPrefixCaching:
                 HybridModel(
                     config=cfg,
                     hybrid_stack_spec=hybrid_stack_spec,
-                    hybrid_layer_pattern="M*-",
+                    hybrid_layer_pattern="M*-/*" if speculative else "M*-",
                     vocab_size=128,
                     max_sequence_length=1024,
                 )
@@ -147,8 +151,8 @@ class TestBatchInvariantMambaPrefixCaching:
                 .eval()
             )
 
-        target_core = build_model(321)
-        source_core = build_model(654) if exercise_real_refit else None
+        target_core = build_model(target_seed)
+        source_core = build_model(source_seed) if exercise_real_refit else None
         mamba_config = MambaInferenceStateConfig.from_model(target_core)
         assert mamba_config.ssm_states_dtype == torch.float32
         model = Float16Module(cfg, target_core).cuda().eval()
@@ -160,10 +164,11 @@ class TestBatchInvariantMambaPrefixCaching:
             source_model = Float16Module(cfg, source_core).cuda().eval()
             source_parameters = dict(source_model.named_parameters())
             assert source_parameters.keys() == target_parameters.keys()
-            assert any(
-                not torch.equal(source_parameters[name], target_parameters[name])
-                for name in source_parameters
-            )
+            if source_seed != target_seed:
+                assert any(
+                    not torch.equal(source_parameters[name], target_parameters[name])
+                    for name in source_parameters
+                )
             target_storage = {
                 name: parameter.data_ptr() for name, parameter in target_parameters.items()
             }
@@ -192,6 +197,7 @@ class TestBatchInvariantMambaPrefixCaching:
                 use_flashinfer_fused_rope=False,
                 unified_memory_level=0,
                 sampling_backend=sampling_backend,
+                num_speculative_tokens=int(speculative),
             ),
         )
         engine = DynamicInferenceEngine(
@@ -229,6 +235,7 @@ class TestBatchInvariantMambaPrefixCaching:
         post_refit_graph_steps = 0
         post_refit_chunked_steps = 0
         post_refit_sampling_start = None
+        post_refit_speculative_start = None
         torch_top_k = int(exercise_real_refit and sampling_backend == "torch")
         for wave, order in enumerate(([0, 1], [1, 0], [2], [3], [4], [5], [0])):
             if wave == 6:
@@ -240,7 +247,7 @@ class TestBatchInvariantMambaPrefixCaching:
                         5999,
                         [125] * 577,
                         SamplingParams(
-                            seed=99 if sampling_backend == "torch" else None,
+                            seed=None,
                             num_tokens_to_generate=8,
                             temperature=1.0,
                             # Torch top-k=1 is exact greedy sampling, so token identity
@@ -271,7 +278,7 @@ class TestBatchInvariantMambaPrefixCaching:
                         6000,
                         [126] * 577,
                         SamplingParams(
-                            seed=100 if sampling_backend == "torch" else None,
+                            seed=None,
                             num_tokens_to_generate=8,
                             temperature=1.0,
                             top_k=torch_top_k,
@@ -284,6 +291,7 @@ class TestBatchInvariantMambaPrefixCaching:
                     queued = engine.get_request(6000)
                     assert queued.finished_chunk_token_count == 0 and not queued.generated_tokens
                     old_salt = queued.block_hash_salt
+                    post_refit_speculative_start = int(engine._spec_tokens_proposed_per_pos.sum())
                     # Old cached states must not be reused after a weight update.
                     engine.suspend()
                     pending_survived_suspend = engine.controller._async_sched_forward.is_valid
@@ -348,7 +356,11 @@ class TestBatchInvariantMambaPrefixCaching:
                     wave * 10 + i + 1,
                     prompts[i],
                     SamplingParams(
-                        seed=100 + i if sampling_backend == "torch" else None,
+                        seed=(
+                            100 + i
+                            if sampling_backend == "torch" and not exercise_real_refit
+                            else None
+                        ),
                         num_tokens_to_generate=8,
                         temperature=1.0,
                         top_k=torch_top_k,
@@ -400,7 +412,8 @@ class TestBatchInvariantMambaPrefixCaching:
                 or (not math.isnan(before) and before != after)
                 for before, after in zip(before_log_probs, after_log_probs)
             )
-            assert before_tokens != after_tokens or finite_log_probs_differ
+            if source_seed != target_seed:
+                assert before_tokens != after_tokens or finite_log_probs_differ
         else:
             # FlashInfer owns one global Philox stream and intentionally does
             # not promise request-local seeded trajectories. Prove that its
@@ -413,9 +426,15 @@ class TestBatchInvariantMambaPrefixCaching:
                 assert len(tokens) == len(log_probs) == 8
                 assert all(0 <= token < 128 for token in tokens)
                 assert all(math.isfinite(float(log_prob)) for log_prob in log_probs)
-        if exercise_real_refit:
+        if speculative:
             assert len(outputs[5999][0]) == 8
             assert len(outputs[6000][0]) == 8
+            assert engine.num_speculative_tokens == 1
+            assert post_refit_speculative_start is not None
+            proposed = engine._spec_tokens_proposed_per_pos
+            accepted = engine._spec_tokens_accepted_per_pos
+            assert int(proposed.sum()) > post_refit_speculative_start
+            assert torch.all(accepted <= proposed)
         if prefix:
             assert engine._prefill_tokens_skipped > 0
         if graphs:
@@ -467,12 +486,31 @@ class TestBatchInvariantMambaPrefixCaching:
         monkeypatch.setenv("NVTE_FUSED_ATTN", "0")
         monkeypatch.setenv("NVTE_UNFUSED_ATTN", "0")
         with set_batch_invariant_mode(True, backend="te_native"):
-            self._run(
+            outputs = self._run(
                 prefix=True,
                 graphs=True,
                 chunked=chunked,
                 kv_cache_management_mode=kv_cache_management_mode,
             )
+            if kv_cache_management_mode == KVCacheManagementMode.PERSIST and not chunked:
+                fresh = self._run(
+                    prefix=True,
+                    graphs=True,
+                    chunked=False,
+                    kv_cache_management_mode=kv_cache_management_mode,
+                    target_seed=654,
+                    source_seed=654,
+                )
+                for request_id in (61, 6000):
+                    actual_tokens, actual_log_probs = outputs[request_id]
+                    fresh_tokens, fresh_log_probs = fresh[request_id]
+                    assert actual_tokens == fresh_tokens
+                    assert len(actual_log_probs) == len(fresh_log_probs)
+                    for actual, expected in zip(actual_log_probs, fresh_log_probs):
+                        if math.isnan(actual) or math.isnan(expected):
+                            assert math.isnan(actual) and math.isnan(expected)
+                        else:
+                            assert actual == expected
 
     @torch.inference_mode()
     def test_refit_executes_flashinfer_sampling(self, monkeypatch):

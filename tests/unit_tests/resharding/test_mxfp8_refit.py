@@ -55,10 +55,12 @@ class TestMXFP8ReshardTransform:
         from megatron.core.resharding.transforms import MXFP8ReshardTransform
 
         M, K = 64, 128
-        buf = MXFP8Tensor.from_bf16(torch.randn(M, K, dtype=torch.bfloat16, device="cuda"))
-
-        if buf.scale.ndim != 2:
-            pytest.skip("FlashInfer produced 1D swizzled scale; 2D-scale test not applicable")
+        try:
+            buf = MXFP8Tensor.from_bf16(
+                torch.randn(M, K, dtype=torch.bfloat16, device="cuda"), scale_layout="linear"
+            )
+        except TypeError:
+            pytest.skip("FlashInfer does not expose its native linear MXFP8 scale layout")
 
         t = MXFP8ReshardTransform(
             convertible_params={"decoder.weight"},
@@ -70,7 +72,7 @@ class TestMXFP8ReshardTransform:
         new_data = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
         t.finalize_recv("decoder.weight", (slice(None), slice(None)), [new_data])
 
-        expected = MXFP8Tensor.from_bf16(new_data)
+        expected = MXFP8Tensor.from_bf16(new_data, scale_layout="linear")
         assert torch.equal(buf.data, expected.data)
         assert torch.equal(buf.scale, expected.scale)
 
@@ -724,6 +726,85 @@ class TestMXFP8RefitIntegration:
             assert torch.equal(actual.data, expected.data)
             assert torch.equal(actual.scale, expected.scale)
 
+    def test_public_refit_native_linear_scales_preserve_graph_storage(self, request):
+        """A real NCCL refit updates native 2D scales and captured consumer output."""
+        Utils.initialize_model_parallel(1, 1)
+        request.addfinalizer(Utils.destroy_model_parallel)
+
+        class TinyModel(torch.nn.Module):
+            def __init__(self, seed):
+                super().__init__()
+                torch.manual_seed(seed)
+                self.decoder = torch.nn.Linear(
+                    128, 64, bias=False, device="cuda", dtype=torch.bfloat16
+                )
+                group = dist.group.WORLD
+                self.pg_collection = SimpleNamespace(
+                    tp=group,
+                    pp=group,
+                    ep=group,
+                    dp=group,
+                    expt_tp=group,
+                    gtp_remat=None,
+                    expt_gtp_remat=None,
+                )
+                self.config = SimpleNamespace(num_moe_experts=None)
+
+            def forward(self, inputs):
+                weight = self.decoder.weight
+                scale_bits = weight.scale.to(torch.int32) << 23
+                scales = scale_bits.view(torch.float32).repeat_interleave(32, dim=1)
+                dequantized = weight.data.float() * scales
+                return torch.matmul(inputs.float(), dequantized.t()).to(torch.bfloat16)
+
+        source = TinyModel(111)
+        target = TinyModel(222)
+        try:
+            target_buffer = MXFP8Tensor.from_bf16(
+                target.decoder.weight.detach(), backend="flashinfer", scale_layout="linear"
+            )
+        except TypeError:
+            pytest.skip("FlashInfer does not expose its native linear MXFP8 scale layout")
+        assert target_buffer.scale.ndim == 2
+        clear_all_caches()
+        prepare_swap_model_weights([source], [target])
+        del target.decoder._parameters["weight"]
+        target.decoder.weight = target_buffer
+        transform = MXFP8ReshardTransform(
+            convertible_params={"decoder.weight"},
+            persistent_buffers={"weight": target_buffer},
+            buffer_key_prefix="decoder.",
+        )
+        source_weight = source.decoder.weight.detach().clone()
+        reference = MXFP8Tensor.from_bf16(
+            source_weight, backend="flashinfer", scale_layout="linear"
+        )
+        reference_model = TinyModel(333)
+        del reference_model.decoder._parameters["weight"]
+        reference_model.decoder.weight = reference
+        inputs = torch.linspace(-1, 1, 256, device="cuda", dtype=torch.bfloat16).reshape(2, 1, 128)
+        expected = reference_model(inputs)
+        pointers = (target_buffer.data.data_ptr(), target_buffer.scale.data_ptr())
+
+        target(inputs)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_output = target(inputs)
+        output_pointer = graph_output.data_ptr()
+        swap_model_weights([source], [target], refit_method="nccl", transform=transform)
+        torch.cuda.synchronize()
+
+        assert (target_buffer.data.data_ptr(), target_buffer.scale.data_ptr()) == pointers
+        assert torch.equal(target_buffer.data, reference.data)
+        assert torch.equal(target_buffer.scale, reference.scale)
+        graph.replay()
+        actual = graph_output.clone()
+        assert graph_output.data_ptr() == output_pointer
+        assert torch.equal(actual.argmax(dim=-1), expected.argmax(dim=-1))
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        clear_all_caches()
+
     def test_public_refit_repeats_and_rebinds_equivalent_destination(self, request):
         """A-B-C-A updates and a replacement target match fresh MXFP8 loads."""
         Utils.initialize_model_parallel(1, 1)
@@ -828,6 +909,18 @@ class TestMXFP8RefitIntegration:
         # The old target remains at A, proving the cached transform did not write through it.
         assert torch.equal(target_buffer.data, references[0].data)
         assert torch.equal(target_buffer.scale, references[0].scale)
+
+        # Return to the already-quantized first target. Its per-target transform
+        # must be restored rather than rediscovered from removed nn.Parameters.
+        swap_model_weights([sources[2]], [target], refit_method="nccl")
+        torch.cuda.synchronize()
+        assert (target_buffer.data.data_ptr(), target_buffer.scale.data_ptr()) == target_pointers
+        assert torch.equal(target_buffer.data, references[2].data)
+        assert torch.equal(target_buffer.scale, references[2].scale)
+        graph.replay()
+        torch.testing.assert_close(graph_output, expected_outputs[2], atol=0, rtol=0)
+        assert torch.equal(replacement_buffer.data, references[1].data)
+        assert torch.equal(replacement_buffer.scale, references[1].scale)
         clear_all_caches()
 
 
