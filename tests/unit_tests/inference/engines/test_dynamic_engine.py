@@ -1429,17 +1429,17 @@ class DynamicInferenceEngineTestBase:
                 ),
                 layernorm_zero_centered_gamma=is_gdn
                 and test_config.transformer_impl != "inference_optimized",
+                gated_linear_unit=is_gdn and test_config.use_moe_layer_spec,
                 activation_func=(
                     squared_relu
                     if test_config.transformer_impl == "inference_optimized"
                     and test_config.use_moe_layer_spec
+                    and not is_gdn
                     else (F.silu if is_gdn else F.gelu)
                 ),
                 is_hybrid_model=True,  # Needs to be set for correct out_proj init
             )
 
-            # When speculative tokens are configured, append MTP depth sections
-            # to the hybrid layer pattern so the model creates MTP blocks.
             mtp_suffix = ("/" + test_config.mtp_layer_pattern) * test_config.num_speculative_tokens
             recurrent_symbol = "G" if is_gdn else "M"
             feedforward_symbol = "E" if test_config.use_moe_layer_spec else "-"
