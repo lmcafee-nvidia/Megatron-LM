@@ -28,13 +28,19 @@ from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (
     VLMInferenceWrapper,
 )
+from megatron.core.inference.quantization.utils import quantize_params_to_mxfp8
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
+    get_gpt_layer_with_inference_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
 from megatron.core.models.multimodal.llava_model import LLaVAModel
-from megatron.core.resharding.refit import clear_all_caches
+from megatron.core.resharding.refit import (
+    clear_all_caches,
+    prepare_swap_model_weights,
+    swap_model_weights,
+)
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import AttnBackend
@@ -253,6 +259,31 @@ async def _drive_engine(engine, futures, witness=None):
         assert step_count < 100, "dynamic engine did not drain the adapter requests"
         await asyncio.sleep(0)
     return await asyncio.gather(*futures)
+
+
+def _build_inference_mxfp8_env(test_case, config, *, quantize=True):
+    """Mirror the production consumer's inference spec and persistent MXFP8 setup."""
+    config_class = dynamic_engine_tests.TransformerConfig
+
+    def build_mxfp8_config(**kwargs):
+        kwargs.update(fp8_recipe="mxfp8", fp8_param=True)
+        return config_class(**kwargs)
+
+    with (
+        mock.patch.object(dynamic_engine_tests, "TransformerConfig", build_mxfp8_config),
+        mock.patch.object(
+            dynamic_engine_tests,
+            "get_gpt_layer_with_transformer_engine_spec",
+            lambda num_experts=None: get_gpt_layer_with_inference_spec(num_experts=num_experts),
+        ),
+    ):
+        env = test_case._build_test_env(config)
+    model = env.engine.controller.inference_wrapped_model.model
+    assert any(type(module).__name__.startswith("Inference") for module in model.modules())
+    buffers = quantize_params_to_mxfp8(model.decoder, backend="triton") if quantize else None
+    if quantize:
+        assert buffers
+    return env
 
 
 class _InProcessInferenceClient:
@@ -559,9 +590,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         adapter_sampling = feature_config.get("adapter_sampling")
         uses_mla = feature_config.get("mla", False)
         uses_mxfp8 = feature_config.get("mxfp8", False)
-        if uses_mxfp8:
-            prompts = [list(range(1, 17)), list(range(17, 33))]
-        elif stresses_prefix:
+        if stresses_prefix:
             shared_prefix = [index % 89 + 1 for index in range(256)]
             prompts = [shared_prefix + [3, 5], shared_prefix + [7, 9, 11, 13]]
         else:
@@ -610,22 +639,13 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
                     dynamic_engine_tests,
                     "get_gpt_layer_with_transformer_engine_spec",
                     lambda num_experts=None: get_gpt_layer_with_transformer_engine_spec(
-                        num_experts=num_experts,
-                        multi_latent_attention=True,
-                        normalization="RMSNorm",
+                        num_experts=num_experts, multi_latent_attention=True
                     ),
                 ),
             ):
                 env = self._build_test_env(config)
         elif uses_mxfp8:
-            config_class = dynamic_engine_tests.TransformerConfig
-
-            def build_mxfp8_config(**kwargs):
-                kwargs["fp8_recipe"] = "mxfp8"
-                return config_class(**kwargs)
-
-            with mock.patch.object(dynamic_engine_tests, "TransformerConfig", build_mxfp8_config):
-                env = self._build_test_env(config)
+            env = _build_inference_mxfp8_env(self, config)
         else:
             env = self._build_test_env(config)
         engine = env.engine
@@ -1149,14 +1169,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             transformer_impl="inference_optimized" if mxfp8 else "local",
         )
         if mxfp8:
-            config_class = dynamic_engine_tests.TransformerConfig
-
-            def build_mxfp8_config(**kwargs):
-                kwargs["fp8_recipe"] = "mxfp8"
-                return config_class(**kwargs)
-
-            with mock.patch.object(dynamic_engine_tests, "TransformerConfig", build_mxfp8_config):
-                engine = self._build_test_env(config).engine
+            engine = _build_inference_mxfp8_env(self, config, quantize=False).engine
             assert (
                 "mxfp8"
                 in str(engine.controller.inference_wrapped_model.model.config.fp8_recipe).lower()
@@ -1166,6 +1179,22 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         engine.controller.tokenizer = _CoordinatorTokenizer()
         prompts = [[3, 5, 7, 9], [2, 4, 6, 8, 10]]
         generation_length = 3
+        refit_expected = None
+        refit_model = None
+        refit_states = None
+        if kv_cache_management_mode == "recompute":
+            source_config = copy.deepcopy(config)
+            source_config.fp8 = False
+            refit_engine = self._build_test_env(source_config).engine
+            refit_model = refit_engine.controller.inference_wrapped_model.model
+            base_state = {
+                name: value.detach().cpu().clone()
+                for name, value in refit_model.state_dict().items()
+            }
+            if mxfp8:
+                inference_model = engine.controller.inference_wrapped_model.model
+                prepare_swap_model_weights(refit_model, inference_model)
+                swap_model_weights(refit_model, inference_model, refit_method="nccl")
         direct_futures = [
             engine.add_request(
                 request_id,
@@ -1183,18 +1212,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             for request_id, prompt in enumerate(prompts, 300)
         ]
         direct = await _drive_engine(engine, direct_futures)
-        refit_expected = None
-        refit_model = None
-        refit_states = None
         if kv_cache_management_mode == "recompute":
-            source_config = copy.deepcopy(config)
-            source_config.fp8 = False
-            refit_engine = self._build_test_env(source_config).engine
-            refit_model = refit_engine.controller.inference_wrapped_model.model
-            base_state = {
-                name: value.detach().cpu().clone()
-                for name, value in refit_model.state_dict().items()
-            }
             refit_expected = []
             refit_states = []
             for version_seed in (901, 902):
