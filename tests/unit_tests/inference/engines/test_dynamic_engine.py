@@ -1084,8 +1084,8 @@ class DynamicEngineTestConfig:
     # a recurrent head has no KV to append, so the gate stays off. See
     # DynamicInferenceContext.enable_mtp_kv_cache.
     mtp_layer_pattern: str = "M"
-    # Required by transformer_config validation when transformer_impl == "inference_optimized"
-    # and num_moe_experts is set: fp32 routing avoids dtype conversions during decode.
+    # Required by transformer_config validation for inference-optimized MoE: fp32 routing
+    # avoids dtype conversions during decode.
     moe_router_dtype: Optional[str] = None
     position_embedding_type: Optional[str] = None
     use_flashinfer_fused_rope: Optional[bool] = None
@@ -1331,7 +1331,10 @@ class DynamicInferenceEngineTestBase:
                     else (
                         "fp32"
                         if test_config.transformer_impl == "inference_optimized"
-                        and test_config.num_moe_experts is not None
+                        and (
+                            test_config.num_moe_experts is not None
+                            or test_config.expert_model_parallel_size > 1
+                        )
                         else None
                     )
                 ),
@@ -1375,7 +1378,10 @@ class DynamicInferenceEngineTestBase:
                 activation_func=(
                     squared_relu
                     if test_config.transformer_impl == "inference_optimized"
-                    and test_config.num_moe_experts is not None
+                    and (
+                        test_config.num_moe_experts is not None
+                        or test_config.expert_model_parallel_size > 1
+                    )
                     else torch.nn.functional.gelu
                 ),
                 inference_moe_token_dispatcher_type=(
