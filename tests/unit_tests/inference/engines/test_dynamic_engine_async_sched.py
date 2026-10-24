@@ -1710,7 +1710,6 @@ def _instrument_scenario_runtime(env, scenario, runtime):
         if (
             "moe" in scenario.signals or "ep1-moe" in scenario.signals
         ) and class_name == "InferenceGroupedMLP":
-
             for kernel_name, method_name in (
                 ("flashinfer", "_flashinfer_forward"),
                 ("mcore", "_mcore_fused_moe_forward"),
@@ -2450,7 +2449,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert model_config.expert_model_parallel_size == 1
             expert_steps = optimized_moe_steps()
             if "latent-moe" in signals:
-                assert all(runtime[("latent-projection-step", step)] == 2 for step in expert_steps)
+                latent, expert = "latent-projection-step", "moe-expert-step"
+                assert all(runtime[latent, s] == 2 * runtime[expert, s] for s in expert_steps)
                 assert (
                     runtime[f"moe-expert-input-width:{model_config.moe_latent_size}"]
                     == runtime["moe-expert-forwards"]
