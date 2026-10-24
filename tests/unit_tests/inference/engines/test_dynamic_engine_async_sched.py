@@ -1610,6 +1610,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             runtime["streaming-counter-steps"] = {}
             runtime["streaming-live-request-ids"] = set()
             runtime["streaming-partial-steps"] = set()
+            runtime["suspend-resume-streamed-request-ids"] = set()
             runtime["streaming-token-history"] = {}
             _instrument_scenario_runtime(env, scenario, runtime)
             for request in env.requests:
