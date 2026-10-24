@@ -30,7 +30,6 @@ from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_w
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_local_spec,
     get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_spec,
 )
@@ -522,7 +521,12 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
                 "use_cuda_graphs_for_non_decode_steps": False,
             },
             {"num_speculative_tokens": 1, "mtp_use_repeated_layer": True},
-            {"mla": True, "context_block_size_tokens": 64, "position_embedding_type": "rope"},
+            {
+                "mla": True,
+                "transformer_impl": "transformer_engine",
+                "context_block_size_tokens": 64,
+                "position_embedding_type": "rope",
+            },
             {"adapter_sampling": {"temperature": 0.73, "top_k": 1, "top_p": 0.91}},
             {"logprobs_mode": "processed_logprobs"},
             {"position_embedding_type": "rope", "use_flashinfer_fused_rope": True},
@@ -604,8 +608,8 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
                 mock.patch.object(dynamic_engine_tests, "TransformerConfig", build_mla_config),
                 mock.patch.object(
                     dynamic_engine_tests,
-                    "get_gpt_layer_local_spec",
-                    lambda num_experts=None: get_gpt_layer_local_spec(
+                    "get_gpt_layer_with_transformer_engine_spec",
+                    lambda num_experts=None: get_gpt_layer_with_transformer_engine_spec(
                         num_experts=num_experts,
                         multi_latent_attention=True,
                         normalization="RMSNorm",
