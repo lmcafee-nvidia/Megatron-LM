@@ -3929,7 +3929,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
     @pytest.mark.internal
     @pytest.mark.skipif(
-        not torch.distributed.is_initialized() or torch.distributed.get_world_size() != 2,
+        int(os.environ.get("WORLD_SIZE", "1")) != 2,
         reason="real KV handoff witness requires exactly two distributed ranks",
     )
     @pytest.mark.skipif(
