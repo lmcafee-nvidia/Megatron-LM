@@ -556,7 +556,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         uses_mla = feature_config.get("mla", False)
         uses_mxfp8 = feature_config.get("mxfp8", False)
         if uses_mxfp8:
-            prompts = [[3, 5, 7, 9, 11, 13, 15, 17], [2, 4, 6, 8, 10, 12, 14, 16]]
+            prompts = [list(range(1, 17)), list(range(17, 33))]
         elif stresses_prefix:
             shared_prefix = [index % 89 + 1 for index in range(256)]
             prompts = [shared_prefix + [3, 5], shared_prefix + [7, 9, 11, 13]]
