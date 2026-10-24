@@ -390,6 +390,8 @@ class TestLifecycleGuards:
 
         sync_llm = _make_worker_instance(MegatronLLM)
         sync_llm._shutdown_called = True
+        sync_llm._shutdown_complete_future = concurrent.futures.Future()
+        sync_llm._shutdown_complete_future.set_result(None)
         sync_llm._loop_manager = MagicMock()
         sync_llm.wait_for_shutdown()
         sync_llm._loop_manager.run_sync.assert_not_called()

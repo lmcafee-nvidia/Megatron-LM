@@ -176,7 +176,7 @@ class MegatronLLM(_MegatronLLMBase):
             running_loop = None
         if self._use_coordinator:
             assert self._loop_manager is not None
-            if running_loop is self._loop_manager.loop:
+            if running_loop is getattr(self._loop_manager, "_loop", None):
                 raise RuntimeError("shutdown called from the background loop would deadlock")
         with self._async_shutdown_lock:
             shutdown_complete_future = self._begin_shutdown()
