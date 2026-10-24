@@ -228,8 +228,6 @@ def test_ready_handoff_uses_safe_no_overlap_admission_point():
 
     assert not engine._should_run_async_sched_overlap()
 
-    # Keep overlap enabled while the active batch is full; the normal lifecycle
-    # boundary will select no-overlap once capacity becomes available.
     engine.context.total_request_count = engine.context.max_requests
     assert engine._should_run_async_sched_overlap()
 
@@ -445,8 +443,6 @@ def test_get_decode_only_log_state(mode, decode_only, expected):
     assert _get_decode_only_log_state(mode, decode_only) == expected
 
 
-# Only list a pair when the harness below observes its production call/state
-# transition during both async phase shapes and checks parity or an exact invariant.
 @dataclass(frozen=True)
 class _AsyncPairScenario:
 
@@ -625,8 +621,6 @@ _ASYNC_PAIR_SCENARIOS = (
             {"return_log_probs": True, "top_n_logprobs": 5},
         ),
         signals=("full-logits", "logprobs", "top-n"),
-        # Different forward batch shapes may exchange a near-tied, non-selected
-        # final candidate; the harness still requires exact async-repeat top-N.
         exact_top_n=False,
     ),
     _pair_scenario(
@@ -700,8 +694,6 @@ _ASYNC_PAIR_SCENARIOS = (
             {"return_log_probs": True, "skip_prompt_log_probs": True, "top_n_logprobs": 4},
         ),
         signals=("cuda-graph", "logprobs", "metadata-compaction", "mtp", "top-n"),
-        # MTP changes the forward batch shape; near-tied non-selected alternatives
-        # may exchange the final top-N slot while selected-token parity remains exact.
         exact_top_n=False,
     ),
     _pair_scenario(
@@ -797,7 +789,6 @@ _ASYNC_PAIR_SCENARIOS = (
     ),
     _pair_scenario(
         "flashinfer-fused-rope",
-        # Width 64 is supported; width 16 crosses half-head boundaries in vectorized NeoX rotation.
         "kernel:flashinfer-fused-rope",
         config={
             "hidden_size": 256,
@@ -1064,8 +1055,6 @@ def _sampling_params_for_request(scenario, request_id, prompt_length):
     elif scenario.request_profile == "bos":
         kwargs["add_BOS"] = True
     elif scenario.request_profile == "termination":
-        # The probe run keeps termination disabled. The parity runs replace
-        # request 1's value with a token observed from that deterministic probe.
         kwargs["termination_id"] = -1
     return SamplingParams(**kwargs)
 
@@ -1860,7 +1849,19 @@ def _assert_request_parity(
         actual_routing = (
             None if request.routing_indices is None else request.routing_indices.tolist()
         )
-        assert actual_routing == reference["routing"]
+        expected_routing = reference["routing"]
+        if actual_routing is not None and expected_routing is not None and not exact_numerics:
+            # Compare routes only while both stochastic modes have the same input history.
+            shared_rows = len(actual_routing) - len(request.generated_tokens) + 1
+            for actual_token, expected_token in zip(
+                request.generated_tokens, reference["tokens"]
+            ):
+                if actual_token != expected_token:
+                    break
+                shared_rows += 1
+            actual_routing = actual_routing[:shared_rows]
+            expected_routing = expected_routing[:shared_rows]
+        assert actual_routing == expected_routing
         if compare_events:
             assert [event.type for event in request.events] == reference["events"]
 
