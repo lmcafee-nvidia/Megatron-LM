@@ -1427,7 +1427,8 @@ class DynamicInferenceEngineTestBase:
                     if is_gdn or test_config.transformer_impl == "inference_optimized"
                     else "LayerNorm"
                 ),
-                layernorm_zero_centered_gamma=is_gdn,
+                layernorm_zero_centered_gamma=is_gdn
+                and test_config.transformer_impl != "inference_optimized",
                 activation_func=(
                     squared_relu
                     if test_config.transformer_impl == "inference_optimized"
@@ -1437,7 +1438,6 @@ class DynamicInferenceEngineTestBase:
                 is_hybrid_model=True,  # Needs to be set for correct out_proj init
             )
 
-            # Hybrid model.
             # When speculative tokens are configured, append MTP depth sections
             # to the hybrid layer pattern so the model creates MTP blocks.
             mtp_suffix = ("/" + test_config.mtp_layer_pattern) * test_config.num_speculative_tokens
