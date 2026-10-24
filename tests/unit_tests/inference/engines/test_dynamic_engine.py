@@ -7669,6 +7669,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             model_provider="gpt",
         )
         env = self._build_test_env(test_config)
+        env.engine.controller.tokenizer.detokenize = lambda tokens, **kw: f"tok_{tokens[0]}"
 
         unwrapped_model = env.engine.controller.inference_wrapped_model.model
         runtime = Counter()
