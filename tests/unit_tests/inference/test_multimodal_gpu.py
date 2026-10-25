@@ -122,6 +122,14 @@ def _transformer_config(hidden_size, num_attention_heads, **kwargs):
     )
 
 
+def _configure_yarn(config):
+    for name, value in zip(
+        "rotary_scaling_factor original_max_position_embeddings beta_fast beta_slow mscale mscale_all_dim correction_range_round_to_int".split(),
+        (2.0, 64, 32.0, 1.0, 1.0, 0.0, True),
+    ):
+        setattr(config, f"yarn_{name}", value)
+
+
 def _build_model(
     modality,
     vision_model_type=None,
@@ -250,11 +258,7 @@ def _build_hybrid_model(ssm_mixer, with_mtp=False):
         **hybrid_mixer_kwargs(ssm_mixer),
     )
     language_config.language_model_type = "dummy"
-    for name, value in zip(
-        "rotary_scaling_factor original_max_position_embeddings beta_fast beta_slow mscale mscale_all_dim correction_range_round_to_int".split(),
-        (2.0, 64, 32.0, 1.0, 1.0, 0.0, True),
-    ):
-        setattr(language_config, f"yarn_{name}", value)
+    _configure_yarn(language_config)
     vision_config = _transformer_config(16, 2)
     vision_config.vision_model_type = "clip"
     projection_config = _transformer_config(256, 1, ffn_hidden_size=512)
@@ -360,6 +364,7 @@ def _build_te_parallel_model(modality):
         inference_sampling_seed=123,
     )
     language_config.language_model_type = "dummy"
+    _configure_yarn(language_config)
     vision_config = _transformer_config(16, 2)
     vision_config.vision_model_type = "clip" if modality == "image" else "radio"
     projection_config = _transformer_config(32, 1, ffn_hidden_size=64)
@@ -388,7 +393,8 @@ def _build_te_parallel_model(modality):
         image_token_index=-200,
         dynamic_resolution=(modality == "video"),
         class_token_len=0 if modality == "video" else None,
-        language_position_embedding_type="rope" if topology.endswith("cp") else "learned_absolute",
+        language_position_embedding_type=os.getenv("MCORE_MM_POSITION_TYPE")
+        or ("rope" if topology.endswith("cp") else "learned_absolute"),
     ).cuda()
     model.bfloat16()
     model.eval()
@@ -574,7 +580,7 @@ def _greedy_token(step, full_logits=False):
 
 
 def _same(first, first_step, first_finished, reuse, reuse_step, reuse_finished):
-    assert torch.equal(first["embeddings"], reuse["embeddings"])
+    assert first["mask"].equal(reuse["mask"]) and first["embeddings"].equal(reuse["embeddings"])
     assert torch.equal(first_step["embeddings"], reuse_step["embeddings"])
     assert torch.equal(first_step["logits"], reuse_step["logits"])
     assert first_finished.generated_tokens == reuse_finished.generated_tokens
@@ -583,8 +589,7 @@ def _same(first, first_step, first_finished, reuse, reuse_step, reuse_finished):
 def _assert_step(admission, step, finished):
     assert step["mask"].ge(0).sum().item() == 4
     assert torch.equal(step["embeddings"], admission["embeddings"])
-    assert step["logits"].shape == (1, 1, VOCAB_SIZE)
-    assert torch.isfinite(step["logits"]).all()
+    assert step["logits"].shape == (1, 1, VOCAB_SIZE) and torch.isfinite(step["logits"]).all()
     assert finished.generated_tokens == [_greedy_token(step)]
 
 
@@ -664,7 +669,7 @@ def _run_request(engine, request_id, media, trace, prompt=None, num_tokens=1):
     finished = []
     while engine.has_unfinished_requests():
         finished.extend(engine.step_modern()["finished_requests"])
-    assert len(finished) == 1
+    assert len(finished) == 1 and len(finished[0].generated_tokens) == num_tokens
     matching_steps = [step for step in trace if step["request_ids"] == [request_id]]
     matching_steps = [step for step in matching_steps if step["embeddings"] is not None]
     assert len(matching_steps) == 1
@@ -776,7 +781,6 @@ def test_real_encoder_cache_reuse_matches_uncached_and_separates_distinct_media(
             tensor, tensor_step, tensor_finished = _run_request(engine, 16, tensor_args, trace)
     assert encoder.call_count == (6 if modality == "video" else 2)
     assert first["key"] == reuse["key"] != distinct["key"]
-    assert torch.equal(first["mask"], reuse["mask"])
     _same(first, first_step, first_finished, reuse, reuse_step, reuse_finished)
     assert torch.equal(first_step["input_ids"], reuse_step["input_ids"])
     assert torch.equal(first_step["mask"], reuse_step["mask"])
@@ -792,7 +796,6 @@ def test_real_encoder_cache_reuse_matches_uncached_and_separates_distinct_media(
         assert raw_args["video_frame_indices"] == [[0, 3]] and raw_args["video_fps"] == [30.0]
         assert raw["key"] != tensor["key"]
         assert torch.equal(raw["tokens"], tensor["tokens"])
-        assert torch.equal(raw["mask"], tensor["mask"])
         _same(raw, raw_step, raw_finished, tensor, tensor_step, tensor_finished)
 
 
@@ -931,8 +934,7 @@ def test_nemotron_omni_real_pixel_shuffle_encoder_reuse_and_prompt_ownership(
         distinct, distinct_step, distinct_finished = _run_request(
             engine, 182, distinct_media, trace
         )
-    assert encoder.call_count == 2
-    assert model._pixel_shuffle
+    assert encoder.call_count == 2 and model._pixel_shuffle
     assert first["mask"].ge(0).sum().item() == expected_embeddings
     assert first["embeddings"].shape == (expected_embeddings, 1, model.config.hidden_size)
     assert first["mask"][first["mask"] >= 0].tolist() == list(range(expected_embeddings))
@@ -974,7 +976,6 @@ def test_multiple_videos_preexpanded_equivalence_and_real_cache_eviction(model_p
         )
     assert encoder.call_count == 4
     assert torch.equal(expanded["tokens"], preexpanded_prompt)
-    assert torch.equal(compact["mask"], expanded["mask"])
     assert torch.equal(
         compact["tokens"][compact["mask"] < 0], expanded["tokens"][expanded["mask"] < 0]
     )
@@ -1264,7 +1265,6 @@ def test_raw_image_matches_preprocessed_dynamic_input_on_real_model(model_parall
     assert raw["key"] != preprocessed["key"]
     assert raw["tokens"].tolist() == [5] + [IMAGE_TOKEN_ID] * 4 + [6]
     assert torch.equal(raw["tokens"], preprocessed["tokens"])
-    assert torch.equal(raw["mask"], preprocessed["mask"])
     _same(raw, raw_step, raw_finished, preprocessed, preprocessed_step, preprocessed_finished)
 
 
@@ -1363,8 +1363,7 @@ def test_real_media_executes_moe_router_with_configured_expert_topology(model_pa
     finally:
         for handle in handles:
             handle.remove()
-    assert encoder.call_count == 1
-    assert router_events
+    assert encoder.call_count == 1 and router_events
     cfg = model.config
     assert cfg.expert_model_parallel_size == parallel_state.get_expert_model_parallel_world_size()
     assert cfg.expert_tensor_parallel_size == parallel_state.get_expert_tensor_parallel_world_size()
@@ -1385,8 +1384,10 @@ def test_real_media_executes_configured_language_implementation_or_parallel_path
     builder = _build_hybrid_model if topology == "hybrid_cp" else _build_te_parallel_model
     model = builder("attention" if topology == "hybrid_cp" else modality)
     rotary_type = type(getattr(model.language_model, "rotary_pos_emb", None)).__name__
-    assert topology != "hybrid_cp" or rotary_type == "YarnRotaryEmbedding"
+    uses_yarn = topology == "hybrid_cp" or os.getenv("MCORE_MM_POSITION_TYPE") == "yarn"
+    assert not uses_yarn or rotary_type == "YarnRotaryEmbedding"
     record_property("position_embedding_type", rotary_type)
+    model.language_model.forward = mock.Mock(wraps=model.language_model.forward)
     prompt = [5, IMAGE_TOKEN_ID, 6, 7, 8] if modality == "video" else None
     if topology in ("cp", "cp_sp", "hybrid_cp"):
         reference_engine, _ = _build_engine(
@@ -1564,9 +1565,12 @@ def test_real_media_executes_configured_language_implementation_or_parallel_path
         torch.distributed.all_gather(rank_tokens, local_token, group=model.language_model.tp_group)
         assert all(torch.equal(token, local_token) for token in rank_tokens)
     elif topology in ("cp", "cp_sp", "hybrid_cp"):
+        assert not uses_yarn or all(
+            call.kwargs.get("context_parallel_input_is_replicated")
+            for call in model.language_model.forward.call_args_list
+        )
         reference_admission, reference_step, reference_finished = reference
         assert torch.equal(admission["tokens"], reference_admission["tokens"])
-        assert torch.equal(admission["mask"], reference_admission["mask"])
         _same(admission, step, finished, reference_admission, reference_step, reference_finished)
         cp_group = model.pg_collection.cp
         assert len(cp_events) == len(trace) == len(reference_trace)
@@ -1712,8 +1716,7 @@ def test_real_media_executes_attention_variant_and_reuses_exact_result(model_par
             patcher.stop()
         for handle in handles:
             handle.remove()
-    assert encoder.call_count == 1
-    assert companion_events
+    assert encoder.call_count == 1 and companion_events
     if variant == "mla_unfused":
         assert unfused_attention.linear_kv_up_proj_linear is original_unfused_projection
     if variant == "swa":
@@ -1746,10 +1749,9 @@ def test_real_media_prefill_replays_actual_cuda_graph_with_eager_parity(model_pa
     graph_trace = _install_forward_trace(graph_engine)
     with _encoder_patch(graph_wrapper) as graph_encoder:
         graphed, graph_step, graph_finished = _run_request(graph_engine, 131, media, graph_trace)
-    assert eager_encoder.call_count == graph_encoder.call_count == 1
-    assert not eager_step["graphed"] and graph_step["graphed"]
+    assert eager_encoder.call_count == graph_encoder.call_count == 1 and not eager_step["graphed"]
+    assert graph_step["graphed"]
     assert torch.equal(eager["tokens"], graphed["tokens"])
-    assert torch.equal(eager["mask"], graphed["mask"])
     _same(eager, eager_step, eager_finished, graphed, graph_step, graph_finished)
 
 
@@ -1784,8 +1786,7 @@ def test_real_media_prefill_and_mtp_draft_share_step_with_greedy_parity(model_pa
         while mtp_engine.has_unfinished_requests():
             mtp_finished.extend(mtp_engine.step_modern()["finished_requests"])
     assert baseline_encoder.call_count == mtp_encoder.call_count == 1
-    assert calls_after_media_prefill > 0
-    assert mtp_trace[0]["mask"].ge(0).sum().item() == 4
+    assert calls_after_media_prefill > 0 and mtp_trace[0]["mask"].ge(0).sum().item() == 4
     assert mtp_trace[0]["embeddings"].shape[0] == 4
     assert len(baseline_finished) == len(mtp_finished) == 1
     assert mtp_finished[0].generated_tokens == baseline_finished[0].generated_tokens
@@ -1818,8 +1819,7 @@ def test_real_media_flashinfer_samples_only_from_requested_top_k(model_parallel)
         finished = []
         while engine.has_unfinished_requests():
             finished.extend(engine.step_modern()["finished_requests"])
-    assert encoder.call_count == 1
-    assert support_checks and all(support_checks)
+    assert encoder.call_count == 1 and support_checks and all(support_checks)
     assert trace[0]["mask"].ge(0).sum().item() == 4
     assert len(finished) == 1
     assert len(finished[0].generated_tokens) == 3
