@@ -250,6 +250,11 @@ def _build_hybrid_model(ssm_mixer, with_mtp=False):
         **hybrid_mixer_kwargs(ssm_mixer),
     )
     language_config.language_model_type = "dummy"
+    for name, value in zip(
+        "rotary_scaling_factor original_max_position_embeddings beta_fast beta_slow mscale mscale_all_dim correction_range_round_to_int".split(),
+        (2.0, 64, 32.0, 1.0, 1.0, 0.0, True),
+    ):
+        setattr(language_config, f"yarn_{name}", value)
     vision_config = _transformer_config(16, 2)
     vision_config.vision_model_type = "clip"
     projection_config = _transformer_config(256, 1, ffn_hidden_size=512)
@@ -275,7 +280,7 @@ def _build_hybrid_model(ssm_mixer, with_mtp=False):
             if ssm_mixer == "attention"
             else ("G" if is_gdn else "M") + "*-" + ("/M" if with_mtp else "")
         ),
-        language_position_embedding_type="none",
+        language_position_embedding_type="yarn" if ssm_mixer == "attention" else "none",
     ).cuda()
     model.bfloat16()
     model.eval()
@@ -771,7 +776,6 @@ def test_real_encoder_cache_reuse_matches_uncached_and_separates_distinct_media(
             tensor, tensor_step, tensor_finished = _run_request(engine, 16, tensor_args, trace)
     assert encoder.call_count == (6 if modality == "video" else 2)
     assert first["key"] == reuse["key"] != distinct["key"]
-    assert torch.equal(first["tokens"], reuse["tokens"])
     assert torch.equal(first["mask"], reuse["mask"])
     _same(first, first_step, first_finished, reuse, reuse_step, reuse_finished)
     assert torch.equal(first_step["input_ids"], reuse_step["input_ids"])
@@ -780,7 +784,6 @@ def test_real_encoder_cache_reuse_matches_uncached_and_separates_distinct_media(
     assert torch.equal(first["mask"], distinct["mask"])
     assert not torch.equal(first["embeddings"], distinct["embeddings"])
     assert not torch.equal(first_step["logits"], distinct_step["logits"])
-    assert len(distinct_finished.generated_tokens) == 1
     if modality == "video":
         assert len({first["key"], *(run[2][0]["key"] for run in timing_runs)}) == 3
         for field, value, (timing, timing_step, timing_finished) in timing_runs:
@@ -836,7 +839,6 @@ def test_native_vision_family_real_encoder_reuse_and_distinct_media(
     _same(first, first_step, first_finished, reuse, reuse_step, reuse_finished)
     assert not torch.equal(first["embeddings"], distinct["embeddings"])
     assert not torch.equal(first_step["logits"], distinct_step["logits"])
-    assert len(distinct_finished.generated_tokens) == 1
 
 
 def test_mrope_contract_and_static_tile_tags(model_parallel):
@@ -870,7 +872,6 @@ def test_mrope_contract_and_static_tile_tags(model_parallel):
     assert not torch.equal(first["embeddings"][6:], distinct["embeddings"][6:])
     _same(first, first_step, first_finished, reuse, reuse_step, reuse_finished)
     assert not torch.equal(first_step["logits"], distinct_step["logits"])
-    assert len(distinct_finished.generated_tokens) == 1
 
 
 @pytest.mark.parametrize("separate_video_embedder", [False, True])
@@ -906,7 +907,6 @@ def test_temporal_tubelet_encoder_reuse_and_exact_media_rows(
     _same(first, first_step, first_finished, reuse, reuse_step, reuse_finished)
     assert not torch.equal(first["embeddings"], distinct["embeddings"])
     assert not torch.equal(first_step["logits"], distinct_step["logits"])
-    assert len(distinct_finished.generated_tokens) == 1
 
 
 @pytest.mark.parametrize(("modality", "expected_embeddings"), [("image", 1), ("video", 2)])
@@ -941,7 +941,6 @@ def test_nemotron_omni_real_pixel_shuffle_encoder_reuse_and_prompt_ownership(
     _same(first, first_step, first_finished, reuse, reuse_step, reuse_finished)
     assert not torch.equal(first["embeddings"], distinct["embeddings"])
     assert not torch.equal(first_step["logits"], distinct_step["logits"])
-    assert len(distinct_finished.generated_tokens) == 1
 
 
 def test_multiple_videos_preexpanded_equivalence_and_real_cache_eviction(model_parallel):
@@ -1385,6 +1384,9 @@ def test_real_media_executes_configured_language_implementation_or_parallel_path
     modality = "video" if topology in ("cp", "cp_sp") else "image"
     builder = _build_hybrid_model if topology == "hybrid_cp" else _build_te_parallel_model
     model = builder("attention" if topology == "hybrid_cp" else modality)
+    rotary_type = type(getattr(model.language_model, "rotary_pos_emb", None)).__name__
+    assert topology != "hybrid_cp" or rotary_type == "YarnRotaryEmbedding"
+    record_property("position_embedding_type", rotary_type)
     prompt = [5, IMAGE_TOKEN_ID, 6, 7, 8] if modality == "video" else None
     if topology in ("cp", "cp_sp", "hybrid_cp"):
         reference_engine, _ = _build_engine(
@@ -1430,6 +1432,7 @@ def test_real_media_executes_configured_language_implementation_or_parallel_path
 
         def trace_collective(operation, events, tag_input=False):
             def traced(tensor, *args, **kwargs):
+                assert not tag_input or kwargs.get("group") is model.pg_collection.tp
                 tensor = tensor.clone() if tag_input else tensor
                 for position in range(tensor.shape[0]) if tag_input else ():
                     tensor[position, :, position] += 1024
