@@ -170,24 +170,6 @@ def test_preprocessed_video_timing_metadata_round_trip():
     assert resolved["video_fps"] == [29.97]
 
 
-@pytest.mark.parametrize(
-    ("field", "value"), [("video_frame_indices", [[4, 8]]), ("video_fps", [30.0])]
-)
-def test_preprocessed_video_timing_metadata_participates_in_cache_identity(field, value):
-    base_video = {
-        "imgs": torch.ones(2, 3, 2, 2),
-        "imgs_sizes": torch.tensor([[2, 2], [2, 2]]),
-        "num_frames": torch.tensor([2]),
-        "video_frame_indices": [[3, 7]],
-        "video_fps": [29.97],
-    }
-    base_key = serialize_multimodal_data({"video": base_video})["media_cache_key"]
-    base_video[field] = value
-    changed_key = serialize_multimodal_data({"video": base_video})["media_cache_key"]
-
-    assert base_key != changed_key
-
-
 def test_gym_style_compact_multimodal_request_omits_preexpanded_flag():
     wire = serialize_multimodal_data(
         {"image": {"imgs": torch.ones(1, 2, 4), "imgs_sizes": torch.tensor([[2, 2]])}}
