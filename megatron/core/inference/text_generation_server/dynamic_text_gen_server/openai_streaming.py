@@ -437,7 +437,7 @@ async def openai_stream(
                             }
                         ]
                     )
-            elif new_tokens:
+            elif delta or new_tokens:
                 choice = {"index": index, "logprobs": logprobs, "finish_reason": None}
                 choice["delta" if chat else "text"] = {"content": delta} if chat else delta
                 yield sse([choice])

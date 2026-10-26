@@ -36,8 +36,9 @@ class _Tokenizer:
 
 
 class _IncrementalDetokenizer:
-    def __init__(self):
+    def __init__(self, finish_tokens=()):
         self._text = ""
+        self.finish = lambda: self.update(finish_tokens)
 
     def update(self, tokens):
         delta = "".join(chr(ord("a") + token - 1) for token in tokens)
@@ -187,7 +188,7 @@ async def test_openai_stream_echoes_completion_prompt_before_generated_text():
         async for record in openai_stream(
             [stream],
             _Tokenizer(),
-            [_IncrementalDetokenizer()],
+            [_IncrementalDetokenizer([2])],
             chat=False,
             return_log_probs=True,
             echo_prompts=["zz"],
@@ -196,7 +197,7 @@ async def test_openai_stream_echoes_completion_prompt_before_generated_text():
     ]
     payloads = [json.loads(record.removeprefix("data: ")) for record in records[:-1]]
 
-    echoed, generated, finished = payloads
+    echoed, generated, flushed, finished = payloads
     assert echoed["choices"][0]["text"] == "zz"
     assert echoed["choices"][0]["logprobs"] == {
         "tokens": ["z", "z"],
@@ -206,7 +207,10 @@ async def test_openai_stream_echoes_completion_prompt_before_generated_text():
     }
     assert generated["choices"][0]["text"] == "a"
     assert generated["choices"][0]["logprobs"]["text_offset"] == [2]
+    assert flushed["choices"][0]["text"] == "b"
+    assert flushed["choices"][0]["logprobs"] is None
     assert finished["choices"][0]["finish_reason"] == "stop"
+    assert finished["choices"][0]["generated_text"] == "ab"
     assert records[-1] == "data: [DONE]\n\n"
 
 
