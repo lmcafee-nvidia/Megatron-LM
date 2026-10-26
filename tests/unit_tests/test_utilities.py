@@ -180,7 +180,7 @@ def test_moe_cache_follows_replaced_model(monkeypatch):
 
     monkeypatch.setattr(moe_layer_module, "MoELayer", FakeMoELayer)
     monkeypatch.setattr(inference_utils, "moe_layer_cache", None)
-    monkeypatch.setattr(inference_utils, "_moe_layer_cache_model", None)
+    monkeypatch.setattr(inference_utils, "_moe_layer_cache_model", None, raising=False)
     monkeypatch.setattr(inference_utils, "_moe_metadata_sync_initialized", False)
 
     first = FakeModel()
