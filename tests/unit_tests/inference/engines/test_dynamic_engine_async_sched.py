@@ -787,6 +787,19 @@ _ASYNC_PAIR_SCENARIOS = (
         atol=5.0e-2,
         parity="reproducible",
     ),
+    _pair_scenario(
+        "mla-local-width",
+        "model:mla",
+        config={
+            "multi_latent_attention": True,
+            "cache_mla_latents": False,
+            "context_block_size_tokens": 64,
+            "flash_attention_version": None,
+            "position_embedding_type": "rope",
+        },
+        signals=("mla",),
+        atol=5.0e-3,
+    ),
     # Four heads of width 64 exercise FlashInfer's supported fused-RoPE kernel.
     # Width 16 crosses half-head boundaries in its vectorized NeoX rotation.
     _pair_scenario(
@@ -919,6 +932,7 @@ _STREAMING_SIGNAL_COUNTERS = {
     "inference-optimized": "module-forward:inference-optimized",
     "logprobs": "log-probs-calculations",
     "mamba": "module-forward:mamba",
+    "mla": "module-forward:mla",
     "mxfp8": "fp8-quantized-forwards",
     "nvfp4": "nvfp4-kernel-forwards",
     "moe": "module-forward:moe",
@@ -1427,6 +1441,7 @@ def _instrument_scenario_runtime(env, scenario, runtime):
         "mamba": lambda name, module: name == "MambaMixer",
         "gdp": lambda name, module: name == "GatedDeltaProductMixer",
         "gdn": lambda name, module: name == "GatedDeltaNet",
+        "mla": lambda name, module: name in {"FusedMLASelfAttention", "MLASelfAttention"},
         "moe": lambda name, module: name in {"MoELayer", "InferenceTopKRouter"},
         "parallel": lambda name, module: "ParallelLinear" in name
         or "ParallelGroupedLinear" in name
@@ -2016,7 +2031,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["mamba-state-commits"] > 0
             assert runtime["mamba-state-compactions"] > 0
             assert runtime["module-forward:hybrid"] > 0
-        for model_family in ("mamba", "gdp", "gdn"):
+        for model_family in ("mamba", "gdp", "gdn", "mla"):
             if model_family in signals:
                 assert runtime[f"module-forward:{model_family}"] > 0
         if "transformer-engine" in signals:

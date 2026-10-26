@@ -93,7 +93,7 @@ from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.spec_utils import get_submodules
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.inference.engines.ssm_test_helpers import (
     hybrid_mixer_kwargs,
@@ -935,6 +935,8 @@ class DynamicEngineTestConfig:
     fp8_recipe: str = "tensorwise"
     hidden_size: Optional[int] = None
     model_provider: str = "gpt"
+    multi_latent_attention: bool = False
+    cache_mla_latents: bool = False
     flash_attention_version: Optional[int] = 2
     # Which linear-attention mixer a hybrid stack uses ("mamba", "gdp", or
     # "gdn"). Ignored unless model_provider == "hybrid": all three build a
@@ -1208,7 +1210,15 @@ class DynamicInferenceEngineTestBase:
 
         if test_config.model_provider == "gpt":
             # Transformer config.
-            transformer_config = TransformerConfig(
+            config_type = (
+                MLATransformerConfig if test_config.multi_latent_attention else TransformerConfig
+            )
+            mla_config = (
+                {"cache_mla_latents": test_config.cache_mla_latents}
+                if test_config.multi_latent_attention
+                else {}
+            )
+            transformer_config = config_type(
                 params_dtype=torch.bfloat16,
                 flash_attention_version=test_config.flash_attention_version,
                 num_layers=4,
@@ -1295,6 +1305,7 @@ class DynamicInferenceEngineTestBase:
                 # inference optimized currently only supports RMS Norm
                 window_size=test_config.window_size,
                 window_attn_skip_freq=test_config.window_attn_skip_freq,
+                **mla_config,
             )
             # Layer-spec factories do not receive TransformerConfig. Forward num_moe_experts
             # explicitly for MoE test cases so they build MoE layers instead of a dense MLP.
@@ -1302,9 +1313,15 @@ class DynamicInferenceEngineTestBase:
                 transformer_config.num_moe_experts if test_config.use_moe_layer_spec else None
             )
             if test_config.fp8 or test_config.transformer_impl == "transformer_engine":
-                layer_spec = get_gpt_layer_with_transformer_engine_spec(num_experts=num_experts)
+                layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                    num_experts=num_experts,
+                    multi_latent_attention=test_config.multi_latent_attention,
+                )
             elif test_config.transformer_impl == "local":
-                layer_spec = get_gpt_layer_local_spec(num_experts=num_experts)
+                layer_spec = get_gpt_layer_local_spec(
+                    num_experts=num_experts,
+                    multi_latent_attention=test_config.multi_latent_attention,
+                )
             elif test_config.transformer_impl == "inference_optimized":
                 layer_spec = get_gpt_layer_with_inference_spec(num_experts=num_experts)
 
