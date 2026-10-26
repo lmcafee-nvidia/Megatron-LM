@@ -74,14 +74,8 @@ def _make_sampler(backend, vocab_size, seed=17):
 
 @pytest.mark.internal
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="real sampling kernels require CUDA")
-@pytest.mark.parametrize(
-    ("backend", "dtype"),
-    [
-        pytest.param("torch", torch.float32, id="dtype0-torch"),
-        pytest.param("flashinfer", torch.float32, id="dtype0-flashinfer"),
-        pytest.param("flashinfer", torch.bfloat16, id="dtype1-flashinfer"),
-    ],
-)
+@pytest.mark.parametrize("backend", ["torch", "flashinfer"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_known_logits_match_independent_filter_and_score_oracle(backend, dtype):
     """Heterogeneous rows must agree with an independent analytic distribution."""
     parameters = [(1.0, 0, 0.0), (0.0, 1, 0.0), (0.75, 3, 0.0), (1.25, 0, 0.72), (0.5, 0, 0.0)]

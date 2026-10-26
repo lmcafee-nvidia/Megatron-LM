@@ -8,6 +8,7 @@ from megatron.core.inference.sampling.request_seed_noise import (
     _request_seed_noise_kernel,
     fill_request_seed_noise,
 )
+from megatron.core.inference.sampling.torch_sampling import TorchSampling
 from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact
 
 
@@ -50,3 +51,30 @@ def test_request_noise_replays_and_preserves_logical_coordinates():
     fill_request_seed_noise(changed, [0, 0, 0, None, 123], [19] * 5)
     for row in (0, 1, 2):
         assert not torch.equal(full[row], changed[row])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_low_precision_temperature_filter_replays_in_float32():
+    """BF16 inputs retain float32 temperature math across contended replays."""
+    logits = torch.tensor([[-1.2344, -0.3125, 0.4922, 1.8125]], device="cuda", dtype=torch.bfloat16)
+    temperature = 0.37
+
+    def filtered():
+        return TorchSampling.filter_logits(logits, temperature, top_k=0, top_p=0.0)
+
+    reference, _ = assert_replays_bit_exact(
+        filtered,
+        (),
+        backward=False,
+        contention=True,
+        what="BF16 sampling logits with float32 temperature scaling",
+    )
+    actual = reference["out"]
+    expected = logits.float()
+    expected.div_(temperature)
+    assert actual.dtype == torch.float32
+    assert torch.equal(actual, expected)
+
+    quantized = logits.clone()
+    quantized.div_(temperature)
+    assert not torch.equal(actual, quantized.float())
