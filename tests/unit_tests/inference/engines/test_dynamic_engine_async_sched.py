@@ -2607,6 +2607,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["prefix-blocks-deregistered"] > 0
         if "cuda-graph" in signals:
             assert context.cuda_graph_batch_dimensions_list
+            assert runtime["cuda-graph-cold-pool-rebinds"] == 1
             assert runtime["cuda_graph_steps"] > 0
             assert runtime["cuda-graph-runner-replays"] > 0
             assert executed_graph_dimensions
