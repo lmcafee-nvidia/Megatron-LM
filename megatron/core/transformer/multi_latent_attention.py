@@ -1317,11 +1317,11 @@ class MLASelfAttention(MultiLatentAttention):
         at a later time.
 
         The method performs the following operations:
-        1. Splits the fused layernorm + linear layer (linear_kv_up_proj) into separate
-        components.
+        1. Splits a fused layernorm + linear layer (linear_kv_up_proj) into separate
+        components, or retains an already non-fused projection.
         2. Extracts and stores the up-projection weights for K and V separately, which
         are used during the absorption process
-        3. Replaces the identity kv_layernorm with the actual layernorm from the split
+        3. Replaces the identity kv_layernorm with the actual layernorm from a fused split
         4. Stores the linear component separately for uncompressing KV cache during
         prefill/mixed stages
 
@@ -1331,24 +1331,31 @@ class MLASelfAttention(MultiLatentAttention):
         # We should only have to call to set once at start
         if not hasattr(self, "up_k_weight"):
             with torch.no_grad():
-                linear_kv_up_proj_norm, linear_kv_up_proj_linear = (
-                    split_te_layernorm_column_parallel_linear(
-                        self.linear_kv_up_proj, self.config, None, self.linear_kv_up_proj.tp_group
+                if HAVE_TE and isinstance(self.linear_kv_up_proj, TELayerNormColumnParallelLinear):
+                    linear_kv_up_proj_norm, linear_kv_up_proj_linear = (
+                        split_te_layernorm_column_parallel_linear(
+                            self.linear_kv_up_proj,
+                            self.config,
+                            None,
+                            self.linear_kv_up_proj.tp_group,
+                        )
                     )
-                )
+                    # The fused projection owns the latent norm, so replace the
+                    # placeholder norm with the extracted module.
+                    self.kv_layernorm = linear_kv_up_proj_norm
+                else:
+                    # With a non-fused projection the configured kv_layernorm has
+                    # already been applied to the latent. Keep the projection itself
+                    # for mixed/prefill cache expansion instead of treating it as a
+                    # Transformer Engine fused norm+linear module.
+                    linear_kv_up_proj_linear = self.linear_kv_up_proj
 
-                # Note: When caching latents we overide the kv_layernorm
-                # which was an identity before because in the is path
-                # we unfused the linear_kv_up_proj
-                self.kv_layernorm = linear_kv_up_proj_norm
-
-                # This is used in absorption when we are
-                # uncompressing the KV cache in prefill/mixed stages
+                # This is used in absorption when we are uncompressing the KV
+                # cache in prefill/mixed stages.
                 self.linear_kv_up_proj_linear = linear_kv_up_proj_linear
 
-                kv_up_weight = (
-                    self.linear_kv_up_proj.weight
-                )  # [num_heads * (qk_head_dim + v_head_dim), kv_lora_rank]
+                kv_up_weight = self.linear_kv_up_proj.weight
+                # [num_heads * (qk_head_dim + v_head_dim), kv_lora_rank]
                 kv_up_weight = kv_up_weight.view(
                     self.num_attention_heads_per_partition,
                     self.config.qk_head_dim + self.config.v_head_dim,
