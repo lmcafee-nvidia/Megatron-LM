@@ -331,19 +331,41 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
             :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
         ].contiguous()
 
-        tokens_per_expert = self.local_map.sum(dim=0).long().cpu()
-
-        permuted_local_hidden_states, _, self.reversed_local_input_permutation_mapping, _, _ = (
-            permute(
-                hidden_states,
-                self.local_map,
-                num_out_tokens=tokens_per_expert.sum().item(),
-                fused=self.config.moe_permute_fusion,
+        fixed_inference_padding = bool(
+            getattr(self, "drop_and_pad", False)
+            and self.config.moe_pad_experts_for_cuda_graph_inference
+        )
+        if fixed_inference_padding:
+            # Inference selects a no-drop capacity that pads every local expert to the
+            # gathered token count. Keep all permutation shapes static and avoid D2H
+            # metadata reads while the enclosing layer is captured.
+            tokens_per_expert = torch.full(
+                (self.num_local_experts,), hidden_states.size(0), dtype=torch.long
             )
+            num_out_tokens = hidden_states.size(0) * self.num_local_experts
+        else:
+            tokens_per_expert = self.local_map.sum(dim=0).long().cpu()
+            num_out_tokens = tokens_per_expert.sum().item()
+
+        (
+            permuted_local_hidden_states,
+            permuted_local_probs,
+            self.reversed_local_input_permutation_mapping,
+            _,
+            _,
+        ) = permute(
+            hidden_states,
+            self.local_map,
+            probs=self.local_probs if fixed_inference_padding else None,
+            num_out_tokens=num_out_tokens,
+            fused=self.config.moe_permute_fusion,
+            drop_and_pad=fixed_inference_padding,
         )
 
-        self.local_probs = self.local_probs.T.contiguous().masked_select(
-            self.local_map.T.contiguous()
+        self.local_probs = (
+            permuted_local_probs
+            if fixed_inference_padding
+            else self.local_probs.T.contiguous().masked_select(self.local_map.T.contiguous())
         )
         self.routing_map = None
         return permuted_local_hidden_states, tokens_per_expert, self.local_probs
