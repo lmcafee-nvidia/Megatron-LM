@@ -143,6 +143,30 @@ async def _wait_for_epoch(engine, epoch):
             return
         await asyncio.sleep(0.01)
     raise AssertionError(f"generation epoch did not reach {epoch}")
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize(
+    ("reply", "message"),
+    [
+        (_reply([7], [-0.7], "stop", [8, 8]), "prompt tokens do not match"),
+        (_reply([7, 8], [-0.7], "length"), "generated token/logprob lengths do not match"),
+    ],
+    ids=["prompt-identity", "score-alignment"],
+)
+def test_native_adapter_rejects_misaligned_reply(reply, message):
+    BatchedDataDict, mixin_cls = _load_nemo_rl_adapter()
+    adapter = _protocol_adapter(mixin_cls)
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[4, 5]], dtype=torch.long),
+            "input_lengths": torch.tensor([2], dtype=torch.long),
+        }
+    )
+    with pytest.raises(RuntimeError, match=message):
+        adapter._parse_result_to_batched_data_dict(data, [reply])
+
+
 async def _drive_engine(engine, futures, witness=None):
     step_count = 0
     while not all(future.done() for future in futures):
