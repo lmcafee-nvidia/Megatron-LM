@@ -804,6 +804,28 @@ _ASYNC_PAIR_SCENARIOS = (
         },
         signals=("offload", "static-pointers", "suspend-resume", "uvm"),
     ),
+    _pair_scenario(
+        "offload-static-uvm-hybrid-mamba-suspend-resume",
+        "model:hybrid-mamba",
+        "kv:offload",
+        "memory:uvm",
+        config={
+            "kv_cache_management_mode": "offload",
+            "model_provider": "hybrid",
+            "static_kv_memory_pointers": True,
+            "unified_memory_level": 1,
+        },
+        signals=(
+            "hybrid",
+            "metadata-compaction",
+            "offload",
+            "static-pointers",
+            "suspend-resume",
+            "uvm",
+        ),
+        prerequisite="mamba",
+        atol=5.0e-3,
+    ),
     # Four heads of width 64 exercise FlashInfer's supported fused-RoPE kernel.
     # Width 16 crosses half-head boundaries in its vectorized NeoX rotation.
     _pair_scenario(
