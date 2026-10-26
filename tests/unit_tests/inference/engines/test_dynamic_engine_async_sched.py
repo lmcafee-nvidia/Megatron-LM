@@ -792,6 +792,25 @@ _ASYNC_PAIR_SCENARIOS = (
         config={"transformer_impl": "inference_optimized"},
         signals=("inference-optimized",),
     ),
+    _pair_scenario(
+        "mxfp8-inference-optimized-moe",
+        "precision:mxfp8",
+        "model:moe",
+        "implementation:inference-optimized",
+        config={
+            "fp8": True,
+            "fp8_recipe": "mxfp8",
+            "hidden_size": 128,
+            "num_moe_experts": 2,
+            "moe_grouped_gemm": True,
+            "use_moe_layer_spec": True,
+            "transformer_impl": "inference_optimized",
+        },
+        signals=("inference-optimized", "moe", "mxfp8", "fixed-history-logits"),
+        prerequisite="mxfp8",
+        atol=0.0,
+        graph_parity="reproducible",
+    ),
     # Four heads of width 64 exercise FlashInfer's supported fused-RoPE kernel.
     # Width 16 crosses half-head boundaries in its vectorized NeoX rotation.
     _pair_scenario(
@@ -900,6 +919,7 @@ _CUDA_GRAPH_DIFFERENTIAL_SCENARIOS = (
             "hybrid-gdp",
             "transformer-engine",
             "inference-optimized",
+            "mxfp8-inference-optimized-moe",
             "flashinfer-fused-rope",
             "flash-attention-3",
             "flash-attention-4",
