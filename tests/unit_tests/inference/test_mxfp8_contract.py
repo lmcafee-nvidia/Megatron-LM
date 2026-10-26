@@ -160,6 +160,30 @@ def test_public_quantizers_document_finite_input_contract(api):
     assert "finite" in documentation
 
 
+def test_hopper_mxfp8_gemm_fails_and_bf16_path_executes(monkeypatch):
+    """Hopper quantizes MXFP8, rejects its GEMM, and retains the BF16 linear path."""
+    if torch.cuda.get_device_capability()[0] >= 10:
+        pytest.skip("negative architecture contract is specific to pre-Blackwell GPUs")
+    x = torch.randn(4, 1, 128, device="cuda", dtype=torch.bfloat16)
+    weight_source = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+    weight = MXFP8Tensor.from_bf16(weight_source, backend="triton")
+    expected_data, expected_scales = _reference_quantize(weight_source)
+
+    assert torch.equal(weight.data.view(torch.uint8), expected_data.view(torch.uint8))
+    assert torch.equal(_logical_scale_bytes(weight), expected_scales)
+
+    def unexpected_dispatch(*args, **kwargs):
+        raise AssertionError("unsupported architecture reached the GEMM backend")
+
+    monkeypatch.setattr(quantization_utils, "_mm_mxfp8_torch", unexpected_dispatch)
+    with pytest.raises(RuntimeError, match="requires NVIDIA Blackwell"):
+        quantization_utils.mm_mxfp8(x, weight)
+
+    bf16_weight = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+    fallback = _apply_linear(x, bf16_weight, SimpleNamespace())
+    assert torch.equal(fallback, torch.matmul(x, bf16_weight.T))
+
+
 @pytest.mark.launch_on_gb200
 @pytest.mark.parametrize(
     "backend,dispatch_name",
