@@ -20,6 +20,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer import multi_latent_attention as mla_module
 from megatron.core.transformer.attention import Attention, SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.utils import is_te_min_version, unwrap_model
@@ -1006,3 +1007,8 @@ class TestFlashMLASoftcapRejected:
                 block_table=torch.zeros(2, 4, dtype=torch.int32),
                 is_decode_only=True,
             )
+
+    def test_missing_flash_mla_has_an_explicit_error(self, monkeypatch):
+        monkeypatch.setattr(mla_module, "HAVE_FMLA", False)
+        with pytest.raises(RuntimeError, match="requires the optional FlashMLA package"):
+            mla_module._require_flash_mla()
