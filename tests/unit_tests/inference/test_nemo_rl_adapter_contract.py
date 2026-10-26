@@ -143,6 +143,25 @@ async def _wait_for_epoch(engine, epoch):
             return
         await asyncio.sleep(0.01)
     raise AssertionError(f"generation epoch did not reach {epoch}")
+
+
+@pytest.mark.internal
+def test_native_adapter_preserves_stop_tokens_and_finish_reason():
+    BatchedDataDict, mixin_cls = _load_nemo_rl_adapter()
+    adapter = _protocol_adapter(mixin_cls, stop_token_ids=[23, 17, 23])
+    params = adapter._build_sampling_params(greedy=False, stop_words=None)
+    assert params.stop_token_ids == [17, 23]
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[4, 5], [6, 0]], dtype=torch.long),
+            "input_lengths": torch.tensor([2, 1], dtype=torch.long),
+        }
+    )
+    replies = [_reply([7, 8, 9], [-0.7, -0.8, -0.9], "length"), _reply([17], [-0.2], "stop")]
+    output = adapter._parse_result_to_batched_data_dict(data, replies)
+    assert output["truncated"].tolist() == [True, False]
+
+
 async def _drive_engine(engine, futures, witness=None):
     step_count = 0
     while not all(future.done() for future in futures):
@@ -935,6 +954,124 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
                 row["logprobs"][0, start : start + 3], expected.generated_log_probs
             )
         assert engine.context.async_sched_step_count > 0
+        assert not engine.requests and not engine.has_unfinished_requests()
+    @pytest.mark.internal
+    @pytest.mark.asyncio
+    async def test_real_stop_and_length_finish_contracts(self):
+        BatchedDataDict, mixin_cls = _load_nemo_rl_adapter()
+        engine = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0,
+                max_prompt_length=6,
+                max_sequence_length=12,
+                context_max_requests=8,
+                context_max_tokens=64,
+                sampling_backend="flashinfer",
+                async_sched_mode=AsyncScheduleMode.ASYNC,
+                return_log_probs=True,
+                skip_prompt_log_probs=True,
+                logprobs_mode="raw_logprobs",
+            )
+        ).engine
+        engine.controller.tokenizer = _CoordinatorTokenizer()
+        prompts = [[3, 5, 7, 9], [2, 4, 6, 8, 10]]
+        generation_length = 4
+        direct = await _drive_engine(
+            engine,
+            [
+                engine.add_request(
+                    request_id,
+                    prompt,
+                    SamplingParams(
+                        temperature=0,
+                        top_k=1,
+                        top_p=0,
+                        return_log_probs=True,
+                        skip_prompt_log_probs=True,
+                        num_tokens_to_generate=generation_length,
+                        termination_id=-1,
+                    ),
+                )
+                for request_id, prompt in enumerate(prompts, 700)
+            ],
+        )
+        first_tokens = [reply.generated_tokens[0] for reply in direct]
+
+        async def run_adapter_case(
+            *,
+            selected_prompts=prompts,
+            stop_token_ids=None,
+            stop_strings=None,
+            row_stop_strings=None,
+            ignore_eos=True,
+            eod=99,
+            first_request_id,
+        ):
+            adapter = _protocol_adapter(
+                mixin_cls, stop_token_ids=stop_token_ids, ignore_eos=ignore_eos
+            )
+            adapter.cfg["generation"]["max_new_tokens"] = generation_length
+            adapter.cfg["generation"]["stop_strings"] = stop_strings
+            adapter.megatron_tokenizer.eod = eod
+            adapter.inference_client = _InProcessInferenceClient(
+                engine,
+                expected_requests=len(selected_prompts),
+                first_request_id=first_request_id,
+                witness={"adapter_submissions": []},
+            )
+            max_prompt_length = max(map(len, selected_prompts))
+            batch = {
+                "input_ids": torch.tensor(
+                    [
+                        prompt + [0] * (max_prompt_length - len(prompt))
+                        for prompt in selected_prompts
+                    ],
+                    device="cuda",
+                ),
+                "input_lengths": torch.tensor(list(map(len, selected_prompts)), device="cuda"),
+            }
+            if row_stop_strings is not None:
+                batch["stop_strings"] = row_stop_strings
+            data = BatchedDataDict(batch)
+            lowered_prompts, media, params = adapter._prepare_data_for_generation(data, greedy=True)
+            replies = await adapter._generate_with_persistent_engine(lowered_prompts, media, params)
+            await adapter.inference_client.driver
+            return replies, adapter._parse_result_to_batched_data_dict(data, replies)
+
+        token_replies, token_output = await run_adapter_case(
+            stop_token_ids=first_tokens, first_request_id=710
+        )
+        assert all(reply.finish_reason == "stop" for reply in token_replies)
+        assert token_output["generation_lengths"].tolist() == [1, 1]
+        assert token_output["truncated"].tolist() == [False, False]
+        string_replies, string_output = await run_adapter_case(
+            stop_strings=[str(first_tokens[0])],
+            row_stop_strings=[None, [str(first_tokens[1])]],
+            first_request_id=720,
+        )
+        assert all(reply.finish_reason == "stop" for reply in string_replies)
+        assert string_output["generation_lengths"].tolist() == [1, 1]
+        assert string_output["truncated"].tolist() == [False, False]
+        eos_replies, eos_output = await run_adapter_case(
+            selected_prompts=prompts[:1],
+            ignore_eos=False,
+            eod=first_tokens[0],
+            first_request_id=730,
+        )
+        assert eos_replies[0].finish_reason == "stop"
+        assert eos_output["generation_lengths"].tolist() == [1]
+        assert eos_output["truncated"].tolist() == [False]
+        length_replies, length_output = await run_adapter_case(
+            selected_prompts=prompts[:1], ignore_eos=True, eod=first_tokens[0], first_request_id=740
+        )
+        assert length_replies[0].finish_reason == "length"
+        assert length_output["generation_lengths"].tolist() == [generation_length]
+        assert length_output["truncated"].tolist() == [True]
+        for output in (token_output, string_output, eos_output, length_output):
+            assert int(output["output_ids"][0, len(prompts[0])]) == first_tokens[0]
+            _assert_exact_scores(
+                output["logprobs"][0, len(prompts[0])], direct[0].generated_log_probs[0]
+            )
         assert not engine.requests and not engine.has_unfinished_requests()
     @pytest.mark.internal
     @pytest.mark.asyncio
