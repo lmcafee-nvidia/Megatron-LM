@@ -271,7 +271,8 @@ def mxfp8_quantize_rows(
     ``n_rows`` is a 1-element CUDA tensor (device-side count, CUDA-graph safe). Data rows
     at or beyond ``n_rows`` are left uninitialized and their scales are zero; callers
     must not read them (grouped GEMMs bounded by expert offsets ending at ``n_rows``).
-    Quantized rows are bitwise identical to ``mxfp8_quantize``. The selected input rows must be finite;
+    Quantized rows are bitwise identical to ``mxfp8_quantize``.
+    The selected input rows must be finite;
     NaN and infinity are outside the MXFP8 inference contract.
     """
     assert x.is_cuda and x.dim() == 2
