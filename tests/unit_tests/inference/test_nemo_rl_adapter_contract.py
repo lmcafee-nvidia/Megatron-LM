@@ -1193,6 +1193,150 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
                 await asyncio.to_thread(coordinator_process.join, 10)
                 assert not coordinator_process.is_alive()
                 client.stop()
+@pytest.mark.internal
+@pytest.mark.asyncio
+async def test_real_noncolocated_consumer_refit_then_adapter_output():
+    if Utils.world_size != 4:
+        pytest.skip("noncolocated source/destination contract requires four ranks")
+
+    from megatron.core.inference.shards import build_inference_pg_collection
+    from megatron.core.resharding.copy_services.gloo_copy_service import GlooCopyService
+    from tests.unit_tests.resharding.test_model_swap import (
+        _build_gpt,
+        _destroy_pg_collection,
+        _run_forward,
+    )
+
+    BatchedDataDict, mixin_cls = _load_nemo_rl_adapter()
+    refit_cls = importlib.import_module(
+        "nemo_rl.models.generation.megatron.megatron_worker"
+    ).MegatronGenerationRefitMixin
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
+    rank = torch.distributed.get_rank()
+    source_pgs = build_inference_pg_collection(world_size=2, tp_size=1, rank_offset=0)
+    target_pgs = build_inference_pg_collection(world_size=2, tp_size=1, rank_offset=2)
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=2,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        attention_backend=AttnBackend.auto,
+    )
+    torch.manual_seed(1234)
+    source_model = (
+        _build_gpt(config, 128, 8, source_pgs, parallel_output=False).cuda().bfloat16().eval()
+        if rank < 2
+        else None
+    )
+    torch.manual_seed(1234)
+    target_model = (
+        _build_gpt(config, 128, 8, target_pgs, parallel_output=False).cuda().bfloat16().eval()
+        if rank >= 2
+        else None
+    )
+    tokens = torch.tensor([[3, 5, 7, 9]], device="cuda")
+    positions = torch.arange(tokens.shape[1], device="cuda").unsqueeze(0)
+    attention_mask = torch.triu(
+        torch.ones((1, 1, 4, 4), dtype=torch.bool, device="cuda"), diagonal=1
+    )
+    refitter = object.__new__(refit_cls)
+    refitter.model = source_model if rank < 2 else target_model
+    refitter.refit_execution_batch_bytes = None
+    refitter.refit_dst_rank_offset = 0
+    with pytest.raises(RuntimeError, match="was not initialized"):
+        refitter.swap_weights_via_reshard(is_source=rank < 2)
+    refitter.refit_execution_batch_bytes = 1 << 20
+    adapter = _protocol_adapter(mixin_cls, ignore_eos=True)
+    adapter.cfg["generation"]["max_new_tokens"] = 1
+    data = BatchedDataDict({"input_ids": tokens.cpu(), "input_lengths": torch.tensor([4])})
+    if target_model is not None:
+        inference_config = dynamic_engine_tests.InferenceConfig(
+            max_sequence_length=8,
+            buffer_size_gb=0.01,
+            max_requests=1,
+            max_tokens=8,
+            sampling_backend="torch",
+            pg_collection=target_pgs,
+        )
+        context = dynamic_engine_tests.DynamicInferenceContext(config, inference_config)
+        wrapper = dynamic_engine_tests.GPTInferenceWrapper(target_model, context)
+        wrapper.model_is_pipeline_parallel = False
+        engine = DynamicInferenceEngine(
+            dynamic_engine_tests.TextGenerationController(wrapper, _CoordinatorTokenizer()), context
+        )
+    previous_token = None
+    refit_group = torch.distributed.new_group(backend="gloo")
+    refitter.refit_pg = refit_group
+    refitter.refit_copy_service = GlooCopyService(group=refit_group)
+    try:
+        for version, delta in enumerate((0.05, 0.11), 1):
+            if source_model is not None:
+                with torch.no_grad():
+                    for parameter in source_model.parameters():
+                        parameter.add_(delta)
+                direct_logits = _run_forward(
+                    source_model, tokens, positions, attention_mask, source_pgs
+                )
+            else:
+                direct_logits = torch.empty(1, 4, 128, device="cuda", dtype=torch.bfloat16)
+            torch.distributed.broadcast(direct_logits, src=0)
+            assert refitter.swap_weights_via_reshard(is_source=rank < 2)
+            torch.cuda.synchronize()
+            if target_model is not None:
+                with torch.inference_mode():
+                    target_logits = target_model(
+                        tokens, positions, attention_mask, runtime_gather_output=True
+                    )
+                torch.testing.assert_close(target_logits, direct_logits, rtol=0, atol=0)
+                if rank == 3:
+                    torch.distributed.barrier()
+                    continue
+                engine._generation_epoch = version
+                prompts, media, sampling_params = adapter._prepare_data_for_generation(
+                    data, greedy=True
+                )
+                direct = (
+                    await _drive_engine(
+                        engine, [engine.add_request(300 + version, prompts[0], sampling_params[0])]
+                    )
+                )[0]
+                witness = {"adapter_submissions": [], "cuda_graph_request_ids": []}
+                adapter.inference_client = _InProcessInferenceClient(
+                    engine, expected_requests=1, first_request_id=400 + version, witness=witness
+                )
+                with mock.patch.object(torch.distributed, "get_rank", return_value=0):
+                    replies = await adapter._generate_with_persistent_engine(
+                        prompts, media, sampling_params
+                    )
+                await adapter.inference_client.driver
+                output = adapter._parse_result_to_batched_data_dict(data, replies)
+                assert direct.generated_tokens == replies[0].generated_tokens
+                assert direct.generated_log_probs == replies[0].generated_log_probs
+                assert replies[0].policy_epoch == [(0, version)]
+                assert output["output_ids"][0, 4].item() == int(target_logits[0, -1].argmax())
+                assert output["logprobs"][0, 4].item() == direct.generated_log_probs[0]
+                assert witness["adapter_submissions"][0]["request_id"] == 400 + version
+                assert not engine.requests and not engine.has_unfinished_requests()
+                if previous_token is not None:
+                    assert output["output_ids"][0, 4].item() != previous_token or not torch.equal(
+                        target_logits, previous_logits
+                    )
+                previous_token, previous_logits = (
+                    output["output_ids"][0, 4].item(),
+                    target_logits.clone(),
+                )
+            torch.distributed.barrier()
+    finally:
+        refitter.refit_copy_service.close()
+        clear_all_caches()
+        torch.distributed.destroy_process_group(refit_group)
+        _destroy_pg_collection(source_pgs)
+        _destroy_pg_collection(target_pgs)
+        Utils.destroy_model_parallel()
+
+
 @pytest.fixture
 def nemo_parallel(request, monkeypatch):
     topology = request.param
