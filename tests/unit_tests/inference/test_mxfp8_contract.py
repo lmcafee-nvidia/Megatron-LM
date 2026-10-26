@@ -415,9 +415,12 @@ def test_hopper_mxfp8_gemm_fails_and_bf16_path_executes(monkeypatch):
     if torch.cuda.get_device_capability()[0] >= 10:
         pytest.skip("negative architecture contract is specific to pre-Blackwell GPUs")
     x = torch.randn(4, 1, 128, device="cuda", dtype=torch.bfloat16)
-    weight = MXFP8Tensor.from_bf16(
-        torch.randn(64, 128, device="cuda", dtype=torch.bfloat16), backend="triton"
-    )
+    weight_source = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+    weight = MXFP8Tensor.from_bf16(weight_source, backend="triton")
+    expected_data, expected_scales = _reference_quantize(weight_source)
+
+    assert torch.equal(weight.data.view(torch.uint8), expected_data.view(torch.uint8))
+    assert torch.equal(_logical_scale_bytes(weight), expected_scales)
 
     def unexpected_dispatch(*args, **kwargs):
         raise AssertionError("unsupported architecture reached the GEMM backend")
