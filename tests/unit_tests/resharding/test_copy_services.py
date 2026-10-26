@@ -188,7 +188,8 @@ def test_local_copy_waits_for_current_stream(service_cls):
     Utils.initialize_distributed()
     service = service_cls()
     source = torch.zeros(1, device="cuda")
-    destination = torch.zeros_like(source)
+    with torch.inference_mode():
+        destination = torch.zeros_like(source)
     torch.cuda.synchronize()
 
     producer_gate = torch.cuda.Event()
