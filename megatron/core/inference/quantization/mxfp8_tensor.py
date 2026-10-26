@@ -67,6 +67,17 @@ def validate_mxfp8_tensor(
         raise TypeError(
             f"{tensor_name} data must use torch.float8_e4m3fn, got {tensor.data.dtype}."
         )
+    if not tensor.data.is_cuda or not tensor.scale.is_cuda:
+        raise ValueError(f"{tensor_name} data and scale must both use CUDA storage.")
+    if tensor.data.device != tensor.scale.device:
+        raise ValueError(
+            f"{tensor_name} data and scale must use the same device, got "
+            f"{tensor.data.device} and {tensor.scale.device}."
+        )
+    if not tensor.data.is_contiguous():
+        raise ValueError(f"{tensor_name} data must be contiguous.")
+    if not tensor.scale.is_contiguous():
+        raise ValueError(f"{tensor_name} scale must be contiguous.")
     backend = expected_backend if expected_backend is not None else tensor.backend
     if expected_backend is not None and tensor.backend != expected_backend:
         raise ValueError(
