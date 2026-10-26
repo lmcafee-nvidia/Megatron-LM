@@ -788,16 +788,18 @@ _ASYNC_PAIR_SCENARIOS = (
         parity="reproducible",
     ),
     _pair_scenario(
-        "mla-local-width",
+        "mla-latent-cache",
         "model:mla",
+        "kv:mla-latent-cache",
         config={
             "multi_latent_attention": True,
-            "cache_mla_latents": False,
+            "cache_mla_latents": True,
             "context_block_size_tokens": 64,
             "flash_attention_version": None,
             "position_embedding_type": "rope",
         },
         signals=("mla",),
+        prerequisite="flash-mla",
         atol=5.0e-3,
     ),
     # Four heads of width 64 exercise FlashInfer's supported fused-RoPE kernel.
@@ -951,6 +953,8 @@ _STREAMING_SIGNAL_COUNTERS = {
 def _check_scenario_prerequisite(scenario):
     if scenario.prerequisite == "flashinfer":
         pytest.importorskip("flashinfer")
+    elif scenario.prerequisite == "flash-mla":
+        pytest.importorskip("flash_mla")
     elif scenario.prerequisite == "mamba":
         available, reason = _check_mamba_sequence_packing_support()
         if not available:
@@ -2034,6 +2038,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         for model_family in ("mamba", "gdp", "gdn", "mla"):
             if model_family in signals:
                 assert runtime[f"module-forward:{model_family}"] > 0
+        if "mla" in signals:
+            assert context.cache_mla_latent
         if "transformer-engine" in signals:
             assert model_config.transformer_impl == "transformer_engine"
             assert runtime["module-forward:transformer-engine"] > 0
