@@ -3126,6 +3126,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         getattr(self, "_request_to_image_token_mask", {}).clear()
         getattr(self, "_request_to_image_token_count", {}).clear()
 
+    @torch.inference_mode()
     def reset(
         self, preserve_prefix_cache: bool = False, *, preserve_counters: bool = False
     ) -> None:
@@ -3139,6 +3140,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         This method is useful after cuda graph warmup iterations, where the
         context's memory buffer is referenced by the cuda graph system and
         cannot be deallocated.
+
+        The reset owns inference mode because construction may allocate its
+        bookkeeping tensors in inference mode while public engine callers do not.
 
         Args:
             preserve_prefix_cache: When True, keep the KV and Mamba prefix-cache
