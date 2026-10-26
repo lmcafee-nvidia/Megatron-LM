@@ -230,6 +230,7 @@ class MXFP8Tensor:
         """
         assert x.is_cuda and x.dim() == 2
         assert x.shape[-1] % group_size == 0
+        x = x.contiguous()
         if backend == "flashinfer":
             assert HAVE_FLASHINFER, "FlashInfer not available"
             data, scale = flashinfer_mxfp8_quantize(x)

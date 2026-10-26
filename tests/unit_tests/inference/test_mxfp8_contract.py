@@ -145,6 +145,45 @@ def _boundary_input(rows: int, cols: int) -> torch.Tensor:
     return result
 
 
+def test_noncontiguous_input_uses_logical_rows():
+    """The public quantizer must not silently treat a strided view as row-major."""
+    logical = _boundary_input(17, 160)
+    x = logical.T.contiguous().T
+    assert not x.is_contiguous()
+    data, scale = mxfp8_quantize(x)
+    expected_data, logical_scale = _reference_quantize(logical)
+
+    assert torch.equal(data.view(torch.uint8), expected_data.view(torch.uint8))
+    assert torch.equal(scale.view(torch.uint8), _swizzle_scales(logical_scale))
+
+    live_rows = torch.tensor([logical.shape[0]], device="cuda", dtype=torch.int32)
+    row_data, row_scale = mxfp8_quantize_rows(x, live_rows)
+    assert torch.equal(row_data.view(torch.uint8), expected_data.view(torch.uint8))
+    assert torch.equal(row_scale.view(torch.uint8), _swizzle_scales(logical_scale))
+
+
+def test_quantize_into_rejects_aliasing_storage():
+    rows, cols = 8, 128
+    input_storage = torch.empty(rows * cols * 2, device="cuda", dtype=torch.uint8)
+    x = input_storage.view(torch.bfloat16).reshape(rows, cols)
+    out_data = input_storage[: rows * cols].view(torch.float8_e4m3fn).reshape(rows, cols)
+    independent_scale = torch.empty(512, device="cuda", dtype=torch.float8_e8m0fnu)
+
+    with pytest.raises(AssertionError, match="must not share storage"):
+        mxfp8_quantize_into(x, out_data, independent_scale)
+
+    output_storage = torch.empty(rows * cols, device="cuda", dtype=torch.uint8)
+    out_data = output_storage.view(torch.float8_e4m3fn).reshape(rows, cols)
+    out_scale = output_storage[:512].view(torch.float8_e8m0fnu)
+    with pytest.raises(AssertionError, match="must not share storage"):
+        mxfp8_quantize_into(torch.randn_like(x), out_data, out_scale)
+
+    independent_data = torch.empty(rows, cols, device="cuda", dtype=torch.float8_e4m3fn)
+    out_scale = input_storage[:512].view(torch.float8_e8m0fnu)
+    with pytest.raises(AssertionError, match="must not share storage"):
+        mxfp8_quantize_into(x, independent_data, out_scale)
+
+
 @pytest.mark.launch_on_gb200
 @pytest.mark.parametrize(
     "backend,dispatch_name",
