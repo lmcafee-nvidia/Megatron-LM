@@ -806,7 +806,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="triton",
         training_path=False,
         notes="Request-local Philox exponential draws replay across batch layouts and "
-        "scalar/batched launches, including under side-stream contention.",
+        "scalar/batched launches, including under side-stream contention. BF16 sampling logits "
+        "also replay with the promised float32 temperature scaling.",
     ),
     KernelEntry(
         name="inference_flashinfer_sampling",
