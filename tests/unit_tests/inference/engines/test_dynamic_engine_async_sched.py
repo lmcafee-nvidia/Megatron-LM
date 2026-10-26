@@ -912,6 +912,22 @@ _ASYNC_PAIR_SCENARIOS = (
     ),
 )
 
+_ASYNC_SUSPEND_RESUME_SCENARIOS = (
+    _pair_scenario(
+        "offload-suspend-resume",
+        "kv:offload",
+        config={"kv_cache_management_mode": "offload", "static_kv_memory_pointers": False},
+        signals=("offload", "suspend-resume"),
+    ),
+    _pair_scenario(
+        "recompute-suspend-resume",
+        "kv:recompute",
+        config={"kv_cache_management_mode": "recompute", "static_kv_memory_pointers": False},
+        signals=("recompute", "suspend-resume"),
+    ),
+)
+
+
 _CUDA_GRAPH_LIFECYCLE_SCENARIOS = (
     _pair_scenario(
         "persist-static-suspend-resume",
@@ -941,6 +957,7 @@ _CUDA_GRAPH_LIFECYCLE_SCENARIOS = (
         signals=("recompute", "static-pointers", "suspend-resume", "tms"),
         prerequisite="torch-memory-saver",
     ),
+    *_ASYNC_SUSPEND_RESUME_SCENARIOS,
 )
 
 
@@ -3282,6 +3299,19 @@ class TestAsyncSchedulePairwise(_AsyncPairwiseHarness):
     @torch.inference_mode()
     def test_async_matches_legacy_for_owned_pair(self, scenario):
         _check_scenario_prerequisite(scenario)
+        try:
+            self._assert_scenario_pair(scenario)
+        finally:
+            gc.collect()
+            delete_cuda_graphs()
+            torch.cuda.empty_cache()
+
+    @pytest.mark.parametrize(
+        "scenario", _ASYNC_SUSPEND_RESUME_SCENARIOS, ids=lambda case: case.name
+    )
+    @torch.inference_mode()
+    def test_async_suspend_resume_mode_matches_legacy(self, scenario):
+        """Real OFFLOAD and RECOMPUTE cycles preserve output parity."""
         try:
             self._assert_scenario_pair(scenario)
         finally:
