@@ -145,6 +145,21 @@ def _boundary_input(rows: int, cols: int) -> torch.Tensor:
     return result
 
 
+def test_from_bf16_rejects_nonstandard_group_size():
+    x = torch.randn(8, 128, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="group size 32"):
+        MXFP8Tensor.from_bf16(x, group_size=64, backend="triton")
+
+
+@pytest.mark.parametrize(
+    "api", [mxfp8_quantize, mxfp8_quantize_into, mxfp8_quantize_rows, MXFP8Tensor.from_bf16]
+)
+def test_public_quantizers_document_finite_input_contract(api):
+    """NaN/Inf are an explicit precondition, not backend-dependent output promises."""
+    documentation = (api.__doc__ or "").lower()
+    assert "finite" in documentation
+
+
 @pytest.mark.launch_on_gb200
 @pytest.mark.parametrize(
     "backend,dispatch_name",
