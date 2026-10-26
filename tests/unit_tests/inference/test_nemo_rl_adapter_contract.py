@@ -221,6 +221,177 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         reset_rounder()
         Utils.destroy_model_parallel()
     @pytest.mark.internal
+    @pytest.mark.parametrize("modality", ["image", "video"])
+    def test_real_multimodal_adapter_runs_vision_and_language_models(self, modality, monkeypatch):
+        monkeypatch.setenv("NVTE_FLASH_ATTN", "1")
+        monkeypatch.setenv("NVTE_FUSED_ATTN", "0")
+        monkeypatch.setenv("NVTE_UNFUSED_ATTN", "0")
+        BatchedDataDict, mixin_cls = _load_nemo_rl_adapter()
+        source = Path(os.environ["NEMO_RL_SOURCE"]).resolve(strict=True)
+        sys.path.insert(0, str(source))
+        try:
+            PackedTensor = importlib.import_module("nemo_rl.data.multimodal_utils").PackedTensor
+        finally:
+            sys.path.remove(str(source))
+        hidden_size, patch_dim, image_size = 64, 14, 28
+        language_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=hidden_size,
+            num_attention_heads=4,
+            use_cpu_initialization=False,
+            bf16=True,
+            attention_backend=AttnBackend.flash,
+        )
+        vision_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=2,
+            use_cpu_initialization=False,
+            bf16=True,
+            attention_backend=AttnBackend.flash,
+        )
+        projection_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=hidden_size,
+            ffn_hidden_size=32,
+            num_attention_heads=1,
+            use_cpu_initialization=False,
+            bf16=True,
+        )
+        submodules = get_gpt_layer_local_submodules()
+        vision_spec = get_gpt_layer_with_transformer_engine_spec()
+        projection_spec = copy.deepcopy(get_submodules(submodules.mlp))
+        assert isinstance(projection_spec, MLPSubmodules)
+        language_config.language_model_type = "dummy"
+        vision_config.vision_model_type = "radio"
+        model = LLaVAModel(
+            language_transformer_config=language_config,
+            language_transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            language_vocab_size=128,
+            language_max_sequence_length=64,
+            vision_transformer_config=vision_config,
+            vision_transformer_layer_spec=vision_spec,
+            drop_vision_class_token=True,
+            vision_projection_config=projection_config,
+            vision_projection_layer_spec=projection_spec,
+            img_h=image_size,
+            img_w=image_size,
+            patch_dim=patch_dim,
+            dynamic_resolution=True,
+        ).cuda()
+        model = Float16Module(model.config, model).eval()
+        context = StaticInferenceContext(max_batch_size=1, max_sequence_length=64)
+        wrapper = VLMInferenceWrapper(model, context)
+        vision_calls = []
+        vision_forward = wrapper._forward_vision_encoder
+
+        def traced_vision_forward(*args, **kwargs):
+            vision_calls.append(modality)
+            return vision_forward(*args, **kwargs)
+
+        wrapper._forward_vision_encoder = traced_vision_forward
+        frame_count = 1 if modality == "image" else 2
+        embedding_count = 4 * frame_count
+        prompt = [10] + [-200] * embedding_count + [20]
+        patches = torch.randn(1, embedding_count, 3 * patch_dim * patch_dim, dtype=torch.float32)
+        sizes = torch.tensor([[image_size, image_size]] * frame_count)
+        batch = {
+            "input_ids": torch.tensor([prompt]),
+            "input_lengths": torch.tensor([len(prompt)]),
+            "pixel_values": PackedTensor(
+                [patches],
+                dim_to_pack=0,
+                preprocess_mode="patchify",
+                preprocess_kwargs={"patch_dim": patch_dim},
+            ),
+            "imgs_sizes": PackedTensor([sizes], dim_to_pack=0),
+        }
+        if modality == "video":
+            batch["num_frames"] = PackedTensor([torch.tensor([frame_count])], dim_to_pack=0)
+        data = BatchedDataDict(batch)
+        adapter = _protocol_adapter(mixin_cls, ignore_eos=True)
+        adapter.cfg["generation"]["max_new_tokens"] = 1
+        adapter._get_megatron_inference_wrapper_cls = lambda: VLMInferenceWrapper
+        prompts, media, params = adapter._prepare_data_for_generation(data, greedy=True)
+        assert prompts == [prompt] and set(media[0]) == {modality, "media_tokens_preexpanded"}
+        assert params[0].return_prompt_tokens
+        engine = object.__new__(DynamicInferenceEngine)
+        engine.controller = SimpleNamespace(
+            inference_wrapped_model=wrapper, tokenizer=SimpleNamespace(eod=127), pp_group=None
+        )
+        engine.context = SimpleNamespace(
+            block_size_tokens=16, enable_prefix_caching=False, add_vlm_request_data=mock.Mock()
+        )
+        engine.vision_embedding_cache_max_bytes = sys.maxsize
+        engine.allow_stale_multimodal_embeddings = False
+        engine._vision_embedding_cache = OrderedDict()
+        engine._vision_embedding_cache_bytes = 0
+        engine._weight_epoch = 0
+        engine.requests = {}
+
+        def build_request(request_id, media_data):
+            payload = media_data[modality]
+            return engine._build_vlm_request(
+                request_id=request_id,
+                prompt_str=None,
+                tokens=torch.tensor(prompt),
+                sampling_params=params[0],
+                num_img_embeddings_per_tile=0,
+                num_tiles=None,
+                precomputed_block_hashes=None,
+                media_tokens_preexpanded=True,
+                media_cache_key=f"consumer-{modality}",
+                **payload,
+            )
+
+        def next_token(request):
+            context.reset()
+            tokens = request.prompt_tokens.unsqueeze(0).cuda()
+            with torch.inference_mode():
+                logits = wrapper._forward_dynamic(
+                    {
+                        "tokens": tokens,
+                        "position_ids": torch.arange(tokens.shape[1], device="cuda").unsqueeze(0),
+                        "attention_mask": None,
+                        "image_token_mask": request.image_token_mask.unsqueeze(0),
+                        "image_embeddings": request.image_embeddings,
+                    }
+                )
+            step_logits = logits[0, -1].float()
+            token = int(step_logits.argmax())
+            return token, float(torch.log_softmax(step_logits, dim=-1)[token])
+
+        direct_request = build_request(1300, media[0])
+        direct_token, direct_score = next_token(direct_request)
+        adapter_request = build_request(1301, media[0])
+        adapter_token, adapter_score = next_token(adapter_request)
+        cache_key = f"consumer-{modality}"
+        assert cache_key in engine._vision_embedding_cache
+        assert vision_calls == [modality]
+        assert torch.equal(direct_request.image_embeddings, adapter_request.image_embeddings)
+        assert (adapter_token, adapter_score) == (direct_token, direct_score)
+        reply = _reply([adapter_token], [adapter_score], "length", adapter_request.prompt_tokens)
+        output = adapter._parse_result_to_batched_data_dict(data, [reply])
+        assert output["output_ids"][0, len(prompt)].item() == direct_token
+        assert output["logprobs"][0, len(prompt)].item() == direct_score
+        assert output["truncated"].tolist() == [True]
+        cached_embedding = engine._vision_embedding_cache[cache_key].embedding
+        engine.allow_stale_multimodal_embeddings = True
+        engine._invalidate_vision_state()
+        assert engine._vision_embedding_cache[cache_key].embedding is cached_embedding
+        stale_request = build_request(1302, media[0])
+        assert stale_request.image_embeddings is cached_embedding
+        assert vision_calls == [modality]
+        engine.allow_stale_multimodal_embeddings = False
+        engine._invalidate_vision_state()
+        assert not engine._vision_embedding_cache
+        rebuilt_request = build_request(1303, media[0])
+        assert rebuilt_request.image_embeddings is not cached_embedding
+        torch.testing.assert_close(
+            rebuilt_request.image_embeddings, cached_embedding, rtol=0, atol=0
+        )
+        assert vision_calls == [modality, modality]
+    @pytest.mark.internal
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "feature_config",
