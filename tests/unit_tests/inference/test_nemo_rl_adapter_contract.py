@@ -940,6 +940,7 @@ class TestNeMoRLAdapterParallelContract(DynamicInferenceEngineTestBase):
                 id="tp2-sp-inference-optimized",
             ),
             pytest.param({"tp": 1, "pp": 2, "ep": 1}, id="pp2"),
+            pytest.param({"tp": 1, "pp": 1, "ep": 2}, id="ep2-moe"),
             pytest.param({"tp": 2, "pp": 1, "ep": 1, "etp": 2, "moe": True}, id="etp2-moe-local"),
             pytest.param(
                 {
