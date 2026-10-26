@@ -15,7 +15,7 @@ dispatcher picks ``ordered_reduce_scatter_v`` instead of ``multimem_reduce_scatt
 MoE reference switches its cross-rank accumulation from fp64 to fp32
 (``megatron/core/transformer/moe/batch_invariant.py:78-79``).
 
-No GPU is needed: the test only toggles the global mode. With Transformer Engine installed (the dfw
+No GPU is needed: the test only toggles the global mode. With Transformer Engine installed (a GPU
 container) the real TE patch/unpatch runs; without TE (a CPU-only environment) the TE kernel patch
 is replaced by a no-op, because ``_te_patch_for_batch_invariant`` imports TE unconditionally and the
 patched TE kernels play no part in the collective bookkeeping under test.

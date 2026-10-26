@@ -7,7 +7,7 @@
 ``flashinfer.sampling.top_k_renorm_probs`` and then ``flashinfer.sampling.top_p_renorm_probs``
 (``:187-188``). The top-p call does not pass ``is_deterministic``, while every sampling call in the
 same class passes ``deterministic=True`` (``:113-136``). FlashInfer's default is
-``is_deterministic=False`` (``flashinfer/sampling.py:1742-1746`` at tag ``v0.6.16.post3``, the dfw
+``is_deterministic=False`` (``flashinfer/sampling.py:1742-1746`` at tag ``v0.6.16.post3``, the tested
 container's version, identical at ``v0.7.0.post1``). For vocabularies of at least 2048 that selects
 the AIR radix top-p kernel with float ``atomicAdd`` histograms
 (``include/flashinfer/air_top_p.cuh:184-191, 271-275``, ``csrc/renorm.cu:43-55``). The histogram
