@@ -160,6 +160,51 @@ def test_public_quantizers_document_finite_input_contract(api):
     assert "finite" in documentation
 
 
+def test_public_validation_rejects_invalid_dtype_and_linear_geometry(monkeypatch):
+    with pytest.raises(TypeError, match="requires BF16, FP16, or FP32"):
+        MXFP8Tensor.from_bf16(
+            torch.ones(8, 128, device="cuda", dtype=torch.int32), backend="triton"
+        )
+    with pytest.raises(ValueError, match="dimensions must be nonzero"):
+        MXFP8Tensor.from_bf16(
+            torch.empty(0, 128, device="cuda", dtype=torch.bfloat16), backend="triton"
+        )
+    with pytest.raises(ValueError, match="divisible"):
+        MXFP8Tensor.from_bf16(
+            torch.empty(8, 130, device="cuda", dtype=torch.bfloat16), backend="triton"
+        )
+    if HAVE_FLASHINFER:
+        with pytest.raises(TypeError, match="accepts BF16 or FP16"):
+            MXFP8Tensor.from_bf16(
+                torch.randn(8, 128, device="cuda", dtype=torch.float32), backend="flashinfer"
+            )
+
+    weight = MXFP8Tensor.from_bf16(
+        torch.randn(64, 128, device="cuda", dtype=torch.bfloat16), backend="triton"
+    )
+
+    def unexpected_dispatch(*args, **kwargs):
+        raise AssertionError("invalid MXFP8 geometry reached the GEMM backend")
+
+    monkeypatch.setattr(quantization_utils, "_mm_mxfp8_torch", unexpected_dispatch)
+    with pytest.raises(ValueError, match=r"\[tokens, 1, hidden\]"):
+        quantization_utils.mm_mxfp8(
+            torch.randn(4, 128, device="cuda", dtype=torch.bfloat16), weight
+        )
+    with pytest.raises(ValueError, match="does not match weight K"):
+        quantization_utils.mm_mxfp8(
+            torch.randn(4, 1, 160, device="cuda", dtype=torch.bfloat16), weight
+        )
+    with pytest.raises(TypeError, match="linear input must use"):
+        quantization_utils.mm_mxfp8(torch.ones(4, 1, 128, device="cuda", dtype=torch.int32), weight)
+    with pytest.raises(ValueError, match="output buffer"):
+        quantization_utils.mm_mxfp8(
+            torch.randn(4, 1, 128, device="cuda", dtype=torch.bfloat16),
+            weight,
+            out=torch.empty(4, 64, device="cuda", dtype=torch.float32),
+        )
+
+
 def test_hopper_mxfp8_gemm_fails_and_bf16_path_executes(monkeypatch):
     """Hopper quantizes MXFP8, rejects its GEMM, and retains the BF16 linear path."""
     if torch.cuda.get_device_capability()[0] >= 10:
