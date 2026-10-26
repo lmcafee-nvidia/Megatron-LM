@@ -792,6 +792,17 @@ _ASYNC_PAIR_SCENARIOS = (
         config={"transformer_impl": "inference_optimized"},
         signals=("inference-optimized",),
     ),
+    *(
+        _pair_scenario(
+            "fp8-transformer-engine" + (f"-{recipe}" if recipe != "tensorwise" else ""),
+            f"precision:fp8-{recipe}",
+            config={"fp8": True, "fp8_recipe": recipe, "hidden_size": 128},
+            signals=("fp8", "fixed-history-logits"),
+            prerequisite="fp8",
+            atol=0.0,
+        )
+        for recipe in ("tensorwise", "delayed", "blockwise")
+    ),
     # Four heads of width 64 exercise FlashInfer's supported fused-RoPE kernel.
     # Width 16 crosses half-head boundaries in its vectorized NeoX rotation.
     _pair_scenario(
@@ -871,7 +882,8 @@ _CUDA_GRAPH_DIFFERENTIAL_SCENARIOS = (
     tuple(
         scenario
         for scenario in _ASYNC_PAIR_SCENARIOS
-        if scenario.name
+        if scenario.name.startswith("fp8-transformer-engine")
+        or scenario.name
         in {
             "prefix-lru-chunked",
             "prefix-ref-zero",
