@@ -129,20 +129,20 @@ async def test_deferred_cuda_graph_recapture_waits_for_idle_boundary():
     engine.controller._async_sched_forward = SimpleNamespace(is_valid=False)
     engine.create_cuda_graphs = mock.Mock()
     engine.use_coordinator = True
-
     with (
         mock.patch.object(DynamicInferenceEngine, "suspend_resume_ctx", return_value=nullcontext()),
         mock.patch("torch.cuda.synchronize"),
         mock.patch("megatron.core.inference.engines.dynamic_engine.InferenceMode.set_active"),
     ):
         engine.resume()
-
     assert engine._cuda_graph_recapture_dimensions == dimensions
     assert context.cuda_graph_batch_dimensions_list == []
     engine.create_cuda_graphs.assert_not_called()
-
-    engine.state = EngineState.RUNNING
     context.has_unfinished_requests.return_value = False
+    for blocked_state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
+        engine.state = blocked_state
+        assert not engine._recapture_cuda_graphs_if_idle()
+    engine.state = EngineState.RUNNING
     blockers = (
         (
             lambda: setattr(context.has_unfinished_requests, "return_value", True),
