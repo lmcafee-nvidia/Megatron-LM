@@ -960,6 +960,20 @@ _ASYNC_PARALLEL_SCENARIOS = (
         signals=("inference-optimized", "moe", "nvls-dispatch", "parallel"),
     ),
     _pair_scenario(
+        "moe-ep2-etp2-local-allgather",
+        "model:moe",
+        "topology:ep",
+        "topology:etp",
+        "dispatcher:allgather",
+        config={
+            "expert_model_parallel_size": 2,
+            "expert_tensor_parallel_size": 2,
+            "num_moe_experts": 4,
+            "use_moe_layer_spec": True,
+        },
+        signals=("etp", "moe", "parallel"),
+    ),
+    _pair_scenario(
         "optimized-tp2-sp",
         "interaction:optimized-tp-sp",
         "seed:shared-across-dp",
