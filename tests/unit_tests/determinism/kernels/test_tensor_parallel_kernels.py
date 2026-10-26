@@ -35,6 +35,7 @@ from megatron.core.tensor_parallel.layers import (
     VocabParallelEmbedding,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import attention_mask_func
@@ -264,6 +265,29 @@ class TestTensorParallelLayers:
             module, (x,), replays=3, contention=True, what="column linear[bf16 input, fp32 output]"
         )
         assert outputs["out[0]"].dtype is torch.float32
+
+    def test_local_attention_unequal_key_value_widths_replay(self):
+        """MLA's local core uses key width for scores and value width for its output."""
+        seeded()
+        config = _config(
+            hidden_size=512,
+            num_attention_heads=8,
+            num_query_groups=2,
+            kv_channels=64,
+            masked_softmax_fusion=False,
+            attention_dropout=0.0,
+        )
+        module = DotProductAttention(
+            config, 1, AttnMaskType.causal, "self", k_channels=64, v_channels=96
+        ).cuda()
+        q = torch.randn(512, 2, 8, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        k = torch.randn(512, 2, 2, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        v = torch.randn(512, 2, 2, 96, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        outputs, _ = assert_module_replays_bit_exact(
+            module, (q, k, v, None), replays=3, contention=True, what="local MLA attention"
+        )
+        assert outputs["out"].shape == (512, 2, 8 * 96)
+        assert module.softmax_scale == 64**-0.5
 
 
 # --- apex fused layer norm ------------------------------------------------------------------
