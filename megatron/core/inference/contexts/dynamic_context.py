@@ -39,7 +39,10 @@ from megatron.core.inference.unified_memory import (
     create_unified_mempool,
 )
 from megatron.core.inference.utils import device_memory_summary, tensor_swap
-from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
+from megatron.core.models.common.embeddings.rope_utils import (
+    apply_rotary_pos_emb,
+    apply_rotary_pos_emb_with_cos_sin,
+)
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
     Symbols,
     get_layer_maps_from_layer_type_list,
@@ -2153,6 +2156,22 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         n = self.padded_active_token_count
         num_q_heads, head_size = query.shape[-2], query.shape[-1]
         num_k_heads = key.shape[-2]
+
+        # A direct GB200 control around FlashInfer's cos/sin-cache API reported
+        # a misaligned access at immediate synchronization for width 8, while
+        # width 64 passed. Preserve the accepted width-8 geometry through
+        # MCore's existing cos/sin path.
+        if head_size == 8:
+            positions = self.gpu_view.token_to_pos_ids[:n]
+            cos, sin = cos_sin_emb.chunk(2, dim=-1)
+            return (
+                apply_rotary_pos_emb_with_cos_sin(
+                    query[:n], cos[positions], sin[positions], config.rotary_interleaved
+                ),
+                apply_rotary_pos_emb_with_cos_sin(
+                    key[:n], cos[positions], sin[positions], config.rotary_interleaved
+                ),
+            )
 
         # use .view instead of .reshape to avoid extra transpose operations
         query_rope, key_rope = flashinfer.rope.apply_rope_with_cos_sin_cache(
