@@ -57,7 +57,7 @@ def validate_mxfp8_tensor(
     expected_backend: Optional[MXFP8Backend] = None,
     tensor_name: str = "MXFP8 tensor",
 ) -> None:
-    """Thorough MXFP8 validation for GEMM consumers, courtesy of Codex."""
+    """Validate logical MXFP8 storage shared by conversion and compute consumers."""
     if tensor.data.ndim != 2:
         raise ValueError(
             f"{tensor_name} data must be 2D before grouped-weight stacking; "
@@ -116,6 +116,38 @@ def validate_mxfp8_tensor(
             f"{tensor_name} scale must be a 1D swizzled tensor or a 2D unswizzled "
             f"tensor, got shape {tuple(tensor.scale.shape)}."
         )
+
+
+def validate_mxfp8_gemm_tensor(
+    tensor: "MXFP8Tensor",
+    *,
+    expected_backend: Optional[MXFP8Backend] = None,
+    tensor_name: str = "MXFP8 tensor",
+) -> None:
+    """Validate MXFP8 storage for kernels that require cuBLAS-swizzled scales."""
+    validate_mxfp8_tensor(tensor, expected_backend=expected_backend, tensor_name=tensor_name)
+    if tensor.scale.ndim != 1:
+        backend = expected_backend if expected_backend is not None else tensor.backend
+        raise ValueError(
+            f"{tensor_name} scales for backend {backend!r} must use 1D "
+            f"swizzled storage at the GEMM boundary; got shape {tuple(tensor.scale.shape)}."
+        )
+
+
+def get_mxfp8_scale_bytes(tensor: "MXFP8Tensor") -> torch.Tensor:
+    """Return logical ``[M, K // 32]`` E8M0 bytes without requantizing data."""
+    rows, cols = tensor.data.shape
+    scale_cols = cols // MXFP8_BLOCK_SIZE
+    if tensor.scale.ndim == 2:
+        return tensor.scale.view(torch.uint8)
+
+    padded_rows = _ceil_div(rows, MXFP8_SCALE_ROW_BLOCK) * MXFP8_SCALE_ROW_BLOCK
+    padded_scale_cols = _ceil_div(scale_cols, MXFP8_SCALE_COL_BLOCK) * MXFP8_SCALE_COL_BLOCK
+    scale = tensor.scale.view(torch.uint8).reshape(
+        padded_rows // MXFP8_SCALE_ROW_BLOCK, padded_scale_cols // MXFP8_SCALE_COL_BLOCK, 32, 4, 4
+    )
+    logical = scale.permute(0, 3, 2, 1, 4).contiguous().reshape(padded_rows, padded_scale_cols)
+    return logical[:rows, :scale_cols]
 
 
 @dataclass
@@ -198,7 +230,15 @@ class MXFP8Tensor:
         else:
             quantized = MXFP8Tensor.from_bf16(value, backend=self.backend)
             self.data.copy_(quantized.data)
-            self.scale.view(torch.uint8).copy_(quantized.scale.view(torch.uint8))
+            if self.scale.shape == quantized.scale.shape:
+                self.scale.view(torch.uint8).copy_(quantized.scale.view(torch.uint8))
+            elif self.scale.ndim == 2:
+                self.scale.view(torch.uint8).copy_(get_mxfp8_scale_bytes(quantized))
+            else:
+                raise ValueError(
+                    "Cannot update 1D MXFP8 scale storage from a producer with shape "
+                    f"{tuple(quantized.scale.shape)}."
+                )
         if self.dtype is None:
             self.dtype = value.dtype
         return self

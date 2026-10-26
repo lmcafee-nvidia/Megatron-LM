@@ -230,6 +230,37 @@ def test_quantize_into_honors_offset_views_without_touching_sentinels():
     assert torch.all(scale_storage[-8:] == 0xA5)
 
 
+@pytest.mark.parametrize(
+    ("backend", "scale_dtype"), (("triton", torch.float8_e8m0fnu), ("flashinfer", torch.uint8))
+)
+def test_logical_2d_scale_validation_and_gemm_boundary(backend, scale_dtype):
+    """Logical storage remains valid, while physical GEMM inputs stay swizzled."""
+    data = torch.empty((64, 128), device="cuda", dtype=torch.float8_e4m3fn)
+    logical_scale = torch.empty((64, 4), device="cuda", dtype=scale_dtype)
+    tensor = MXFP8Tensor(data=data, scale=logical_scale, backend=backend, dtype=torch.bfloat16)
+
+    validate_mxfp8_tensor(tensor)
+    with pytest.raises(ValueError, match="swizzled storage at the GEMM boundary"):
+        quantization_utils.mm_mxfp8(
+            torch.ones(1, 1, 128, device="cuda", dtype=torch.bfloat16), tensor
+        )
+
+    from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+    grouped = SimpleNamespace(num_local_experts=1, linear_fc1=SimpleNamespace(weight0=tensor))
+    with pytest.raises(ValueError, match="swizzled storage at the GEMM boundary"):
+        InferenceGroupedMLP._stack_mxfp8_linear_weight(grouped, "linear_fc1", backend)
+
+    invalid = MXFP8Tensor(
+        data=data,
+        scale=torch.empty((64, 5), device="cuda", dtype=scale_dtype),
+        backend=backend,
+        dtype=torch.bfloat16,
+    )
+    with pytest.raises(ValueError, match="2D scale has shape"):
+        validate_mxfp8_tensor(invalid)
+
+
 @pytest.mark.launch_on_gb200
 @pytest.mark.parametrize(
     "backend,dispatch_name",
