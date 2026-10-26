@@ -767,6 +767,280 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         assert not engine.requests and not engine.has_unfinished_requests()
     @pytest.mark.internal
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("kv_cache_management_mode", "mxfp8"),
+        [("persist", False)],
+        ids=["persist"],
+    )
+    async def test_real_client_coordinator_adapter_matches_direct(
+        self, kv_cache_management_mode, mxfp8
+    ):
+        BatchedDataDict, mixin_cls = _load_nemo_rl_adapter()
+        config = DynamicEngineTestConfig(
+            num_requests=0,
+            max_prompt_length=8,
+            max_sequence_length=64,
+            context_max_requests=8,
+            context_max_tokens=64,
+            sampling_backend="flashinfer",
+            async_sched_mode=AsyncScheduleMode.ASYNC,
+            return_log_probs=True,
+            skip_prompt_log_probs=True,
+            logprobs_mode="raw_logprobs",
+            kv_cache_management_mode=kv_cache_management_mode,
+            fp8=mxfp8,
+            hidden_size=128 if mxfp8 else None,
+            transformer_impl="inference_optimized" if mxfp8 else "local",
+        )
+        if mxfp8:
+            engine = _build_inference_mxfp8_env(self, config, quantize=False).engine
+            assert (
+                "mxfp8"
+                in str(engine.controller.inference_wrapped_model.model.config.fp8_recipe).lower()
+            )
+        else:
+            engine = self._build_test_env(config).engine
+        engine.controller.tokenizer = _CoordinatorTokenizer()
+        prompts = [[3, 5, 7, 9], [2, 4, 6, 8, 10]]
+        generation_length, refit_expected, refit_model = 3, None, None
+        if kv_cache_management_mode == "recompute":
+            source_config = copy.deepcopy(config)
+            source_config.fp8 = False
+            refit_engine = self._build_test_env(source_config).engine
+            refit_model = refit_engine.controller.inference_wrapped_model.model
+            base_state = copy.deepcopy(refit_model.state_dict())
+            if mxfp8:
+                inference_model = engine.controller.inference_wrapped_model.model
+                prepare_swap_model_weights(refit_model, inference_model)
+                swap_model_weights(refit_model, inference_model, refit_method="nccl")
+        direct_futures = [
+            engine.add_request(
+                request_id,
+                prompt,
+                SamplingParams(
+                    temperature=0,
+                    top_k=1,
+                    top_p=0.0,
+                    skip_prompt_log_probs=True,
+                    return_log_probs=True,
+                    num_tokens_to_generate=generation_length,
+                    termination_id=-1,
+                ),
+            )
+            for request_id, prompt in enumerate(prompts, 300)
+        ]
+        direct = await _drive_engine(engine, direct_futures)
+        if kv_cache_management_mode == "recompute":
+            refit_expected = []
+            refit_states = []
+            for version_seed in (901, 902):
+                torch.manual_seed(version_seed)
+                with torch.inference_mode():
+                    refit_model.load_state_dict(base_state)
+                    for parameter in refit_model.parameters():
+                        parameter.add_(0.05 * torch.randn_like(parameter))
+                expected = await _drive_engine(
+                    refit_engine,
+                    [
+                        refit_engine.add_request(
+                            request_id,
+                            prompt,
+                            SamplingParams(
+                                temperature=0,
+                                top_k=1,
+                                top_p=0,
+                                skip_prompt_log_probs=True,
+                                return_log_probs=True,
+                                num_tokens_to_generate=generation_length,
+                                termination_id=-1,
+                            ),
+                        )
+                        for request_id, prompt in enumerate(prompts, 350 + version_seed)
+                    ],
+                )
+                refit_expected.append(expected)
+                refit_states.append(copy.deepcopy(refit_model.state_dict()))
+            assert any(
+                first.generated_tokens != second.generated_tokens
+                or first.generated_log_probs != second.generated_log_probs
+                for first, second in zip(*refit_expected, strict=True)
+            )
+            with torch.inference_mode():
+                refit_model.load_state_dict(refit_states[0])
+            del refit_engine, base_state
+
+        client = None
+        try:
+            coordinator_address = await engine.start_listening_to_data_parallel_coordinator(
+                hostname="127.0.0.1"
+            )
+            client = InferenceClient(coordinator_address, deserialize=True)
+            client.start(loop=asyncio.get_running_loop(), connect_timeout_seconds=10)
+            adapter = _protocol_adapter(mixin_cls, ignore_eos=True)
+            adapter.inference_client = client
+            adapter._token_capture_enabled = True
+            adapter._inference_loop = asyncio.get_running_loop()
+            await asyncio.to_thread(adapter.set_rollout_weight_version, 0)
+            await _wait_for_epoch(engine, 0)
+            padded = torch.tensor([prompts[0] + [0], prompts[1]], dtype=torch.long, device="cuda")
+            data = BatchedDataDict(
+                {"input_ids": padded, "input_lengths": torch.tensor([4, 5], device="cuda")}
+            )
+            lowered_prompts, media, params = adapter._prepare_data_for_generation(data, greedy=True)
+
+            async def direct_target_reference(first_request_id):
+                rng_state = engine.controller.sampling_rng.get_state()
+                references = await asyncio.gather(
+                    *(
+                        engine.add_request(first_request_id + index, *request)
+                        for index, request in enumerate(zip(lowered_prompts, params, strict=True))
+                    )
+                )
+                engine.controller.sampling_rng.set_state(rng_state)
+                return references
+
+            def assert_mxfp8_refit_content():
+                if not mxfp8:
+                    return
+                from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+                params, matched = dict(refit_model.named_parameters()), 0
+                for module_name, module in adapter.inference_model.decoder.named_modules():
+                    for name, dst in vars(module).items():
+                        if not isinstance(dst, MXFP8Tensor):
+                            continue
+                        key = f"decoder.{module_name}.{name}".replace("..", ".")
+                        src = MXFP8Tensor.from_bf16(params[key].to(dst.device), backend=dst.backend)
+                        assert torch.equal(dst.data, src.data) and torch.equal(dst.scale, src.scale)
+                        matched += 1
+                assert matched
+
+            replies = await asyncio.wait_for(
+                adapter._generate_with_persistent_engine(lowered_prompts, media, params), timeout=30
+            )
+            output = adapter._parse_result_to_batched_data_dict(data, replies)
+            assert all(reply.policy_epoch == [(0, 0)] for reply in replies)
+            for index, expected in enumerate(direct):
+                prompt_length = len(prompts[index])
+                assert output["output_ids"][
+                    index, prompt_length : prompt_length + generation_length
+                ].tolist() == (expected.generated_tokens)
+                _assert_exact_scores(
+                    output["logprobs"][index, prompt_length : prompt_length + generation_length],
+                    expected.generated_log_probs,
+                )
+            weight_epoch = engine._weight_epoch
+            adapter.dynamic_inference_engine = engine
+            await adapter._sleep_engine()
+            assert engine.state == EngineState.SUSPENDED
+            if refit_model is not None:
+                adapter.model = refit_model
+                adapter.inference_model = engine.controller.inference_wrapped_model.model
+                adapter.cfg["generation"]["mcore_generation_config"] = {
+                    "refit_backend": "nccl",
+                    "refit_execution_batch_bytes": None,
+                }
+                adapter._inference_model_offloaded = False
+                adapter._swap_weights_plan_prepared = False
+                adapter.should_disable_forward_pre_hook = False
+                adapter.move_model = lambda model, device, **_kwargs: model.to(device)
+                adapter._reshard_into_inference_model()
+                assert_mxfp8_refit_content()
+            await asyncio.to_thread(adapter.set_rollout_weight_version, 1)
+            await adapter._wake_engine()
+            assert engine.state == EngineState.RUNNING
+            assert engine._weight_epoch == weight_epoch + 1
+            await _wait_for_epoch(engine, 1)
+            expected_after_first_refit = refit_expected[0] if refit_expected else direct
+            if mxfp8:
+                expected_after_first_refit = await direct_target_reference(500)
+            resumed_replies = await asyncio.wait_for(
+                adapter._generate_with_persistent_engine(lowered_prompts, media, params), timeout=30
+            )
+            resumed_output = adapter._parse_result_to_batched_data_dict(data, resumed_replies)
+            assert all(reply.policy_epoch == [(0, 1)] for reply in resumed_replies)
+            for actual, expected in zip(resumed_replies, expected_after_first_refit, strict=True):
+                assert actual.generated_tokens == expected.generated_tokens
+                assert actual.generated_log_probs == expected.generated_log_probs
+            spanning_params = [adapter._build_sampling_params(greedy=True, stop_words=None)]
+            spanning_params[0].num_tokens_to_generate = 48
+            spanning_task = asyncio.create_task(
+                adapter._generate_with_persistent_engine([prompts[0]], [None], spanning_params)
+            )
+            for _ in range(10_000):
+                if any(
+                    len(engine.get_request(request_id).generated_tokens) >= 2
+                    for request_id in engine.requests
+                ):
+                    break
+                await asyncio.sleep(0.001)
+            assert engine.requests, "spanning request was not observed in flight"
+            if refit_model is not None:
+                await adapter._sleep_engine()
+                with torch.inference_mode():
+                    refit_model.load_state_dict(refit_states[1])
+                adapter._reshard_into_inference_model()
+                assert_mxfp8_refit_content()
+                await asyncio.to_thread(adapter.set_rollout_weight_version, 2)
+                await adapter._wake_engine()
+                assert engine._weight_epoch == weight_epoch + 2
+            else:
+                await asyncio.to_thread(adapter.set_rollout_weight_version, 2)
+            await _wait_for_epoch(engine, 2)
+            spanning_reply = (await asyncio.wait_for(spanning_task, timeout=30))[0]
+            assert spanning_reply.policy_epoch[0] == (0, 1)
+            assert spanning_reply.policy_epoch[-1][1] == 2
+            assert spanning_reply.policy_epoch[-1][0] > len(prompts[0])
+
+            if refit_expected is not None:
+                final_expected = await direct_target_reference(600) if mxfp8 else refit_expected[1]
+                final_replies = await asyncio.wait_for(
+                    adapter._generate_with_persistent_engine(lowered_prompts, media, params),
+                    timeout=30,
+                )
+                assert all(reply.policy_epoch == [(0, 2)] for reply in final_replies)
+                for actual, expected in zip(final_replies, final_expected, strict=True):
+                    assert actual.generated_tokens == expected.generated_tokens
+                    assert actual.generated_log_probs == expected.generated_log_probs
+
+            cancel_params = [adapter._build_sampling_params(greedy=True, stop_words=None)]
+            cancel_params[0].num_tokens_to_generate = 48
+            cancel_task = asyncio.create_task(
+                adapter._generate_with_persistent_engine([prompts[1]], [None], cancel_params)
+            )
+            for _ in range(10_000):
+                if engine.requests:
+                    break
+                await asyncio.sleep(0.001)
+            cancelled_request_ids = set(engine.requests)
+            assert cancelled_request_ids
+            cancel_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await cancel_task
+            for _ in range(200):
+                if not engine.requests and not client.abort_futures:
+                    break
+                await asyncio.sleep(0.01)
+            assert cancelled_request_ids.isdisjoint(engine.requests)
+            assert not client.abort_futures
+        finally:
+            if client is not None:
+                if engine.state == EngineState.RUNNING:
+                    client.pause_engines()
+                    await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), timeout=10)
+                client.stop_engines()
+                await asyncio.wait_for(engine.engine_loop_task, timeout=10)
+                client.shutdown_coordinator()
+                coordinator_process = getattr(engine, "inference_coordinator_process", None)
+                if coordinator_process is not None:
+                    await asyncio.to_thread(coordinator_process.join, 10)
+                    assert not coordinator_process.is_alive()
+                client.stop()
+            if refit_model is not None:
+                clear_all_caches()
+
+    @pytest.mark.internal
+    @pytest.mark.asyncio
     async def test_real_token_capture_stages_exact_concurrent_versioned_payloads(self):
         _, mixin_cls = _load_nemo_rl_adapter()
         capture_module, gym_module, records_module = _load_nemo_rl_token_capture()
