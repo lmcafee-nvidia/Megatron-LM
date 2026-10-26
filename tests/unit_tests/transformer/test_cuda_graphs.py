@@ -2263,6 +2263,38 @@ class TestInlineCaptureManager:
         assert len(mgr.cudagraph_runners) == 1
         assert mgr.cudagraph_runners[0].fwd_graph_recorded
 
+        runner = mgr.cudagraph_runners[0]
+        old_mempool = runner.mempool
+        buffer_metadata = cuda_graphs_module.CudagraphBufferMetadata(
+            fwd_cudagraph_buffer=runner.fwd_graph_input_surface[0],
+            bwd_cudagraph_buffer=runner.fwd_graph_output_surface[0],
+        )
+        runner.fwd_graph_input_arg_metas[0].cg_buffer_metadata = buffer_metadata
+        runner.static_grad_inputs = runner.fwd_graph_input_surface
+        runner.static_grad_outputs = runner.fwd_graph_output_surface
+
+        delete_cuda_graphs()
+
+        assert mgr.cudagraph_runners[0] is runner
+        assert buffer_metadata.fwd_cudagraph_buffer is None
+        assert buffer_metadata.bwd_cudagraph_buffer is None
+        for name in (
+            "fwd_graph_input_surface",
+            "fwd_graph_output_surface",
+            "static_grad_inputs",
+            "static_grad_outputs",
+        ):
+            assert not getattr(runner, name)
+
+        x.add_(1)
+        eager_after_delete = module.my_op(x, eager=True).clone()
+        for graph_out in (module.my_op(x), module.my_op(x)):
+            assert torch.equal(eager_after_delete, graph_out)
+        assert mgr.cudagraph_runners[0] is runner
+        assert runner.fwd_graph_recorded
+        assert runner.mempool == CudaGraphManager.global_mempool is not None
+        assert runner.mempool != old_mempool
+
     @torch.inference_mode()
     def test_eager_bypass(self):
         """eager=True must bypass graph capture entirely."""

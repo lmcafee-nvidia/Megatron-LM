@@ -1484,7 +1484,10 @@ class InferenceTopKRouter(TopKRouter):
             dense_output=True,
             precomputed_indices=precomputed_indices,
         )
-        return probs.squeeze(1), top_indices.squeeze(1)
+        # Keep the dense inference contract [num_tokens, topk] when topk == 1.
+        # Squeezing that singleton route dimension breaks inference dispatchers
+        # and fused-MoE kernels, all of which index the top-k axis explicitly.
+        return probs, top_indices
 
     def forward(
         self,
