@@ -145,6 +145,27 @@ def _boundary_input(rows: int, cols: int) -> torch.Tensor:
     return result
 
 
+@pytest.mark.parametrize("requested,expected_rows", [(-3, 0), (11, 8)])
+def test_live_rows_count_is_safely_bounded(requested: int, expected_rows: int):
+    """A device-resident scheduler count must not address outside fixed storage."""
+    x = _boundary_input(8, 128)
+    n_rows = torch.tensor([requested], device="cuda", dtype=torch.int64)
+    data, scale = mxfp8_quantize_rows(x, n_rows, max_programs=3)
+
+    if expected_rows:
+        expected_data, logical_scale = _reference_quantize(x)
+        assert torch.equal(data.view(torch.uint8), expected_data.view(torch.uint8))
+        assert torch.equal(scale.view(torch.uint8), _swizzle_scales(logical_scale))
+    else:
+        assert torch.count_nonzero(scale.view(torch.uint8)) == 0
+
+
+def test_live_rows_rejects_nonintegral_count():
+    x = torch.randn(8, 128, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(AssertionError, match="int32 or int64"):
+        mxfp8_quantize_rows(x, torch.tensor([4.0], device="cuda"))
+
+
 @pytest.mark.launch_on_gb200
 @pytest.mark.parametrize(
     "backend,dispatch_name",
