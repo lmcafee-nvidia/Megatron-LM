@@ -36,9 +36,8 @@ class _Tokenizer:
 
 
 class _IncrementalDetokenizer:
-    def __init__(self, finish_tokens=()):
+    def __init__(self):
         self._text = ""
-        self.finish = lambda: self.update(finish_tokens)
 
     def update(self, tokens):
         delta = "".join(chr(ord("a") + token - 1) for token in tokens)
@@ -155,16 +154,19 @@ def test_huggingface_fast_incremental_detokenizer_requires_optional_dependencies
         HuggingFaceFastIncrementalDetokenizer(_Tokenizer(), [])
 
 
+@pytest.mark.parametrize("drop,suffix", [(False, "<|im_end|>"), (True, "")], ids=("keep", "drop"))
 @pytest.mark.asyncio
-async def test_openai_stream_echoes_completion_prompt_before_generated_text():
+async def test_openai_stream_echoes_completion_prompt_before_generated_text(drop, suffix):
+    tokenizer, huggingface_tokenizer = _with_chat_markers(eos_marker="<|im_end|>")
+    token_ids = huggingface_tokenizer.encode("a<|im_end|>", add_special_tokens=False)
     stream = AsyncStream(request_id=1, cancel=lambda: None)
     stream.put(
         {
             "partial": {
                 "request_id": 1,
-                "new_tokens": [1],
-                "new_log_probs": [-0.1],
-                "new_top_n_logprobs": [{"a": -0.01}],
+                "new_tokens": token_ids,
+                "new_log_probs": [-0.1, -0.2],
+                "new_top_n_logprobs": [{"a": -0.01}, {"<|im_end|>": -0.02}],
                 "prompt_log_probs": [NEG_INF],
                 "prompt_top_n_logprobs": [{"z": -0.04}],
             }
@@ -174,10 +176,10 @@ async def test_openai_stream_echoes_completion_prompt_before_generated_text():
         {
             "final": {
                 "prompt_tokens": [26, 26],
-                "generated_tokens": [1],
-                "generated_log_probs": [-0.1],
-                "generated_top_n_logprobs": [{"a": -0.01}],
-                "sampling_params": {"num_tokens_to_generate": 2},
+                "generated_tokens": token_ids,
+                "generated_log_probs": [-0.1, -0.2],
+                "generated_top_n_logprobs": [{"a": -0.01}, {"<|im_end|>": -0.02}],
+                "sampling_params": {"num_tokens_to_generate": 3},
             }
         }
     )
@@ -188,7 +190,7 @@ async def test_openai_stream_echoes_completion_prompt_before_generated_text():
         async for record in openai_stream(
             [stream],
             _Tokenizer(),
-            [_IncrementalDetokenizer([2])],
+            [HuggingFaceFastIncrementalDetokenizer(tokenizer, [], remove_eos=drop)],
             chat=False,
             return_log_probs=True,
             echo_prompts=["zz"],
@@ -197,7 +199,7 @@ async def test_openai_stream_echoes_completion_prompt_before_generated_text():
     ]
     payloads = [json.loads(record.removeprefix("data: ")) for record in records[:-1]]
 
-    echoed, generated, flushed, finished = payloads
+    echoed, generated, *_, finished = payloads
     assert echoed["choices"][0]["text"] == "zz"
     assert echoed["choices"][0]["logprobs"] == {
         "tokens": ["z", "z"],
@@ -206,11 +208,10 @@ async def test_openai_stream_echoes_completion_prompt_before_generated_text():
         "text_offset": [0, 1],
     }
     assert generated["choices"][0]["text"] == "a"
-    assert generated["choices"][0]["logprobs"]["text_offset"] == [2]
-    assert flushed["choices"][0]["text"] == "b"
-    assert flushed["choices"][0]["logprobs"] is None
+    assert generated["choices"][0]["logprobs"]["text_offset"] == [2, 3]
     assert finished["choices"][0]["finish_reason"] == "stop"
-    assert finished["choices"][0]["generated_text"] == "ab"
+    assert "".join(payload["choices"][0]["text"] for payload in payloads[1:-1]) == "a" + suffix
+    assert finished["choices"][0]["generated_text"] == "a" + suffix
     assert records[-1] == "data: [DONE]\n\n"
 
 
