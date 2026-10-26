@@ -228,6 +228,13 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             {},
             {
                 "context_block_size_tokens": 256,
+                "context_max_tokens": 256,
+                "enable_chunked_prefill": True,
+                "enable_prefix_caching": True,
+                "prefix_caching_eviction_policy": PrefixCachingEvictionPolicy.LRU,
+            },
+            {
+                "context_block_size_tokens": 256,
                 "context_max_tokens": 1024,
                 "enable_prefix_caching": True,
                 "prefix_caching_eviction_policy": PrefixCachingEvictionPolicy.REF_ZERO,
@@ -252,6 +259,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         ],
         ids=[
             "dense",
+            "prefix-cache-chunked-prefill",
             "prefix-ref-zero",
             "mamba-hybrid",
             "gdn-hybrid",
