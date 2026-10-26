@@ -132,6 +132,45 @@ def token_permutation(token_dispatcher, hidden_states, probs, indices):
     return hidden_states, tokens_per_expert, permuted_probs
 
 
+@pytest.mark.internal
+def test_allgather_fixed_padding_is_capture_safe():
+    """Fixed inference padding keeps static counts and probability order during capture."""
+    dispatcher = object.__new__(token_dispatcher.MoEAllGatherTokenDispatcher)
+    dispatcher.num_local_experts = 2
+    dispatcher.local_expert_indices = [0, 1]
+    dispatcher.drop_and_pad = True
+    dispatcher.config = SimpleNamespace(
+        moe_pad_experts_for_cuda_graph_inference=True, moe_permute_fusion=False
+    )
+
+    hidden = torch.arange(12, device="cuda", dtype=torch.float32).view(3, 4)
+    routing_map = torch.tensor([[True, False], [False, True], [False, False]], device="cuda")
+    probs = torch.tensor([[0.9, 0.0], [0.0, 0.8], [0.0, 0.0]], device="cuda")
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        dispatcher.routing_map = routing_map
+        dispatcher.dispatch_postprocess(hidden, probs)
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+
+    dispatcher.routing_map = routing_map
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        permuted_hidden, tokens_per_expert, permuted_probs = dispatcher.dispatch_postprocess(
+            hidden, probs
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert tokens_per_expert.tolist() == [3, 3]
+    torch.testing.assert_close(
+        permuted_probs, torch.tensor([0.9, 0.0, 0.0, 0.8, 0.0, 0.0], device="cuda")
+    )
+    torch.testing.assert_close(permuted_hidden[[0, 3]], torch.stack((hidden[0], hidden[1])))
+    assert torch.count_nonzero(permuted_probs[[1, 2, 4, 5]]) == 0
+
+
 def token_unpermutation(token_dispatcher, hidden_states):
     hidden_states = token_dispatcher.combine_preprocess(hidden_states)
     hidden_states = token_dispatcher.token_combine(hidden_states)
