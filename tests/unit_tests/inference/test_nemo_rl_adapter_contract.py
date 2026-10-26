@@ -756,6 +756,160 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             )
         assert engine.context.async_sched_step_count > 0
         assert not engine.requests and not engine.has_unfinished_requests()
+    @pytest.mark.internal
+    @pytest.mark.asyncio
+    async def test_real_token_capture_stages_exact_concurrent_versioned_payloads(self):
+        _, mixin_cls = _load_nemo_rl_adapter()
+        capture_module, gym_module, records_module = _load_nemo_rl_token_capture()
+
+        class ConcurrentMemorySink:
+            media_pixel_dtype = None
+
+            def __init__(self):
+                self.records = []
+                self.lock = threading.Lock()
+                self.barrier = threading.Barrier(2)
+                self.active = 0
+                self.peak = 0
+
+            def stage(self, record, *, attachments=None):
+                assert attachments is None
+                with self.lock:
+                    self.active += 1
+                    self.peak = max(self.peak, self.active)
+                try:
+                    if record.model_call_id in {"call-1", "call-2"}:
+                        self.barrier.wait(timeout=10)
+                    with self.lock:
+                        self.records.append(record)
+                finally:
+                    with self.lock:
+                        self.active -= 1
+                return records_module.StageResult(ok=True, staging_key=record.staging_key)
+
+        config = DynamicEngineTestConfig(
+            num_requests=0,
+            max_prompt_length=8,
+            max_sequence_length=64,
+            context_max_requests=8,
+            context_max_tokens=64,
+            sampling_backend="flashinfer",
+            async_sched_mode=AsyncScheduleMode.ASYNC,
+            return_log_probs=True,
+            skip_prompt_log_probs=True,
+            logprobs_mode="raw_logprobs",
+        )
+        engine = self._build_test_env(config).engine
+        engine.controller.tokenizer = _CoordinatorTokenizer()
+        prompts = [[3, 5, 7, 9], [2, 4, 6, 8]]
+
+        def sampling_params(num_tokens):
+            return SamplingParams(
+                temperature=0,
+                top_k=1,
+                top_p=0,
+                skip_prompt_log_probs=True,
+                return_log_probs=True,
+                num_tokens_to_generate=num_tokens,
+                termination_id=-1,
+            )
+
+        direct = await _drive_engine(
+            engine,
+            [
+                engine.add_request(request_id, prompt, sampling_params(3))
+                for request_id, prompt in enumerate(prompts, 800)
+            ],
+        )
+        sink = ConcurrentMemorySink()
+        stager = capture_module.TQMegatronTokenStager(sink)
+        engine.payload_stager = stager
+        client = None
+        try:
+            address = await engine.start_listening_to_data_parallel_coordinator(
+                hostname="127.0.0.1"
+            )
+            client = InferenceClient(address, deserialize=True)
+            client.start(loop=asyncio.get_running_loop(), connect_timeout_seconds=10)
+            adapter = _protocol_adapter(mixin_cls, ignore_eos=True)
+            adapter.inference_client = client
+            adapter._token_capture_enabled = True
+            adapter._inference_loop = asyncio.get_running_loop()
+            await asyncio.to_thread(adapter.set_rollout_weight_version, 7)
+            await _wait_for_epoch(engine, 7)
+
+            futures = []
+            for index, prompt in enumerate(prompts, 1):
+                admission = records_module.CaptureAdmission(
+                    rollout_id="rollout-concurrent", model_call_id=f"call-{index}", mode="text"
+                )
+                futures.append(
+                    client.add_request(
+                        prompt,
+                        sampling_params(3),
+                        offload_params={
+                            gym_module.NG_CAPTURE_FIELD: admission.model_dump(mode="json")
+                        },
+                    )
+                )
+            replies = await asyncio.wait_for(asyncio.gather(*futures), timeout=30)
+            assert sink.peak == 2
+            staged = {record.model_call_id: record for record in sink.records}
+            assert set(staged) == {"call-1", "call-2"}
+            for index, (prompt, expected, reply) in enumerate(
+                zip(prompts, direct, replies, strict=True), 1
+            ):
+                record = staged[f"call-{index}"]
+                assert reply.payload_offloaded
+                assert reply.generated_tokens == expected.generated_tokens
+                assert reply.generated_log_probs is None
+                assert record.weight_version == 7
+                assert record.token_ids_delta == prompt + expected.generated_tokens
+                assert record.token_mask_delta == [0.0] * len(prompt) + [1.0] * 3
+                assert record.generation_log_probs_delta == [0.0] * len(prompt) + (
+                    expected.generated_log_probs
+                )
+                coords = reply.payload_stage_metadata[gym_module.NG_COMMIT_COORDS_FIELD]
+                assert coords["weight_version"] == 7
+                assert coords["staging_key"] == record.staging_key
+
+            spanning_admission = records_module.CaptureAdmission(
+                rollout_id="rollout-spanning", model_call_id="call-spanning", mode="text"
+            )
+            spanning_id, spanning_future = client.add_request_with_id(
+                prompts[0],
+                sampling_params(48),
+                offload_params={
+                    gym_module.NG_CAPTURE_FIELD: spanning_admission.model_dump(mode="json")
+                },
+            )
+            for _ in range(10_000):
+                request = engine.requests.get(spanning_id)
+                if request is not None and len(request.record[-1].generated_tokens) >= 2:
+                    break
+                await asyncio.sleep(0.001)
+            assert spanning_id in engine.requests
+            await asyncio.to_thread(adapter.set_rollout_weight_version, 8)
+            spanning_reply = await asyncio.wait_for(spanning_future, timeout=30)
+            spanning_record = next(
+                record for record in sink.records if record.model_call_id == "call-spanning"
+            )
+            assert spanning_reply.policy_epoch[0] == (0, 7)
+            assert spanning_reply.policy_epoch[-1][1] == 8
+            assert spanning_record.weight_version == 7
+            assert spanning_record.token_ids_delta == (prompts[0] + spanning_reply.generated_tokens)
+            assert stager.epoch_span_count == 1
+        finally:
+            if client is not None:
+                client.pause_engines()
+                await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), timeout=10)
+                client.stop_engines()
+                await asyncio.wait_for(engine.engine_loop_task, timeout=10)
+                client.shutdown_coordinator()
+                coordinator_process = engine.inference_coordinator_process
+                await asyncio.to_thread(coordinator_process.join, 10)
+                assert not coordinator_process.is_alive()
+                client.stop()
 @pytest.fixture
 def nemo_parallel(request, monkeypatch):
     topology = request.param
