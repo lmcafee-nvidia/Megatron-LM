@@ -15,6 +15,7 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endp
 )
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.incremental_detokenizer import (
     HuggingFaceFastIncrementalDetokenizer,
+    detokenize_generated_tokens,
 )
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.openai_streaming import (
     JSON_SAFE_LOGPROB_FLOOR,
@@ -442,6 +443,21 @@ def test_huggingface_fast_incremental_detokenizer_uses_prompt_context():
     assert streamed_text == full_text[len(prompt_text) :]
 
 
+def test_completed_generation_uses_streaming_prompt_context():
+    backend = Tokenizer(models.WordPiece(vocab={"[UNK]": 0, "hello": 1, "world": 2}))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    backend.decoder = decoders.WordPiece(prefix="##", cleanup=False)
+    huggingface_tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend)
+    tokenizer = SimpleNamespace(
+        _tokenizer=SimpleNamespace(tokenizer=huggingface_tokenizer, include_special_tokens=True)
+    )
+
+    text = detokenize_generated_tokens(tokenizer, [1], [2])
+
+    assert huggingface_tokenizer.decode([2]) == "world"
+    assert text == " world"
+
+
 def test_huggingface_fast_incremental_detokenizer_skips_special_tokens():
     tokenizer = _make_byte_level_fast_tokenizer()
     huggingface_tokenizer = tokenizer._tokenizer.tokenizer
@@ -501,6 +517,21 @@ def test_huggingface_fast_incremental_detokenizer_drops_eos_and_special_map_toke
     streamed_text = "".join(detokenizer.update([token_id]) for token_id in token_ids)
 
     assert streamed_text == "<think>x</think>ab"
+
+
+@pytest.mark.parametrize("remove_eos", [False, True])
+def test_huggingface_fast_incremental_detokenizer_matches_trailing_eos_policy(remove_eos):
+    tokenizer, huggingface_tokenizer = _with_chat_markers(eos_marker="<|im_end|>")
+    huggingface_tokenizer.add_special_tokens({"additional_special_tokens": ["<special>"]})
+    token_ids = huggingface_tokenizer.encode(
+        "a<special><|im_end|>b<|im_end|>", add_special_tokens=False
+    )
+    detokenizer = HuggingFaceFastIncrementalDetokenizer(tokenizer, [], remove_eos=remove_eos)
+
+    streamed_text = detokenizer.update(token_ids) + detokenizer.finish()
+    expected_tokens = token_ids[:-1] if remove_eos else token_ids
+
+    assert streamed_text == _non_streaming_text(huggingface_tokenizer, expected_tokens)
 
 
 def test_incremental_detokenizer_rejects_unsupported_tokenizer():
