@@ -57,7 +57,7 @@ def validate_mxfp8_tensor(
     expected_backend: Optional[MXFP8Backend] = None,
     tensor_name: str = "MXFP8 tensor",
 ) -> None:
-    """Thorough MXFP8 validation for GEMM consumers, courtesy of Codex."""
+    """Validate logical MXFP8 storage shared by conversion and compute consumers."""
     if tensor.data.ndim != 2:
         raise ValueError(
             f"{tensor_name} data must be 2D before grouped-weight stacking; "
@@ -67,6 +67,17 @@ def validate_mxfp8_tensor(
         raise TypeError(
             f"{tensor_name} data must use torch.float8_e4m3fn, got {tensor.data.dtype}."
         )
+    if not tensor.data.is_cuda or not tensor.scale.is_cuda:
+        raise ValueError(f"{tensor_name} data and scale must both use CUDA storage.")
+    if tensor.data.device != tensor.scale.device:
+        raise ValueError(
+            f"{tensor_name} data and scale must use the same device, got "
+            f"{tensor.data.device} and {tensor.scale.device}."
+        )
+    if not tensor.data.is_contiguous():
+        raise ValueError(f"{tensor_name} data must be contiguous.")
+    if not tensor.scale.is_contiguous():
+        raise ValueError(f"{tensor_name} scale must be contiguous.")
     backend = expected_backend if expected_backend is not None else tensor.backend
     if expected_backend is not None and tensor.backend != expected_backend:
         raise ValueError(
@@ -116,6 +127,38 @@ def validate_mxfp8_tensor(
             f"{tensor_name} scale must be a 1D swizzled tensor or a 2D unswizzled "
             f"tensor, got shape {tuple(tensor.scale.shape)}."
         )
+
+
+def validate_mxfp8_gemm_tensor(
+    tensor: "MXFP8Tensor",
+    *,
+    expected_backend: Optional[MXFP8Backend] = None,
+    tensor_name: str = "MXFP8 tensor",
+) -> None:
+    """Validate MXFP8 storage for kernels that require cuBLAS-swizzled scales."""
+    validate_mxfp8_tensor(tensor, expected_backend=expected_backend, tensor_name=tensor_name)
+    if tensor.scale.ndim != 1:
+        backend = expected_backend if expected_backend is not None else tensor.backend
+        raise ValueError(
+            f"{tensor_name} scales for backend {backend!r} must use 1D "
+            f"swizzled storage at the GEMM boundary; got shape {tuple(tensor.scale.shape)}."
+        )
+
+
+def get_mxfp8_scale_bytes(tensor: "MXFP8Tensor") -> torch.Tensor:
+    """Return logical ``[M, K // 32]`` E8M0 bytes without requantizing data."""
+    rows, cols = tensor.data.shape
+    scale_cols = cols // MXFP8_BLOCK_SIZE
+    if tensor.scale.ndim == 2:
+        return tensor.scale.view(torch.uint8)
+
+    padded_rows = _ceil_div(rows, MXFP8_SCALE_ROW_BLOCK) * MXFP8_SCALE_ROW_BLOCK
+    padded_scale_cols = _ceil_div(scale_cols, MXFP8_SCALE_COL_BLOCK) * MXFP8_SCALE_COL_BLOCK
+    scale = tensor.scale.view(torch.uint8).reshape(
+        padded_rows // MXFP8_SCALE_ROW_BLOCK, padded_scale_cols // MXFP8_SCALE_COL_BLOCK, 32, 4, 4
+    )
+    logical = scale.permute(0, 3, 2, 1, 4).contiguous().reshape(padded_rows, padded_scale_cols)
+    return logical[:rows, :scale_cols]
 
 
 @dataclass
@@ -198,7 +241,15 @@ class MXFP8Tensor:
         else:
             quantized = MXFP8Tensor.from_bf16(value, backend=self.backend)
             self.data.copy_(quantized.data)
-            self.scale.view(torch.uint8).copy_(quantized.scale.view(torch.uint8))
+            if self.scale.shape == quantized.scale.shape:
+                self.scale.view(torch.uint8).copy_(quantized.scale.view(torch.uint8))
+            elif self.scale.ndim == 2:
+                self.scale.view(torch.uint8).copy_(get_mxfp8_scale_bytes(quantized))
+            else:
+                raise ValueError(
+                    "Cannot update 1D MXFP8 scale storage from a producer with shape "
+                    f"{tuple(quantized.scale.shape)}."
+                )
         if self.dtype is None:
             self.dtype = value.dtype
         return self
@@ -220,7 +271,10 @@ class MXFP8Tensor:
 
         The historical method name is retained for compatibility. The Triton
         backend accepts BF16, FP16, and FP32 inputs; FlashInfer accepts BF16 and
-        FP16 inputs.
+        FP16 inputs. Inputs must contain only finite values. NaN and infinity are
+        outside the MXFP8 inference contract and are not scanned here because a
+        device-wide reduction would add synchronization or graph-visible work to
+        every quantization on the inference hot path.
 
         Args:
             x: [M, K] floating-point tensor on CUDA.
@@ -229,9 +283,23 @@ class MXFP8Tensor:
                      'flashinfer' (single fused FlashInfer CUDA kernel).
         """
         assert x.is_cuda and x.dim() == 2
-        assert x.shape[-1] % group_size == 0
+        if group_size != MXFP8_BLOCK_SIZE:
+            raise ValueError(
+                f"MXFP8 backends implement group size {MXFP8_BLOCK_SIZE}, got {group_size}."
+            )
+        if x.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+            raise TypeError(f"MXFP8 quantization requires BF16, FP16, or FP32, got {x.dtype}.")
+        if x.shape[0] == 0 or x.shape[1] == 0:
+            raise ValueError(f"MXFP8 input dimensions must be nonzero, got {tuple(x.shape)}.")
+        if x.shape[-1] % group_size != 0:
+            raise ValueError(
+                f"MXFP8 K dimension {x.shape[-1]} must be divisible by group size {group_size}."
+            )
+        x = x.contiguous()
         if backend == "flashinfer":
             assert HAVE_FLASHINFER, "FlashInfer not available"
+            if x.dtype == torch.float32:
+                raise TypeError("FlashInfer MXFP8 quantization accepts BF16 or FP16, not FP32.")
             data, scale = flashinfer_mxfp8_quantize(x)
             if scale.dtype == torch.float8_e8m0fnu:
                 scale = scale.view(torch.uint8)

@@ -25,6 +25,24 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _logical_scale_bytes(tensor: MXFP8Tensor) -> torch.Tensor:
+    """Independently decode a native scale layout to logical exponent bytes."""
+    rows, cols = tensor.data.shape
+    scale_cols = cols // 32
+    if tensor.scale.ndim == 2:
+        return tensor.scale.view(torch.uint8)
+    padded_cols = (scale_cols + 3) // 4 * 4
+    row = torch.arange(rows, device=tensor.device)[:, None]
+    col = torch.arange(scale_cols, device=tensor.device)[None, :]
+    offset = (
+        ((row // 128) * (padded_cols // 4) + col // 4) * 512
+        + (row % 32) * 16
+        + ((row % 128) // 32) * 4
+        + col % 4
+    )
+    return tensor.scale.view(torch.uint8)[offset]
+
+
 # ===========================================================================
 # MXFP8ReshardTransform
 # ===========================================================================
@@ -38,17 +56,25 @@ class TestMXFP8ReshardTransform:
     logic that avoids corrupting swizzled scales from partial updates.
     """
 
-    @pytest.mark.skipif(not _HAVE_FLASHINFER, reason="test requires FlashInfer")
-    def test_finalize_recv_bf16_2d_scale(self):
-        """Receiver-side conversion with 2D scale: immediate per-slice quantization."""
-        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
-        from megatron.core.resharding.transforms import MXFP8ReshardTransform
+    @pytest.mark.parametrize("backend", ["triton", "flashinfer"])
+    def test_finalize_recv_bf16_2d_scale(self, backend):
+        """A real native quantizer updates pinned-compatible logical 2D storage."""
+        if backend == "flashinfer" and not _HAVE_FLASHINFER:
+            pytest.skip("test requires FlashInfer")
 
-        M, K = 64, 128
-        buf = MXFP8Tensor.from_bf16(torch.randn(M, K, dtype=torch.bfloat16, device="cuda"))
-
-        if buf.scale.ndim != 2:
-            pytest.skip("FlashInfer produced 1D swizzled scale; 2D-scale test not applicable")
+        M, K = 129, 160
+        scale_dtype = torch.uint8 if backend == "flashinfer" else torch.float8_e8m0fnu
+        buf = MXFP8Tensor(
+            data=torch.full((M, K), 0xA5, device="cuda", dtype=torch.uint8).view(
+                torch.float8_e4m3fn
+            ),
+            scale=torch.full((M, K // 32), 0xA5, device="cuda", dtype=torch.uint8).view(
+                scale_dtype
+            ),
+            backend=backend,
+            dtype=torch.bfloat16,
+        )
+        data_ptr, scale_ptr = buf.data.data_ptr(), buf.scale.data_ptr()
 
         t = MXFP8ReshardTransform(
             convertible_params={"decoder.weight"},
@@ -57,12 +83,32 @@ class TestMXFP8ReshardTransform:
             convert_on_send=False,
         )
 
+        torch.manual_seed(1049)
         new_data = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
-        t.finalize_recv("decoder.weight", (slice(None), slice(None)), [new_data])
+        split = 65
+        t.finalize_recv("decoder.weight", (slice(0, split), slice(None)), [new_data[:split]])
+        first_expected = MXFP8Tensor.from_bf16(new_data[:split], backend=backend)
+        assert first_expected.scale.ndim == 1
+        assert torch.equal(buf.data[:split], first_expected.data)
+        assert torch.equal(
+            buf.scale[:split].view(torch.uint8), _logical_scale_bytes(first_expected)
+        )
+        assert torch.all(buf.data[split:].view(torch.uint8) == 0xA5)
+        assert torch.all(buf.scale[split:].view(torch.uint8) == 0xA5)
 
-        expected = MXFP8Tensor.from_bf16(new_data)
+        t.finalize_recv("decoder.weight", (slice(split, M), slice(None)), [new_data[split:]])
+        expected = MXFP8Tensor.from_bf16(new_data, backend=backend)
+        assert expected.scale.ndim == 1
         assert torch.equal(buf.data, expected.data)
-        assert torch.equal(buf.scale, expected.scale)
+        assert torch.equal(buf.scale.view(torch.uint8), _logical_scale_bytes(expected))
+        assert (buf.data.data_ptr(), buf.scale.data_ptr()) == (data_ptr, scale_ptr)
+
+        replacement = new_data.flip(0).contiguous()
+        buf.copy_(replacement)
+        expected_replacement = MXFP8Tensor.from_bf16(replacement, backend=backend)
+        assert torch.equal(buf.data, expected_replacement.data)
+        assert torch.equal(buf.scale.view(torch.uint8), _logical_scale_bytes(expected_replacement))
+        assert (buf.data.data_ptr(), buf.scale.data_ptr()) == (data_ptr, scale_ptr)
 
     @pytest.mark.skipif(not _HAVE_FLASHINFER, reason="test requires FlashInfer")
     def test_finalize_recv_bf16_1d_scale_accumulation(self):
@@ -179,23 +225,61 @@ class TestMXFP8ReshardTransform:
         assert recv_buffers[0].shape == buf.shape
         assert recv_buffers[0].dtype == torch.bfloat16
 
-    def test_sender_side_conversion_supports_explicit_triton_backend(self):
-        """A sender without persistent buffers can select the Triton wire format."""
-        from megatron.core.resharding.transforms import MXFP8ReshardTransform
+    @pytest.mark.parametrize("backend", ["triton", "flashinfer"])
+    def test_sender_side_conversion_uses_logical_2d_wire_scale(self, backend):
+        """Native quantization reaches a 2D receiver through an exact logical wire scale."""
+        if backend == "flashinfer" and not _HAVE_FLASHINFER:
+            pytest.skip("test requires FlashInfer")
 
-        transform = MXFP8ReshardTransform(
+        M, K = 129, 160
+        scale_dtype = torch.uint8 if backend == "flashinfer" else torch.float8_e8m0fnu
+        sender = MXFP8ReshardTransform(
             convertible_params={"decoder.weight"},
             persistent_buffers={},
             convert_on_send=True,
-            backend="triton",
+            backend=backend,
         )
+        destination = MXFP8Tensor(
+            data=torch.full((M, K), 0xA5, device="cuda", dtype=torch.uint8).view(
+                torch.float8_e4m3fn
+            ),
+            scale=torch.full((M, K // 32), 0xA5, device="cuda", dtype=torch.uint8).view(
+                scale_dtype
+            ),
+            backend=backend,
+            dtype=torch.bfloat16,
+        )
+        receiver = MXFP8ReshardTransform(
+            convertible_params={"decoder.weight"},
+            persistent_buffers={"weight": destination},
+            buffer_key_prefix="decoder.",
+            convert_on_send=True,
+        )
+        data_ptr, scale_ptr = destination.data.data_ptr(), destination.scale.data_ptr()
+        torch.manual_seed(1051)
         source = torch.nn.Parameter(
-            torch.randn(64, 128, dtype=torch.bfloat16, device="cuda"), requires_grad=False
+            torch.randn(M, K, dtype=torch.bfloat16, device="cuda"), requires_grad=False
         )
-        data, scale = transform.prepare_send("decoder.weight", (slice(None), slice(None)), source)
+        whole = (slice(None), slice(None))
+        sent = sender.prepare_send("decoder.weight", whole, source)
+        expected = MXFP8Tensor.from_bf16(source.data, backend=backend)
+        assert expected.scale.ndim == 1
+        assert sent[1].shape == (M, K // 32)
+        assert sent[1].dtype == scale_dtype
+        assert torch.equal(sent[0], expected.data)
+        assert torch.equal(sent[1].view(torch.uint8), _logical_scale_bytes(expected))
 
-        assert data.dtype == torch.float8_e4m3fn
-        assert scale.dtype == torch.float8_e8m0fnu
+        received = receiver.prepare_recv("decoder.weight", whole)
+        assert [tensor.shape for tensor in received] == [tensor.shape for tensor in sent]
+        received[0].copy_(sent[0])
+        # Local copy_ does not implement E8M0, so simulate the wire transfer on
+        # the format's byte representation just as finalize_recv does below.
+        received[1].view(torch.uint8).copy_(sent[1].view(torch.uint8))
+        receiver.finalize_recv("decoder.weight", whole, received)
+
+        assert torch.equal(destination.data, expected.data)
+        assert torch.equal(destination.scale.view(torch.uint8), _logical_scale_bytes(expected))
+        assert (destination.data.data_ptr(), destination.scale.data_ptr()) == (data_ptr, scale_ptr)
 
     def test_sender_side_conversion_requires_explicit_backend(self):
         """A sender without persistent buffers cannot infer its wire format."""
