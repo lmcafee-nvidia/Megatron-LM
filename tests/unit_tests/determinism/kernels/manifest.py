@@ -158,7 +158,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "CP1/CP2/CP4, including input/parameter gradients and CP-state restoration, in "
         "test_runtime_cp_attention.py. The dynamic-inference flash_decode_and_prefill "
         "dispatch (FA2 prefill/decode) is replayed there with a config-driven softmax_scale, "
-        "with and without a per-head sink.",
+        "with and without a per-head sink, and FA4 sinks are checked against an exact reference.",
     ),
     KernelEntry(
         name="fused_vocab_parallel_cross_entropy",

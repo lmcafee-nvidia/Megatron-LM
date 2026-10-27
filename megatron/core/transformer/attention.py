@@ -1130,6 +1130,12 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         need_lse = softmax_offset is not None
 
         use_fa4, use_fa3 = self._resolve_flash_version()
+        # FA4 4.0.0b20 requires a BF16 sink independently of the Q/K/V dtype.
+        fa4_sink = (
+            softmax_offset.to(dtype=torch.bfloat16)
+            if use_fa4 and softmax_offset is not None
+            else softmax_offset
+        )
 
         # Flash attn kernel.
         if not is_decode_only:
@@ -1138,6 +1144,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             softcap = self.config.attn_logit_softcapping
             softcap_kwargs = {} if softcap is None else {"softcap": softcap}
             if use_fa4:
+                # FA4 applies sinks in-kernel; its inference path may not return LSE.
                 output_total, softmax_lse = flash_attn4_varlen_func(
                     q,
                     k,
@@ -1151,6 +1158,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                     causal=True,
                     window_size=window_size,
                     num_splits=0 if not self.batch_invariant_mode else 1,
+                    learnable_sink=fa4_sink,
                     **softcap_kwargs,
                 )
             elif use_fa3:
@@ -1206,7 +1214,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 else:
                     output_total = fa2_ret
                     softmax_lse = None
-            if need_lse:
+            if need_lse and not use_fa4:
                 # output_total: (total_q, H, D); softmax_lse: (H, total_q)
                 output_total = self._apply_sink_softmax_correction_varlen(
                     output_total, softmax_lse, softmax_offset
@@ -1281,6 +1289,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             else:
                 if use_fa4:
                     softmax_scale = self.get_softmax_scale(q)
+                    # FA4 applies sinks in-kernel; its inference path may not return LSE.
                     # Reshape q from (B, S, H, D) to (B*S, H, D) for varlen interface
                     q_varlen = q.reshape(-1, q.shape[-2], q.shape[-1])
                     decode_softcap = self.config.attn_logit_softcapping
@@ -1298,9 +1307,10 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         causal=True,
                         window_size=window_size,
                         num_splits=0 if not self.batch_invariant_mode else 1,
+                        learnable_sink=fa4_sink,
                         **softcap_kwargs,
                     )
-                    if need_lse:
+                    if need_lse and not use_fa4:
                         # output_total: (B*S, H, D); softmax_lse: (H, B*S)
                         output_total = self._apply_sink_softmax_correction_varlen(
                             output_total, softmax_lse, softmax_offset
