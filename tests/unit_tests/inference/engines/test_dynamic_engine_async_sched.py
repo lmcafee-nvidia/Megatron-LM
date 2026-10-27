@@ -1100,6 +1100,16 @@ _CUDA_GRAPH_VARIANT_SCENARIOS = (
         signals=("request-seed",),
     ),
     _variant("flashinfer-fused-rope", "flashinfer-fused-rope-exact", parity="exact"),
+    _variant(
+        "fp8-transformer-engine",
+        "fp8-transformer-engine-delayed",
+        "precision:fp8-delayed",
+        config={"fp8_recipe": "delayed"},
+        signals=("fixed-history-logits",),
+        atol=0.0,
+        parity="exact",
+    ),
+    # Current and block scaling replay through the runner's own recipe.
     *(
         _variant(
             "fp8-transformer-engine",
@@ -1110,7 +1120,7 @@ _CUDA_GRAPH_VARIANT_SCENARIOS = (
             atol=0.0,
             parity="exact",
         )
-        for recipe in ("tensorwise", "delayed", "blockwise")
+        for recipe in ("tensorwise", "blockwise")
     ),
 )
 
