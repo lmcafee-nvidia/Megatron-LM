@@ -256,7 +256,8 @@ def _replay_flash_dispatch(path, flash_version, sink):
             hidden_dropout=0.0,
             add_bias_linear=False,
             softmax_scale=0.25,  # Not 1/sqrt(head_dim): the choice must be observable.
-            flash_attention_version=flash_version,  # Pin it so every environment replays the same kernel.
+            # Pin the version so every environment replays the same kernel.
+            flash_attention_version=flash_version,
         )
         submodules = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
         module = SelfAttention(
