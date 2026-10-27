@@ -470,6 +470,7 @@ class _AsyncPairScenario:
     prerequisite: str | None = None
     atol: float = 1.0e-3
     parity: str = "exact"
+    graph_parity: str | None = None
     exact_top_n: bool = True
 
 
@@ -800,9 +801,10 @@ _ASYNC_PAIR_SCENARIOS = (
             "use_moe_layer_spec": True,
             "transformer_impl": "inference_optimized",
         },
-        signals=("inference-optimized", "moe", "mxfp8"),
+        signals=("inference-optimized", "moe", "mxfp8", "fixed-history-logits"),
         prerequisite="mxfp8",
         atol=0.0,
+        graph_parity="reproducible",
     ),
     # Four heads of width 64 exercise FlashInfer's supported fused-RoPE kernel.
     # Width 16 crosses half-head boundaries in its vectorized NeoX rotation.
@@ -1055,6 +1057,7 @@ _CUDA_GRAPH_DIFFERENTIAL_SCENARIOS = (
             "hybrid-gdp",
             "transformer-engine",
             "inference-optimized",
+            "mxfp8-inference-optimized-moe",
             "flash-attention-3",
             "flash-attention-4",
             "swa-off-by-one-sink",
@@ -1475,7 +1478,7 @@ def _instrument_cuda_graph_replays(model, context, runtime):
             runtime[("cuda-graph-warmup-steps", runner.num_warmup_steps)] += 1
 
 
-def _instrument_scenario_runtime(env, scenario, runtime):
+def _instrument_scenario_runtime(env, scenario, runtime, teacher_tokens=None):
     """Record production calls and state transitions used as pairwise evidence."""
     controller = env.engine.controller
     context = env.engine.context
@@ -1539,6 +1542,7 @@ def _instrument_scenario_runtime(env, scenario, runtime):
     original_forward = controller._dynamic_step_forward_logits
 
     def traced_forward(*args, **kwargs):
+        replays_before = runtime["cuda-graph-runner-replays"]
         real_dimensions = context.batch_dimensions
         if context.prefix_cache_hits > 0:
             runtime[("prefix-hit-forward-step", context.step_count)] += 1
@@ -1598,6 +1602,25 @@ def _instrument_scenario_runtime(env, scenario, runtime):
             result = original_forward(*args, **kwargs)
         runtime["model-forward"] += 1
         runtime[f"logits-dtype:{controller._all_logits_cuda.dtype}"] += 1
+        if "fixed-history-logits" in scenario.signals and not runtime["cuda-graph-capture-active"]:
+            active_count = context.total_request_count - context.paused_request_count
+            active_slice = slice(context.paused_request_count, context.total_request_count)
+            request_ids = context.request_ids[active_slice].tolist()
+            last_idxs = context.gpu_view.active_request_last_token_idxs[:active_count].long()
+            positions = args[1][0, last_idxs].tolist()
+            input_tokens = args[0][0, last_idxs].tolist()
+            logits = controller._all_logits_cuda[0, :active_count].detach().float().cpu()
+            blocks = context.gpu_view.token_to_block_idx[last_idxs].long()
+            offsets = context.gpu_view.token_to_local_position_within_kv_block[last_idxs].long()
+            last_kv = context.memory_buffer[:, :, blocks, offsets].detach().float().cpu()
+            replayed = runtime["cuda-graph-runner-replays"] > replays_before
+            snapshots = runtime.setdefault("fixed-history-logit-snapshots", {})
+            for i, (request_id, position, input_token, row) in enumerate(
+                zip(request_ids, positions, input_tokens, logits)
+            ):
+                key = (request_id, position)
+                assert key not in snapshots, f"duplicate fixed-history logit row {key}"
+                snapshots[key] = (input_token, replayed, row.clone(), last_kv[:, :, i])
         if context.config.materialize_only_last_token_logits:
             runtime["last-logits-forward"] += 1
         else:
@@ -1673,7 +1696,19 @@ def _instrument_scenario_runtime(env, scenario, runtime):
                             torch_sampling, "fill_request_seed_noise", new=traced_seed_noise
                         )
                     )
-                return original_sample_kernel(*args, **kwargs)
+                sampled = original_sample_kernel(*args, **kwargs)
+                if "fixed-history-logits" in scenario.signals:
+                    active_slice = slice(context.paused_request_count, context.total_request_count)
+                    request_ids = context.request_ids[active_slice].tolist()
+                    if teacher_tokens is not None:
+                        forced = [
+                            teacher_tokens[request_id][runtime[("teacher-token-index", request_id)]]
+                            for request_id in request_ids
+                        ]
+                        sampled[:active_count].copy_(sampled.new_tensor(forced))
+                    for request_id in request_ids:
+                        runtime[("teacher-token-index", request_id)] += 1
+                return sampled
 
         if sampling_class == "FlashInferSampling":
             from megatron.core.inference.sampling import flashinfer_sampling
@@ -1988,6 +2023,32 @@ def _assert_request_parity(
             assert [event.type for event in request.events] == reference["events"]
 
 
+def _assert_fixed_history_logit_parity(actual, expected, atol):
+    assert actual.keys() == expected.keys()
+    failures = []
+    for key in sorted(expected):
+        input_token, replayed, logits, last_kv = actual[key]
+        expected_input, _, expected_logits, expected_kv = expected[key]
+        assert input_token == expected_input
+        assert replayed, f"fixed-history comparison at {key} did not replay a CUDA graph"
+        assert torch.isfinite(logits).all() and torch.isfinite(expected_logits).all()
+        assert torch.isfinite(last_kv).all() and torch.isfinite(expected_kv).all()
+        top2 = expected_logits.topk(2)
+        actual_top2 = logits.topk(2)
+        margin = float((top2.values[0] - top2.values[1]).item())
+        max_diff = float((logits - expected_logits).abs().max().item())
+        kv_diff = float((last_kv - expected_kv).abs().max().item())
+        print(
+            f"request/position {key}: max_abs={max_diff:.8g}, eager_margin={margin:.8g}, "
+            f"replay_margin={float((actual_top2.values[0] - actual_top2.values[1]).item()):.8g}, "
+            f"last_kv_max_abs={kv_diff:.8g}"
+        )
+        actual_top1, expected_top1 = logits.argmax().item(), expected_logits.argmax().item()
+        if actual_top1 != expected_top1 or max_diff > atol or kv_diff > atol:
+            failures.append((key, max_diff, kv_diff, margin, actual_top1, expected_top1))
+    assert not failures, failures
+
+
 class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
     """Shared real-engine runner for the async pair owners."""
 
@@ -1999,7 +2060,13 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
 
     @classmethod
     def _run_scenario_mode(
-        cls, scenario, mode, stop_tokens=None, termination_token=None, force_graph_eager=False
+        cls,
+        scenario,
+        mode,
+        stop_tokens=None,
+        termination_token=None,
+        teacher_tokens=None,
+        force_graph_eager=False,
     ):
         RouterReplay.clear_global_router_replay_instances()
         config = dict(_BASE_PAIR_CONFIG)
@@ -2018,7 +2085,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         model = env.engine.controller.inference_wrapped_model.model
         runtime = Counter()
         if mode == AsyncScheduleMode.ASYNC:
-            _instrument_scenario_runtime(env, scenario, runtime)
+            _instrument_scenario_runtime(env, scenario, runtime, teacher_tokens)
         if env.config.defer_cuda_graph_creation:
             env.engine.create_cuda_graphs()
             capture_evidence = {
@@ -2704,7 +2771,11 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["fp8-quantized-forwards"] > 0
             assert runtime["fp8-recipe-forwards"] > 0
         if "mxfp8" in signals:
+            from megatron.core.fp8_utils import get_fp8_align_size
             from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+            from megatron.core.transformer.moe.token_dispatcher_inference import (
+                NCCLAllGatherDispatcher,
+            )
 
             experts = [
                 module
@@ -2712,7 +2783,25 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 if type(module).__name__ == "InferenceGroupedMLP"
             ]
             assert experts
-            assert runtime["module-forward:moe"] > 0
+            if "cuda-graph" in signals:
+                alignment = get_fp8_align_size(model_config.fp8_recipe)
+                assert executed_graph_dimensions
+                assert all(
+                    token_count % alignment == 0 for token_count, *_ in executed_graph_dimensions
+                )
+                assert runtime["cuda-graph-padded-replays"] > 0
+                assert "InferenceGroupedMLP" in replayed_module_names
+                dispatchers = [
+                    module._inference_token_dispatcher
+                    for module in controller.inference_wrapped_model.model.modules()
+                    if hasattr(module, "_inference_token_dispatcher")
+                ]
+                assert dispatchers
+                assert all(
+                    isinstance(dispatcher, NCCLAllGatherDispatcher) for dispatcher in dispatchers
+                )
+            else:
+                assert runtime["module-forward:moe"] > 0
             assert all(module._uses_mxfp8_weights for module in experts)
             assert all(isinstance(module._fc1_weight, MXFP8Tensor) for module in experts)
             assert all(isinstance(module._fc2_weight, MXFP8Tensor) for module in experts)
@@ -3100,9 +3189,17 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
     @staticmethod
     def _weight_snapshot(env):
         model = env.engine.controller.inference_wrapped_model.model
-        return {
+        snapshot = {
             name: parameter.detach().cpu().clone() for name, parameter in model.named_parameters()
         }
+        for module_name, module in model.named_modules():
+            for weight_name in ("_fc1_weight", "_fc2_weight"):
+                weight = getattr(module, weight_name, None)
+                if weight is not None and hasattr(weight, "scale"):
+                    prefix = f"{module_name}.{weight_name}"
+                    snapshot[f"{prefix}.data"] = weight.data.detach().cpu().clone()
+                    snapshot[f"{prefix}.scale"] = weight.scale.detach().cpu().clone()
+        return snapshot
 
     @classmethod
     def _assert_graph_pair(cls, scenario):
@@ -3136,6 +3233,19 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
             )
             expected = _snapshot_requests(eager_env.requests)
             expected_weights = cls._weight_snapshot(eager_env)
+            eager_logits = eager_runtime.get("fixed-history-logit-snapshots", {})
+            teacher_tokens = {request["request_id"]: request["tokens"] for request in expected}
+            if "fixed-history-logits" in scenario.signals:
+                expected_logit_keys = {
+                    (request.request_id, len(request.prompt_tokens) + offset - 1)
+                    for request in eager_env.requests
+                    for offset in range(len(request.generated_tokens))
+                }
+                assert expected_logit_keys <= eager_logits.keys()
+                discarded_logit_keys = eager_logits.keys() - expected_logit_keys
+                print(
+                    f"fixed-history: completed={len(expected_logit_keys)}, discarded={sorted(discarded_logit_keys)}"
+                )
             assert eager_runtime["cuda-graph-runner-replays"] == 0
             del eager_env
             gc.collect()
@@ -3146,6 +3256,7 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
                 AsyncScheduleMode.ASYNC,
                 stop_tokens=stop_tokens,
                 termination_token=termination_token,
+                teacher_tokens=teacher_tokens,
             )
             actual_weights = cls._weight_snapshot(graph_env)
             assert expected_weights.keys() == actual_weights.keys()
@@ -3153,12 +3264,18 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
                 torch.equal(expected_weights[name], actual_weights[name])
                 for name in expected_weights
             )
+            graph_parity = scenario.graph_parity or scenario.parity
+            graph_logits = {}
+            if "fixed-history-logits" in scenario.signals:
+                graph_logits = graph_runtime.get("fixed-history-logit-snapshots", {})
+                assert eager_logits and graph_logits
+                assert graph_logits.keys() == expected_logit_keys | discarded_logit_keys
             _assert_request_parity(
                 graph_env.requests,
                 expected,
                 scenario.atol,
-                exact_numerics=scenario.parity == "exact",
-                exact_top_n=scenario.parity == "exact" and scenario.exact_top_n,
+                exact_numerics=graph_parity == "exact" and not eager_logits,
+                exact_top_n=graph_parity == "exact" and scenario.exact_top_n and not eager_logits,
             )
             cls._assert_runtime_signals(
                 graph_env, graph_scenario, graph_runtime, stop_tokens, termination_token
@@ -3173,8 +3290,9 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
             for padded, _real, request_ids, input_ids in live_inputs:
                 inputs_by_shape_and_requests.setdefault((padded, request_ids), set()).add(input_ids)
             assert any(len(inputs) > 1 for inputs in inputs_by_shape_and_requests.values())
-            if scenario.parity != "exact":
+            if graph_parity != "exact" or eager_logits:
                 graph_expected = _snapshot_requests(graph_env.requests)
+                graph_requests = graph_env.requests
                 del graph_env
                 gc.collect()
                 delete_cuda_graphs()
@@ -3184,13 +3302,27 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
                     AsyncScheduleMode.ASYNC,
                     stop_tokens=stop_tokens,
                     termination_token=termination_token,
+                    teacher_tokens=teacher_tokens,
                 )
+                repeat_exact = "fixed-history-logits" not in scenario.signals
+                if not repeat_exact:
+                    repeat_logits = repeat_runtime.get("fixed-history-logit-snapshots", {})
+                    _assert_fixed_history_logit_parity(repeat_logits, graph_logits, 0.0)
+                    _assert_fixed_history_logit_parity(repeat_logits, eager_logits, scenario.atol)
+                    _assert_fixed_history_logit_parity(graph_logits, eager_logits, scenario.atol)
+                    _assert_request_parity(
+                        graph_requests,
+                        expected,
+                        scenario.atol,
+                        exact_numerics=True,
+                        exact_top_n=graph_parity == "exact" and scenario.exact_top_n,
+                    )
                 _assert_request_parity(
                     repeat_env.requests,
-                    graph_expected,
+                    expected if eager_logits else graph_expected,
                     scenario.atol,
-                    exact_numerics=True,
-                    exact_top_n=True,
+                    exact_numerics=repeat_exact or bool(eager_logits),
+                    exact_top_n=repeat_exact or bool(eager_logits),
                 )
                 cls._assert_runtime_signals(
                     repeat_env, graph_scenario, repeat_runtime, stop_tokens, termination_token
