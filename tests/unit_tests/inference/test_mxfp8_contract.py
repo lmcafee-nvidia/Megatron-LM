@@ -174,8 +174,27 @@ def test_conversion_verifier_decodes_e8m0_byte_zero_as_finite_scale():
     quantization_utils._verify_te_to_mcore_mxfp8_conversion(x, quantized)
 
 
+def test_conversion_verifier_rejects_mismatched_byte_zero_block():
+    """A byte-zero block that dequantizes to different tiny values must not pass the check."""
+    x = torch.full(
+        (1, MXFP8_BLOCK_SIZE),
+        torch.finfo(torch.float32).tiny / 4,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    quantized = MXFP8Tensor.from_bf16(x, backend="triton")
+
+    with pytest.raises(ValueError, match="sanity check failed"):
+        quantization_utils._verify_te_to_mcore_mxfp8_conversion(x * 2, quantized)
+
+
 def test_odd_live_rows_graph_replay_clears_stale_swizzled_scales():
-    """Changing graph-time row tails must update targets and clear former targets."""
+    """E8M0 byte-zero scales stay exact through CUDA-graph replay of the live-row quantizer.
+
+    The input carries a block of float32 ``tiny / 4`` values at row 32, so every live-row
+    count of 33 or more must encode that block with scale byte zero. Changing the live count
+    between replays must also update the scale targets and clear former ones.
+    """
     rows, cols = 257, 160
     x = _boundary_input(rows, cols).to(torch.bfloat16)
     n_rows = torch.tensor([129], device="cuda", dtype=torch.int32)
@@ -207,7 +226,12 @@ def test_odd_live_rows_graph_replay_clears_stale_swizzled_scales():
 
 
 def test_quantize_into_honors_offset_views_without_touching_sentinels():
-    """Exact-sized output views may safely reuse larger persistent allocations."""
+    """E8M0 byte-zero scales stay exact when quantizing into offset output views.
+
+    The input carries a block of float32 ``tiny / 4`` values at row 32, which must be encoded
+    with scale byte zero. The exact-sized output views must not touch their surrounding
+    sentinel bytes.
+    """
     x = _boundary_input(129, 160).to(torch.bfloat16)
     expected_data, logical_scale = _reference_quantize(x)
     expected_scale = _swizzle_scales(logical_scale)
