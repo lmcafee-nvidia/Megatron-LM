@@ -423,6 +423,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             rebuilt_request.image_embeddings, cached_embedding, rtol=0, atol=0
         )
         assert vision_calls == [modality, modality]
+
     @pytest.mark.internal
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
