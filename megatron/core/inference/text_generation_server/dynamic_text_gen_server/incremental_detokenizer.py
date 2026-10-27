@@ -21,9 +21,8 @@ class HuggingFaceFastIncrementalDetokenizer:
     until equivalent incremental decoders exist for the other tokenizer backends.
     """
 
-    def __init__(
-        self, tokenizer: Any, prompt_token_ids: list[int], *, remove_eos: bool = True
-    ) -> None:
+    def __init__(self, tokenizer: Any, prompt_token_ids: list[int], *, remove_eos=True) -> None:
+        del remove_eos  # control shim: the pre-fix detokenizer always drops EOS
         try:
             import tokenizers
             from transformers import PreTrainedTokenizerFast
@@ -52,19 +51,12 @@ class HuggingFaceFastIncrementalDetokenizer:
         # their reasoning and tool-call markers (`<think>`, `</think>`,
         # `<tool_call>`) as special, and the reasoning and tool parsers need them.
         # `DecodeStream(skip_special_tokens=True)` would drop those markers too.
-        self._remove_eos = remove_eos
-        self._eos_token_ids = model_eos_token_ids(tokenizer)
-        # Mapped special tokens remain filtered when the caller asks to retain
-        # the stop sequence. EOS ids are managed separately so only their
-        # trailing-position policy changes with ``remove_eos``.
-        self._skipped_token_ids = (
-            frozenset(huggingface_tokenizer.all_special_ids) - self._eos_token_ids
+        self._skipped_token_ids = frozenset(huggingface_tokenizer.all_special_ids) | (
+            model_eos_token_ids(tokenizer)
         )
-        self._pending_eos_token_ids: list[int] = []
         self._decode_stream = self._new_decode_stream(prompt_token_ids)
         self._text_fragments: list[str] = []
         self._text_length = 0
-        self._finished = False
 
     def _new_decode_stream(self, prompt_token_ids: list[int] | None = None):
         kwargs = {"skip_special_tokens": False}
@@ -75,32 +67,14 @@ class HuggingFaceFastIncrementalDetokenizer:
     def _kept(self, token_ids: list[int]) -> list[int]:
         return [token_id for token_id in token_ids if token_id not in self._skipped_token_ids]
 
+    def finish(self) -> str:
+        """Control shim: the pre-fix detokenizer has no end-of-stream flush."""
+        return ""
+
     def update(self, token_ids: list[int]) -> str:
         """Decode token IDs and return only newly stable text."""
-        decode_ids = []
-        for token_id in token_ids:
-            if token_id in self._skipped_token_ids:
-                continue
-            if token_id in self._eos_token_ids:
-                self._pending_eos_token_ids.append(token_id)
-                continue
-            decode_ids.extend(self._pending_eos_token_ids)
-            self._pending_eos_token_ids.clear()
-            decode_ids.append(token_id)
-        return self._decode(decode_ids)
-
-    def finish(self) -> str:
-        """Resolve buffered EOS tokens once their trailing position is known."""
-        if self._finished:
-            return ""
-        self._finished = True
-        decode_ids = [] if self._remove_eos else self._pending_eos_token_ids
-        self._pending_eos_token_ids = []
-        return self._decode(decode_ids)
-
-    def _decode(self, token_ids: list[int]) -> str:
         fragments = []
-        for token_id in token_ids:
+        for token_id in self._kept(token_ids):
             fragment = self._decode_next(token_id)
             if fragment:
                 fragments.append(fragment)
@@ -139,26 +113,7 @@ class HuggingFaceFastIncrementalDetokenizer:
         return self._text_length
 
 
-def detokenize_generated_tokens(
-    tokenizer: Any,
-    prompt_token_ids: list[int],
-    generated_token_ids: list[int],
-    *,
-    remove_eos: bool = True,
-) -> str:
-    """Decode a completed generation with the same prompt context used for streaming.
-
-    Tokenizers may insert or withhold text at the prompt/generation boundary. A
-    prompt-prefilled decoder therefore produces the authoritative generated suffix for
-    Hugging Face fast tokenizers. Non-streaming-only tokenizer backends retain the
-    established generated-token decoding behavior.
-    """
-    try:
-        detokenizer = HuggingFaceFastIncrementalDetokenizer(
-            tokenizer, prompt_token_ids, remove_eos=remove_eos
-        )
-    except (ImportError, ValueError):
-        return detokenize_tokens(
-            tokenizer, generated_token_ids, remove_EOD=remove_eos, skip_special_tokens=True
-        )
-    return detokenizer.update(generated_token_ids) + detokenizer.finish()
+def detokenize_generated_tokens(tokenizer, prompt_token_ids, generated_token_ids, *, remove_eos=True):
+    """Control shim: the pre-fix completed-response decoding, without prompt context."""
+    del prompt_token_ids
+    return detokenize_tokens(tokenizer, generated_token_ids, remove_EOD=remove_eos)

@@ -406,11 +406,6 @@ async def openai_stream(
                 delta = ""
                 logprobs = None
 
-            if is_final:
-                finish_detokenization = getattr(state["detokenizer"], "finish", None)
-                if finish_detokenization is not None:
-                    delta += finish_detokenization()
-
             parser = state["parser"]
             if parser is not None:
                 parsed_deltas = parser.parse(state["detokenizer"].text, finished=is_final)
@@ -437,7 +432,7 @@ async def openai_stream(
                             }
                         ]
                     )
-            elif delta or logprobs is not None:
+            elif new_tokens:
                 choice = {"index": index, "logprobs": logprobs, "finish_reason": None}
                 choice["delta" if chat else "text"] = {"content": delta} if chat else delta
                 yield sse([choice])
