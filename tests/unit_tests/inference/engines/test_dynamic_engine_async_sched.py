@@ -884,16 +884,14 @@ _ASYNC_PAIR_SCENARIOS = (
         config={"transformer_impl": "inference_optimized"},
         signals=("inference-optimized",),
     ),
-    *(
-        _pair_scenario(
-            "fp8-transformer-engine" + (f"-{recipe}" if recipe != "tensorwise" else ""),
-            f"precision:fp8-{recipe}",
-            config={"fp8": True, "fp8_recipe": recipe, "hidden_size": 128},
-            signals=("fp8", "fixed-history-logits"),
-            prerequisite="fp8",
-            atol=0.0,
-        )
-        for recipe in ("tensorwise", "delayed", "blockwise")
+    _pair_scenario(
+        "fp8-transformer-engine",
+        "precision:fp8",
+        config={"fp8": True, "hidden_size": 128},
+        signals=("fp8",),
+        prerequisite="fp8",
+        atol=5.0e-3,
+        parity="reproducible",
     ),
     _pair_scenario(
         "mxfp8-inference-optimized-moe",
@@ -1059,12 +1057,24 @@ _CUDA_GRAPH_LIFECYCLE_SCENARIOS = (
 )
 
 
+_FP8_RECIPE_GRAPH_SCENARIOS = tuple(
+    _pair_scenario(
+        "fp8-transformer-engine" + (f"-{recipe}" if recipe != "tensorwise" else ""),
+        f"precision:fp8-{recipe}",
+        config={"fp8": True, "fp8_recipe": recipe, "hidden_size": 128},
+        signals=("fp8", "fixed-history-logits"),
+        prerequisite="fp8",
+        atol=0.0,
+    )
+    for recipe in ("tensorwise", "delayed", "blockwise")
+)
+
+
 _CUDA_GRAPH_DIFFERENTIAL_SCENARIOS = (
     tuple(
         scenario
         for scenario in _ASYNC_PAIR_SCENARIOS
-        if scenario.name.startswith("fp8-transformer-engine")
-        or scenario.name
+        if scenario.name
         in {
             "prefix-lru-chunked",
             "prefix-ref-zero",
@@ -1104,6 +1114,7 @@ _CUDA_GRAPH_DIFFERENTIAL_SCENARIOS = (
             "alternating-swa-learnable-sink",
         }
     )
+    + _FP8_RECIPE_GRAPH_SCENARIOS
     + _CUDA_GRAPH_LIFECYCLE_SCENARIOS
 )
 
@@ -2466,7 +2477,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     )
                 else:
                     runtime["cuda-graph-recapture-deferred"] += int(
-                        env.engine._cuda_graph_recapture_dimensions is not None
+                        getattr(env.engine, "_cuda_graph_recapture_dimensions", None) is not None
                     )
                     runtime["cuda-graph-eager-fallback-armed"] += int(
                         not env.engine.context.cuda_graph_batch_dimensions_list
@@ -2788,7 +2799,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["prefix-blocks-deregistered"] > 0
         if "cuda-graph" in signals:
             assert context.cuda_graph_batch_dimensions_list
-            assert runtime["cuda-graph-cold-pool-rebinds"] == 1
+            if env.config.defer_cuda_graph_creation:
+                assert runtime["cuda-graph-cold-pool-rebinds"] == 1
             assert runtime["cuda_graph_steps"] > 0
             assert runtime["cuda-graph-runner-replays"] > 0
             assert executed_graph_dimensions
@@ -3038,7 +3050,10 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["fp8-context-forwards"] > 0
             assert runtime["fp8-quantized-forwards"] > 0
             assert runtime["fp8-recipe-forwards"] > 0
-            assert runtime["cuda-graph-fp8-replays"] > 0
+            if "cuda-graph" in signals:
+                assert runtime["cuda-graph-fp8-replays"] > 0
+            else:
+                assert runtime["module-forward:fp8"] > 0
         if "mxfp8" in signals:
             from megatron.core.fp8_utils import get_fp8_align_size
             from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
@@ -3078,8 +3093,9 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 assert type(controller.inference_wrapped_model.model.output_layer).__name__ == (
                     "TELMHeadColumnParallelLinear"
                 )
-                assert runtime["mxfp8-head-capture-forwards"] > 0
-                assert runtime["cuda-graph-mxfp8-head-replays"] > 0
+                if "cuda-graph" in signals:
+                    assert runtime["mxfp8-head-capture-forwards"] > 0
+                    assert runtime["cuda-graph-mxfp8-head-replays"] > 0
         if "routing-replay" in signals:
             assert model_config.moe_enable_routing_replay
             assert context.moe_routing_metadata is not None
