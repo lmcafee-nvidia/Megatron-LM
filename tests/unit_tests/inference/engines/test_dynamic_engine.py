@@ -5761,9 +5761,10 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @pytest.mark.parametrize("mode", ["legacy", "async"])
     @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     @torch.inference_mode()
-    def test_offload_resume_with_cuda_graphs_keeps_live_requests(self, model_provider):
+    def test_offload_resume_with_cuda_graphs_keeps_live_requests(self, model_provider, mode):
         """OFFLOAD resume recaptures CUDA graphs without disturbing in-flight requests."""
         skip_if_mamba_sequence_packing_not_available(model_provider)
 
@@ -5781,7 +5782,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     static_kv_memory_pointers=False,
                     suspend_resume_interval=suspend_resume_interval,
                     # Nothing is pending across suspend, so only the live-state restore is tested.
-                    async_sched_mode=AsyncScheduleMode.LEGACY,
+                    async_sched_mode=(
+                        AsyncScheduleMode.LEGACY if mode == "legacy" else AsyncScheduleMode.ASYNC
+                    ),
                 )
             )
             live_requests_at_suspend = []
@@ -5806,6 +5809,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         expected, _ = run(suspend_resume_interval=None)
         actual, live_requests_at_suspend = run(suspend_resume_interval=3)
+        print(f"DIAG {model_provider} {mode} expected={expected}")
+        print(f"DIAG {model_provider} {mode} actual={actual}")
         assert max(live_requests_at_suspend) > 0
         assert all(status == Status.COMPLETED for status, _ in expected)
         assert actual == expected
