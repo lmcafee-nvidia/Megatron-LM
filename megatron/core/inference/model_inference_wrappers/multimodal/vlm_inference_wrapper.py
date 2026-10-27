@@ -57,16 +57,6 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
                 "This parameter will be removed in `megatron-core` 0.13."
             )
 
-        module = get_attr_wrapped_model(
-            self.model, "position_embedding_type", return_model_obj=True
-        )
-        if module.position_embedding_type == "mrope":
-            raise NotImplementedError(
-                "LLaVA inference does not support mRoPE: media expansion produces scalar token "
-                "positions, but MultimodalRotaryEmbedding requires three-axis temporal/height/width "
-                "position IDs."
-            )
-
         super().prep_model_for_inference()
 
         # For TP only model both is_pp_first_stage and _is_pp_last_stage returns True
