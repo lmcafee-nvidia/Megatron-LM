@@ -161,8 +161,10 @@ def _build_model(
     modality,
     vision_model_type=None,
     pixel_shuffle=False,
+    tile_tags=None,
     temporal_patch_dim=1,
     separate_video_embedder=False,
+    language_position_embedding_type="learned_absolute",
     **language_config_overrides,
 ):
     language_config = _transformer_config(
@@ -213,8 +215,12 @@ def _build_model(
         class_token_len=0 if dynamic_resolution else None,
         conv_merging=native_merged,
         pixel_shuffle=pixel_shuffle,
+        tile_tags=tile_tags,
+        max_num_tiles=1 if tile_tags else 0,
+        tokenizer_type="nemotron5" if tile_tags else "",
         temporal_patch_dim=temporal_patch_dim,
         separate_video_embedder=separate_video_embedder,
+        language_position_embedding_type=language_position_embedding_type,
     )
 
 
@@ -676,6 +682,34 @@ def test_native_vision_family_real_encoder_reuse_and_distinct_media(
     assert first["mask"].ge(0).sum().item() == expected_embeddings
     _same(first, first_step, first_finished, reuse, reuse_step, reuse_finished)
     assert not torch.equal(first["embeddings"], distinct["embeddings"])
+    assert not torch.equal(first_step["logits"], distinct_step["logits"])
+
+
+def test_static_tile_tags_lower_and_reject_learned_absolute_positions(model_parallel):
+    tile_tags = [[11, 12, 13, 14, 15, 16]]
+    with pytest.raises(ValueError, match="Tile tags require"):
+        _build_model("image", tile_tags=tile_tags)
+    model = _build_model("image", tile_tags=tile_tags, language_position_embedding_type="rope")
+    engine, wrapper = _build_engine("image", model=model)
+    trace = _install_forward_trace(engine)
+    first_media, distinct_media = _media("image", 0.0), _media("image", 0.5)
+    with (
+        _encoder_patch(wrapper) as encoder,
+        mock.patch.object(model, "_apply_tile_tagging", wraps=model._apply_tile_tagging) as tagger,
+    ):
+        first, first_step, first_finished = _run_request(engine, 175, first_media, trace)
+        reuse, reuse_step, reuse_finished = _run_request(
+            engine, 176, {"media_cache_key": first_media["media_cache_key"]}, trace
+        )
+        distinct, distinct_step, distinct_finished = _run_request(
+            engine, 177, distinct_media, trace
+        )
+    assert encoder.call_count == tagger.call_count == 2
+    assert first["mask"].ge(0).sum().item() == 10
+    assert first["mask"][first["mask"] >= 0].tolist() == list(range(10))
+    assert torch.equal(first["embeddings"][:6], distinct["embeddings"][:6])
+    assert not torch.equal(first["embeddings"][6:], distinct["embeddings"][6:])
+    _same(first, first_step, first_finished, reuse, reuse_step, reuse_finished)
     assert not torch.equal(first_step["logits"], distinct_step["logits"])
 
 
