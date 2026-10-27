@@ -902,9 +902,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             cuda_graph_token_alignment = 1
         # Model alignment pads capture sizes above cuda_graph_max_tokens, so steps past
         # that ceiling must run eagerly. Unaligned ladders keep their historical matching.
-        self._cuda_graph_max_real_tokens = (
-            cuda_graph_max_tokens if cuda_graph_token_alignment > 1 else None
-        )
+        self._cuda_graph_max_real_tokens = cuda_graph_max_tokens
         self.cuda_graph_batch_dimensions_list, self.cuda_graph_token_counts = (
             CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
                 tp_size=tp_size,
