@@ -802,9 +802,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
     @pytest.mark.internal
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ("kv_cache_management_mode", "mxfp8"),
-        [("persist", False)],
-        ids=["persist"],
+        ("kv_cache_management_mode", "mxfp8"), [("persist", False)], ids=["persist"]
     )
     async def test_real_client_coordinator_adapter_matches_direct(
         self, kv_cache_management_mode, mxfp8
