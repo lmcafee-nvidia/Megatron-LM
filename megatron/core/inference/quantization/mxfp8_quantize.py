@@ -231,7 +231,6 @@ def _mxfp8_quant_swizzle_rows_kernel(
     scale_ptr,
     src_ptr,
     n_rows_ptr,  # scalar int32/int64 CUDA tensor: rows [0, n_rows) are quantized
-    M,
     K,
     n_col_blocks,
     REAL_GROUPS: tl.constexpr,
@@ -247,10 +246,6 @@ def _mxfp8_quant_swizzle_rows_kernel(
     """
     pid = tl.program_id(0)
     n_rows = tl.load(n_rows_ptr).to(tl.int64)
-    # The live count is device-resident so it can change between graph replays and
-    # cannot be validated on the host without a synchronization. Clamp it in the
-    # kernel to keep malformed scheduler state from reading or writing past storage.
-    n_rows = tl.minimum(tl.maximum(n_rows, 0), M)
     for row in tl.range(pid, n_rows, NUM_PROGRAMS):
         _mxfp8_quant_swizzle_row(
             row.to(tl.int64),
@@ -270,19 +265,14 @@ def mxfp8_quantize_rows(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Like ``mxfp8_quantize`` but only rows ``[0, n_rows)`` are quantized.
 
-    ``n_rows`` is a 1-element CUDA tensor (device-side count, CUDA-graph safe) and is
-    clamped to ``[0, x.shape[0]]`` in the kernel. Data rows at or beyond the clamped
-    count are left uninitialized and their scales are zero; callers must not read them
-    (grouped GEMMs are bounded by expert offsets ending at ``n_rows``). Quantized rows
-    are bitwise identical to ``mxfp8_quantize``.
+    ``n_rows`` is a 1-element CUDA tensor (device-side count, CUDA-graph safe). Data rows
+    at or beyond ``n_rows`` are left uninitialized and their scales are zero; callers
+    must not read them (grouped GEMMs bounded by expert offsets ending at ``n_rows``).
+    Quantized rows are bitwise identical to ``mxfp8_quantize``.
     """
     assert x.is_cuda and x.dim() == 2
     assert x.dtype in (torch.bfloat16, torch.float16, torch.float32)
-    assert n_rows.is_cuda and n_rows.device == x.device and n_rows.numel() == 1
-    assert n_rows.dtype in (
-        torch.int32,
-        torch.int64,
-    ), f"n_rows must use int32 or int64, got {n_rows.dtype}"
+    assert n_rows.is_cuda and n_rows.numel() == 1
     M, K = x.shape
     assert K % MXFP8_BLOCK_SIZE == 0, f"K ({K}) must be divisible by {MXFP8_BLOCK_SIZE}"
     scale_cols = K // MXFP8_BLOCK_SIZE
@@ -298,7 +288,6 @@ def mxfp8_quantize_rows(
         out_scale,
         x,
         n_rows,
-        M,
         K,
         n_col_blocks,
         REAL_GROUPS=scale_cols,
