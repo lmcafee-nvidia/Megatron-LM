@@ -180,6 +180,17 @@ class TestBatchInvariantMambaPrefixCaching:
             ),
             context,
         )
+        flashinfer_sampling_calls = 0
+        if sampling_backend == "flashinfer":
+            sample_kernel = engine.controller._sampling.sample_kernel
+
+            def observe_flashinfer_sampling(*args, **kwargs):
+                nonlocal flashinfer_sampling_calls
+                sampled = sample_kernel(*args, **kwargs)
+                flashinfer_sampling_calls += 1
+                return sampled
+
+            engine.controller._sampling.sample_kernel = observe_flashinfer_sampling
         graph_recaptures = 0
         graph_recapture_reset_context = []
         if graphs and kv_cache_management_mode != KVCacheManagementMode.PERSIST:
@@ -195,7 +206,7 @@ class TestBatchInvariantMambaPrefixCaching:
         prompts = [[i % 120 + 1 for i in range(n)] for n in (600, 650, 512, 513, 768, 769)]
         outputs = {}
         graph_steps = post_refit_graph_steps = post_refit_chunked_steps = 0
-        post_refit_speculative_start = None
+        post_refit_sampling_start = post_refit_speculative_start = None
         torch_top_k = int(exercise_real_refit and sampling_backend == "torch")
         for wave, order in enumerate(([0, 1], [1, 0], [2], [3], [4], [5], [0])):
             if wave == 6:
@@ -275,12 +286,15 @@ class TestBatchInvariantMambaPrefixCaching:
                     if kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
                         assert resumed_resident_salt != resident_salt
                         assert resumed_resident_salt == queued.block_hash_salt
+                    else:
+                        assert resumed_resident_salt == resident_salt
                 else:
                     engine.suspend()
                     for parameter in model.parameters():
                         parameter.mul_(1.03)
                     engine.resume()
                 skipped_before_refit_request = engine._prefill_tokens_skipped
+                post_refit_sampling_start = flashinfer_sampling_calls
             for i in order:
                 engine.add_request(
                     wave * 10 + i + 1,
@@ -344,6 +358,14 @@ class TestBatchInvariantMambaPrefixCaching:
             )
             if source_seed != target_seed:
                 assert before_tokens != after_tokens or finite_log_probs_differ
+        else:
+            assert post_refit_sampling_start is not None
+            assert flashinfer_sampling_calls > post_refit_sampling_start
+            for request_id in (61, 5999, 6000):
+                tokens, log_probs = outputs[request_id]
+                assert len(tokens) == len(log_probs) == 8
+                assert all(0 <= token < 128 for token in tokens)
+                assert all(math.isfinite(float(log_prob)) for log_prob in log_probs)
         if speculative:
             assert len(outputs[5999][0]) == 8
             assert len(outputs[6000][0]) == 8
@@ -382,7 +404,9 @@ class TestBatchInvariantMambaPrefixCaching:
             )
         assert cached == baseline
 
-    @pytest.mark.parametrize("kv_cache_management_mode", [KVCacheManagementMode.RECOMPUTE])
+    @pytest.mark.parametrize(
+        "kv_cache_management_mode", [KVCacheManagementMode.PERSIST, KVCacheManagementMode.RECOMPUTE]
+    )
     @pytest.mark.parametrize("chunked", [False, True])
     @torch.inference_mode()
     def test_refit_across_reallocating_cache_lifecycle(
@@ -390,9 +414,35 @@ class TestBatchInvariantMambaPrefixCaching:
     ):
         self._set_env(monkeypatch)
         with set_batch_invariant_mode(False):
-            self._run(
+            outputs = self._run(
                 prefix=True,
                 graphs=True,
                 chunked=chunked,
                 kv_cache_management_mode=kv_cache_management_mode,
             )
+            if kv_cache_management_mode == KVCacheManagementMode.PERSIST and not chunked:
+                fresh = self._run(
+                    prefix=True,
+                    graphs=True,
+                    chunked=False,
+                    kv_cache_management_mode=kv_cache_management_mode,
+                    target_seed=654,
+                    source_seed=654,
+                )
+                for request_id in (61, 6000):
+                    actual_tokens, actual_log_probs = outputs[request_id]
+                    fresh_tokens, fresh_log_probs = fresh[request_id]
+                    assert actual_tokens == fresh_tokens
+                    assert len(actual_log_probs) == len(fresh_log_probs)
+                    for actual, expected in zip(actual_log_probs, fresh_log_probs):
+                        if math.isnan(actual) or math.isnan(expected):
+                            assert math.isnan(actual) and math.isnan(expected)
+                        else:
+                            assert actual == expected
+
+    @torch.inference_mode()
+    def test_refit_executes_flashinfer_sampling(self, monkeypatch):
+        pytest.importorskip("flashinfer", reason="FlashInfer sampling is not installed")
+        self._set_env(monkeypatch)
+        with set_batch_invariant_mode(True, backend="te_native"):
+            self._run(prefix=False, graphs=False, chunked=False, sampling_backend="flashinfer")

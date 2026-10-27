@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from unittest import mock
 
+import msgpack
 import pytest
 import torch
 from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, check_fp8_support
@@ -29,8 +30,9 @@ from megatron.core.inference.disaggregation.engine import (
 from megatron.core.inference.disaggregation.inference_state_handoff import (
     InferenceStateHandoffMixin,
 )
-from megatron.core.inference.engines import DynamicInferenceEngine
+from megatron.core.inference.engines import DynamicInferenceEngine, dynamic_engine
 from megatron.core.inference.engines.dynamic_engine import EngineState, _get_decode_only_log_state
+from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import (
     DynamicInferenceEventType,
     DynamicInferenceRequest,
@@ -2109,6 +2111,41 @@ def test_async_suspend_pending_logits_lifecycle(mode, preserve_pending):
         )
     else:
         assert engine.controller._async_sched_forward.token_row_indices is None
+
+
+@pytest.mark.parametrize("new_epoch,expect_pending", [(7, True), (8, False)])
+def test_generation_epoch_change_discards_pending_logits_from_prior_weights(
+    new_epoch, expect_pending
+):
+    """An RL weight epoch cannot sample logits computed by the previous policy."""
+    pending = AsyncScheduleForwardState()
+    pending.set_pending(4, torch.tensor([0, 1, 2]))
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.controller = SimpleNamespace(_async_sched_forward=pending)
+    engine._generation_epoch = 7
+    engine.requests = {}
+    engine.failed_request_ids = []
+    engine.is_mp_coordinator = True
+    engine._pending_signals = deque()
+    engine._invalidate_vision_state = mock.Mock()
+    engine._drain_handoff_completion_notifications = mock.Mock(return_value=[])
+    engine._poll_pending_kv_imports = mock.Mock(return_value=0)
+    engine._poll_pending_kv_pushes = mock.Mock(return_value=0)
+    engine._collect_failed_requests = mock.Mock(return_value=[])
+    engine.model_parallel_publisher_socket = mock.Mock()
+    engine.socket_for_receiving_requests = mock.Mock()
+    engine.socket_for_receiving_requests.recv_multipart.side_effect = [
+        [msgpack.packb([Headers.SET_GENERATION_EPOCH.value, new_epoch])],
+        dynamic_engine.zmq.Again,
+    ]
+
+    assert engine.schedule_requests() == 1
+    assert pending.is_valid is expect_pending
+    assert engine._generation_epoch == new_epoch
+    if new_epoch == 7:
+        engine._invalidate_vision_state.assert_not_called()
+    else:
+        engine._invalidate_vision_state.assert_called_once_with()
 
 
 @pytest.mark.parametrize(
