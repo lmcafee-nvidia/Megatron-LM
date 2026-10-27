@@ -73,7 +73,7 @@ class GlooCopyService(CopyService):
                 local_sends, local_recv_objs, "GlooCopyService", self.rank
             )
             self._copy_stream.wait_stream(torch.cuda.current_stream())
-            with torch.inference_mode(), torch.cuda.stream(self._copy_stream):
+            with torch.no_grad(), torch.cuda.stream(self._copy_stream):
                 for send_op, recv_op in pairs:
                     src_tensor = send_op.tensor
                     dst_tensor = dst_by_task_id[recv_op.task_id]
@@ -120,7 +120,7 @@ class GlooCopyService(CopyService):
         # Copy received CPU buffers back into the original destination tensors.
         # Use non_blocking with pinned memory for overlap.  Routed through
         # _copy_stream so subsequent default-stream work isn't blocked.
-        with torch.inference_mode(), torch.cuda.stream(self._copy_stream):
+        with torch.cuda.stream(self._copy_stream):
             for recv, dst_tensor in remote_recvs:
                 if dst_tensor.is_cuda:
                     dst_tensor.copy_(recv.tensor, non_blocking=True)
