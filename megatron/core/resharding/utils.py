@@ -4,7 +4,6 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Mapping, Optional
-from weakref import WeakKeyDictionary
 
 import torch
 import torch.distributed as dist
@@ -155,17 +154,6 @@ class ReshardPlan:
     send_ops: list[TransferOp]
     recv_ops: list[TransferOp]
     transform: Optional["ReshardTransform"] = None
-    # Weak target identity for transforms created automatically by refit. A
-    # caller-supplied transform leaves this unset and is never replaced.
-    _auto_transform_target_ref: object | None = field(
-        default=None, init=False, repr=False, compare=False
-    )
-    # A cached plan can serve equivalent destination model instances. Keep each
-    # instance's persistent-buffer transform so returning to an already-quantized
-    # target does not try to rediscover parameters that were replaced by MXFP8Tensor.
-    _auto_transforms: WeakKeyDictionary = field(
-        default_factory=WeakKeyDictionary, init=False, repr=False, compare=False
-    )
     # Cache of persistent-buffer dtypes keyed by local destination module path.
     # Populated by _harmonize_buffer_dtypes on first call; reused thereafter to
     # skip the all_gather_object + named_modules() walks on the hot path.
