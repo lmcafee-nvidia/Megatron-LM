@@ -254,7 +254,7 @@ class TestInferenceTopKRouter:
         # Same expert selections
         assert training_experts == inference_experts
 
-    @pytest.mark.parametrize("topk", [NANOV3_BASE["moe_router_topk"]])
+    @pytest.mark.parametrize("topk", [1, NANOV3_BASE["moe_router_topk"]])
     def test_sinkhorn_inference_matches_evaluation_probabilities(self, topk):
         router = self._make_router(
             moe_router_load_balancing_type="sinkhorn",
