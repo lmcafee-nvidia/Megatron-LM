@@ -824,14 +824,6 @@ _ASYNC_PAIR_SCENARIOS = (
         atol=5.0e-3,
     ),
     _pair_scenario(
-        "disagg-decode-handoff",
-        "disaggregation:decode-handoff",
-        "kv:transferred-prefix",
-        config={"enable_prefix_caching": True, "engine_cls": StateHandoffDynamicInferenceEngine},
-        signals=("disagg-handoff",),
-        request_profile="handoff",
-    ),
-    _pair_scenario(
         "hybrid-mamba",
         "model:hybrid-mamba",
         "interaction:mamba-state-compaction",
@@ -1147,6 +1139,20 @@ def _variant(base_name, name, *pairs, config=None, signals=(), **changes):
     )
 
 
+# The harness follows handed-off requests only in asynchronous runs, so this case is
+# compared with and without graphs, both scheduled asynchronously.
+_CUDA_GRAPH_HANDOFF_SCENARIOS = (
+    _pair_scenario(
+        "disagg-decode-handoff",
+        "disaggregation:decode-handoff",
+        "kv:transferred-prefix",
+        config={"enable_prefix_caching": True, "engine_cls": StateHandoffDynamicInferenceEngine},
+        signals=("disagg-handoff",),
+        request_profile="handoff",
+    ),
+)
+
+
 # CUDA-graph comparisons of upstream cases with extra settings or checks.
 _CUDA_GRAPH_VARIANT_SCENARIOS = (
     _variant(
@@ -1212,7 +1218,6 @@ _CUDA_GRAPH_DIFFERENTIAL_SCENARIOS = (
             "mtp-graph-heterogeneous-logprobs",
             "mla-latent-kv",
             "vlm-precomputed-media",
-            "disagg-decode-handoff",
             "hybrid-mamba",
             "hybrid-gdn",
             "hybrid-gdp",
@@ -1228,6 +1233,7 @@ _CUDA_GRAPH_DIFFERENTIAL_SCENARIOS = (
         }
     )
     + _CUDA_GRAPH_VARIANT_SCENARIOS
+    + _CUDA_GRAPH_HANDOFF_SCENARIOS
     + _CUDA_GRAPH_LIFECYCLE_SCENARIOS
 )
 
