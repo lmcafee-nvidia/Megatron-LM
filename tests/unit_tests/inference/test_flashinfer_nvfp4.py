@@ -215,6 +215,10 @@ def test_flashinfer_forward_dispatches_to_nvfp4(monkeypatch):
 
 @pytest.mark.parametrize("built", [False, True], ids=["before_first_forward", "after"])
 def test_refit_refreshes_built_nvfp4_expert_weights(monkeypatch, built):
+    """A refit after the NVFP4 copy is built refreshes it before graphs replay.
+
+    Before the first forward there is no copy yet; it is built from the refit weights.
+    """
     from megatron.core.resharding import refit
 
     experts_module = torch.nn.Module()
