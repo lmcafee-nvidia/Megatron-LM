@@ -731,14 +731,6 @@ _ASYNC_PAIR_SCENARIOS = (
         atol=5.0e-3,
     ),
     _pair_scenario(
-        "disagg-decode-handoff",
-        "disaggregation:decode-handoff",
-        "kv:transferred-prefix",
-        config={"enable_prefix_caching": True, "engine_cls": StateHandoffDynamicInferenceEngine},
-        signals=("disagg-handoff",),
-        request_profile="handoff",
-    ),
-    _pair_scenario(
         "hybrid-mamba",
         "model:hybrid-mamba",
         "interaction:mamba-state-compaction",
@@ -1000,6 +992,20 @@ def _variant(base_name, name, *pairs, config=None, signals=(), **changes):
     )
 
 
+# The harness follows handed-off requests only in asynchronous runs, so this case is
+# compared with and without graphs, both scheduled asynchronously.
+_CUDA_GRAPH_HANDOFF_SCENARIOS = (
+    _pair_scenario(
+        "disagg-decode-handoff",
+        "disaggregation:decode-handoff",
+        "kv:transferred-prefix",
+        config={"enable_prefix_caching": True, "engine_cls": StateHandoffDynamicInferenceEngine},
+        signals=("disagg-handoff",),
+        request_profile="handoff",
+    ),
+)
+
+
 # CUDA-graph comparisons of upstream cases with extra settings or checks.
 _CUDA_GRAPH_VARIANT_SCENARIOS = (
     _variant(
@@ -1025,6 +1031,15 @@ _CUDA_GRAPH_VARIANT_SCENARIOS = (
         signals=("request-seed",),
     ),
     _variant("flashinfer-fused-rope", "flashinfer-fused-rope-exact", parity="exact"),
+    _variant(
+        "fp8-transformer-engine",
+        "fp8-transformer-engine-delayed",
+        "precision:fp8-delayed",
+        config={"fp8_recipe": "delayed"},
+        signals=("fixed-history-logits",),
+        atol=0.0,
+        parity="exact",
+    ),
 )
 
 
@@ -1052,7 +1067,6 @@ _CUDA_GRAPH_DIFFERENTIAL_SCENARIOS = (
             "mtp-repeated-all-accept",
             "mtp-graph-heterogeneous-logprobs",
             "vlm-precomputed-media",
-            "disagg-decode-handoff",
             "hybrid-mamba",
             "hybrid-gdn",
             "hybrid-gdp",
@@ -1066,6 +1080,7 @@ _CUDA_GRAPH_DIFFERENTIAL_SCENARIOS = (
         }
     )
     + _CUDA_GRAPH_VARIANT_SCENARIOS
+    + _CUDA_GRAPH_HANDOFF_SCENARIOS
     + _CUDA_GRAPH_LIFECYCLE_SCENARIOS
 )
 
@@ -1421,6 +1436,7 @@ def _instrument_cuda_graph_replays(model, context, runtime):
             replayed_module_names = tuple(
                 sorted({type(module).__name__ for module in replayed_modules})
             )
+            fp8_runtime_enabled = bool(runner.fp8_enabled)
 
             def traced_replay(
                 is_first_microbatch,
@@ -1429,6 +1445,7 @@ def _instrument_cuda_graph_replays(model, context, runtime):
                 _original=original_replay,
                 _runner=runner,
                 _module_names=replayed_module_names,
+                _fp8_runtime_enabled=fp8_runtime_enabled,
                 _owner=owner,
             ):
                 if runtime["cuda-graph-capture-active"]:
@@ -1438,6 +1455,7 @@ def _instrument_cuda_graph_replays(model, context, runtime):
                 dimension = (padded.token_count, padded.prefill_req_count, padded.decode_req_count)
                 step_key = ("cuda-graph-replay-step", context.step_count, *dimension)
                 runtime["cuda-graph-runner-replays"] += 1
+                runtime["cuda-graph-fp8-replays"] += int(_fp8_runtime_enabled)
                 runtime["cuda-graph-real-token-scalar-matches"] += int(
                     int(context.gpu_view.real_token_count.item()) == real.token_count
                 )
@@ -2112,7 +2130,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     isinstance(key, tuple)
                     and key[0] in ("cuda-graph-warmup-steps", "flash-attention-version")
                 )
-                or (isinstance(key, str) and key.startswith("nccl-"))
+                or (isinstance(key, str) and key.startswith(("nccl-", "fp8-")))
             }
             runtime.clear()
             runtime.update(capture_evidence)
@@ -2721,7 +2739,10 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             )
         if "fp8" in signals:
             assert model_config.fp8 is not None
-            assert runtime["module-forward:fp8"] > 0
+            if "cuda-graph" in signals:
+                assert runtime["cuda-graph-fp8-replays"] > 0
+            else:
+                assert runtime["module-forward:fp8"] > 0
             assert runtime["fp8-context-forwards"] > 0
             assert runtime["fp8-quantized-forwards"] > 0
             assert runtime["fp8-recipe-forwards"] > 0
@@ -2884,8 +2905,11 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     model_config.sequence_parallel
                     and model_config.transformer_impl != "inference_optimized"
                 ):
-                    assert runtime["tp-collective:reduce_scatter_to_sequence_parallel_region"] > 0
-                    assert runtime["tp-sp-reduce-scatter-dimensions"] > 0
+                    if "cuda-graph" not in signals:
+                        assert (
+                            runtime["tp-collective:reduce_scatter_to_sequence_parallel_region"] > 0
+                        )
+                        assert runtime["tp-sp-reduce-scatter-dimensions"] > 0
                 elif not model_config.sequence_parallel:
                     assert runtime["tp-collective:reduce_from_tensor_model_parallel_region"] > 0
             if model_config.pipeline_model_parallel_size > 1:
