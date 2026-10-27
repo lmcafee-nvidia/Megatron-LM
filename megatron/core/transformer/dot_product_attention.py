@@ -49,8 +49,6 @@ class DotProductAttention(MegatronModule):
         softmax_scale: Optional[float] = None,
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
-        k_channels: Optional[int] = None,
-        v_channels: Optional[int] = None,
     ):
         super().__init__(config=config)
 
@@ -64,9 +62,7 @@ class DotProductAttention(MegatronModule):
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type  # unused for now
 
-        query_key_channels = k_channels if k_channels is not None else self.config.kv_channels
-        value_channels = v_channels if v_channels is not None else self.config.kv_channels
-        projection_size = value_channels * self.config.num_attention_heads
+        projection_size = self.config.kv_channels * self.config.num_attention_heads
 
         # Per attention head and per partition values.
         if pg_collection is None:
@@ -80,7 +76,7 @@ class DotProductAttention(MegatronModule):
 
         world_size = pg_collection.tp.size()
         self.hidden_size_per_partition = divide(projection_size, world_size)
-        self.hidden_size_per_attention_head = query_key_channels
+        self.hidden_size_per_attention_head = divide(projection_size, config.num_attention_heads)
         self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
         self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
 
