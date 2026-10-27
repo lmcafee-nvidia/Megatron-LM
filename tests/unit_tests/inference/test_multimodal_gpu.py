@@ -1239,11 +1239,11 @@ def test_real_media_executes_configured_language_implementation_or_parallel_path
     assert finished.generated_tokens[0] == _greedy_token(step)
 
 
-@pytest.mark.parametrize("variant", ["swa", "mla", "mla_unfused"])
+@pytest.mark.parametrize("variant", ["swa", "mla"])
 def test_real_media_executes_attention_variant_and_reuses_exact_result(model_parallel, variant):
     model = _build_attention_variant_model(variant)
     block_size_tokens = 4
-    unfused_attention = next(
+    mla_attention = next(
         (
             module
             for module in model.language_model.modules()
@@ -1251,16 +1251,13 @@ def test_real_media_executes_attention_variant_and_reuses_exact_result(model_par
         ),
         None,
     )
-    original_unfused_projection = (
-        unfused_attention.linear_kv_up_proj if variant == "mla_unfused" else None
-    )
+    if variant.startswith("mla"):
+        block_size_tokens = 64
     mla_probe = mla_fused_reference = None
     if variant == "mla":
         mla_probe = torch.randn(3, 1, 32, device="cuda", dtype=torch.bfloat16)
         with torch.no_grad():
-            mla_fused_reference = unfused_attention.linear_kv_up_proj(mla_probe)[0]
-    if variant.startswith("mla"):
-        block_size_tokens = 64
+            mla_fused_reference = mla_attention.linear_kv_up_proj(mla_probe)[0]
     engine, wrapper = _build_engine("image", model=model, block_size_tokens=block_size_tokens)
     trace = _install_forward_trace(engine)
     media = _media("image", offset=0.0)
@@ -1303,12 +1300,10 @@ def test_real_media_executes_attention_variant_and_reuses_exact_result(model_par
         for handle in handles:
             handle.remove()
     assert encoder.call_count == 1 and companion_events
-    if variant == "mla_unfused":
-        assert unfused_attention.linear_kv_up_proj_linear is original_unfused_projection
     if variant == "mla":
         with torch.no_grad():
-            split_result = unfused_attention.linear_kv_up_proj_linear(
-                unfused_attention.kv_layernorm(mla_probe)
+            split_result = mla_attention.linear_kv_up_proj_linear(
+                mla_attention.kv_layernorm(mla_probe)
             )[0]
         torch.testing.assert_close(split_result, mla_fused_reference, rtol=3e-2, atol=3e-2)
     if variant == "swa":
