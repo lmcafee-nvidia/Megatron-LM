@@ -2,7 +2,6 @@
 
 """Async high-level inference API for Megatron (``MegatronAsyncLLM``)."""
 
-import asyncio
 from typing import List, Optional, Type, Union
 
 from megatron.core.inference.apis._llm_base import _MegatronLLMBase
@@ -103,7 +102,6 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         Raises:
             RuntimeError: if called on a non-primary rank.
         """
-        self._assert_not_shutdown()
         self._assert_primary()
         if sampling_params is None:
             sampling_params = SamplingParams()
@@ -131,7 +129,6 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         Raises:
             RuntimeError: in direct mode (``use_coordinator=False``).
         """
-        self._assert_not_shutdown()
         self._assert_coordinator()
         assert self._loop_manager is not None
         await self._loop_manager.run_async(self._pause_impl())
@@ -142,7 +139,6 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         Raises:
             RuntimeError: in direct mode (``use_coordinator=False``).
         """
-        self._assert_not_shutdown()
         self._assert_coordinator()
         assert self._loop_manager is not None
         await self._loop_manager.run_async(self._unpause_impl())
@@ -155,7 +151,6 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         Raises:
             RuntimeError: in direct mode (``use_coordinator=False``).
         """
-        self._assert_not_shutdown()
         self._assert_coordinator()
         assert self._loop_manager is not None
         await self._loop_manager.run_async(self._suspend_impl())
@@ -166,7 +161,6 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         Raises:
             RuntimeError: in direct mode (``use_coordinator=False``).
         """
-        self._assert_not_shutdown()
         self._assert_coordinator()
         assert self._loop_manager is not None
         await self._loop_manager.run_async(self._resume_impl())
@@ -176,11 +170,17 @@ class MegatronAsyncLLM(_MegatronLLMBase):
 
         Idempotent. No-op in direct mode.
         """
-        with self._async_shutdown_lock:
-            shutdown_complete_future = self._begin_shutdown()
-        # Each caller gets a loop-local wrapper around the shared completion
-        # future, so concurrent callers and callers on distinct loops are safe.
-        await asyncio.shield(asyncio.wrap_future(shutdown_complete_future))
+        if self._shutdown_called:
+            return
+        self._shutdown_called = True
+
+        self._stop_frontend_if_started()
+
+        if not self._use_coordinator:
+            return
+        assert self._loop_manager is not None
+        await self._loop_manager.run_async(self._shutdown_impl())
+        self._loop_manager.stop()
 
     async def serve(self, serve_config: ServeConfig, *, blocking: bool = True) -> None:
         """Start the OpenAI-compatible HTTP frontend.
@@ -200,7 +200,6 @@ class MegatronAsyncLLM(_MegatronLLMBase):
             ValueError: if ``use_coordinator=False`` (HTTP serving requires
                 the coordinator path).
         """
-        self._assert_not_shutdown()
         if not self._use_coordinator:
             raise ValueError("MegatronAsyncLLM.serve() requires use_coordinator=True")
 
@@ -246,13 +245,6 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         No-op in direct mode.
         """
         if not self._use_coordinator:
-            return
-        with self._async_shutdown_lock:
-            shutdown_called = self._shutdown_called
-            shutdown_complete_future = self._shutdown_complete_future
-        if shutdown_called:
-            assert shutdown_complete_future is not None
-            await asyncio.shield(asyncio.wrap_future(shutdown_complete_future))
             return
         assert self._loop_manager is not None
         await self._loop_manager.run_async(self._wait_for_shutdown_impl())
