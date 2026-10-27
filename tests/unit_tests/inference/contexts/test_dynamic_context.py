@@ -566,6 +566,40 @@ class TestDynamicContext:
             )  # Exceeding max token count
 
     @pytest.mark.internal
+    @pytest.mark.parametrize("head_size", [8, 64])
+    def test_fused_rope_matches_reference_rotation(self, head_size):
+        """The FlashInfer RoPE path, including its narrow-head fallback, rotates correctly."""
+        pytest.importorskip("flashinfer")
+        positions = torch.tensor([0, 3, 7, 12, 30], device="cuda")
+        heads = 2
+        exponents = torch.arange(0, head_size, 2, device="cuda", dtype=torch.float32) / head_size
+        freqs = torch.outer(
+            torch.arange(64, device="cuda", dtype=torch.float32), 1.0 / (10000**exponents)
+        )
+        cos_sin = torch.cat([freqs.cos(), freqs.sin()], dim=-1)
+        query, key = (
+            torch.randn(len(positions), 1, heads, head_size, device="cuda", dtype=torch.bfloat16)
+            for _ in range(2)
+        )
+        context = SimpleNamespace(
+            use_flashinfer_fused_rope=True,
+            padded_active_token_count=len(positions),
+            gpu_view=SimpleNamespace(token_to_pos_ids=positions),
+        )
+        rotated_query, rotated_key = DynamicInferenceContext.apply_fused_qk_rotary_emb(
+            context, query, key, cos_sin, SimpleNamespace(rotary_interleaved=False)
+        )
+
+        def reference(x):
+            cos = freqs[positions].cos()[:, None, None, :]
+            sin = freqs[positions].sin()[:, None, None, :]
+            first, second = x.float().chunk(2, dim=-1)
+            return torch.cat([first * cos - second * sin, second * cos + first * sin], dim=-1)
+
+        torch.testing.assert_close(rotated_query.float(), reference(query), atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(rotated_key.float(), reference(key), atol=2e-2, rtol=2e-2)
+
+    @pytest.mark.internal
     @rounder_override(64)
     def test_current_input_and_position_ids_view_cache(self):
         dynamic_context = self._get_dynamic_context(
