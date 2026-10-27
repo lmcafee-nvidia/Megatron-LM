@@ -62,6 +62,7 @@ if HAVE_TE:
         TENorm,
         TERowParallelGroupedLinear,
         TERowParallelLinear,
+        split_te_layernorm_column_parallel_linear,
         te_cross_entropy,
     )
 
@@ -539,6 +540,49 @@ class TestTEWrappers:
             contention=True,
             what=f"TELayerNormColumnParallelLinear[{normalization}]",
         )
+
+    @pytest.mark.parametrize("normalization", ["LayerNorm", "RMSNorm"])
+    @pytest.mark.parametrize("skip_bias_add", [False, True])
+    def test_te_layernorm_column_parallel_linear_split_keeps_device_mode_and_output(
+        self, normalization, skip_bias_add
+    ):
+        """Splitting a fused norm+linear keeps its device, eval mode, parameters, and output."""
+        seeded()
+        config = _config(normalization=normalization)
+        module = TELayerNormColumnParallelLinear(
+            HIDDEN,
+            3 * HIDDEN,
+            config=config,
+            init_method=init_method_normal(0.02),
+            gather_output=False,
+            bias=True,
+            skip_bias_add=skip_bias_add,
+            is_expert=False,
+        ).cuda()
+        torch.nn.init.constant_(module.layer_norm_weight, 0.75)
+        torch.nn.init.constant_(module.bias, 0.375)
+        if getattr(module, "layer_norm_bias", None) is not None:
+            torch.nn.init.constant_(module.layer_norm_bias, -0.125)
+        module.eval()
+        x = torch.randn(TOKENS, 2, HIDDEN, device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad():
+            fused_output, fused_bias = module(x)
+        # CPU initialization is what built the split modules on the CPU before the fix.
+        config.use_cpu_initialization = True
+        norm, linear = split_te_layernorm_column_parallel_linear(module, config)
+        assert norm.weight.is_cuda and not norm.training
+        assert linear.weight.is_cuda and not linear.training
+        assert torch.equal(norm.weight, module.layer_norm_weight)
+        if getattr(module, "layer_norm_bias", None) is not None:
+            assert torch.equal(norm.bias, module.layer_norm_bias)
+        assert torch.equal(linear.weight, module.weight)
+        assert torch.equal(linear.bias, module.bias)
+        with torch.no_grad():
+            split_output, split_bias = linear(norm(x))
+        torch.testing.assert_close(split_output, fused_output, rtol=3e-2, atol=3e-2)
+        assert (fused_bias is not None, split_bias is not None) == (skip_bias_add,) * 2
+        if skip_bias_add:
+            torch.testing.assert_close(split_bias, fused_bias, rtol=0, atol=0)
 
     @pytest.mark.parametrize("normalization", ["LayerNorm", "RMSNorm"])
     def test_te_norm_replays(self, normalization):

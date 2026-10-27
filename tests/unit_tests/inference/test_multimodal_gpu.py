@@ -61,7 +61,7 @@ from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.inference.engines.ssm_test_helpers import (
     hybrid_mixer_kwargs,
@@ -352,6 +352,8 @@ def _build_te_parallel_model(modality, topology):
 
 
 def _build_attention_variant_model(variant):
+    if variant.startswith("mla"):
+        return _build_mla_model(qk_layernorm=variant == "mla")
     common = _language_defaults(num_layers=1, hidden_size=32, num_attention_heads=4, kv_channels=64)
     language_config = TransformerConfig(
         transformer_impl="local", window_size=(4, 0) if variant == "swa" else None, **common
@@ -359,6 +361,26 @@ def _build_attention_variant_model(variant):
     layer_submodules = get_gpt_layer_local_submodules()
     language_spec = ModuleSpec(module=TransformerLayer, submodules=copy.deepcopy(layer_submodules))
     return _variant_llava_model(language_config, language_spec, "learned_absolute")
+
+
+def _build_mla_model(qk_layernorm):
+    common = _language_defaults(num_layers=1, hidden_size=64, num_attention_heads=4, kv_channels=64)
+    language_config = MLATransformerConfig(
+        transformer_impl="transformer_engine",
+        q_lora_rank=32,
+        kv_lora_rank=32,
+        qk_head_dim=32,
+        qk_pos_emb_head_dim=16,
+        v_head_dim=32,
+        cache_mla_latents=True,
+        qk_layernorm=qk_layernorm,
+        rope_type="rope",
+        **common,
+    )
+    language_spec = get_gpt_layer_with_transformer_engine_spec(
+        qk_layernorm=qk_layernorm, multi_latent_attention=True
+    )
+    return _variant_llava_model(language_config, language_spec, "rope")
 
 
 def _variant_llava_model(language_config, language_spec, position_embedding_type):
@@ -1222,10 +1244,28 @@ def test_real_media_executes_configured_language_implementation_or_parallel_path
     assert finished.generated_tokens[0] == _greedy_token(step)
 
 
-@pytest.mark.parametrize("variant", ["swa"])
+@pytest.mark.parametrize("variant", ["swa", "mla", "mla_unfused"])
 def test_real_media_executes_attention_variant_and_reuses_exact_result(model_parallel, variant):
     model = _build_attention_variant_model(variant)
     block_size_tokens = 4
+    unfused_attention = next(
+        (
+            module
+            for module in model.language_model.modules()
+            if type(module).__name__ == "MLASelfAttention"
+        ),
+        None,
+    )
+    original_unfused_projection = (
+        unfused_attention.linear_kv_up_proj if variant == "mla_unfused" else None
+    )
+    mla_probe = mla_fused_reference = None
+    if variant == "mla":
+        mla_probe = torch.randn(3, 1, 32, device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad():
+            mla_fused_reference = unfused_attention.linear_kv_up_proj(mla_probe)[0]
+    if variant.startswith("mla"):
+        block_size_tokens = 64
     engine, wrapper = _build_engine("image", model=model, block_size_tokens=block_size_tokens)
     trace = _install_forward_trace(engine)
     media = _media("image", offset=0.0)
@@ -1240,6 +1280,14 @@ def test_real_media_executes_attention_variant_and_reuses_exact_result(model_par
             return original_flash(attention, *args, **kwargs)
 
         patchers.append(mock.patch.object(Attention, "flash_decode_and_prefill", new=record_window))
+    if variant.startswith("mla"):
+        handles = [
+            module.register_forward_pre_hook(
+                lambda _module, args: companion_events.append(tuple(args[0].shape))
+            )
+            for module in model.language_model.modules()
+            if type(module).__name__ == "MLASelfAttention"
+        ]
     for patcher in patchers:
         patcher.start()
     try:
@@ -1260,6 +1308,14 @@ def test_real_media_executes_attention_variant_and_reuses_exact_result(model_par
         for handle in handles:
             handle.remove()
     assert encoder.call_count == 1 and companion_events
+    if variant == "mla_unfused":
+        assert unfused_attention.linear_kv_up_proj_linear is original_unfused_projection
+    if variant == "mla":
+        with torch.no_grad():
+            split_result = unfused_attention.linear_kv_up_proj_linear(
+                unfused_attention.kv_layernorm(mla_probe)
+            )[0]
+        torch.testing.assert_close(split_result, mla_fused_reference, rtol=3e-2, atol=3e-2)
     if variant == "swa":
         assert all(window == (4, 0) for window, _ in companion_events)
     assert first_step["mask"].ge(0).sum().item() == 4
