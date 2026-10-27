@@ -1089,6 +1089,7 @@ _CUDA_GRAPH_DIFFERENTIAL_SCENARIOS = (
             "hybrid-gdp",
             "transformer-engine",
             "inference-optimized",
+            "offload-static-uvm-suspend-resume",
             "flash-attention-3",
             "flash-attention-4",
             "swa-off-by-one-sink",

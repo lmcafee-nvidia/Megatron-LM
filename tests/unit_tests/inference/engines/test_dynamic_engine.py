@@ -1170,6 +1170,7 @@ class DynamicInferenceEngineTestBase:
                 prefix_caching_mamba_gb=test_config.prefix_caching_mamba_gb,
                 prefix_caching_eviction_policy=test_config.prefix_caching_eviction_policy,
                 use_flashinfer_fused_rope=test_config.use_flashinfer_fused_rope,
+                # this is for compatibility with the LTS environment
                 unified_memory_level=test_config.unified_memory_level,
                 allow_stale_multimodal_embeddings=(test_config.allow_stale_multimodal_embeddings),
                 track_generated_token_events=test_config.track_generated_token_events,
