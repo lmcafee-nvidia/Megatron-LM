@@ -29,10 +29,7 @@ from megatron.core.extensions.transformer_engine import (
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
-from megatron.core.inference.quantization.mxfp8_tensor import (
-    MXFP8Tensor,
-    validate_mxfp8_gemm_tensor,
-)
+from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor, validate_mxfp8_tensor
 from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -1485,7 +1482,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
                     f"Expected MXFP8Tensor for {linear_name}.weight{i}, "
                     f"got {type(weight).__name__}. Was quantize_model_to_mxfp8 called?"
                 )
-            validate_mxfp8_gemm_tensor(
+            validate_mxfp8_tensor(
                 mxfp8, expected_backend=backend, tensor_name=f"{linear_name}.weight{i}"
             )
             if mxfp8.dtype is not None:
