@@ -997,10 +997,6 @@ class DynamicInferenceRequest(InferenceRequest):
     def _post_deserialize(self, obj):
         super()._post_deserialize(obj)
         self.events = [DynamicInferenceEvent.deserialize(e) for e in obj.get("events", [])]
-        for field_name in ("policy_epoch", "kv_cache_epoch"):
-            boundaries = getattr(self, field_name)
-            if boundaries is not None:
-                setattr(self, field_name, [tuple(boundary) for boundary in boundaries])
 
     @property
     def tracked_metadata(self) -> List[Any]:
