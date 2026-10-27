@@ -1130,12 +1130,6 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         need_lse = softmax_offset is not None
 
         use_fa4, use_fa3 = self._resolve_flash_version()
-        # FA4 4.0.0b20 requires a BF16 sink independently of the Q/K/V dtype.
-        fa4_sink = (
-            softmax_offset.to(dtype=torch.bfloat16)
-            if use_fa4 and softmax_offset is not None
-            else softmax_offset
-        )
 
         # Flash attn kernel.
         if not is_decode_only:
@@ -1158,7 +1152,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                     causal=True,
                     window_size=window_size,
                     num_splits=0 if not self.batch_invariant_mode else 1,
-                    learnable_sink=fa4_sink,
+                    learnable_sink=softmax_offset,
                     **softcap_kwargs,
                 )
             elif use_fa3:
@@ -1307,7 +1301,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         causal=True,
                         window_size=window_size,
                         num_splits=0 if not self.batch_invariant_mode else 1,
-                        learnable_sink=fa4_sink,
+                        learnable_sink=softmax_offset,
                         **softcap_kwargs,
                     )
                     if need_lse and not use_fa4:
