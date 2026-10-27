@@ -214,11 +214,7 @@ def test_flashinfer_forward_dispatches_to_nvfp4(monkeypatch):
 
 
 @pytest.mark.parametrize("built", [False, True], ids=["before_first_forward", "after"])
-def test_refit_rejects_built_nvfp4_expert_weights(monkeypatch, built):
-    """A refit after the NVFP4 copy is built would leave generation on the old weights.
-
-    Before the first forward there is no copy yet; it is built from the refit weights.
-    """
+def test_refit_accepts_built_nvfp4_expert_weights(monkeypatch, built):
     from megatron.core.resharding import refit
 
     experts_module = torch.nn.Module()
@@ -233,12 +229,8 @@ def test_refit_rejects_built_nvfp4_expert_weights(monkeypatch, built):
     )
     service = SimpleNamespace(set_model_roles=lambda **kwargs: None)
 
-    if built:
-        with pytest.raises(NotImplementedError, match="per-token NVFP4"):
-            refit.reshard_model_weights(None, target, service)
-    else:
-        refit.reshard_model_weights(None, target, service)
-    assert executed == ["plan"], "the plan must run on every rank before raising"
+    refit.reshard_model_weights(None, target, service)
+    assert executed == ["plan"]
 
 
 def test_gated_fc1_is_padded_per_half_and_interleaved_up_gate():
@@ -806,7 +798,9 @@ class TestNVFP4MoELayer:
                 stale, _ = layer(hidden_states.clone())
             torch.testing.assert_close(stale, before, atol=0, rtol=0)
 
-            assert layer.experts.refresh_flashinfer_nvfp4_weights() is True
+            from megatron.core.resharding.execution import refresh_module_caches
+
+            refresh_module_caches(layer)
             with InferenceMode.active():
                 refreshed, _ = layer(hidden_states.clone())
 
@@ -853,7 +847,9 @@ class TestNVFP4MoELayer:
             before_refresh = graph_output.clone()
 
             layer.experts._fc1_weight.mul_(-1)
-            assert layer.experts.refresh_flashinfer_nvfp4_weights() is True
+            from megatron.core.resharding.execution import refresh_module_caches
+
+            refresh_module_caches(layer)
             graph.replay()
             torch.testing.assert_close(graph_output, _eager(static_hidden), atol=0, rtol=0)
 
