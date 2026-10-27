@@ -217,6 +217,11 @@ class LLaVAModel(MegatronModule):
         self.temporal_patch_dim = temporal_patch_dim
         self.separate_video_embedder = separate_video_embedder
         self.temporal_ckpt_compat = temporal_ckpt_compat
+        if tile_tags is not None and language_position_embedding_type == 'learned_absolute':
+            raise ValueError(
+                "Tile tags require a language position embedding type that is applied in the "
+                "decoder (for example, 'rope' or 'none'), not 'learned_absolute'."
+            )
         self._vision_fp8 = bool(vision_transformer_config.fp8 or use_vision_backbone_fp8_arch)
         self._vision_fp8_recipe = vision_transformer_config.fp8_recipe
         self._vision_projection_fp8 = bool(vision_projection_config.fp8)
