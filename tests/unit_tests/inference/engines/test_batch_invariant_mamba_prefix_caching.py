@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from megatron.core.inference.config import (
+    AsyncScheduleMode,
     InferenceConfig,
     KVCacheManagementMode,
     MambaInferenceStateConfig,
@@ -92,7 +93,9 @@ class TestBatchInvariantMambaPrefixCaching:
         refit_callback=None,
         lifecycle_callback=None,
         target_alloc_context=None,
+        async_sched_mode=AsyncScheduleMode.ASYNC,
     ):
+        is_async = async_sched_mode == AsyncScheduleMode.ASYNC
         model_parallel_cuda_manual_seed(321, inference_rng_tracker=True, force_reset_rng=True)
         torch.manual_seed(321)
         speculative = exercise_real_refit and sampling_backend == "torch"
@@ -187,6 +190,7 @@ class TestBatchInvariantMambaPrefixCaching:
                 unified_memory_level=0,
                 sampling_backend=sampling_backend,
                 num_speculative_tokens=int(speculative),
+                async_sched_mode=async_sched_mode,
             ),
         )
         engine = DynamicInferenceEngine(
@@ -243,7 +247,7 @@ class TestBatchInvariantMambaPrefixCaching:
                     for _ in range(2):
                         pre_refit_result = engine.step_modern()
                         assert not pre_refit_result["finished_requests"]
-                    assert engine.controller._async_sched_forward.is_valid
+                    assert engine.controller._async_sched_forward.is_valid or not is_async
                     resident = engine.get_request(5999)
                     assert resident.finished_chunk_token_count > 0 or resident.generated_tokens
                     resident_salt = resident.block_hash_salt
@@ -279,7 +283,7 @@ class TestBatchInvariantMambaPrefixCaching:
                     assert {
                         name: parameter.data_ptr() for name, parameter in target_parameters.items()
                     } == target_storage
-                    assert pending_survived_suspend is (
+                    assert not is_async or pending_survived_suspend is (
                         kv_cache_management_mode != KVCacheManagementMode.RECOMPUTE
                     )
 
@@ -594,3 +598,32 @@ class TestBatchInvariantMambaPrefixCaching:
         self._set_env(monkeypatch)
         with set_batch_invariant_mode(True, backend="te_native"):
             self._run(prefix=False, graphs=False, chunked=False, sampling_backend="flashinfer")
+
+
+class TestDiagResidentAcrossEpoch(TestBatchInvariantMambaPrefixCaching):
+    """Disposable diagnostic (not for review): resident request 5999 against a legacy oracle."""
+
+    @pytest.mark.parametrize(
+        "kv_cache_management_mode",
+        [KVCacheManagementMode.PERSIST, KVCacheManagementMode.OFFLOAD],
+        ids=["persist", "offload"],
+    )
+    @torch.inference_mode()
+    def test_diag_resident_matches_legacy(self, kv_cache_management_mode, monkeypatch):
+        self._set_env(monkeypatch)
+        with set_batch_invariant_mode(False):
+            outputs = {}
+            for mode in (AsyncScheduleMode.LEGACY, AsyncScheduleMode.ASYNC):
+                outputs[mode.name] = self._run(
+                    prefix=True,
+                    graphs=True,
+                    chunked=False,
+                    kv_cache_management_mode=kv_cache_management_mode,
+                    async_sched_mode=mode,
+                )
+        for request_id in sorted(outputs["LEGACY"]):
+            legacy_tokens = outputs["LEGACY"][request_id][0]
+            async_tokens = outputs["ASYNC"][request_id][0]
+            print(f"DIAG {kv_cache_management_mode.name} {request_id} "
+                  f"match={legacy_tokens == async_tokens} legacy={legacy_tokens} async={async_tokens}")
+        assert outputs["ASYNC"][5999][0] == outputs["LEGACY"][5999][0]
