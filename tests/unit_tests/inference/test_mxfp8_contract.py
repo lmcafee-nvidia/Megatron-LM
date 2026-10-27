@@ -147,8 +147,13 @@ def _boundary_input(rows: int, cols: int) -> torch.Tensor:
 
 @pytest.mark.parametrize("requested,expected_rows", [(-3, 0), (11, 8)])
 def test_live_rows_count_is_safely_bounded(requested: int, expected_rows: int):
-    """A device-resident scheduler count must not address outside fixed storage."""
-    x = _boundary_input(8, 128)
+    """A device-resident scheduler count must not address outside the input's rows.
+
+    ``x`` is an 8-row view whose parent storage continues with nonzero rows, so an
+    unclamped count of 11 would quantize those rows and write their scale bytes.
+    """
+    parent = _boundary_input(11, 128)
+    x = parent[:8]
     n_rows = torch.tensor([requested], device="cuda", dtype=torch.int64)
     data, scale = mxfp8_quantize_rows(x, n_rows, max_programs=3)
 
