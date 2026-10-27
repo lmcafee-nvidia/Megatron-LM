@@ -4,6 +4,7 @@ import copy
 import importlib
 import os
 import sys
+from collections import OrderedDict
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest import mock
@@ -12,8 +13,12 @@ import pytest
 import torch
 
 from megatron.core.inference.config import AsyncScheduleMode, PrefixCachingEvictionPolicy
-from megatron.core.inference.engines.dynamic_engine import EngineState
+from megatron.core.inference.contexts import StaticInferenceContext
+from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, EngineState
 from megatron.core.inference.inference_client import InferenceClient
+from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (
+    VLMInferenceWrapper,
+)
 from megatron.core.inference.quantization.utils import quantize_params_to_mxfp8
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -21,10 +26,19 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_inference_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
+from megatron.core.models.multimodal.llava_model import LLaVAModel
+from megatron.core.resharding.refit import (
+    clear_all_caches,
+    prepare_swap_model_weights,
+    swap_model_weights,
+)
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import attention as attention_module
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
-from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.mlp import MLPSubmodules
+from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.inference.engines import test_dynamic_engine as dynamic_engine_tests
@@ -101,8 +115,25 @@ def _protocol_adapter(mixin_cls, *, stop_token_ids=None, ignore_eos=False):
     return adapter
 
 
+def _reply(tokens, scores, reason, prompt=None):
+    return SimpleNamespace(
+        prompt_tokens=prompt,
+        generated_tokens=tokens,
+        generated_log_probs=scores,
+        finish_reason=reason,
+    )
+
+
 def _assert_exact_scores(actual, expected):
     torch.testing.assert_close(actual, torch.tensor(expected), rtol=0, atol=0)
+
+
+async def _wait_for_epoch(engine, epoch):
+    for _ in range(100):
+        if engine._generation_epoch == epoch:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"generation epoch did not reach {epoch}")
 
 
 async def _drive_engine(engine, futures, witness=None):
@@ -193,6 +224,177 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         delete_cuda_graphs()
         reset_rounder()
         Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("modality", ["image", "video"])
+    def test_real_multimodal_adapter_runs_vision_and_language_models(self, modality, monkeypatch):
+        monkeypatch.setenv("NVTE_FLASH_ATTN", "1")
+        monkeypatch.setenv("NVTE_FUSED_ATTN", "0")
+        monkeypatch.setenv("NVTE_UNFUSED_ATTN", "0")
+        BatchedDataDict, mixin_cls = _load_nemo_rl_adapter()
+        source = Path(os.environ["NEMO_RL_SOURCE"]).resolve(strict=True)
+        sys.path.insert(0, str(source))
+        try:
+            PackedTensor = importlib.import_module("nemo_rl.data.multimodal_utils").PackedTensor
+        finally:
+            sys.path.remove(str(source))
+        hidden_size, patch_dim, image_size = 64, 14, 28
+        language_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=hidden_size,
+            num_attention_heads=4,
+            use_cpu_initialization=False,
+            bf16=True,
+            attention_backend=AttnBackend.flash,
+        )
+        vision_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=2,
+            use_cpu_initialization=False,
+            bf16=True,
+            attention_backend=AttnBackend.flash,
+        )
+        projection_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=hidden_size,
+            ffn_hidden_size=32,
+            num_attention_heads=1,
+            use_cpu_initialization=False,
+            bf16=True,
+        )
+        submodules = get_gpt_layer_local_submodules()
+        vision_spec = get_gpt_layer_with_transformer_engine_spec()
+        projection_spec = copy.deepcopy(get_submodules(submodules.mlp))
+        assert isinstance(projection_spec, MLPSubmodules)
+        language_config.language_model_type = "dummy"
+        vision_config.vision_model_type = "radio"
+        model = LLaVAModel(
+            language_transformer_config=language_config,
+            language_transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            language_vocab_size=128,
+            language_max_sequence_length=64,
+            vision_transformer_config=vision_config,
+            vision_transformer_layer_spec=vision_spec,
+            drop_vision_class_token=True,
+            vision_projection_config=projection_config,
+            vision_projection_layer_spec=projection_spec,
+            img_h=image_size,
+            img_w=image_size,
+            patch_dim=patch_dim,
+            dynamic_resolution=True,
+        ).cuda()
+        model = Float16Module(model.config, model).eval()
+        context = StaticInferenceContext(max_batch_size=1, max_sequence_length=64)
+        wrapper = VLMInferenceWrapper(model, context)
+        vision_calls = []
+        vision_forward = wrapper._forward_vision_encoder
+
+        def traced_vision_forward(*args, **kwargs):
+            vision_calls.append(modality)
+            return vision_forward(*args, **kwargs)
+
+        wrapper._forward_vision_encoder = traced_vision_forward
+        frame_count = 1 if modality == "image" else 2
+        embedding_count = 4 * frame_count
+        prompt = [10] + [-200] * embedding_count + [20]
+        patches = torch.randn(1, embedding_count, 3 * patch_dim * patch_dim, dtype=torch.float32)
+        sizes = torch.tensor([[image_size, image_size]] * frame_count)
+        batch = {
+            "input_ids": torch.tensor([prompt]),
+            "input_lengths": torch.tensor([len(prompt)]),
+            "pixel_values": PackedTensor(
+                [patches],
+                dim_to_pack=0,
+                preprocess_mode="patchify",
+                preprocess_kwargs={"patch_dim": patch_dim},
+            ),
+            "imgs_sizes": PackedTensor([sizes], dim_to_pack=0),
+        }
+        if modality == "video":
+            batch["num_frames"] = PackedTensor([torch.tensor([frame_count])], dim_to_pack=0)
+        data = BatchedDataDict(batch)
+        adapter = _protocol_adapter(mixin_cls, ignore_eos=True)
+        adapter.cfg["generation"]["max_new_tokens"] = 1
+        adapter._get_megatron_inference_wrapper_cls = lambda: VLMInferenceWrapper
+        prompts, media, params = adapter._prepare_data_for_generation(data, greedy=True)
+        assert prompts == [prompt] and set(media[0]) == {modality, "media_tokens_preexpanded"}
+        assert params[0].return_prompt_tokens
+        engine = object.__new__(DynamicInferenceEngine)
+        engine.controller = SimpleNamespace(
+            inference_wrapped_model=wrapper, tokenizer=SimpleNamespace(eod=127), pp_group=None
+        )
+        engine.context = SimpleNamespace(
+            block_size_tokens=16, enable_prefix_caching=False, add_vlm_request_data=mock.Mock()
+        )
+        engine.vision_embedding_cache_max_bytes = sys.maxsize
+        engine.allow_stale_multimodal_embeddings = False
+        engine._vision_embedding_cache = OrderedDict()
+        engine._vision_embedding_cache_bytes = 0
+        engine._weight_epoch = 0
+        engine.requests = {}
+
+        def build_request(request_id, media_data):
+            payload = media_data[modality]
+            return engine._build_vlm_request(
+                request_id=request_id,
+                prompt_str=None,
+                tokens=torch.tensor(prompt),
+                sampling_params=params[0],
+                num_img_embeddings_per_tile=0,
+                num_tiles=None,
+                precomputed_block_hashes=None,
+                media_tokens_preexpanded=True,
+                media_cache_key=f"consumer-{modality}",
+                **payload,
+            )
+
+        def next_token(request):
+            context.reset()
+            tokens = request.prompt_tokens.unsqueeze(0).cuda()
+            with torch.inference_mode():
+                logits = wrapper._forward_dynamic(
+                    {
+                        "tokens": tokens,
+                        "position_ids": torch.arange(tokens.shape[1], device="cuda").unsqueeze(0),
+                        "attention_mask": None,
+                        "image_token_mask": request.image_token_mask.unsqueeze(0),
+                        "image_embeddings": request.image_embeddings,
+                    }
+                )
+            step_logits = logits[0, -1].float()
+            token = int(step_logits.argmax())
+            return token, float(torch.log_softmax(step_logits, dim=-1)[token])
+
+        direct_request = build_request(1300, media[0])
+        direct_token, direct_score = next_token(direct_request)
+        adapter_request = build_request(1301, media[0])
+        adapter_token, adapter_score = next_token(adapter_request)
+        cache_key = f"consumer-{modality}"
+        assert cache_key in engine._vision_embedding_cache
+        assert vision_calls == [modality]
+        assert torch.equal(direct_request.image_embeddings, adapter_request.image_embeddings)
+        assert (adapter_token, adapter_score) == (direct_token, direct_score)
+        reply = _reply([adapter_token], [adapter_score], "length", adapter_request.prompt_tokens)
+        output = adapter._parse_result_to_batched_data_dict(data, [reply])
+        assert output["output_ids"][0, len(prompt)].item() == direct_token
+        assert output["logprobs"][0, len(prompt)].item() == direct_score
+        cached_embedding = engine._vision_embedding_cache[cache_key].embedding
+        engine.allow_stale_multimodal_embeddings = True
+        engine._invalidate_vision_state()
+        assert engine._vision_embedding_cache[cache_key].embedding is cached_embedding
+        stale_request = build_request(1302, media[0])
+        assert stale_request.image_embeddings is cached_embedding
+        assert vision_calls == [modality]
+        engine.allow_stale_multimodal_embeddings = False
+        engine._invalidate_vision_state()
+        assert not engine._vision_embedding_cache
+        rebuilt_request = build_request(1303, media[0])
+        assert rebuilt_request.image_embeddings is not cached_embedding
+        torch.testing.assert_close(
+            rebuilt_request.image_embeddings, cached_embedding, rtol=0, atol=0
+        )
+        assert vision_calls == [modality, modality]
 
     @pytest.mark.internal
     @pytest.mark.asyncio
@@ -748,6 +950,424 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             )
         assert engine.context.async_sched_step_count > 0
         assert not engine.requests and not engine.has_unfinished_requests()
+
+    @pytest.mark.internal
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("kv_cache_management_mode", "mxfp8"),
+        [("persist", False), ("offload", False), ("recompute", False), ("recompute", True)],
+        ids=["persist", "offload", "recompute", "recompute-mxfp8"],
+    )
+    async def test_real_client_coordinator_adapter_matches_direct(
+        self, kv_cache_management_mode, mxfp8
+    ):
+        BatchedDataDict, mixin_cls = _load_nemo_rl_adapter()
+        config = DynamicEngineTestConfig(
+            num_requests=0,
+            max_prompt_length=8,
+            max_sequence_length=64,
+            context_max_requests=8,
+            context_max_tokens=64,
+            sampling_backend="flashinfer",
+            async_sched_mode=AsyncScheduleMode.ASYNC,
+            return_log_probs=True,
+            skip_prompt_log_probs=True,
+            logprobs_mode="raw_logprobs",
+            kv_cache_management_mode=kv_cache_management_mode,
+            fp8=mxfp8,
+            hidden_size=128 if mxfp8 else None,
+            transformer_impl="inference_optimized" if mxfp8 else "local",
+        )
+        if mxfp8:
+            engine = _build_inference_mxfp8_env(self, config, quantize=False).engine
+            assert (
+                "mxfp8"
+                in str(engine.controller.inference_wrapped_model.model.config.fp8_recipe).lower()
+            )
+        else:
+            engine = self._build_test_env(config).engine
+        engine.controller.tokenizer = _CoordinatorTokenizer()
+        prompts = [[3, 5, 7, 9], [2, 4, 6, 8, 10]]
+        generation_length, refit_expected, refit_model = 3, None, None
+        if kv_cache_management_mode == "recompute":
+            source_config = copy.deepcopy(config)
+            source_config.fp8 = False
+            refit_engine = self._build_test_env(source_config).engine
+            refit_model = refit_engine.controller.inference_wrapped_model.model
+            base_state = copy.deepcopy(refit_model.state_dict())
+            if mxfp8:
+                inference_model = engine.controller.inference_wrapped_model.model
+                prepare_swap_model_weights(refit_model, inference_model)
+                swap_model_weights(refit_model, inference_model, refit_method="nccl")
+        direct_futures = [
+            engine.add_request(
+                request_id,
+                prompt,
+                SamplingParams(
+                    temperature=0,
+                    top_k=1,
+                    top_p=0.0,
+                    skip_prompt_log_probs=True,
+                    return_log_probs=True,
+                    num_tokens_to_generate=generation_length,
+                    termination_id=-1,
+                ),
+            )
+            for request_id, prompt in enumerate(prompts, 300)
+        ]
+        direct = await _drive_engine(engine, direct_futures)
+        if kv_cache_management_mode == "recompute":
+            refit_expected = []
+            refit_states = []
+            for version_seed in (901, 902):
+                torch.manual_seed(version_seed)
+                with torch.inference_mode():
+                    refit_model.load_state_dict(base_state)
+                    for parameter in refit_model.parameters():
+                        parameter.add_(0.05 * torch.randn_like(parameter))
+                expected = await _drive_engine(
+                    refit_engine,
+                    [
+                        refit_engine.add_request(
+                            request_id,
+                            prompt,
+                            SamplingParams(
+                                temperature=0,
+                                top_k=1,
+                                top_p=0,
+                                skip_prompt_log_probs=True,
+                                return_log_probs=True,
+                                num_tokens_to_generate=generation_length,
+                                termination_id=-1,
+                            ),
+                        )
+                        for request_id, prompt in enumerate(prompts, 350 + version_seed)
+                    ],
+                )
+                refit_expected.append(expected)
+                refit_states.append(copy.deepcopy(refit_model.state_dict()))
+            assert any(
+                first.generated_tokens != second.generated_tokens
+                or first.generated_log_probs != second.generated_log_probs
+                for first, second in zip(*refit_expected, strict=True)
+            )
+            with torch.inference_mode():
+                refit_model.load_state_dict(refit_states[0])
+            del refit_engine, base_state
+
+        client = None
+        try:
+            coordinator_address = await engine.start_listening_to_data_parallel_coordinator(
+                hostname="127.0.0.1"
+            )
+            client = InferenceClient(coordinator_address, deserialize=True)
+            client.start(loop=asyncio.get_running_loop(), connect_timeout_seconds=10)
+            adapter = _protocol_adapter(mixin_cls, ignore_eos=True)
+            adapter.inference_client = client
+            adapter._token_capture_enabled = True
+            adapter._inference_loop = asyncio.get_running_loop()
+            await asyncio.to_thread(adapter.set_rollout_weight_version, 0)
+            await _wait_for_epoch(engine, 0)
+            padded = torch.tensor([prompts[0] + [0], prompts[1]], dtype=torch.long, device="cuda")
+            data = BatchedDataDict(
+                {"input_ids": padded, "input_lengths": torch.tensor([4, 5], device="cuda")}
+            )
+            lowered_prompts, media, params = adapter._prepare_data_for_generation(data, greedy=True)
+
+            async def direct_target_reference(first_request_id):
+                rng_state = engine.controller.sampling_rng.get_state()
+                references = await asyncio.gather(
+                    *(
+                        engine.add_request(first_request_id + index, *request)
+                        for index, request in enumerate(zip(lowered_prompts, params, strict=True))
+                    )
+                )
+                engine.controller.sampling_rng.set_state(rng_state)
+                return references
+
+            def assert_mxfp8_refit_content():
+                if not mxfp8:
+                    return
+                from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+                params, matched = dict(refit_model.named_parameters()), 0
+                for module_name, module in adapter.inference_model.decoder.named_modules():
+                    for name, dst in vars(module).items():
+                        if not isinstance(dst, MXFP8Tensor):
+                            continue
+                        key = f"decoder.{module_name}.{name}".replace("..", ".")
+                        src = MXFP8Tensor.from_bf16(params[key].to(dst.device), backend=dst.backend)
+                        assert torch.equal(dst.data, src.data) and torch.equal(dst.scale, src.scale)
+                        matched += 1
+                assert matched
+
+            replies = await asyncio.wait_for(
+                adapter._generate_with_persistent_engine(lowered_prompts, media, params), timeout=30
+            )
+            output = adapter._parse_result_to_batched_data_dict(data, replies)
+            assert all(reply.policy_epoch == [(0, 0)] for reply in replies)
+            for index, expected in enumerate(direct):
+                prompt_length = len(prompts[index])
+                assert output["output_ids"][
+                    index, prompt_length : prompt_length + generation_length
+                ].tolist() == (expected.generated_tokens)
+                _assert_exact_scores(
+                    output["logprobs"][index, prompt_length : prompt_length + generation_length],
+                    expected.generated_log_probs,
+                )
+            weight_epoch = engine._weight_epoch
+            adapter.dynamic_inference_engine = engine
+            await adapter._sleep_engine()
+            assert engine.state == EngineState.SUSPENDED
+            if refit_model is not None:
+                adapter.model = refit_model
+                adapter.inference_model = engine.controller.inference_wrapped_model.model
+                adapter.cfg["generation"]["mcore_generation_config"] = {
+                    "refit_backend": "nccl",
+                    "refit_execution_batch_bytes": None,
+                }
+                adapter._inference_model_offloaded = False
+                adapter._swap_weights_plan_prepared = False
+                adapter.should_disable_forward_pre_hook = False
+                adapter.move_model = lambda model, device, **_kwargs: model.to(device)
+                adapter._reshard_into_inference_model()
+                assert_mxfp8_refit_content()
+            await asyncio.to_thread(adapter.set_rollout_weight_version, 1)
+            await adapter._wake_engine()
+            assert engine.state == EngineState.RUNNING
+            assert engine._weight_epoch == weight_epoch + 1
+            await _wait_for_epoch(engine, 1)
+            expected_after_first_refit = refit_expected[0] if refit_expected else direct
+            if mxfp8:
+                expected_after_first_refit = await direct_target_reference(500)
+            resumed_replies = await asyncio.wait_for(
+                adapter._generate_with_persistent_engine(lowered_prompts, media, params), timeout=30
+            )
+            resumed_output = adapter._parse_result_to_batched_data_dict(data, resumed_replies)
+            assert all(reply.policy_epoch == [(0, 1)] for reply in resumed_replies)
+            for actual, expected in zip(resumed_replies, expected_after_first_refit, strict=True):
+                assert actual.generated_tokens == expected.generated_tokens
+                assert actual.generated_log_probs == expected.generated_log_probs
+            spanning_params = [adapter._build_sampling_params(greedy=True, stop_words=None)]
+            spanning_params[0].num_tokens_to_generate = 48
+            spanning_task = asyncio.create_task(
+                adapter._generate_with_persistent_engine([prompts[0]], [None], spanning_params)
+            )
+            for _ in range(10_000):
+                if any(
+                    len(engine.get_request(request_id).generated_tokens) >= 2
+                    for request_id in engine.requests
+                ):
+                    break
+                await asyncio.sleep(0.001)
+            assert engine.requests, "spanning request was not observed in flight"
+            if refit_model is not None:
+                await adapter._sleep_engine()
+                with torch.inference_mode():
+                    refit_model.load_state_dict(refit_states[1])
+                adapter._reshard_into_inference_model()
+                assert_mxfp8_refit_content()
+                await asyncio.to_thread(adapter.set_rollout_weight_version, 2)
+                await adapter._wake_engine()
+                assert engine._weight_epoch == weight_epoch + 2
+            else:
+                await asyncio.to_thread(adapter.set_rollout_weight_version, 2)
+            await _wait_for_epoch(engine, 2)
+            spanning_reply = (await asyncio.wait_for(spanning_task, timeout=30))[0]
+            assert spanning_reply.policy_epoch[0] == (0, 1)
+            assert spanning_reply.policy_epoch[-1][1] == 2
+            assert spanning_reply.policy_epoch[-1][0] > len(prompts[0])
+
+            if refit_expected is not None:
+                final_expected = await direct_target_reference(600) if mxfp8 else refit_expected[1]
+                final_replies = await asyncio.wait_for(
+                    adapter._generate_with_persistent_engine(lowered_prompts, media, params),
+                    timeout=30,
+                )
+                assert all(reply.policy_epoch == [(0, 2)] for reply in final_replies)
+                for actual, expected in zip(final_replies, final_expected, strict=True):
+                    assert actual.generated_tokens == expected.generated_tokens
+                    assert actual.generated_log_probs == expected.generated_log_probs
+
+            cancel_params = [adapter._build_sampling_params(greedy=True, stop_words=None)]
+            cancel_params[0].num_tokens_to_generate = 48
+            cancel_task = asyncio.create_task(
+                adapter._generate_with_persistent_engine([prompts[1]], [None], cancel_params)
+            )
+            for _ in range(10_000):
+                if engine.requests:
+                    break
+                await asyncio.sleep(0.001)
+            cancelled_request_ids = set(engine.requests)
+            assert cancelled_request_ids
+            cancel_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await cancel_task
+            for _ in range(200):
+                if not engine.requests and not client.abort_futures:
+                    break
+                await asyncio.sleep(0.01)
+            assert cancelled_request_ids.isdisjoint(engine.requests)
+            assert not client.abort_futures
+        finally:
+            if client is not None:
+                if engine.state == EngineState.RUNNING:
+                    client.pause_engines()
+                    await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), timeout=10)
+                client.stop_engines()
+                await asyncio.wait_for(engine.engine_loop_task, timeout=10)
+                client.shutdown_coordinator()
+                coordinator_process = getattr(engine, "inference_coordinator_process", None)
+                if coordinator_process is not None:
+                    await asyncio.to_thread(coordinator_process.join, 10)
+                    assert not coordinator_process.is_alive()
+                client.stop()
+            if refit_model is not None:
+                clear_all_caches()
+
+
+@pytest.mark.internal
+@pytest.mark.asyncio
+async def test_real_noncolocated_consumer_refit_then_adapter_output():
+    if Utils.world_size != 4:
+        pytest.skip("noncolocated source/destination contract requires four ranks")
+
+    from megatron.core.inference.shards import build_inference_pg_collection
+    from megatron.core.resharding.copy_services.gloo_copy_service import GlooCopyService
+    from tests.unit_tests.resharding.test_model_swap import (
+        _build_gpt,
+        _destroy_pg_collection,
+        _run_forward,
+    )
+
+    BatchedDataDict, mixin_cls = _load_nemo_rl_adapter()
+    refit_cls = importlib.import_module(
+        "nemo_rl.models.generation.megatron.megatron_worker"
+    ).MegatronGenerationRefitMixin
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
+    rank = torch.distributed.get_rank()
+    source_pgs = build_inference_pg_collection(world_size=2, tp_size=1, rank_offset=0)
+    target_pgs = build_inference_pg_collection(world_size=2, tp_size=1, rank_offset=2)
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=2,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        attention_backend=AttnBackend.auto,
+    )
+    torch.manual_seed(1234)
+    source_model = (
+        _build_gpt(config, 128, 8, source_pgs, parallel_output=False).cuda().bfloat16().eval()
+        if rank < 2
+        else None
+    )
+    torch.manual_seed(1234)
+    target_model = (
+        _build_gpt(config, 128, 8, target_pgs, parallel_output=False).cuda().bfloat16().eval()
+        if rank >= 2
+        else None
+    )
+    tokens = torch.tensor([[3, 5, 7, 9]], device="cuda")
+    positions = torch.arange(tokens.shape[1], device="cuda").unsqueeze(0)
+    attention_mask = torch.triu(
+        torch.ones((1, 1, 4, 4), dtype=torch.bool, device="cuda"), diagonal=1
+    )
+    refitter = object.__new__(refit_cls)
+    refitter.model = source_model if rank < 2 else target_model
+    refitter.refit_execution_batch_bytes = None
+    refitter.refit_dst_rank_offset = 0
+    with pytest.raises(RuntimeError, match="was not initialized"):
+        refitter.swap_weights_via_reshard(is_source=rank < 2)
+    refitter.refit_execution_batch_bytes = 1 << 20
+    adapter = _protocol_adapter(mixin_cls, ignore_eos=True)
+    adapter.cfg["generation"]["max_new_tokens"] = 1
+    data = BatchedDataDict({"input_ids": tokens.cpu(), "input_lengths": torch.tensor([4])})
+    if target_model is not None:
+        inference_config = dynamic_engine_tests.InferenceConfig(
+            max_sequence_length=8,
+            buffer_size_gb=0.01,
+            max_requests=1,
+            max_tokens=8,
+            sampling_backend="torch",
+            pg_collection=target_pgs,
+        )
+        context = dynamic_engine_tests.DynamicInferenceContext(config, inference_config)
+        wrapper = dynamic_engine_tests.GPTInferenceWrapper(target_model, context)
+        wrapper.model_is_pipeline_parallel = False
+        engine = DynamicInferenceEngine(
+            dynamic_engine_tests.TextGenerationController(wrapper, _CoordinatorTokenizer()), context
+        )
+    previous_token = None
+    refit_group = torch.distributed.new_group(backend="gloo")
+    refitter.refit_pg = refit_group
+    refitter.refit_copy_service = GlooCopyService(group=refit_group)
+    try:
+        for version, delta in enumerate((0.05, 0.11), 1):
+            if source_model is not None:
+                with torch.no_grad():
+                    for parameter in source_model.parameters():
+                        parameter.add_(delta)
+                direct_logits = _run_forward(
+                    source_model, tokens, positions, attention_mask, source_pgs
+                )
+            else:
+                direct_logits = torch.empty(1, 4, 128, device="cuda", dtype=torch.bfloat16)
+            torch.distributed.broadcast(direct_logits, src=0)
+            assert refitter.swap_weights_via_reshard(is_source=rank < 2)
+            torch.cuda.synchronize()
+            if target_model is not None:
+                with torch.inference_mode():
+                    target_logits = target_model(
+                        tokens, positions, attention_mask, runtime_gather_output=True
+                    )
+                torch.testing.assert_close(target_logits, direct_logits, rtol=0, atol=0)
+                if rank == 3:
+                    torch.distributed.barrier()
+                    continue
+                engine._generation_epoch = version
+                prompts, media, sampling_params = adapter._prepare_data_for_generation(
+                    data, greedy=True
+                )
+                direct = (
+                    await _drive_engine(
+                        engine, [engine.add_request(300 + version, prompts[0], sampling_params[0])]
+                    )
+                )[0]
+                witness = {"adapter_submissions": [], "cuda_graph_request_ids": []}
+                adapter.inference_client = _InProcessInferenceClient(
+                    engine, expected_requests=1, first_request_id=400 + version, witness=witness
+                )
+                with mock.patch.object(torch.distributed, "get_rank", return_value=0):
+                    replies = await adapter._generate_with_persistent_engine(
+                        prompts, media, sampling_params
+                    )
+                await adapter.inference_client.driver
+                output = adapter._parse_result_to_batched_data_dict(data, replies)
+                assert direct.generated_tokens == replies[0].generated_tokens
+                assert direct.generated_log_probs == replies[0].generated_log_probs
+                assert replies[0].policy_epoch == [(0, version)]
+                assert output["output_ids"][0, 4].item() == int(target_logits[0, -1].argmax())
+                assert output["logprobs"][0, 4].item() == direct.generated_log_probs[0]
+                assert witness["adapter_submissions"][0]["request_id"] == 400 + version
+                assert not engine.requests and not engine.has_unfinished_requests()
+                if previous_token is not None:
+                    assert output["output_ids"][0, 4].item() != previous_token or not torch.equal(
+                        target_logits, previous_logits
+                    )
+                previous_token, previous_logits = (
+                    output["output_ids"][0, 4].item(),
+                    target_logits.clone(),
+                )
+            torch.distributed.barrier()
+    finally:
+        refitter.refit_copy_service.close()
+        clear_all_caches()
+        torch.distributed.destroy_process_group(refit_group)
+        _destroy_pg_collection(source_pgs)
+        _destroy_pg_collection(target_pgs)
+        Utils.destroy_model_parallel()
 
 
 @pytest.fixture
