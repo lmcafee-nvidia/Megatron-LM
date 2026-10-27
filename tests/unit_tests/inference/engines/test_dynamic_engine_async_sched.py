@@ -791,6 +791,52 @@ _ASYNC_SUSPEND_RESUME_SCENARIOS = (
         },
         signals=("cuda-graph", "graph-recapture", "offload", "suspend-resume"),
     ),
+    _pair_scenario(
+        "diag-hybrid-offload-graph-recapture",
+        "model:hybrid-mamba",
+        "graph:recapture",
+        config={
+            "model_provider": "hybrid",
+            "kv_cache_management_mode": "offload",
+            "static_kv_memory_pointers": False,
+            "num_cuda_graphs": 4,
+            "force_build_cuda_graphs": True,
+            "use_cuda_graphs_for_non_decode_steps": False,
+        },
+        signals=("cuda-graph", "graph-recapture", "offload", "suspend-resume"),
+        atol=5.0e-3,
+    ),
+    _pair_scenario(
+        "diag-hybrid-mtp-offload-graph-recapture",
+        "model:hybrid-mamba",
+        "speculation:mtp-depth-one",
+        "graph:recapture",
+        config={
+            "model_provider": "hybrid",
+            "num_speculative_tokens": 1,
+            "kv_cache_management_mode": "offload",
+            "static_kv_memory_pointers": False,
+            "num_cuda_graphs": 4,
+            "force_build_cuda_graphs": True,
+            "use_cuda_graphs_for_non_decode_steps": False,
+        },
+        signals=("cuda-graph", "graph-recapture", "mtp", "offload", "suspend-resume"),
+        atol=5.0e-3,
+    ),
+    _pair_scenario(
+        "diag-gpt-mtp-offload-graph-recapture",
+        "speculation:mtp-depth-one",
+        "graph:recapture",
+        config={
+            "num_speculative_tokens": 1,
+            "kv_cache_management_mode": "offload",
+            "static_kv_memory_pointers": False,
+            "num_cuda_graphs": 4,
+            "force_build_cuda_graphs": True,
+            "use_cuda_graphs_for_non_decode_steps": False,
+        },
+        signals=("cuda-graph", "graph-recapture", "mtp", "offload", "suspend-resume"),
+    ),
 )
 
 _ASYNC_PARALLEL_SCENARIOS = (
