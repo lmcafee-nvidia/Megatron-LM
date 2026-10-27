@@ -8499,3 +8499,72 @@ class TestGDNDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         staggered = self._run_test(**common, num_gap_steps=3)
 
         assert self._generated_tokens(staggered) == self._generated_tokens(dense)
+
+
+class TestDiagMambaQueueOccupancy(DynamicInferenceEngineTestBase):
+    """Disposable diagnostic (not for review): queued Mamba ops at suspend and after capture."""
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+        )
+
+    @classmethod
+    def teardown_class(cls):
+        delete_cuda_graphs()
+        reset_rounder()
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize(
+        "mode", [AsyncScheduleMode.ASYNC, AsyncScheduleMode.LEGACY], ids=["async", "legacy"]
+    )
+    @pytest.mark.parametrize("interval", [2, 3])
+    @torch.inference_mode()
+    def test_diag_mamba_queue_occupancy(self, mode, interval):
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                model_provider="hybrid",
+                num_requests=8,
+                num_tokens_to_generate=12,
+                top_k=1,
+                num_cuda_graphs=4,
+                force_build_cuda_graphs=True,
+                use_cuda_graphs_for_non_decode_steps=False,
+                kv_cache_management_mode="offload",
+                static_kv_memory_pointers=False,
+                suspend_resume_interval=interval,
+                async_sched_mode=mode,
+                context_max_requests=4,
+            )
+        )
+        ctx = env.engine.context
+        seen = {"suspend": [], "capture_left": [], "live": []}
+        suspend = env.engine.suspend
+
+        def recording_suspend():
+            seen["suspend"].append(len(ctx._pending_mamba_zeros) + len(ctx._pending_mamba_restores))
+            seen["live"].append(ctx.total_request_count)
+            suspend()
+
+        env.engine.suspend = recording_suspend
+        restore = ctx._restore_live_request_state_after_graph_recapture
+
+        def recording_restore(state):
+            seen["capture_left"].append(
+                len(ctx._pending_mamba_zeros) + len(ctx._pending_mamba_restores)
+            )
+            restore(state)
+
+        ctx._restore_live_request_state_after_graph_recapture = recording_restore
+        for request in env.requests:
+            env.engine._add_request(request)
+        for _ in range(256):
+            self._run_step(env)
+            if not env.engine.has_unfinished_requests():
+                break
+        print(f"DIAG mamba mode={mode.name} interval={interval} {seen}")
+        assert not env.engine.has_unfinished_requests()
