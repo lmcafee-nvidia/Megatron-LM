@@ -2630,12 +2630,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self.batch_dimensions = batch_dimensions
 
         graph_dimensions = self.cuda_graph_batch_dimensions_list
-        if (
-            construct_graph_dimensions is None
-            and self._cuda_graph_max_real_tokens is not None
-            and batch_dimensions.token_count > self._cuda_graph_max_real_tokens
-        ):
-            graph_dimensions = []
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
             batch_dimensions,
             graph_dimensions,
