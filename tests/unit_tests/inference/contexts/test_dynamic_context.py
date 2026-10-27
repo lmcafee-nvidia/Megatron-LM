@@ -12,7 +12,12 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
-from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
+from megatron.core.inference.config import (
+    InferenceConfig,
+    KVCacheManagementMode,
+    MambaInferenceStateConfig,
+)
+from megatron.core.inference.contexts import dynamic_context as dynamic_context_module
 from megatron.core.inference.contexts import zero_padding_rows_kernel
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
@@ -356,6 +361,39 @@ class TestDynamicContext:
         assert max_seqlen_q >= 2
 
     @pytest.mark.internal
+    def test_prefill_padding_stays_within_max_tokens(self):
+        """A prefill step is padded up to the token rounder, but never past max_tokens."""
+        ctx = self._get_dynamic_context(
+            params_dtype=torch.bfloat16,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=256,
+            buffer_size_gb=0.01,
+            block_size_tokens=16,
+            max_tokens=8,
+            max_requests=8,
+        )
+        ctx.add_request(
+            DynamicInferenceRequest(
+                request_id=1,
+                prompt_tokens=torch.arange(0, 5, device='cpu'),
+                sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=9),
+            )
+        )
+        assert ctx.round_up_tokens(ctx.active_token_count) > ctx.max_tokens
+        clear_input_id_padding = ctx._clear_input_id_padding
+
+        def check_padding_then_clear():
+            # Check as soon as the padded count is set, before any padded GPU work runs.
+            assert ctx.padded_active_token_count <= ctx.max_tokens
+            clear_input_id_padding()
+
+        ctx._clear_input_id_padding = check_padding_then_clear
+        ctx.initialize_attention_state()
+        assert ctx.padded_active_token_count == ctx.max_tokens
+
+    @pytest.mark.internal
     @pytest.mark.parametrize("flash_attention_version", [2, 4])
     def test_one_token_prefill_metadata_is_correct_under_flash_attention(
         self, flash_attention_version
@@ -468,6 +506,52 @@ class TestDynamicContext:
 
         # Check initializations to -1
         assert torch.all(dynamic_context.request_ids == -1)
+
+    @pytest.mark.internal
+    def test_reset_from_outside_inference_mode(self):
+        """A context built in inference mode can be reset by a public caller outside it."""
+        with torch.inference_mode():
+            context = self._get_dynamic_context(
+                params_dtype=torch.float32,
+                num_layers=2,
+                kv_channels=64,
+                num_attention_heads=8,
+                max_sequence_length=512,
+                buffer_size_gb=0.03,
+                block_size_tokens=128,
+                max_tokens=None,
+            )
+        assert torch.is_inference(context.request_ids)
+        context.reset()
+        assert context.total_request_count == 0
+
+    @pytest.mark.internal
+    def test_recompute_resume_from_outside_inference_mode(self, monkeypatch):
+        """Resuming a memory-saver RECOMPUTE context resets inference tensors in place."""
+        with torch.inference_mode():
+            context = self._get_dynamic_context(
+                params_dtype=torch.float32,
+                num_layers=2,
+                kv_channels=64,
+                num_attention_heads=8,
+                max_sequence_length=512,
+                buffer_size_gb=0.03,
+                block_size_tokens=128,
+                max_tokens=None,
+            )
+        # Take the torch_memory_saver resume path without needing the package installed.
+        monkeypatch.setattr(
+            dynamic_context_module,
+            "torch_memory_saver",
+            SimpleNamespace(resume=lambda tag: None),
+            raising=False,
+        )
+        context._uses_torch_memory_saver = True
+        context.kv_cache_management_mode = KVCacheManagementMode.RECOMPUTE
+        context.is_tensor_state_allocated = False
+        assert torch.is_inference(context.request_ids)
+        context.reinitialize_inference_state_buffers()
+        assert context.is_tensor_state_allocated and context.total_request_count == 0
 
     @pytest.mark.internal
     def test_is_static_batching(self):

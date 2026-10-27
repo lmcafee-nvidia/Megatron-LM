@@ -1689,10 +1689,13 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # Reset tensor-related metadata.
         self.reset_metadata()
 
+    @torch.inference_mode()
     def reinitialize_inference_state_buffers(self):
         """Restore large tensors (KV cache, Mamba states) after a suspend.
 
         Called by the engine during `resume()`. Initial allocation is in `initialize_all_tensors()`.
+        This method owns inference mode because the public engine caller does not, while the
+        restored bookkeeping tensors may have been allocated as inference tensors.
         """
         if self.is_tensor_state_allocated:
             return
@@ -2648,7 +2651,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     padded_decode_req_count = padded_token_count
                 padded_prefill_req_count = 0
             else:
-                padded_token_count = self.round_up_tokens(self.active_token_count)
+                padded_token_count = min(
+                    self.max_tokens, self.round_up_tokens(self.active_token_count)
+                )
                 target_padding_req_count = min(
                     self.max_requests,
                     self.round_up_requests(self.total_request_count - self.paused_request_count),
@@ -3123,6 +3128,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         getattr(self, "_request_to_image_token_mask", {}).clear()
         getattr(self, "_request_to_image_token_count", {}).clear()
 
+    @torch.inference_mode()
     def reset(
         self, preserve_prefix_cache: bool = False, *, preserve_counters: bool = False
     ) -> None:
@@ -3136,6 +3142,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         This method is useful after cuda graph warmup iterations, where the
         context's memory buffer is referenced by the cuda graph system and
         cannot be deallocated.
+
+        The reset owns inference mode because construction may allocate its
+        bookkeeping tensors in inference mode while public engine callers do not.
 
         Args:
             preserve_prefix_cache: When True, keep the KV and Mamba prefix-cache

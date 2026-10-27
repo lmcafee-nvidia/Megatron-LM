@@ -129,7 +129,8 @@ class NCCLCopyService(CopyService):
                 local_sends, local_recvs, "NCCLCopyService", self.rank
             )
             self._copy_stream.wait_stream(torch.cuda.current_stream())
-            with torch.no_grad(), torch.cuda.stream(self._copy_stream):
+            # Inference engines may create destination parameters in inference mode.
+            with torch.inference_mode(), torch.cuda.stream(self._copy_stream):
                 for send_op, recv_op in pairs:
                     recv_op.tensor.copy_(send_op.tensor)
 

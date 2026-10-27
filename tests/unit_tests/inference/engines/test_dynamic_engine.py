@@ -3425,6 +3425,34 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_coordinator_abort_after_inference_mode_step(self) -> None:
+        """An abort message may arrive outside inference mode after an inference-mode step."""
+        with torch.inference_mode():
+            env = self._build_test_env(DynamicEngineTestConfig(num_requests=1))
+            env.engine._add_request(env.requests[0])
+            env.engine.step_modern()
+        engine, context = env.engine, env.engine.context
+        request_id = env.requests[0].request_id
+        assert torch.is_inference(context.request_output_lengths)
+        socket = mock.Mock()
+        socket.recv_multipart.side_effect = [
+            [msgpack.packb([Headers.ABORT_REQUEST.value, request_id], use_bin_type=True)],
+            dynamic_engine.zmq.Again(),
+        ]
+        engine.is_mp_coordinator = True
+        engine.socket_for_receiving_requests = socket
+        engine.model_parallel_publisher_socket = mock.Mock()
+        engine.schedule_requests()
+        active_ids = context.request_ids[: context.total_request_count]
+        index = int(torch.where(active_ids == request_id)[0])
+        assert context.request_output_lengths[index] == (
+            context.request_kv_length_offsets[index] + context.request_query_lengths[index]
+        )
+
     @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     def test_block_overflow(self, model_provider: str) -> None:
         """Test block overflow."""
