@@ -220,10 +220,7 @@ class MXFP8Tensor:
 
         The historical method name is retained for compatibility. The Triton
         backend accepts BF16, FP16, and FP32 inputs; FlashInfer accepts BF16 and
-        FP16 inputs. Inputs must contain only finite values. NaN and infinity are
-        outside the MXFP8 inference contract and are not scanned here because a
-        device-wide reduction would add synchronization or graph-visible work to
-        every quantization on the inference hot path.
+        FP16 inputs.
 
         Args:
             x: [M, K] floating-point tensor on CUDA.
@@ -232,22 +229,9 @@ class MXFP8Tensor:
                      'flashinfer' (single fused FlashInfer CUDA kernel).
         """
         assert x.is_cuda and x.dim() == 2
-        if group_size != MXFP8_BLOCK_SIZE:
-            raise ValueError(
-                f"MXFP8 backends implement group size {MXFP8_BLOCK_SIZE}, got {group_size}."
-            )
-        if x.dtype not in (torch.bfloat16, torch.float16, torch.float32):
-            raise TypeError(f"MXFP8 quantization requires BF16, FP16, or FP32, got {x.dtype}.")
-        if x.shape[0] == 0 or x.shape[1] == 0:
-            raise ValueError(f"MXFP8 input dimensions must be nonzero, got {tuple(x.shape)}.")
-        if x.shape[-1] % group_size != 0:
-            raise ValueError(
-                f"MXFP8 K dimension {x.shape[-1]} must be divisible by group size {group_size}."
-            )
+        assert x.shape[-1] % group_size == 0
         if backend == "flashinfer":
             assert HAVE_FLASHINFER, "FlashInfer not available"
-            if x.dtype == torch.float32:
-                raise TypeError("FlashInfer MXFP8 quantization accepts BF16 or FP16, not FP32.")
             data, scale = flashinfer_mxfp8_quantize(x)
             if scale.dtype == torch.float8_e8m0fnu:
                 scale = scale.view(torch.uint8)

@@ -4,8 +4,6 @@
 
 One block per token. Quantizes BF16 → FP8 e4m3 and writes scales directly
 in cuBLAS 2D blocked (swizzled) layout. No FP4, no triton_kernels dependency.
-Inputs must be finite. NaN and infinity are outside this inference contract;
-the hot-path kernels deliberately do not add a device-wide validation pass.
 
 Usage:
     from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize
@@ -185,7 +183,7 @@ def mxfp8_quantize_into(x: torch.Tensor, out_data: torch.Tensor, out_scale: torc
     """Quantize a 2D tensor into existing MXFP8 data and scale storage.
 
     Args:
-        x: Finite [M, K] tensor in bf16/fp16/fp32. K must be divisible by 32.
+        x: [M, K] tensor in bf16/fp16/fp32. K must be divisible by 32.
         out_data: [M, K] contiguous float8_e4m3fn output tensor.
         out_scale: Contiguous 1D scale storage in cuBLAS blocked layout. The
             dtype may be uint8 or float8_e8m0fnu.
@@ -193,7 +191,6 @@ def mxfp8_quantize_into(x: torch.Tensor, out_data: torch.Tensor, out_scale: torc
     assert x.is_cuda and x.dim() == 2
     assert x.dtype in (torch.bfloat16, torch.float16, torch.float32)
     M, K = x.shape
-    assert M > 0 and K > 0, f"MXFP8 input dimensions must be nonzero, got {tuple(x.shape)}"
     assert K % MXFP8_BLOCK_SIZE == 0, f"K ({K}) must be divisible by {MXFP8_BLOCK_SIZE}"
     assert out_data.is_cuda and out_data.device == x.device
     assert out_data.shape == x.shape and out_data.dtype == torch.float8_e4m3fn
@@ -272,14 +269,11 @@ def mxfp8_quantize_rows(
     at or beyond ``n_rows`` are left uninitialized and their scales are zero; callers
     must not read them (grouped GEMMs bounded by expert offsets ending at ``n_rows``).
     Quantized rows are bitwise identical to ``mxfp8_quantize``.
-    The selected input rows must be finite;
-    NaN and infinity are outside the MXFP8 inference contract.
     """
     assert x.is_cuda and x.dim() == 2
     assert x.dtype in (torch.bfloat16, torch.float16, torch.float32)
     assert n_rows.is_cuda and n_rows.numel() == 1
     M, K = x.shape
-    assert M > 0 and K > 0, f"MXFP8 input dimensions must be nonzero, got {tuple(x.shape)}"
     assert K % MXFP8_BLOCK_SIZE == 0, f"K ({K}) must be divisible by {MXFP8_BLOCK_SIZE}"
     scale_cols = K // MXFP8_BLOCK_SIZE
     n_row_blocks = _ceil_div(M, MXFP8_SCALE_ROW_BLOCK)
@@ -308,7 +302,7 @@ def mxfp8_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize a 2D tensor to MXFP8 with fused scale swizzle.
 
     Args:
-        x: Finite [M, K] tensor in bf16/fp16/fp32. K must be divisible by 32.
+        x: [M, K] tensor in bf16/fp16/fp32. K must be divisible by 32.
 
     Returns:
         (data, swizzled_scales):
@@ -318,7 +312,6 @@ def mxfp8_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     assert x.is_cuda and x.dim() == 2
     assert x.dtype in (torch.bfloat16, torch.float16, torch.float32)
     M, K = x.shape
-    assert M > 0 and K > 0, f"MXFP8 input dimensions must be nonzero, got {tuple(x.shape)}"
     assert K % MXFP8_BLOCK_SIZE == 0, f"K ({K}) must be divisible by {MXFP8_BLOCK_SIZE}"
     scale_cols = K // MXFP8_BLOCK_SIZE
     n_row_blocks = _ceil_div(M, MXFP8_SCALE_ROW_BLOCK)
