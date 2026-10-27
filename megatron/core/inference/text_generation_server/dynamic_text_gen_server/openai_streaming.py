@@ -406,11 +406,6 @@ async def openai_stream(
                 delta = ""
                 logprobs = None
 
-            if is_final:
-                finish_detokenization = getattr(state["detokenizer"], "finish", None)
-                if finish_detokenization is not None:
-                    delta += finish_detokenization()
-
             parser = state["parser"]
             if parser is not None:
                 parsed_deltas = parser.parse(state["detokenizer"].text, finished=is_final)
