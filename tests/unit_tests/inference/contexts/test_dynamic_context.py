@@ -23,6 +23,7 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling.flashinfer_sampling import FlashInferSampling
 from megatron.core.inference.sampling.torch_sampling import TorchSampling
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.models.common.embeddings import rope_utils
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_block import get_num_layers_to_build
@@ -598,6 +599,49 @@ class TestDynamicContext:
 
         torch.testing.assert_close(rotated_query.float(), reference(query), atol=2e-2, rtol=2e-2)
         torch.testing.assert_close(rotated_key.float(), reference(key), atol=2e-2, rtol=2e-2)
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("rotary_interleaved", [False, True])
+    def test_small_head_rope_without_flash_attn_matches_reference_rotation(
+        self, monkeypatch, rotary_interleaved
+    ):
+        """Without flash_attn, 8-wide heads are rotated directly, not treated as angles."""
+        monkeypatch.setattr(rope_utils, "apply_rotary_emb_flash", None)
+        positions = torch.tensor([0, 3, 7, 12, 30], device="cuda")
+        exponents = torch.arange(0, 8, 2, device="cuda", dtype=torch.float32) / 8
+        freqs = torch.outer(
+            torch.arange(64, device="cuda", dtype=torch.float32), 1.0 / (10000**exponents)
+        )
+        query, key = (
+            torch.randn(len(positions), 1, 2, 8, device="cuda", dtype=torch.bfloat16)
+            for _ in range(2)
+        )
+        context = SimpleNamespace(
+            use_flashinfer_fused_rope=True,
+            padded_active_token_count=len(positions),
+            gpu_view=SimpleNamespace(token_to_pos_ids=positions),
+        )
+        rotated = DynamicInferenceContext.apply_fused_qk_rotary_emb(
+            context,
+            query,
+            key,
+            torch.cat([freqs.cos(), freqs.sin()], dim=-1),
+            SimpleNamespace(rotary_interleaved=rotary_interleaved),
+        )
+
+        # Reference: rotate each channel pair as one complex number.
+        turns = torch.polar(torch.ones_like(freqs[positions]), freqs[positions])[:, None, None]
+        for actual, x in zip(rotated, (query, key), strict=True):
+            if rotary_interleaved:
+                pairs = x.float().unflatten(-1, (4, 2))
+            else:
+                pairs = torch.stack(x.float().chunk(2, dim=-1), dim=-1)
+            expected = torch.view_as_real(torch.view_as_complex(pairs.contiguous()) * turns)
+            if rotary_interleaved:
+                expected = expected.flatten(-2)
+            else:
+                expected = torch.cat(expected.unbind(-1), dim=-1)
+            torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=2e-2)
 
     @pytest.mark.internal
     @rounder_override(64)

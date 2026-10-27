@@ -39,10 +39,8 @@ from megatron.core.inference.unified_memory import (
     create_unified_mempool,
 )
 from megatron.core.inference.utils import device_memory_summary, tensor_swap
-from megatron.core.models.common.embeddings.rope_utils import (
-    apply_rotary_pos_emb,
-    apply_rotary_pos_emb_with_cos_sin,
-)
+from megatron.core.models.common.embeddings import rope_utils
+from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
     Symbols,
     get_layer_maps_from_layer_type_list,
@@ -341,6 +339,30 @@ class DynamoHelper:
                 listener(kind, payload)
             except Exception:  # pylint: disable=broad-exception-caught
                 logging.exception("KV-event listener failed while handling %r", kind)
+
+
+def _apply_rotary_with_cos_sin(x: Tensor, cos: Tensor, sin: Tensor, interleaved: bool) -> Tensor:
+    """Rotate `x` ([tokens, batch, heads, dim]) by per-token cos/sin of half its rotary width.
+
+    Uses flash_attn's rotary kernel when it is installed. Otherwise computes the rotation
+    directly, rotating the first `2 * cos.shape[-1]` channels and passing the rest through.
+    """
+    if rope_utils.apply_rotary_emb_flash is not None:
+        rotated = rope_utils.apply_rotary_emb_flash(
+            x.transpose(0, 1), cos.to(x.dtype), sin.to(x.dtype), interleaved
+        )
+        return rotated.transpose(0, 1)
+    rotary_dim = 2 * cos.shape[-1]
+    cos, sin = cos[:, None, None, :].float(), sin[:, None, None, :].float()
+    rotary = x[..., :rotary_dim].float()
+    if interleaved:
+        first, second = rotary[..., 0::2], rotary[..., 1::2]
+        rotary = torch.stack((first * cos - second * sin, second * cos + first * sin), dim=-1)
+        rotary = rotary.flatten(-2)
+    else:
+        first, second = rotary.chunk(2, dim=-1)
+        rotary = torch.cat((first * cos - second * sin, second * cos + first * sin), dim=-1)
+    return torch.cat((rotary.to(x.dtype), x[..., rotary_dim:]), dim=-1)
 
 
 @internal_api
@@ -2154,20 +2176,14 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         num_q_heads, head_size = query.shape[-2], query.shape[-1]
         num_k_heads = key.shape[-2]
 
-        # A direct GB200 control around FlashInfer's cos/sin-cache API reported
-        # a misaligned access at immediate synchronization for width 8, while
-        # width 64 passed. Preserve the accepted width-8 geometry through
-        # MCore's existing cos/sin path.
+        # FlashInfer's cos/sin-cache kernel fails with a CUDA misaligned-address error for
+        # 8-wide heads on both H100 and GB200, while width 64 works. Rotate 8-wide heads with
+        # flash_attn's rotary kernel, or directly when flash_attn is not installed.
         if head_size == 8:
-            positions = self.gpu_view.token_to_pos_ids[:n]
-            cos, sin = cos_sin_emb.chunk(2, dim=-1)
+            cos, sin = cos_sin_emb[self.gpu_view.token_to_pos_ids[:n]].chunk(2, dim=-1)
             return (
-                apply_rotary_pos_emb_with_cos_sin(
-                    query[:n], cos[positions], sin[positions], config.rotary_interleaved
-                ),
-                apply_rotary_pos_emb_with_cos_sin(
-                    key[:n], cos[positions], sin[positions], config.rotary_interleaved
-                ),
+                _apply_rotary_with_cos_sin(query[:n], cos, sin, config.rotary_interleaved),
+                _apply_rotary_with_cos_sin(key[:n], cos, sin, config.rotary_interleaved),
             )
 
         # use .view instead of .reshape to avoid extra transpose operations
