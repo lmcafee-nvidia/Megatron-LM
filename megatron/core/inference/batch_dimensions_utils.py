@@ -453,7 +453,6 @@ class CUDAGraphBatchDimensionBuilder:
         use_cuda_graphs_for_non_decode_steps: bool,
         num_speculative_tokens: int = 0,
         sizing_distribution: "CudaGraphSizingDistribution" = None,
-        token_alignment: int = 1,
     ) -> Tuple[List[InferenceBatchDimensions], Optional[List[int]]]:
         """
         Generate CUDA graph batch dimensions.
@@ -494,8 +493,6 @@ class CUDAGraphBatchDimensionBuilder:
             sizing_distribution: How token counts are spaced. Defaults to HYBRID when None,
                 matching the config default. HYBRID is resolved here into EXPONENTIAL for the
                 prefill/mixed family and LINEAR for the decode-only family.
-            token_alignment: Minimum token-row alignment required by the model's GEMMs.
-                The logical request dimensions are validated before this padding is applied.
 
         Returns:
             Tuple containing:
@@ -504,13 +501,10 @@ class CUDAGraphBatchDimensionBuilder:
             - Optional list of CUDA graph token counts
         """
 
-        assert token_alignment >= 1, f"token_alignment must be positive, got {token_alignment}"
-
         def add_if_valid(token_count: int, prefill_req_count: int, decode_req_count: int) -> None:
             """Helper to create and append batch dimension to list only if it's valid."""
             batch_dim = InferenceBatchDimensions(token_count, prefill_req_count, decode_req_count)
             if batch_dim.is_valid(max_requests, max_sequence_length, num_speculative_tokens):
-                required_alignment = math.lcm(token_alignment, tp_size)
                 if _batch_invariant_mode_enabled():
                     # Batch-invariant mode: align the bucket's token count up
                     # to a 64-multiple (see _batch_invariant_token_align). The
@@ -519,20 +513,11 @@ class CUDAGraphBatchDimensionBuilder:
                     # what the requests produce), so validity is judged on the
                     # unpadded dims; request counts are untouched. Aligning can
                     # collide previously-distinct buckets, so skip duplicates.
-                    required_alignment = math.lcm(required_alignment, TOKEN_ROUNDER)
-                if required_alignment > 1:
                     batch_dim = InferenceBatchDimensions(
-                        math.ceil(token_count / required_alignment) * required_alignment,
+                        _batch_invariant_token_align(token_count),
                         prefill_req_count,
                         decode_req_count,
                     )
-                # FP8 alignment is physical padding, but context input and metadata
-                # buffers are still bounded by max_tokens. Leave an unrepresentable
-                # top bucket to the normal eager fallback instead of capturing past
-                # the configured capacity. Preserve the historical batch-invariant
-                # behavior when no model-specific alignment was requested.
-                if token_alignment > 1 and batch_dim.token_count > max_tokens:
-                    return
                 if batch_dim not in cuda_graph_batch_dimensions_list:
                     cuda_graph_batch_dimensions_list.append(batch_dim)
 
