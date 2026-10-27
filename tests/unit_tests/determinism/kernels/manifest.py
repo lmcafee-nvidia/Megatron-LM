@@ -101,6 +101,7 @@ class KernelEntry:
 # Test-file prefixes used below.
 K = "tests/unit_tests/determinism/kernels/"
 C = "tests/unit_tests/determinism/correctness/"
+MM = "tests/unit_tests/inference/test_multimodal_gpu.py"
 
 KERNELS: Tuple[KernelEntry, ...] = (
     # ---------------------------------------------------------------- fused elementwise (jit_fuser / torch.compile)
@@ -758,7 +759,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/fp4_utils.py",
             "megatron/core/distributed/fsdp/src/megatron_fsdp/mixed_precision.py",
         ),
-        tests=(C + "test_fp8_determinism.py", K + "test_optimizer_kernels.py"),
+        tests=(C + "test_fp8_determinism.py", K + "test_optimizer_kernels.py", MM),
         kind="dispatch",
         notes="TE cast_master_weights_to_fp8 / cast_to_fp8 (covered at model level by "
         "test_fp8_determinism.py), NVFP4 quantize_master_weights (needs TE>=2.7 + Blackwell, "
