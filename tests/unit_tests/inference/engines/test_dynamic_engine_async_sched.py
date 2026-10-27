@@ -3038,7 +3038,10 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["fp8-context-forwards"] > 0
             assert runtime["fp8-quantized-forwards"] > 0
             assert runtime["fp8-recipe-forwards"] > 0
-            assert runtime["cuda-graph-fp8-replays"] > 0
+            if "cuda-graph" in signals:
+                assert runtime["cuda-graph-fp8-replays"] > 0
+            else:
+                assert runtime["module-forward:fp8"] > 0
         if "mxfp8" in signals:
             from megatron.core.fp8_utils import get_fp8_align_size
             from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
