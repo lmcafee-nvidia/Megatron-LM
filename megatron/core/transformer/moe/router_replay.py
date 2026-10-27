@@ -1,5 +1,4 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-import weakref
 from enum import Enum
 from typing import Callable, List, Optional, Tuple
 
@@ -24,7 +23,7 @@ class RouterReplay:
     """
 
     # Static variable to hold all router instances, one per MoE layer.
-    global_router_replay_instances: List[weakref.ReferenceType] = []
+    global_router_replay_instances: List['RouterReplay'] = []
 
     @staticmethod
     def get_instances(is_mtp_layer: bool | None = None) -> List['RouterReplay']:
@@ -37,9 +36,7 @@ class RouterReplay:
         Returns:
             List[RouterReplay]: Matching router replay instances in registration order.
         """
-        references = RouterReplay.global_router_replay_instances
-        instances = [instance for reference in references if (instance := reference()) is not None]
-        references[:] = [weakref.ref(instance) for instance in instances]
+        instances = RouterReplay.global_router_replay_instances
         if is_mtp_layer is None:
             return list(instances)
         return [instance for instance in instances if instance.is_mtp_layer == is_mtp_layer]
@@ -52,13 +49,12 @@ class RouterReplay:
                                         topk indices for a specific layer. The order
                                         must match the instantiation order of the routers.
         """
-        instances = RouterReplay.get_instances()
-        if len(all_layers_topk_indices) != len(instances):
+        if len(all_layers_topk_indices) != len(RouterReplay.global_router_replay_instances):
             raise ValueError(
                 f"The number of replay tensors ({len(all_layers_topk_indices)}) "
-                f"does not match instances ({len(instances)})."
+                f"does not match instances ({len(RouterReplay.global_router_replay_instances)})."
             )
-        for i, router_instance in enumerate(instances):
+        for i, router_instance in enumerate(RouterReplay.global_router_replay_instances):
             router_instance.set_target_indices(all_layers_topk_indices[i])
 
     @staticmethod
@@ -79,7 +75,7 @@ class RouterReplay:
     @staticmethod
     def clear_global_indices():
         """Clears the recorded and target topk indices in all instances."""
-        for router in RouterReplay.get_instances():
+        for router in RouterReplay.global_router_replay_instances:
             router.clear_indices()
 
     @staticmethod
@@ -99,7 +95,7 @@ class RouterReplay:
     @staticmethod
     def clear_global_router_replay_action():
         """Clears the router replay action for all router instances."""
-        for router in RouterReplay.get_instances():
+        for router in RouterReplay.global_router_replay_instances:
             router.clear_router_replay_action()
 
     @staticmethod
@@ -171,7 +167,7 @@ class RouterReplay:
         self.static_buffer_index: Optional[torch.Tensor] = None
         self.static_layer_index: Optional[torch.Tensor] = None
         self.layer_number: Optional[int] = None
-        RouterReplay.global_router_replay_instances.append(weakref.ref(self))
+        RouterReplay.global_router_replay_instances.append(self)
 
     def set_target_indices(self, topk_indices: torch.Tensor):
         """Sets the target topk indices for replay."""
