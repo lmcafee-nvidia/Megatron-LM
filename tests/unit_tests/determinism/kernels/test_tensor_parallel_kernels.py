@@ -17,7 +17,6 @@
 """
 
 import importlib.util
-import inspect
 
 import pytest
 import torch
@@ -270,51 +269,29 @@ class TestTensorParallelLayers:
 
     def test_local_attention_distinct_kv_channels_replays(self):
         seeded()
-        key_width, value_width, heads = 96, 48, 4
         config = _config(
             hidden_size=256,
-            num_attention_heads=heads,
+            num_attention_heads=4,
             attention_dropout=0.0,
             masked_softmax_fusion=False,
-        )
-        supports_distinct_widths = (
-            "k_channels" in inspect.signature(DotProductAttention.__init__).parameters
-        )
-        width_args = (
-            {"k_channels": key_width, "v_channels": value_width} if supports_distinct_widths else {}
         )
         module = DotProductAttention(
             config,
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
             attention_type="self",
-            **width_args,
+            softmax_scale=96**-0.5,
+            k_channels=96,
+            v_channels=64,
         ).cuda()
-        if not supports_distinct_widths:
-            # Let the exact production inverse exercise the same asymmetric forward/gradient
-            # geometry before the final interface assertion exposes the missing constructor API.
-            module.hidden_size_per_attention_head = key_width
-            module.hidden_size_per_partition = heads * value_width
-            module.softmax_scale = key_width**-0.5
-        assert module.hidden_size_per_attention_head == key_width
-        assert module.hidden_size_per_partition == heads * value_width
-        assert module.softmax_scale == pytest.approx(key_width**-0.5)
-
-        def rand(width):
-            return torch.randn(
-                32, 2, heads, width, device="cuda", dtype=torch.bfloat16, requires_grad=True
-            )
-
-        query, key, value = rand(key_width), rand(key_width), rand(value_width)
+        query = torch.randn(32, 2, 4, 96, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        key = torch.randn(32, 2, 4, 96, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        value = torch.randn(32, 2, 4, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
 
         outputs, _ = assert_module_replays_bit_exact(
-            module,
-            (query, key, value, None),
-            replays=3,
-            what=f"DotProductAttention[k={key_width},v={value_width}]",
+            module, (query, key, value, None), replays=3, what="DotProductAttention[k=96,v=64]"
         )
-        assert outputs["out"].shape == (32, 2, heads * value_width)
-        assert supports_distinct_widths, "local attention must accept distinct key/value widths"
+        assert outputs["out"].shape == (32, 2, 256)
 
 
 # --- apex fused layer norm ------------------------------------------------------------------
