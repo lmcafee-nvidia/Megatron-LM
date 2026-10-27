@@ -5761,13 +5761,16 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     @torch.inference_mode()
-    def test_offload_resume_with_cuda_graphs_keeps_live_requests(self):
+    def test_offload_resume_with_cuda_graphs_keeps_live_requests(self, model_provider):
         """OFFLOAD resume recaptures CUDA graphs without disturbing in-flight requests."""
+        skip_if_mamba_sequence_packing_not_available(model_provider)
 
         def run(suspend_resume_interval):
             env = self._build_test_env(
                 DynamicEngineTestConfig(
+                    model_provider=model_provider,
                     num_requests=4,
                     num_tokens_to_generate=12,
                     top_k=1,
