@@ -120,6 +120,10 @@ class _EventLoopManager:
         """Schedule ``coro`` on the background loop and await it from any loop."""
         return await asyncio.wrap_future(self.submit(coro))
 
+    def stop_when_complete(self, future):
+        """Control shim: the pre-fix shutdown path never calls this."""
+        raise NotImplementedError("control shim")
+
     def stop(self) -> None:
         """Stop the event loop and join the background thread. Idempotent."""
         if not self._started or self._stopped:
