@@ -858,16 +858,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             and model_config.inference_moe_token_dispatcher_type == 'nccl'
         )
 
-        # Are optimized MoE layers using the NVLS dispatcher? Even EP=1 needs
-        # this flag so the dispatcher receives the real-token-count tensor and
-        # can mask CUDA-graph padding before its communication-free early return.
+        # are we using the inference_optimized nvls ep dispatcher for MoEs?
         self._nvls_dispatcher = (
-            model_config.num_moe_experts is not None
-            and model_config.transformer_impl == "inference_optimized"
+            get_pg_size(self.expert_model_parallel_group) > 1
             and model_config.inference_moe_token_dispatcher_type == 'nvls'
-        )
-        self._nvls_ep_dispatcher = (
-            get_pg_size(self.expert_model_parallel_group) > 1 and self._nvls_dispatcher
         )
 
         # are we using the training a2a dispatcher for MoEs?
@@ -926,7 +920,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         InferenceAllGatherDispatcherBase.allocate_valid_tokens_tensor()
         if self._nccl_ep_dispatcher:
             NCCLAllGatherDispatcher.allocate_buffers()
-        elif self._nvls_ep_dispatcher:
+        elif self._nvls_dispatcher:
             # Use moe_latent_size if set (latent MoE: SuperV3, UltraV3), else hidden_size.
             moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
             NVLSAllGatherVDispatcher.allocate_buffers(
