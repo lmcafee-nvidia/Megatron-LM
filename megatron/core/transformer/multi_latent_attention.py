@@ -1317,11 +1317,11 @@ class MLASelfAttention(MultiLatentAttention):
         at a later time.
 
         The method performs the following operations:
-        1. Splits a fused TE layernorm + linear layer (linear_kv_up_proj), or reuses
-        the already separate normalization and projection from local/unfused specs.
+        1. Splits the fused layernorm + linear layer (linear_kv_up_proj) into separate
+        components.
         2. Extracts and stores the up-projection weights for K and V separately, which
         are used during the absorption process
-        3. Installs the extracted fused norm or retains the separate spec's kv_layernorm
+        3. Replaces the identity kv_layernorm with the actual layernorm from the split
         4. Stores the linear component separately for uncompressing KV cache during
         prefill/mixed stages
 
@@ -1331,25 +1331,15 @@ class MLASelfAttention(MultiLatentAttention):
         # We should only have to call to set once at start
         if not hasattr(self, "up_k_weight"):
             with torch.no_grad():
-                if TELayerNormColumnParallelLinear is not None and isinstance(
-                    self.linear_kv_up_proj, TELayerNormColumnParallelLinear
-                ):
-                    linear_kv_up_proj_norm, linear_kv_up_proj_linear = (
-                        split_te_layernorm_column_parallel_linear(
-                            self.linear_kv_up_proj,
-                            self.config,
-                            None,
-                            self.linear_kv_up_proj.tp_group,
-                        )
+                linear_kv_up_proj_norm, linear_kv_up_proj_linear = (
+                    split_te_layernorm_column_parallel_linear(
+                        self.linear_kv_up_proj, self.config, None, self.linear_kv_up_proj.tp_group
                     )
-                else:
-                    # Local and unfused TE specs already expose normalization and
-                    # projection as separate modules; only the fused TE layer needs splitting.
-                    linear_kv_up_proj_norm = self.kv_layernorm
-                    linear_kv_up_proj_linear = self.linear_kv_up_proj
+                )
 
-                # A fused TE spec starts with an identity kv_layernorm, so replace it
-                # with the extracted norm. Separate specs retain their existing norm.
+                # Note: When caching latents we overide the kv_layernorm
+                # which was an identity before because in the is path
+                # we unfused the linear_kv_up_proj
                 self.kv_layernorm = linear_kv_up_proj_norm
 
                 # This is used in absorption when we are
