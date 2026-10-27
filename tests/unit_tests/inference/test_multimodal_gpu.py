@@ -97,6 +97,8 @@ def model_parallel(request):
         init_kwargs["expert_model_parallel_size"] = 2
     elif topology == "etp":
         init_kwargs["expert_tensor_parallel_size"] = 2
+    elif topology == "cp":
+        init_kwargs["context_parallel_size"] = 2
     tp_size = min(Utils.world_size, 2) if topology == "tp" else 1
     Utils.initialize_model_parallel(tp_size, 1, **init_kwargs)
     torch.manual_seed(123)
@@ -321,6 +323,7 @@ def _build_te_parallel_model(modality, topology):
         hidden_size=32,
         num_attention_heads=4,
         kv_channels=64,
+        context_parallel_size=parallel_state.get_context_parallel_world_size(),
         transformer_impl="inference_optimized" if optimized else "transformer_engine",
         normalization="RMSNorm" if optimized else "LayerNorm",
         add_bias_linear=not optimized,
@@ -348,6 +351,7 @@ def _build_te_parallel_model(modality, topology):
         vision_projection_layer_spec=copy.deepcopy(get_submodules(layer_submodules.mlp)),
         dynamic_resolution=(modality == "video"),
         class_token_len=0 if modality == "video" else None,
+        language_position_embedding_type="rope" if topology == "cp" else "learned_absolute",
     )
 
 
@@ -1170,6 +1174,14 @@ def test_real_media_executes_moe_router_with_configured_expert_topology(model_pa
     torch.distributed.all_gather_into_tensor(rank_logits, local_logits)
     rank_logits = rank_logits.view(Utils.world_size, -1)
     assert torch.all(torch.isfinite(rank_logits) & (rank_logits == rank_logits[:1]))
+
+
+@pytest.mark.parametrize("model_parallel", ["cp"], indirect=True)
+def test_dynamic_vlm_rejects_context_parallelism(model_parallel):
+    model = _build_te_parallel_model("video", model_parallel)
+    assert model.config.context_parallel_size == 2
+    with pytest.raises(NotImplementedError, match="Context parallelism is not supported"):
+        _build_engine("video", model=model)
 
 
 @pytest.mark.parametrize("model_parallel", ["tp", "dp", "ep", "etp", "opt"], indirect=True)
