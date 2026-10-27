@@ -104,6 +104,10 @@ def test_flashinfer_nvfp4_token_capacity_rejects_invalid_configuration(overrides
             {**_ACTIVATIONS["swiglu"], "activation_func_clamp_value": 7.0},
             "supports only plain SwiGLU",
         ),
+        (
+            {**_ACTIVATIONS["swiglu"], "activation_func_tanh_clamp_scale_linear": 2.0},
+            "supports only plain SwiGLU",
+        ),
         ({**_ACTIVATIONS["swiglu"], "glu_linear_offset": 1.0}, "supports only plain SwiGLU"),
         (
             {**_ACTIVATIONS["swiglu"], "moe_mlp_glu_interleave_size": 64},
