@@ -5757,6 +5757,54 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 f"Before: {addr_before:#x}, After: {addr_after:#x}"
             )
 
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_offload_resume_with_cuda_graphs_keeps_live_requests(self):
+        """OFFLOAD resume recaptures CUDA graphs without disturbing in-flight requests."""
+
+        def run(suspend_resume_interval):
+            env = self._build_test_env(
+                DynamicEngineTestConfig(
+                    num_requests=4,
+                    num_tokens_to_generate=12,
+                    top_k=1,
+                    num_cuda_graphs=4,
+                    force_build_cuda_graphs=True,
+                    use_cuda_graphs_for_non_decode_steps=False,
+                    kv_cache_management_mode="offload",
+                    static_kv_memory_pointers=False,
+                    suspend_resume_interval=suspend_resume_interval,
+                )
+            )
+            live_requests_at_suspend = []
+            suspend = env.engine.suspend
+
+            def recording_suspend():
+                live_requests_at_suspend.append(env.engine.context.total_request_count)
+                suspend()
+
+            env.engine.suspend = recording_suspend
+            for request in env.requests:
+                env.engine._add_request(request)
+            for _ in range(64):
+                self._run_step(env)
+                if not env.engine.has_unfinished_requests():
+                    break
+            assert (
+                not env.engine.has_unfinished_requests()
+            ), "in-flight requests stopped progressing"
+            outputs = [(request.status, request.output) for request in env.requests]
+            return outputs, live_requests_at_suspend
+
+        expected, _ = run(suspend_resume_interval=None)
+        actual, live_requests_at_suspend = run(suspend_resume_interval=3)
+        assert max(live_requests_at_suspend) > 0
+        assert all(status == Status.COMPLETED for status, _ in expected)
+        assert actual == expected
+
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
