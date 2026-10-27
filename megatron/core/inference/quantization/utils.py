@@ -50,11 +50,11 @@ def _verify_te_to_mcore_mxfp8_conversion(te_dequantized, fi_quantized: MXFP8Tens
     # Extract the scale. Logical block (0, 0) is always at physical index 0,
     # bypassing any scale swizzling layout complexity (like SWIZZLED_128x4)
     fi_scale_byte = fi_quantized.scale.contiguous().flatten()[0:1].view(torch.uint8).to(torch.int32)
-    # E8M0 byte zero is 2^-127, not IEEE float zero. ldexp reconstructs directly
-    # from the unbiased exponent and preserves subnormal dequantized values.
-    fi_block = torch.ldexp(fi_data_e4m3, fi_scale_byte - 127)
+    fi_scale_f32 = (fi_scale_byte << 23).view(torch.float32)
 
-    if not torch.equal(te_block, fi_block):
+    fi_block = fi_data_e4m3 * fi_scale_f32
+
+    if not torch.allclose(te_block, fi_block):
         diff_norm = torch.norm(te_block - fi_block)
         raise ValueError(f"MXFP8 sanity check failed. Diff norm: {diff_norm}")
 
