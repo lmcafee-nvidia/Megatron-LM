@@ -896,6 +896,25 @@ _ASYNC_PAIR_SCENARIOS = (
         for recipe in ("tensorwise", "delayed", "blockwise")
     ),
     _pair_scenario(
+        "mxfp8-inference-optimized-moe",
+        "precision:mxfp8",
+        "model:moe",
+        "implementation:inference-optimized",
+        config={
+            "fp8": True,
+            "fp8_recipe": "mxfp8",
+            "hidden_size": 128,
+            "num_moe_experts": 2,
+            "moe_grouped_gemm": True,
+            "use_moe_layer_spec": True,
+            "transformer_impl": "inference_optimized",
+        },
+        signals=("inference-optimized", "moe", "mxfp8", "fixed-history-logits"),
+        prerequisite="mxfp8",
+        atol=0.0,
+        graph_parity="reproducible",
+    ),
+    _pair_scenario(
         "mxfp8-inference-topk1",
         config={
             "fp8": True,
@@ -1075,6 +1094,7 @@ _CUDA_GRAPH_DIFFERENTIAL_SCENARIOS = (
             "hybrid-gdp",
             "transformer-engine",
             "inference-optimized",
+            "mxfp8-inference-optimized-moe",
             "mxfp8-inference-topk1",
             "offload-static-uvm-suspend-resume",
             "flashinfer-fused-rope",
