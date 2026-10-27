@@ -1,4 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import gc
+
 import pytest
 import torch
 
@@ -125,3 +127,15 @@ def test_set_replay_data_length_mismatch():
         RouterReplay.set_replay_data(
             [torch.tensor([[0, 1]], dtype=torch.long), torch.tensor([[1, 0]], dtype=torch.long)]
         )
+
+
+def test_garbage_collected_routers_leave_the_registry():
+    """A recreated model's routers must not be paired with a deleted model's routers."""
+    retired = [RouterReplay(), RouterReplay()]
+    del retired
+    gc.collect()
+    current = [RouterReplay(), RouterReplay()]
+    assert RouterReplay.get_instances() == current
+    indices = [torch.tensor([[0, 1]], dtype=torch.long), torch.tensor([[1, 0]], dtype=torch.long)]
+    RouterReplay.set_replay_data(indices)
+    assert all(torch.equal(r.target_topk_idx, i) for r, i in zip(current, indices))
