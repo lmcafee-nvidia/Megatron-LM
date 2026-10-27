@@ -261,10 +261,16 @@ def test_mxfp8_quantize_replays():
         return data.view(torch.uint8), scale.view(torch.uint8), get_mxfp8_scale_bytes(tensor)
 
     assert_replays_bit_exact(fn, (x,), backward=False, what="mxfp8_quantize")
-    data, scale, _ = fn(x)
+    data, scale, logical = fn(x)
     assert scale[0].item() == 0  # E8M0 byte zero is the finite 2**-127 scale.
     assert torch.count_nonzero(data[0, :32]) == 32
     assert torch.count_nonzero(data[1, :32]) == 0
+    # The logical view must put each block's scale at its own row and block column: only
+    # the two crafted blocks use byte zero, and every random block has a nonzero exponent.
+    assert logical.shape == (x.shape[0], x.shape[1] // 32)
+    assert logical[0, 0].item() == 0
+    assert logical[1, 0].item() == 0
+    assert torch.count_nonzero(logical) == logical.numel() - 2
 
 
 @pytest.mark.skipif(not hasattr(torch, "float8_e8m0fnu"), reason="needs torch float8 e8m0 dtype")
