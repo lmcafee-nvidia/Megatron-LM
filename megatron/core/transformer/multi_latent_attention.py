@@ -1331,18 +1331,11 @@ class MLASelfAttention(MultiLatentAttention):
         # We should only have to call to set once at start
         if not hasattr(self, "up_k_weight"):
             with torch.no_grad():
-                if HAVE_TE and isinstance(self.linear_kv_up_proj, TELayerNormColumnParallelLinear):
-                    linear_kv_up_proj_norm, linear_kv_up_proj_linear = (
-                        split_te_layernorm_column_parallel_linear(
-                            self.linear_kv_up_proj,
-                            self.config,
-                            None,
-                            self.linear_kv_up_proj.tp_group,
-                        )
+                linear_kv_up_proj_norm, linear_kv_up_proj_linear = (
+                    split_te_layernorm_column_parallel_linear(
+                        self.linear_kv_up_proj, self.config, None, self.linear_kv_up_proj.tp_group
                     )
-                else:
-                    linear_kv_up_proj_norm = self.kv_layernorm
-                    linear_kv_up_proj_linear = self.linear_kv_up_proj
+                )
 
                 # Note: When caching latents we overide the kv_layernorm
                 # which was an identity before because in the is path
