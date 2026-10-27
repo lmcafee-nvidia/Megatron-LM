@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import asyncio
 import builtins
 import json
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endp
 )
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.incremental_detokenizer import (
     HuggingFaceFastIncrementalDetokenizer,
+    detokenize_generated_tokens,
 )
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.openai_streaming import (
     JSON_SAFE_LOGPROB_FLOOR,
@@ -139,6 +141,64 @@ async def test_openai_stream_emits_delta_chunks_and_terminal_metadata():
     assert records[-1] == "data: [DONE]\n\n"
 
 
+@pytest.mark.asyncio
+async def test_openai_stream_preserves_scores_while_detokenizer_buffers_text():
+    class BufferedDetokenizer:
+        def __init__(self):
+            self.text = ""
+            self.pending = []
+
+        def update(self, tokens):
+            self.pending.extend(tokens)
+            if len(self.pending) < 2:
+                return ""
+            delta = _Tokenizer().detokenize(self.pending)
+            self.pending.clear()
+            self.text += delta
+            return delta
+
+        @property
+        def text_length(self):
+            return len(self.text)
+
+    stream = AsyncStream(request_id=1, cancel=lambda: None)
+    for token, score in [(1, -0.1), (2, -0.2)]:
+        stream.put(
+            {
+                "partial": {
+                    "request_id": 1,
+                    "new_tokens": [token],
+                    "new_log_probs": [score],
+                    "new_top_n_logprobs": [{chr(ord("a") + token - 1): score}],
+                }
+            }
+        )
+    stream.put(
+        {
+            "final": {
+                "prompt_tokens": [9],
+                "generated_tokens": [1, 2],
+                "generated_log_probs": [-0.1, -0.2],
+                "sampling_params": {"num_tokens_to_generate": 2},
+            }
+        }
+    )
+    stream.finish()
+
+    records = [
+        json.loads(record.removeprefix("data: "))
+        async for record in openai_stream(
+            [stream], _Tokenizer(), [BufferedDetokenizer()], chat=False, return_log_probs=True
+        )
+        if record != "data: [DONE]\n\n"
+    ]
+    deltas = [record["choices"][0] for record in records[:-1]]
+
+    assert [delta["text"] for delta in deltas] == ["", "ab"]
+    assert [delta["logprobs"]["token_logprobs"] for delta in deltas] == [[-0.1], [-0.2]]
+    assert records[-1]["choices"][0]["generated_text"] == "ab"
+
+
 def test_huggingface_fast_incremental_detokenizer_requires_optional_dependencies(monkeypatch):
     original_import = builtins.__import__
 
@@ -206,6 +266,67 @@ async def test_openai_stream_echoes_completion_prompt_before_generated_text():
     assert generated["choices"][0]["text"] == "a"
     assert generated["choices"][0]["logprobs"]["text_offset"] == [2]
     assert finished["choices"][0]["finish_reason"] == "stop"
+    assert records[-1] == "data: [DONE]\n\n"
+
+
+@pytest.mark.parametrize("drop,suffix", [(False, "<|im_end|>"), (True, "")], ids=("keep", "drop"))
+@pytest.mark.asyncio
+async def test_openai_stream_echo_follows_trailing_eos_policy(drop, suffix):
+    tokenizer, huggingface_tokenizer = _with_chat_markers(eos_marker="<|im_end|>")
+    token_ids = huggingface_tokenizer.encode("a<|im_end|>", add_special_tokens=False)
+    stream = AsyncStream(request_id=1, cancel=lambda: None)
+    stream.put(
+        {
+            "partial": {
+                "request_id": 1,
+                "new_tokens": token_ids,
+                "new_log_probs": [-0.1, -0.2],
+                "new_top_n_logprobs": [{"a": -0.01}, {"<|im_end|>": -0.02}],
+                "prompt_log_probs": [NEG_INF],
+                "prompt_top_n_logprobs": [{"z": -0.04}],
+            }
+        }
+    )
+    stream.put(
+        {
+            "final": {
+                "prompt_tokens": [26, 26],
+                "generated_tokens": token_ids,
+                "generated_log_probs": [-0.1, -0.2],
+                "generated_top_n_logprobs": [{"a": -0.01}, {"<|im_end|>": -0.02}],
+                "sampling_params": {"num_tokens_to_generate": 3},
+            }
+        }
+    )
+    stream.finish()
+
+    records = [
+        record
+        async for record in openai_stream(
+            [stream],
+            _Tokenizer(),
+            [HuggingFaceFastIncrementalDetokenizer(tokenizer, [], remove_eos=drop)],
+            chat=False,
+            return_log_probs=True,
+            echo_prompts=["zz"],
+            prompt_token_ids=[[26, 26]],
+        )
+    ]
+    payloads = [json.loads(record.removeprefix("data: ")) for record in records[:-1]]
+
+    echoed, generated, *_, finished = payloads
+    assert echoed["choices"][0]["text"] == "zz"
+    assert echoed["choices"][0]["logprobs"] == {
+        "tokens": ["z", "z"],
+        "token_logprobs": [None, JSON_SAFE_LOGPROB_FLOOR],
+        "top_logprobs": [None, {"z": -0.04}],
+        "text_offset": [0, 1],
+    }
+    assert generated["choices"][0]["text"] == "a"
+    assert generated["choices"][0]["logprobs"]["text_offset"] == [2, 3]
+    assert finished["choices"][0]["finish_reason"] == "stop"
+    assert "".join(payload["choices"][0]["text"] for payload in payloads[1:-1]) == "a" + suffix
+    assert finished["choices"][0]["generated_text"] == "a" + suffix
     assert records[-1] == "data: [DONE]\n\n"
 
 
@@ -330,6 +451,24 @@ def test_streaming_chat_parser_emits_structured_stable_tool_call_deltas():
         )
         == "tool_calls"
     )
+    # Reaching the token limit is reported as "length" even after streaming tool calls.
+    assert (
+        parser.finish_reason(
+            {"generated_tokens": [1, 2], "sampling_params": {"num_tokens_to_generate": 2}}
+        )
+        == "length"
+    )
+
+
+def test_streaming_chat_parser_propagates_parser_failures():
+    def parse(_text, *, finished=False):
+        del finished
+        raise RuntimeError("parser failed")
+
+    parser = StreamingChatParser(parse)
+
+    with pytest.raises(RuntimeError, match="parser failed"):
+        parser.parse("generated text", finished=True)
 
 
 def test_streaming_chat_parser_handles_single_multi_turn_tool_call_request():
@@ -442,6 +581,21 @@ def test_huggingface_fast_incremental_detokenizer_uses_prompt_context():
     assert streamed_text == full_text[len(prompt_text) :]
 
 
+def test_completed_generation_uses_streaming_prompt_context():
+    backend = Tokenizer(models.WordPiece(vocab={"[UNK]": 0, "hello": 1, "world": 2}))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    backend.decoder = decoders.WordPiece(prefix="##", cleanup=False)
+    huggingface_tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend)
+    tokenizer = SimpleNamespace(
+        _tokenizer=SimpleNamespace(tokenizer=huggingface_tokenizer, include_special_tokens=True)
+    )
+
+    text = detokenize_generated_tokens(tokenizer, [1], [2])
+
+    assert huggingface_tokenizer.decode([2]) == "world"
+    assert text == " world"
+
+
 def test_huggingface_fast_incremental_detokenizer_skips_special_tokens():
     tokenizer = _make_byte_level_fast_tokenizer()
     huggingface_tokenizer = tokenizer._tokenizer.tokenizer
@@ -501,6 +655,102 @@ def test_huggingface_fast_incremental_detokenizer_drops_eos_and_special_map_toke
     streamed_text = "".join(detokenizer.update([token_id]) for token_id in token_ids)
 
     assert streamed_text == "<think>x</think>ab"
+
+
+@pytest.mark.parametrize("remove_eos", [False, True])
+def test_huggingface_fast_incremental_detokenizer_matches_trailing_eos_policy(remove_eos):
+    tokenizer, huggingface_tokenizer = _with_chat_markers(eos_marker="<|im_end|>")
+    huggingface_tokenizer.add_special_tokens({"additional_special_tokens": ["<special>"]})
+    token_ids = huggingface_tokenizer.encode(
+        "a<special><|im_end|>b<|im_end|>", add_special_tokens=False
+    )
+    detokenizer = HuggingFaceFastIncrementalDetokenizer(tokenizer, [], remove_eos=remove_eos)
+
+    streamed_text = detokenizer.update(token_ids) + detokenizer.finish()
+    expected_tokens = token_ids[:-1] if remove_eos else token_ids
+
+    assert streamed_text == _non_streaming_text(huggingface_tokenizer, expected_tokens)
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_rejects_clean_termination_without_a_final_record():
+    stream = AsyncStream(request_id=1, cancel=lambda: None)
+    stream.finish()
+
+    records = [
+        record
+        async for record in openai_stream(
+            [stream], _Tokenizer(), [_IncrementalDetokenizer()], chat=False
+        )
+    ]
+
+    assert records[-1] != "data: [DONE]\n\n"
+    assert "error" in json.loads(records[-1].removeprefix("data: "))
+
+
+@pytest.mark.asyncio
+async def test_short_choice_gets_terminal_before_longer_choice_finishes():
+    short = AsyncStream(request_id=1, cancel=lambda: None)
+    long = AsyncStream(request_id=2, cancel=lambda: None)
+    short.put(
+        {
+            "final": {
+                "prompt_tokens": [9],
+                "generated_tokens": [1],
+                "sampling_params": {"num_tokens_to_generate": 4},
+            }
+        }
+    )
+    short.finish()
+    long.put({"partial": {"request_id": 2, "new_tokens": [2]}})
+    terminal_seen = asyncio.Event()
+    records = []
+
+    async def collect():
+        async for record in openai_stream(
+            [short, long],
+            _Tokenizer(),
+            [_IncrementalDetokenizer(), _IncrementalDetokenizer()],
+            chat=False,
+        ):
+            records.append(record)
+            if record == "data: [DONE]\n\n":
+                continue
+            payload = json.loads(record.removeprefix("data: "))
+            if any(
+                choice["index"] == 0 and choice["finish_reason"] is not None
+                for choice in payload.get("choices", [])
+            ):
+                terminal_seen.set()
+
+    collector = asyncio.create_task(collect())
+    try:
+        await asyncio.wait_for(terminal_seen.wait(), timeout=2)
+        assert not long.finished
+    finally:
+        long.put(
+            {
+                "final": {
+                    "prompt_tokens": [9],
+                    "generated_tokens": [2, 3],
+                    "sampling_params": {"num_tokens_to_generate": 4},
+                }
+            }
+        )
+        long.finish()
+        await collector
+
+    terminal_indices = []
+    for record in records:
+        if record == "data: [DONE]\n\n":
+            continue
+        payload = json.loads(record.removeprefix("data: "))
+        terminal_indices.extend(
+            choice["index"]
+            for choice in payload.get("choices", [])
+            if choice["finish_reason"] is not None
+        )
+    assert terminal_indices == [0, 1]
 
 
 def test_incremental_detokenizer_rejects_unsupported_tokenizer():
@@ -601,3 +851,27 @@ async def test_stream_preserves_engine_finish_reason_at_budget(reason):
     ]
     payloads = [json.loads(record.removeprefix("data: ")) for record in records[:-1]]
     assert payloads[-1]["choices"][0]["finish_reason"] == reason
+
+
+@pytest.mark.asyncio
+async def test_closing_the_stream_waits_for_its_reader_tasks(monkeypatch):
+    """Closing the SSE generator must not leave its per-choice reader tasks pending."""
+    created = []
+    real_create_task = asyncio.create_task
+
+    def recording_create_task(coro, **kwargs):
+        task = real_create_task(coro, **kwargs)
+        created.append(task)
+        return task
+
+    monkeypatch.setattr(asyncio, "create_task", recording_create_task)
+    stream = AsyncStream(request_id=1, cancel=lambda: None)
+    stream.put({"partial": {"request_id": 1, "new_tokens": [2]}})
+    generator = openai_stream([stream], _Tokenizer(), [_IncrementalDetokenizer()], chat=False)
+
+    await anext(generator)
+    await generator.aclose()
+
+    readers = [task for task in created if task.get_coro().__name__ == "pump"]
+    assert len(readers) == 1
+    assert all(task.done() for task in readers)
