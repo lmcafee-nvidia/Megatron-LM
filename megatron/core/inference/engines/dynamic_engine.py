@@ -1733,7 +1733,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST
                 and not self.context.static_kv_memory_pointers
             ):
-                pending_inputs = self.controller._snapshot_async_sched_pending_inputs()
                 live_state = None
                 if (
                     self.context.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
@@ -1746,8 +1745,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 finally:
                     if live_state is not None:
                         self.context._restore_live_request_state_after_graph_recapture(live_state)
-                    if pending_inputs is not None:
-                        self.controller._restore_async_sched_pending_inputs(pending_inputs)
             capture_time = time.time() - capture_time
 
             # Request records outlive the context buffers. Refresh every stale
