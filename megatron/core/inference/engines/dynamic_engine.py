@@ -840,10 +840,6 @@ class DynamicInferenceEngine(AbstractEngine):
             self._pending_signals = deque()
 
         self.resume_request_ids = None
-        # Non-static suspend/resume may retain live requests after deleting the
-        # graphs whose storage was released. In that case graph dimensions move
-        # here until the requests drain through the eager path.
-        self._cuda_graph_recapture_dimensions = None
 
         # Speculative decoding acceptance tracking (per-position).
         # Each tensor has length num_speculative_tokens; index i tracks position i+1
@@ -1273,50 +1269,6 @@ class DynamicInferenceEngine(AbstractEngine):
         )
 
         self.capture_stats = capture_stats
-
-    def _defer_cuda_graph_recapture(self) -> None:
-        """Force eager execution until live work reaches a safe recapture boundary.
-
-        Non-static OFFLOAD and RECOMPUTE release the storage referenced by local
-        CUDA graphs.  Their request records can nevertheless survive the cycle.
-        Dummy graph construction resets context bookkeeping, so it must not run
-        while any of those requests are resident or queued.  An empty graph-shape
-        list makes the normal graph matcher select eager execution without
-        changing the configured graph scope.
-        """
-
-        if self._cuda_graph_recapture_dimensions is None:
-            self._cuda_graph_recapture_dimensions = list(
-                self.context.cuda_graph_batch_dimensions_list
-            )
-        self.context.cuda_graph_batch_dimensions_list = []
-
-    def _recapture_cuda_graphs_if_idle(self) -> bool:
-        """Rebuild deferred local graphs after all retained work has drained."""
-
-        dimensions = self._cuda_graph_recapture_dimensions
-        if dimensions is None:
-            return False
-        if (
-            self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING)
-            or self.context.has_unfinished_requests()
-            or self.waiting_request_ids
-            or self.pending_kv_import_count
-            or self.pending_kv_push_count
-            or self.controller._async_sched_forward.is_valid
-        ):
-            return False
-
-        self.context.cuda_graph_batch_dimensions_list = dimensions
-        try:
-            self.create_cuda_graphs()
-        except Exception:
-            # A failed rebuild must leave subsequent live work on the safe eager
-            # path rather than allowing inline capture with a partial graph set.
-            self.context.cuda_graph_batch_dimensions_list = []
-            raise
-        self._cuda_graph_recapture_dimensions = None
-        return True
 
     @internal_api
     async def start_listening_to_data_parallel_coordinator(
@@ -1779,17 +1731,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST
                 and not self.context.static_kv_memory_pointers
             ):
-                local_graphs_enabled = (
-                    self.cuda_graph_impl == "local"
-                    and self.inference_cuda_graph_scope != InferenceCudaGraphScope.none
-                )
-                live_work = bool(self.resume_request_ids) or self.context.has_unfinished_requests()
-                if local_graphs_enabled and (
-                    self._cuda_graph_recapture_dimensions is not None or live_work
-                ):
-                    self._defer_cuda_graph_recapture()
-                else:
-                    self.create_cuda_graphs()
+                self.create_cuda_graphs()
             capture_time = time.time() - capture_time
 
             # Request records outlive the context buffers. Refresh every stale
@@ -4599,7 +4541,6 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         last_step_data = await self.async_forward()
         ret = await self.async_bookkeep(*last_step_data)
-        self._recapture_cuda_graphs_if_idle()
         # Keep for compatibility with current test suite.
         return ret
 
