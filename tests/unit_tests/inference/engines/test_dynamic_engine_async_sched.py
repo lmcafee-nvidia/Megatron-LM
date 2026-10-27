@@ -2476,7 +2476,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     runtime["context-reset-replays"] += int(
                         runtime["cuda-graph-runner-replays"] > replays_before
                     )
-
         return env, runtime
 
     @staticmethod
