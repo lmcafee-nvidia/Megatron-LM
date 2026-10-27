@@ -2396,6 +2396,7 @@ def test_cuda_graph_runner_keeps_module_fp8_recipe(monkeypatch):
         num_layers=1, hidden_size=64, num_attention_heads=4, fp8="hybrid", fp8_recipe="tensorwise"
     )
     try:
+        TestSkipFp8WeightUpdateTensor._reset_skip_tensor()
         runner = cuda_graphs_module._CudaGraphRunner(
             MegatronModule(config), None, [], {}, None, need_backward=False
         )
