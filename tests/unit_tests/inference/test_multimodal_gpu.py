@@ -316,7 +316,7 @@ def _build_moe_model():
     )
 
 
-def _build_te_parallel_model(modality, topology):
+def _build_te_parallel_model(topology):
     optimized = topology == "opt"
     language_config = TransformerConfig(
         num_layers=2,
@@ -332,7 +332,6 @@ def _build_te_parallel_model(modality, topology):
     )
     language_config.language_model_type = "dummy"
     vision_config, projection_config, layer_submodules = _component_configs(32, 64)
-    vision_config.vision_model_type = "clip" if modality == "image" else "radio"
     return _llava_model(
         language_transformer_config=language_config,
         language_transformer_layer_spec=(
@@ -341,16 +340,12 @@ def _build_te_parallel_model(modality, topology):
             else get_gpt_layer_with_transformer_engine_spec()
         ),
         vision_transformer_config=vision_config,
-        vision_transformer_layer_spec=(
-            get_vit_layer_with_transformer_engine_spec()
-            if modality == "video"
-            else ModuleSpec(module=TransformerLayer, submodules=copy.deepcopy(layer_submodules))
+        vision_transformer_layer_spec=ModuleSpec(
+            module=TransformerLayer, submodules=copy.deepcopy(layer_submodules)
         ),
-        drop_vision_class_token=(modality == "image"),
+        drop_vision_class_token=True,
         vision_projection_config=projection_config,
         vision_projection_layer_spec=copy.deepcopy(get_submodules(layer_submodules.mlp)),
-        dynamic_resolution=(modality == "video"),
-        class_token_len=0 if modality == "video" else None,
         language_position_embedding_type="rope" if topology == "cp" else "learned_absolute",
     )
 
@@ -384,8 +379,7 @@ def _variant_llava_model(language_config, language_spec, position_embedding_type
     )
 
 
-def _build_engine(modality, model=None, wrapper_cls=VLMInferenceWrapper, **config_overrides):
-    model = model or _build_model(modality)
+def _inference_config(model, **overrides):
     config_kwargs = dict(
         block_size_tokens=4,
         buffer_size_gb=0.01,
@@ -395,9 +389,13 @@ def _build_engine(modality, model=None, wrapper_cls=VLMInferenceWrapper, **confi
         vision_embedding_cache_max_bytes=1024 * 1024,
         mamba_inference_state_config=MambaInferenceStateConfig.from_model(model),
     )
-    config_kwargs.update(config_overrides)
-    inference_config = InferenceConfig(**config_kwargs)
-    context = DynamicInferenceContext(model.config, inference_config)
+    config_kwargs.update(overrides)
+    return InferenceConfig(**config_kwargs)
+
+
+def _build_engine(modality, model=None, wrapper_cls=VLMInferenceWrapper, **config_overrides):
+    model = model or _build_model(modality)
+    context = DynamicInferenceContext(model.config, _inference_config(model, **config_overrides))
     wrapper = wrapper_cls(model, context)
     wrapper.prep_model_for_inference()
     tokenizer = SimpleNamespace(
@@ -423,9 +421,8 @@ def _encoder_patch(wrapper):
     )
 
 
-def _greedy_token(step, full_logits=False):
-    row = int(step["logit_indices"][0]) if full_logits else -1
-    return int(step["logits"][0, row].argmax())
+def _greedy_token(step):
+    return int(step["logits"][0, -1].argmax())
 
 
 def _drain(engine):
@@ -461,7 +458,6 @@ def _install_forward_trace(engine):
         kv_offsets = engine.context.request_kv_length_offsets[active_slice].tolist()
         mask = engine.context.current_image_token_mask()
         embeddings = engine.context.current_image_embeddings()
-        logit_indices = engine.context.speculative_required_logit_indices().detach().cpu().clone()
         original_forward(input_ids, position_ids)
         trace.append(
             {
@@ -472,7 +468,6 @@ def _install_forward_trace(engine):
                 "mask": None if mask is None else mask.detach().cpu().clone(),
                 "embeddings": (None if embeddings is None else embeddings.detach().cpu().clone()),
                 "logits": engine.controller._all_logits_cuda.detach().cpu().clone(),
-                "logit_indices": logit_indices,
                 "graphed": engine.context.using_cuda_graph_this_step(),
             }
         )
@@ -1178,10 +1173,10 @@ def test_real_media_executes_moe_router_with_configured_expert_topology(model_pa
 
 @pytest.mark.parametrize("model_parallel", ["cp"], indirect=True)
 def test_dynamic_vlm_rejects_context_parallelism(model_parallel):
-    model = _build_te_parallel_model("video", model_parallel)
+    model = _build_te_parallel_model(model_parallel)
     assert model.config.context_parallel_size == 2
     with pytest.raises(NotImplementedError, match="Context parallelism is not supported"):
-        _build_engine("video", model=model)
+        _build_engine("image", model=model)
 
 
 @pytest.mark.parametrize("model_parallel", ["tp", "dp", "ep", "etp", "opt"], indirect=True)
@@ -1189,7 +1184,7 @@ def test_real_media_executes_configured_language_implementation_or_parallel_path
     model_parallel, record_property
 ):
     topology = model_parallel
-    model = _build_te_parallel_model("image", topology)
+    model = _build_te_parallel_model(topology)
     rotary_type = type(getattr(model.language_model, "rotary_pos_emb", None)).__name__
     record_property("position_embedding_type", rotary_type)
     model.language_model.forward = mock.Mock(wraps=model.language_model.forward)
@@ -1242,7 +1237,6 @@ def test_real_media_executes_attention_variant_and_reuses_exact_result(model_par
     trace = _install_forward_trace(engine)
     media = _media("image", offset=0.0)
     companion_events = []
-    handles = []
     patchers = []
     if variant == "swa":
         original_flash = Attention.flash_decode_and_prefill
@@ -1269,8 +1263,6 @@ def test_real_media_executes_attention_variant_and_reuses_exact_result(model_par
     finally:
         for patcher in reversed(patchers):
             patcher.stop()
-        for handle in handles:
-            handle.remove()
     assert encoder.call_count == 1 and companion_events
     if variant == "swa":
         assert all(window == (4, 0) for window, _ in companion_events)
