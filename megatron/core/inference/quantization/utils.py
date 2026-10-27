@@ -353,44 +353,6 @@ def mm_mxfp8(x: torch.Tensor, weight: MXFP8Tensor, out: torch.Tensor = None):
     assert (
         backend is not None
     ), "weight.backend is None — was the weight created via MXFP8Tensor.from_bf16?"
-    if x.ndim != 3 or x.shape[1] != 1:
-        raise ValueError(
-            "MXFP8 inference linear input must have shape [tokens, 1, hidden], "
-            f"got {tuple(x.shape)}."
-        )
-    if not x.is_cuda or x.device != weight.device:
-        raise ValueError(
-            f"MXFP8 input and weight must use the same CUDA device, got "
-            f"{x.device} and {weight.device}."
-        )
-    if x.dtype not in (torch.bfloat16, torch.float16, torch.float32):
-        raise TypeError(f"MXFP8 linear input must use BF16, FP16, or FP32, got {x.dtype}.")
-    if backend == "flashinfer" and x.dtype == torch.float32:
-        raise TypeError("FlashInfer MXFP8 linear input must use BF16 or FP16, not FP32.")
-    if x.shape[-1] != weight.shape[-1]:
-        raise ValueError(
-            f"MXFP8 input hidden size {x.shape[-1]} does not match weight K "
-            f"dimension {weight.shape[-1]}."
-        )
-    if out is not None:
-        expected_out_shape = (x.shape[0], weight.shape[0])
-        if (
-            tuple(out.shape) != expected_out_shape
-            or out.dtype != torch.bfloat16
-            or out.device != x.device
-            or not out.is_contiguous()
-        ):
-            raise ValueError(
-                "MXFP8 output buffer must be contiguous BF16 on the input device with "
-                f"shape {expected_out_shape}; got shape={tuple(out.shape)}, "
-                f"dtype={out.dtype}, device={out.device}."
-            )
-    capability = torch.cuda.get_device_capability(x.device)
-    if capability[0] < 10:
-        raise RuntimeError(
-            "Native MXFP8 inference GEMM requires NVIDIA Blackwell (SM100 or newer); "
-            f"got SM{capability[0]}{capability[1]}. Keep this layer in BF16 on Hopper."
-        )
 
     x_squeezed = x.squeeze(1)
     x_mxfp8 = MXFP8Tensor.from_bf16(x_squeezed, backend=backend)
