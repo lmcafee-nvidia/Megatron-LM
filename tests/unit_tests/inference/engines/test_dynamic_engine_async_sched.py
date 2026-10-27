@@ -2008,12 +2008,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         config.update(scenario.config)
         config["async_sched_mode"] = mode
         env = cls._build_test_env(_DynamicEngineTestConfig(**config))
-        if env.engine.controller.inference_wrapped_model.model.config.fp8:
-            from megatron.core.fp8_utils import get_fp8_align_size
-
-            DynamicInferenceContext.TOKEN_ROUNDER = get_fp8_align_size(
-                env.engine.controller.inference_wrapped_model.model.config.fp8_recipe
-            )
         env.requests = _make_scenario_requests(
             env, scenario, stop_tokens=stop_tokens, termination_token=termination_token
         )
