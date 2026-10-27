@@ -443,12 +443,9 @@ async def openai_stream(
             prompt_len = result.get("prompt_length")
             if prompt_len is None:
                 prompt_len = len(result.get("prompt_tokens") or [])
-            prompt_tokens = max(prompt_tokens, prompt_len) if chat else prompt_tokens + prompt_len
+            prompt_tokens = max(prompt_tokens, prompt_len)
             completion_tokens += len(result.get("generated_tokens") or [])
-            if chat:
-                cached_token_count = max(cached_token_count, result.get("num_cached_tokens", 0))
-            else:
-                cached_token_count += result.get("num_cached_tokens", 0)
+            cached_token_count = max(cached_token_count, result.get("num_cached_tokens", 0))
             parser = state["parser"]
             choice = {
                 "index": index,
