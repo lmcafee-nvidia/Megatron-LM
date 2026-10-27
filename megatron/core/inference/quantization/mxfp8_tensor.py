@@ -196,12 +196,7 @@ class MXFP8Tensor:
         ):
             mcore_mxfp8_quantize_into(value, self.data, self.scale)
         else:
-            if self.backend == "flashinfer" and self.scale.ndim == 2:
-                quantized = MXFP8Tensor.from_bf16(
-                    value, backend=self.backend, scale_layout="linear"
-                )
-            else:
-                quantized = MXFP8Tensor.from_bf16(value, backend=self.backend)
+            quantized = MXFP8Tensor.from_bf16(value, backend=self.backend)
             self.data.copy_(quantized.data)
             self.scale.view(torch.uint8).copy_(quantized.scale.view(torch.uint8))
         if self.dtype is None:
