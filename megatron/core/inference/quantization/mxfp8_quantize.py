@@ -73,14 +73,10 @@ def _mxfp8_quant_swizzle_row(
     # (exponent-only mask) bumps the exponent if any mantissa bits are set.
     # Result: 2^ceil(log2(max/448)) as a uint32-encoded float.
     dequant_exp = (dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000
-    # E8M0 byte zero represents 2^-127, one exponent below float32's minimum normal
-    # value. The exponent-only bit trick rounds all nonzero subnormal values to
-    # 2^-126, so restore the byte-zero bin explicitly before computing the reciprocal.
-    scale_exp = (dequant_exp >> 23).to(tl.uint8)
-    scale_exp = tl.where(dequant_scale <= 5.877471754111438e-39, 0, scale_exp)
-    # Guard all-zero groups separately: they share the byte-zero scale encoding but
-    # must keep a zero payload instead of multiplying by 2^127.
-    quant_scale = tl.where(max_vals == 0.0, 0.0, tl.exp2(127.0 - scale_exp.to(tl.float32)))
+    # Reinterpret uint32 back as float32 — now a power-of-2 dequantization scale.
+    dequant_rounded = dequant_exp.to(tl.float32, bitcast=True)
+    # Quantization scale is the reciprocal; guard against div-by-zero for all-zero groups.
+    quant_scale = tl.where(dequant_rounded == 0, 0.0, 1.0 / dequant_rounded)
 
     # Quantize
     quantized = x_grouped * quant_scale[:, None]
@@ -91,6 +87,7 @@ def _mxfp8_quant_swizzle_row(
     tl.store(out_row + offs, out_fp8, mask=mask)
 
     # Store swizzled scales
+    scale_exp = (dequant_exp >> 23).to(tl.uint8)
     col_offs = tl.arange(0, BLOCK_GROUPS)
     col_mask = col_offs < REAL_GROUPS
 
