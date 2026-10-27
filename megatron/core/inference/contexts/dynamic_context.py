@@ -1774,10 +1774,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     "is_creating_cuda_graphs",
                 )
             },
-            "pending_mamba_ops": (
-                list(self._pending_mamba_zeros),
-                list(self._pending_mamba_restores),
-            ),
             "vlm_maps": {
                 name: dict(getattr(self, name))
                 for name in (
@@ -1824,10 +1820,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.mamba_metadata.request_to_mamba_state_idx.copy_(state["mamba_request_slots"])
             self.mamba_metadata.mamba_state_free_slots.copy_(state["mamba_free_slots"])
             self.mamba_metadata.mamba_state_free_slot_count = state["mamba_free_slot_count"]
-        # Keep only the live requests' queued Mamba ops. Capture's dummy requests
-        # queue zeroing for slots that live requests may own after this restore.
-        self._pending_mamba_zeros[:] = state["pending_mamba_ops"][0]
-        self._pending_mamba_restores[:] = state["pending_mamba_ops"][1]
         for name, value in state["vlm_maps"].items():
             target = getattr(self, name)
             target.clear()
