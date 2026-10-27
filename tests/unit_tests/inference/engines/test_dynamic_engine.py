@@ -5777,6 +5777,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     kv_cache_management_mode="offload",
                     static_kv_memory_pointers=False,
                     suspend_resume_interval=suspend_resume_interval,
+                    # Nothing is pending across suspend, so only the live-state restore is tested.
+                    async_sched_mode=AsyncScheduleMode.LEGACY,
                 )
             )
             live_requests_at_suspend = []
