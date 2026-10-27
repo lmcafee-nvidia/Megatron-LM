@@ -1282,10 +1282,15 @@ class TestMoEModules:
         )
 
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
-    @pytest.mark.parametrize("op_fuser", [False, True], ids=["unfused", "op-fuser-mxfp8"])
-    def test_te_grouped_mlp_tanh_clamp_replays_on_uneven_experts(self, op_fuser):
+    @pytest.mark.parametrize(
+        "op_fuser,fused_activation",
+        [(False, True), (True, True), (False, False)],
+        ids=["unfused", "op-fuser-mxfp8", "unfused-bf16-activation"],
+    )
+    def test_te_grouped_mlp_tanh_clamp_replays_on_uneven_experts(self, op_fuser, fused_activation):
         """Squared ReLU with the tanh soft clamp: the unfused weighted_squared_relu_impl path, and
-        the fused cuDNN srelu_tanh grouped GEMM (op fuser + MXFP8; SM100 and ScaledTanhSReLU)."""
+        the fused cuDNN srelu_tanh grouped GEMM (op fuser + MXFP8; SM100 and ScaledTanhSReLU).
+        The last case uses the unfused BF16 activation, which rounds before the routing weight."""
         if op_fuser:
             if torch.cuda.get_device_capability()[0] < 10:
                 pytest.skip("fused grouped MLP under MXFP8 needs SM100+")
@@ -1299,7 +1304,7 @@ class TestMoEModules:
             gated_linear_unit=False,
             activation_func=squared_relu,
             bias_activation_fusion=False,
-            use_fused_weighted_squared_relu=True,
+            use_fused_weighted_squared_relu=fused_activation,
             activation_func_tanh_clamp_scale=16.0,
             use_transformer_engine_op_fuser=op_fuser,
             **({"fp8": "e4m3", "fp8_recipe": "mxfp8"} if op_fuser else {}),
