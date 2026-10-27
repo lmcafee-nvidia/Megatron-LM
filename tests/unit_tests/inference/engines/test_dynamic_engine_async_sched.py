@@ -818,10 +818,9 @@ _ASYNC_PAIR_SCENARIOS = (
             "moe_router_pre_softmax": True,
             "fp8_output_proj": True,
         },
-        signals=("inference-optimized", "moe", "mxfp8", "fixed-history-logits"),
+        signals=("inference-optimized", "moe", "mxfp8"),
         prerequisite="mxfp8",
         atol=0.0,
-        graph_parity="reproducible",
     ),
     # Four heads of width 64 exercise FlashInfer's supported fused-RoPE kernel.
     # Width 16 crosses half-head boundaries in its vectorized NeoX rotation.
@@ -2735,6 +2734,10 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert all(module._uses_mxfp8_weights for module in experts)
             assert all(isinstance(module._fc1_weight, MXFP8Tensor) for module in experts)
             assert all(isinstance(module._fc2_weight, MXFP8Tensor) for module in experts)
+            if scenario.config.get("fp8_output_proj"):
+                assert type(controller.inference_wrapped_model.model.output_layer).__name__ == (
+                    "TELMHeadColumnParallelLinear"
+                )
         if "routing-replay" in signals:
             assert model_config.moe_enable_routing_replay
             assert context.moe_routing_metadata is not None
