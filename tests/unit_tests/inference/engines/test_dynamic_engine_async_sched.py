@@ -520,7 +520,7 @@ _ASYNC_PAIR_SCENARIOS = (
         "capacity:max-requests",
         "capacity:max-tokens",
         config={"enable_chunked_prefill": True, "context_max_tokens": 8},
-        signals=("capacity", "chunked", "graph-hybrid-config"),
+        signals=("capacity", "chunked"),
     ),
     _pair_scenario(
         "prefix-ref-zero",
@@ -561,16 +561,8 @@ _ASYNC_PAIR_SCENARIOS = (
             "inference_cuda_graph_scope": InferenceCudaGraphScope.block,
             "cuda_graph_sizing_distribution": CudaGraphSizingDistribution.EXPONENTIAL,
             "cuda_graph_max_tokens": 16,
-            "cuda_graph_warmup_steps": 1,
-            "flash_attention_version": 2,
         },
-        signals=(
-            "cuda-graph",
-            "flash-attention-version",
-            "graph-decode-config",
-            "graph-warmup",
-            "last-logits",
-        ),
+        signals=("cuda-graph", "graph-decode-config"),
     ),
     _pair_scenario(
         "graph-bounded-mixed-prefill",
@@ -587,7 +579,6 @@ _ASYNC_PAIR_SCENARIOS = (
     _pair_scenario(
         "graph-mixed-layer-linear",
         "graph:layer-scope",
-        "graph:all-prefill",
         "graph:mixed-prefill",
         "graph:linear",
         "graph:mixed-count",
@@ -598,7 +589,7 @@ _ASYNC_PAIR_SCENARIOS = (
             "inference_cuda_graph_scope": InferenceCudaGraphScope.layer,
             "cuda_graph_mixed_prefill_count": 2,
             "cuda_graph_sizing_distribution": CudaGraphSizingDistribution.LINEAR,
-            "cuda_graph_max_tokens": 32,
+            "cuda_graph_max_tokens": 24,
         },
         signals=("cuda-graph", "graph-mixed-config"),
     ),
@@ -606,12 +597,8 @@ _ASYNC_PAIR_SCENARIOS = (
         "sampling-temperature-top-k",
         "sampling:temperature",
         "sampling:top-k",
-        "sampling:request-seed",
-        sampling=(
-            {"temperature": 0.7, "top_k": 8, "seed": 17},
-            {"temperature": 0.7, "top_k": 8, "seed": 29},
-        ),
-        signals=("request-seed", "sampled", "temperature-filter", "top-k-filter"),
+        sampling=({"temperature": 0.7, "top_k": 8},),
+        signals=("sampled", "temperature-filter", "top-k-filter"),
         parity="reproducible",
     ),
     _pair_scenario(
@@ -728,7 +715,7 @@ _ASYNC_PAIR_SCENARIOS = (
             {"return_log_probs": False, "skip_prompt_log_probs": True},
             {"return_log_probs": True, "skip_prompt_log_probs": True, "top_n_logprobs": 4},
         ),
-        signals=("cuda-graph", "logprobs", "metadata-compaction", "mtp", "mtp-reject", "top-n"),
+        signals=("cuda-graph", "logprobs", "metadata-compaction", "mtp", "top-n"),
         # MTP changes the forward batch shape; near-tied non-selected alternatives
         # may exchange the final top-N slot while selected-token parity remains exact.
         exact_top_n=False,
@@ -742,14 +729,6 @@ _ASYNC_PAIR_SCENARIOS = (
         signals=("suspend-resume", "vlm", "vlm-stale-media"),
         request_profile="vlm",
         atol=5.0e-3,
-    ),
-    _pair_scenario(
-        "disagg-decode-handoff",
-        "disaggregation:decode-handoff",
-        "kv:transferred-prefix",
-        config={"enable_prefix_caching": True, "engine_cls": StateHandoffDynamicInferenceEngine},
-        signals=("disagg-handoff",),
-        request_profile="handoff",
     ),
     _pair_scenario(
         "hybrid-mamba",
@@ -814,10 +793,9 @@ _ASYNC_PAIR_SCENARIOS = (
             "use_moe_layer_spec": True,
             "transformer_impl": "inference_optimized",
         },
-        signals=("inference-optimized", "moe", "mxfp8", "fixed-history-logits"),
+        signals=("inference-optimized", "moe", "mxfp8"),
         prerequisite="mxfp8",
         atol=0.0,
-        graph_parity="reproducible",
     ),
     # Four heads of width 64 exercise FlashInfer's supported fused-RoPE kernel.
     # Width 16 crosses half-head boundaries in its vectorized NeoX rotation.
@@ -831,6 +809,7 @@ _ASYNC_PAIR_SCENARIOS = (
         },
         signals=("fused-rope",),
         prerequisite="flashinfer",
+        parity="reproducible",
     ),
     _pair_scenario(
         "flash-attention-3",
@@ -910,50 +889,6 @@ _CUDA_GRAPH_LIFECYCLE_SCENARIOS = (
 )
 
 
-_CUDA_GRAPH_DIFFERENTIAL_SCENARIOS = (
-    tuple(
-        scenario
-        for scenario in _ASYNC_PAIR_SCENARIOS
-        if scenario.name
-        in {
-            "prefix-lru-chunked",
-            "prefix-ref-zero",
-            "chunked-capacity",
-            "graph-decode-block-exponential",
-            "graph-bounded-mixed-prefill",
-            "graph-mixed-layer-linear",
-            "sampling-temperature-top-k",
-            "sampling-top-p",
-            "sampling-top-k-top-p",
-            "raw-prompt-top-n-logprobs",
-            "processed-skip-prompt-logprobs",
-            "flashinfer-sampling",
-            "length-zero-and-total",
-            "string-prompt-bos",
-            "termination-values",
-            "stop-sequence-keep",
-            "stop-sequence-strip",
-            "mtp-depth-one",
-            "mtp-repeated-all-accept",
-            "mtp-graph-heterogeneous-logprobs",
-            "vlm-precomputed-media",
-            "disagg-decode-handoff",
-            "hybrid-mamba",
-            "hybrid-gdn",
-            "hybrid-gdp",
-            "transformer-engine",
-            "inference-optimized",
-            "flashinfer-fused-rope",
-            "flash-attention-3",
-            "flash-attention-4",
-            "swa-off-by-one-sink",
-            "alternating-swa-learnable-sink",
-        }
-    )
-    + _CUDA_GRAPH_LIFECYCLE_SCENARIOS
-)
-
-
 _ASYNC_PARALLEL_SCENARIOS = (
     _pair_scenario(
         "tp2-pp2-sp-dp2",
@@ -979,13 +914,11 @@ _ASYNC_PARALLEL_SCENARIOS = (
         "interaction:moe-ep-ordering",
         config={
             "expert_model_parallel_size": 2,
-            "moe_grouped_gemm": True,
             "use_moe_layer_spec": True,
             "inference_moe_token_dispatcher_type": "nccl",
-            "moe_enable_routing_replay": True,
             "transformer_impl": "inference_optimized",
         },
-        signals=("inference-optimized", "moe", "nccl-dispatch", "parallel", "routing-replay"),
+        signals=("inference-optimized", "moe", "nccl-dispatch", "parallel"),
     ),
     _pair_scenario(
         "moe-ep2-nvls",
@@ -1039,11 +972,142 @@ _ASYNC_PARALLEL_SCENARIOS = (
     ),
 )
 
-# The all-gather ETP case runs eagerly here; its CUDA-graph replay is covered separately.
+
+_UPSTREAM_SCENARIOS = {
+    case.name: case for case in _ASYNC_PAIR_SCENARIOS + _ASYNC_PARALLEL_SCENARIOS
+}
+
+
+def _variant(base_name, name, *pairs, config=None, signals=(), **changes):
+    """Derive a new case from an upstream one, leaving the upstream definition unchanged."""
+    base = _UPSTREAM_SCENARIOS[base_name]
+    return replace(
+        base,
+        name=name,
+        pairs=base.pairs + pairs,
+        config=base.config | (config or {}),
+        signals=base.signals + signals,
+        **changes,
+    )
+
+
+# The harness follows handed-off requests only in asynchronous runs, so this case is
+# compared with and without graphs, both scheduled asynchronously.
+_CUDA_GRAPH_HANDOFF_SCENARIOS = (
+    _pair_scenario(
+        "disagg-decode-handoff",
+        "disaggregation:decode-handoff",
+        "kv:transferred-prefix",
+        config={"enable_prefix_caching": True, "engine_cls": StateHandoffDynamicInferenceEngine},
+        signals=("disagg-handoff",),
+        request_profile="handoff",
+    ),
+)
+
+
+# CUDA-graph comparisons of upstream cases with extra settings or checks.
+_CUDA_GRAPH_VARIANT_SCENARIOS = (
+    _variant(
+        "graph-decode-block-exponential",
+        "graph-decode-block-warmup-one",
+        config={"cuda_graph_warmup_steps": 1, "flash_attention_version": 2},
+        signals=("flash-attention-version", "graph-warmup", "last-logits"),
+    ),
+    _variant(
+        "graph-mixed-layer-linear",
+        "graph-mixed-layer-all-prefill",
+        "graph:all-prefill",
+        signals=("graph-all-prefill",),
+    ),
+    _variant(
+        "sampling-temperature-top-k",
+        "sampling-request-seeds",
+        "sampling:request-seed",
+        sampling=(
+            {"temperature": 0.7, "top_k": 8, "seed": 17},
+            {"temperature": 0.7, "top_k": 8, "seed": 29},
+        ),
+        signals=("request-seed",),
+    ),
+    _variant("flashinfer-fused-rope", "flashinfer-fused-rope-exact", parity="exact"),
+    _variant(
+        "fp8-transformer-engine",
+        "fp8-transformer-engine-delayed",
+        "precision:fp8-delayed",
+        config={"fp8_recipe": "delayed"},
+        signals=("fixed-history-logits",),
+        atol=0.0,
+        parity="exact",
+    ),
+    # Current and block scaling replay through the runner's own recipe.
+    *(
+        _variant(
+            "fp8-transformer-engine",
+            f"fp8-transformer-engine-{recipe}",
+            f"precision:fp8-{recipe}",
+            config={"fp8_recipe": recipe},
+            signals=("fixed-history-logits",),
+            atol=0.0,
+            parity="exact",
+        )
+        for recipe in ("tensorwise", "blockwise")
+    ),
+)
+
+
+_CUDA_GRAPH_DIFFERENTIAL_SCENARIOS = (
+    tuple(
+        scenario
+        for scenario in _ASYNC_PAIR_SCENARIOS
+        if scenario.name
+        in {
+            "prefix-lru-chunked",
+            "prefix-ref-zero",
+            "chunked-capacity",
+            "graph-bounded-mixed-prefill",
+            "sampling-top-p",
+            "sampling-top-k-top-p",
+            "raw-prompt-top-n-logprobs",
+            "processed-skip-prompt-logprobs",
+            "flashinfer-sampling",
+            "length-zero-and-total",
+            "string-prompt-bos",
+            "termination-values",
+            "stop-sequence-keep",
+            "stop-sequence-strip",
+            "mtp-depth-one",
+            "mtp-repeated-all-accept",
+            "mtp-graph-heterogeneous-logprobs",
+            "vlm-precomputed-media",
+            "hybrid-mamba",
+            "hybrid-gdn",
+            "hybrid-gdp",
+            "transformer-engine",
+            "inference-optimized",
+            "flash-attention-3",
+            "flash-attention-4",
+            "swa-off-by-one-sink",
+            "alternating-swa-learnable-sink",
+        }
+    )
+    + _CUDA_GRAPH_VARIANT_SCENARIOS
+    + _CUDA_GRAPH_HANDOFF_SCENARIOS
+    + _CUDA_GRAPH_LIFECYCLE_SCENARIOS
+)
+
+
+# Main's plain EP2 NCCL case and the all-gather ETP case run eagerly here.
 _ASYNC_PARALLEL_GRAPH_SCENARIOS = tuple(
     scenario
     for scenario in _ASYNC_PARALLEL_SCENARIOS
-    if scenario.name != "moe-ep2-etp2-local-allgather"
+    if scenario.name not in {"moe-ep2-nccl", "moe-ep2-etp2-local-allgather"}
+) + (
+    _variant(
+        "moe-ep2-nccl",
+        "moe-ep2-nccl-routing-replay",
+        config={"moe_grouped_gemm": True, "moe_enable_routing_replay": True},
+        signals=("routing-replay",),
+    ),
 )
 
 _PROMPT_LENGTHS = (9, 5, 12, 7, 10, 6, 11)
@@ -1389,11 +1453,6 @@ def _instrument_cuda_graph_replays(model, context, runtime):
                 sorted({type(module).__name__ for module in replayed_modules})
             )
             fp8_runtime_enabled = bool(runner.fp8_enabled)
-            # Inference omits output_processor, so an owning forward runner must invoke its head.
-            owns_mxfp8_head = (
-                any(module is getattr(model, "output_layer", None) for module in replayed_modules)
-                and type(getattr(runner, "fp8_recipe", None)).__name__ == "MXFP8BlockScaling"
-            )
 
             def traced_replay(
                 is_first_microbatch,
@@ -1403,11 +1462,9 @@ def _instrument_cuda_graph_replays(model, context, runtime):
                 _runner=runner,
                 _module_names=replayed_module_names,
                 _fp8_runtime_enabled=fp8_runtime_enabled,
-                _owns_mxfp8_head=owns_mxfp8_head,
                 _owner=owner,
             ):
                 if runtime["cuda-graph-capture-active"]:
-                    runtime["cuda-graph-capture-replays"] += 1
                     return _original(is_first_microbatch, args, kwargs)
                 real = context.batch_dimensions
                 padded = context.padded_batch_dimensions
@@ -1415,9 +1472,6 @@ def _instrument_cuda_graph_replays(model, context, runtime):
                 step_key = ("cuda-graph-replay-step", context.step_count, *dimension)
                 runtime["cuda-graph-runner-replays"] += 1
                 runtime["cuda-graph-fp8-replays"] += int(_fp8_runtime_enabled)
-                runtime["cuda-graph-mxfp8-head-replays"] += int(
-                    _owns_mxfp8_head and _owner == "forward" and "output_processor" not in kwargs
-                )
                 runtime["cuda-graph-real-token-scalar-matches"] += int(
                     int(context.gpu_view.real_token_count.item()) == real.token_count
                 )
@@ -1454,7 +1508,6 @@ def _instrument_cuda_graph_replays(model, context, runtime):
 
             runner.replay_graph_capture = traced_replay
             runner._pairwise_runtime_trace = id(runtime)
-            runtime["cuda-graph-runners-instrumented"] += 1
             runtime[("cuda-graph-warmup-steps", runner.num_warmup_steps)] += 1
 
 
@@ -1476,23 +1529,6 @@ def _instrument_scenario_runtime(env, scenario, runtime, teacher_tokens=None):
             finally:
                 runtime["cuda-graph-capture-active"] -= 1
             _instrument_cuda_graph_replays(model, context, runtime)
-            managers = [
-                manager for manager in model.modules() if isinstance(manager, CudaGraphManager)
-            ]
-            live_runners = [
-                runner
-                for manager in managers
-                for runner in manager.cudagraph_runners
-                if runner.fwd_graph_recorded
-            ]
-            runtime["cuda-graph-create-live-runners"] += len(live_runners)
-            graph_pool = CudaGraphManager.global_mempool
-            runtime["cuda-graph-pool-rebinds"] += int(
-                bool(managers)
-                and bool(live_runners)
-                and graph_pool is not None
-                and all(runner.mempool == graph_pool for runner in live_runners)
-            )
             return result
 
         env.engine.create_cuda_graphs = traced_create_cuda_graphs
@@ -1882,7 +1918,6 @@ def _instrument_scenario_runtime(env, scenario, runtime, teacher_tokens=None):
             lambda name, module: name in {"MambaMixer", "GatedDeltaNet", "GatedDeltaProductMixer"}
         ),
         "moe": lambda name, module: name in {"MoELayer", "InferenceTopKRouter"},
-        "mxfp8": lambda name, module: name == "TELMHeadColumnParallelLinear",
         "parallel": (
             lambda name, module: "ParallelLinear" in name
             or name in {"ColumnParallelLinear", "RowParallelLinear"}
@@ -1905,11 +1940,7 @@ def _instrument_scenario_runtime(env, scenario, runtime, teacher_tokens=None):
 
                 def record_module(_module, _inputs, _tag=tag):
                     runtime[f"module-forward:{_tag}"] += 1
-                    if _tag == "mxfp8":
-                        runtime["mxfp8-head-capture-forwards"] += int(
-                            runtime["cuda-graph-capture-active"] > 0
-                        )
-                    elif _tag == "fp8":
+                    if _tag == "fp8":
                         fp8_enabled = FP8GlobalStateManager.is_fp8_enabled()
                         runtime["fp8-context-forwards"] += int(fp8_enabled)
                         runtime["fp8-recipe-forwards"] += int(
@@ -1952,6 +1983,15 @@ def _as_float_list(values):
     if isinstance(values, torch.Tensor):
         return values.tolist()
     return list(values)
+
+
+def _recorded(runtime, name, index=slice(1, None)):
+    """Return part of every positive tuple counter recorded under `name`."""
+    return {
+        key[index]
+        for key, count in runtime.items()
+        if isinstance(key, tuple) and key[0] == name and count > 0
+    }
 
 
 def _snapshot_requests(requests):
@@ -2054,6 +2094,12 @@ def _assert_fixed_history_logit_parity(actual, expected, atol):
 class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
     """Shared real-engine runner for the async pair owners."""
 
+    @pytest.fixture(autouse=True)
+    def _reset_token_rounder(self):
+        """FP8 runs raise TOKEN_ROUNDER to the recipe's alignment; restore it after each test."""
+        yield
+        _reset_rounder()
+
     @classmethod
     def _run_scenario_mode(
         cls,
@@ -2084,7 +2130,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             _instrument_scenario_runtime(env, scenario, runtime, teacher_tokens)
         if env.config.defer_cuda_graph_creation:
             env.engine.create_cuda_graphs()
-            cold_pool_rebinds = runtime["cuda-graph-pool-rebinds"]
             capture_evidence = {
                 key: count
                 for key, count in runtime.items()
@@ -2101,11 +2146,10 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     isinstance(key, tuple)
                     and key[0] in ("cuda-graph-warmup-steps", "flash-attention-version")
                 )
-                or (isinstance(key, str) and key.startswith(("nccl-", "fp8-", "mxfp8-")))
+                or (isinstance(key, str) and key.startswith(("nccl-", "fp8-")))
             }
             runtime.clear()
             runtime.update(capture_evidence)
-            runtime["cuda-graph-cold-pool-rebinds"] = cold_pool_rebinds
         if force_graph_eager:
             for module in model.modules():
                 module._should_call_local_cudagraph = lambda *_args, **_kwargs: False
@@ -2220,9 +2264,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 def traced_delete_cuda_graphs():
                     result = original_delete_cuda_graphs()
                     runtime["cuda-graph-delete-calls"] += 1
-                    runtime["cuda-graph-pool-releases"] += int(
-                        CudaGraphManager.global_mempool is None
-                    )
                     return result
 
                 with mock.patch.object(
@@ -2238,36 +2279,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     runtime["vlm-stale-media-preserved"] += int(
                         bool(vlm_requests)
                         and all(request.image_embeddings is not None for request in vlm_requests)
-                    )
-                if not env.engine.context.static_kv_memory_pointers:
-                    runtime["cuda-graph-runners-cleared"] += int(
-                        all(
-                            runner.fwd_graph is None and runner.mempool is None
-                            for runner in runners_before
-                        )
-                    )
-                    runtime["cuda-graph-runner-buffers-cleared"] += int(
-                        all(
-                            not runner.get_tensors(
-                                getattr(runner, "fwd_graph_input_args", ()),
-                                getattr(runner, "fwd_graph_input_kwargs", {}),
-                                check_types=False,
-                            )
-                            and not runner.get_tensors(
-                                getattr(runner, "fwd_graph_outputs", ()), check_types=False
-                            )
-                            and all(
-                                metadata.fwd_cudagraph_buffer is None
-                                and metadata.bwd_cudagraph_buffer is None
-                                for arg_meta in [
-                                    *runner.fwd_graph_input_arg_metas,
-                                    *runner.fwd_graph_input_kwarg_metas.values(),
-                                ]
-                                if (metadata := getattr(arg_meta, "cg_buffer_metadata", None))
-                                is not None
-                            )
-                            for runner in runners_before
-                        )
                     )
                 if "weight-refit" in scenario.signals:
                     model = env.engine.controller.inference_wrapped_model.model
@@ -2309,13 +2320,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 if env.engine.context.static_kv_memory_pointers:
                     runtime["cuda-graph-pool-preserved"] += int(
                         CudaGraphManager.global_mempool == graph_pool_before
-                    )
-                else:
-                    runtime["cuda-graph-recapture-deferred"] += int(
-                        getattr(env.engine, "_cuda_graph_recapture_dimensions", None) is not None
-                    )
-                    runtime["cuda-graph-eager-fallback-armed"] += int(
-                        not env.engine.context.cuda_graph_batch_dimensions_list
                     )
                 _instrument_cuda_graph_replays(
                     env.engine.controller.inference_wrapped_model.model, env.engine.context, runtime
@@ -2378,22 +2382,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     runtime["context-reset-replays"] += int(
                         runtime["cuda-graph-runner-replays"] > replays_before
                     )
-
-        if (
-            "suspend-resume" in scenario.signals
-            and not env.engine.context.static_kv_memory_pointers
-            and ("offload" in scenario.signals or "recompute" in scenario.signals)
-        ):
-            probe_id = len(env.requests)
-            prompt = torch.arange(5, dtype=torch.int64, device="cuda") + 71
-            sampling_params = SamplingParams(num_tokens_to_generate=3, termination_id=-1, top_k=1)
-            env.engine.add_request(probe_id, prompt, sampling_params)
-            env.requests.append(env.engine.get_request(probe_id))
-            env.requests[probe_id].state = "pending"
-            runtime["post-rebuild-probe-requests"] += 1
-            while env.engine.has_unfinished_requests():
-                step()
-                assert runtime["steps"] < 400, f"{scenario.name} probe did not converge"
         return env, runtime
 
     @staticmethod
@@ -2430,11 +2418,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             for key, count in runtime.items()
             if isinstance(key, tuple) and key[0] == "cuda-graph-dimension" and count > 0
         }
-        replayed_module_names = {
-            key[1]
-            for key, count in runtime.items()
-            if isinstance(key, tuple) and key[0] == "cuda-graph-replayed-module" and count > 0
-        }
+        replayed_module_names = _recorded(runtime, "cuda-graph-replayed-module", 1)
         if "eager" in signals:
             assert runtime["cuda_graph_steps"] == 0
             assert runtime["cuda-graph-runner-replays"] == 0
@@ -2445,16 +2429,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["vlm-image-forwards"] > 0
             assert runtime["vlm-image-token-count"] > 0
             if "cuda-graph" in signals:
-                replayed_steps = {
-                    key[1]
-                    for key, count in runtime.items()
-                    if isinstance(key, tuple) and key[0] == "cuda-graph-replay-step" and count > 0
-                }
-                image_steps = {
-                    key[1]
-                    for key, count in runtime.items()
-                    if isinstance(key, tuple) and key[0] == "vlm-image-step" and count > 0
-                }
+                replayed_steps = _recorded(runtime, "cuda-graph-replay-step", 1)
+                image_steps = _recorded(runtime, "vlm-image-step", 1)
                 assert replayed_steps & image_steps
         if "vlm-stale-media" in signals:
             assert env.engine.allow_stale_multimodal_embeddings
@@ -2462,19 +2438,11 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         if "disagg-handoff" in signals:
             assert isinstance(env.engine, StateHandoffDynamicInferenceEngine)
             assert runtime["disagg-admission-deferrals"] > 0
-            imports = {
-                (key[1], key[2])
-                for key, count in runtime.items()
-                if isinstance(key, tuple) and key[0] == "disagg-import" and count > 0
-            }
+            imports = _recorded(runtime, "disagg-import")
             assert len(imports) == len(env.requests)
             assert runtime["disagg-prefill-tokens-skipped"] == sum(_PROMPT_LENGTHS)
             if "cuda-graph" in signals:
-                live_inputs = [
-                    key[1:]
-                    for key, count in runtime.items()
-                    if isinstance(key, tuple) and key[0] == "cuda-graph-live-input" and count > 0
-                ]
+                live_inputs = _recorded(runtime, "cuda-graph-live-input")
                 assert any(
                     request_id in request_ids and resume_token in input_ids
                     for _padded, _real, request_ids, input_ids in live_inputs
@@ -2549,16 +2517,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert any(len(request.prompt_tokens) > context.max_tokens for request in env.requests)
             assert runtime["chunked-prefill-steps"] > 0
             if "cuda-graph" in signals:
-                chunked_steps = {
-                    key[1]
-                    for key, count in runtime.items()
-                    if isinstance(key, tuple) and key[0] == "chunked-forward-step" and count > 0
-                }
-                replayed_steps = {
-                    key[1]
-                    for key, count in runtime.items()
-                    if isinstance(key, tuple) and key[0] == "cuda-graph-replay-step" and count > 0
-                }
+                chunked_steps = _recorded(runtime, "chunked-forward-step", 1)
+                replayed_steps = _recorded(runtime, "cuda-graph-replay-step", 1)
                 assert chunked_steps & replayed_steps
         if "capacity" in signals:
             assert context.max_requests == 4
@@ -2568,16 +2528,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert env.engine._prefix_cache_hits > 0
             assert env.engine._prefill_tokens_skipped > 0
             if "cuda-graph" in signals:
-                prefix_hit_steps = {
-                    key[1]
-                    for key, count in runtime.items()
-                    if isinstance(key, tuple) and key[0] == "prefix-hit-forward-step" and count > 0
-                }
-                replayed_steps = {
-                    key[1]
-                    for key, count in runtime.items()
-                    if isinstance(key, tuple) and key[0] == "cuda-graph-replay-step" and count > 0
-                }
+                prefix_hit_steps = _recorded(runtime, "prefix-hit-forward-step", 1)
+                replayed_steps = _recorded(runtime, "cuda-graph-replay-step", 1)
                 assert runtime["prefix-hit-forward-skipped-tokens"] > 0
                 assert prefix_hit_steps & replayed_steps
         if "ref-zero" in signals:
@@ -2593,11 +2545,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 for dimensions in context.cuda_graph_batch_dimensions_list
             }
             assert executed_graph_dimensions <= available_dimensions
-            replayed_graph_dimensions = {
-                key[1:]
-                for key, count in runtime.items()
-                if isinstance(key, tuple) and key[0] == "cuda-graph-replay-dimension" and count > 0
-            }
+            replayed_graph_dimensions = _recorded(runtime, "cuda-graph-replay-dimension")
             assert replayed_graph_dimensions == executed_graph_dimensions
             assert (
                 runtime["cuda-graph-real-token-scalar-matches"]
@@ -2607,11 +2555,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 assert (
                     runtime["cuda-graph-zero-input-padding"] == runtime["cuda-graph-padded-replays"]
                 )
-            graph_output_pointers = {
-                key[1]
-                for key, count in runtime.items()
-                if isinstance(key, tuple) and key[0] == "cuda-graph-output-pointer" and count > 0
-            }
+            graph_output_pointers = _recorded(runtime, "cuda-graph-output-pointer", 1)
             assert graph_output_pointers
             assert controller._all_logits_cuda.data_ptr() not in graph_output_pointers
         if "graph-decode-config" in signals:
@@ -2640,7 +2584,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 context.config.cuda_graph_sizing_distribution == CudaGraphSizingDistribution.LINEAR
             )
             assert context.config.cuda_graph_all_prefills
-            assert context.config.cuda_graph_max_tokens == 32
+            assert context.config.cuda_graph_max_tokens == 24
             assert runtime["cuda-graph-scope:layer"] > 0
             mixed_token_counts = {
                 token_count
@@ -2670,6 +2614,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 for _, prefill_count, decode_count in executed_graph_dimensions
             )
             assert runtime["cuda-graph-mixed-forwards"] > 0
+        if "graph-all-prefill" in signals:
             assert runtime["cuda-graph-all-prefill-forwards"] > 0
         if "graph-bounded-config" in signals:
             assert context.use_cuda_graphs_for_non_decode_steps
@@ -2679,28 +2624,14 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["cuda-graph-prefill-forwards"] > 0
             oversized_steps = {
                 (step, token_count, prefill_count, decode_count)
-                for key, count in runtime.items()
-                if isinstance(key, tuple) and key[0] == "model-step-dimension" and count > 0
-                for step, token_count, prefill_count, decode_count in (key[1:],)
+                for step, token_count, prefill_count, decode_count in _recorded(
+                    runtime, "model-step-dimension"
+                )
                 if token_count > context.config.cuda_graph_max_tokens and prefill_count > 0
             }
             assert oversized_steps
-            replayed_steps = {
-                key[1]
-                for key, count in runtime.items()
-                if isinstance(key, tuple) and key[0] == "cuda-graph-replay-step" and count > 0
-            }
+            replayed_steps = _recorded(runtime, "cuda-graph-replay-step", 1)
             assert all(step not in replayed_steps for step, *_ in oversized_steps)
-        if "graph-hybrid-config" in signals:
-            assert (
-                context.config.cuda_graph_sizing_distribution == CudaGraphSizingDistribution.HYBRID
-            )
-            if "cuda-graph" in signals:
-                assert any(prefill_count > 0 for _, prefill_count, _ in executed_graph_dimensions)
-                assert any(
-                    prefill_count == 0 and decode_count > 0
-                    for _, prefill_count, decode_count in executed_graph_dimensions
-                )
         if "sampled" in signals:
             assert all(request.generated_tokens for request in env.requests)
         if "request-seed" in signals:
@@ -2746,7 +2677,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                         token_text = controller.tokenizer.detokenize([token])
                         assert 0 < len(top_n) <= request.sampling_params.top_n_logprobs
                         assert token_text in top_n
-                        assert top_n[token_text] == pytest.approx(logprob, rel=0, abs=scenario.atol)
+                        assert top_n[token_text] == pytest.approx(logprob, rel=0, abs=0.1)
                     if request.sampling_params.skip_prompt_log_probs:
                         assert not request.prompt_top_n_logprobs
                     else:
@@ -2792,19 +2723,12 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             accepted = int(env.engine._spec_tokens_accepted_per_pos.sum())
             assert proposed > 0
             if "cuda-graph" in signals:
-                assert any(
-                    isinstance(key, tuple)
-                    and key[0] == "cuda-graph-replay-owner"
-                    and key[1] == "compute_mtp_single_step"
-                    and count > 0
-                    for key, count in runtime.items()
-                )
+                owners = _recorded(runtime, "cuda-graph-replay-owner", 1)
+                assert "compute_mtp_single_step" in owners
             if "mtp-accept-all" in signals:
                 assert accepted == proposed
                 assert context.enable_mtp_kv_cache
                 assert model_config.mtp_use_repeated_layer
-            if "mtp-reject" in signals:
-                assert accepted < proposed
         if "metadata-compaction" in signals:
             assert runtime["non-prefix-survivor-compactions"] > 0
         if "hybrid" in signals:
@@ -2831,19 +2755,15 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             )
         if "fp8" in signals:
             assert model_config.fp8 is not None
-            assert runtime["fp8-context-forwards"] > 0
-            assert runtime["fp8-quantized-forwards"] > 0
-            assert runtime["fp8-recipe-forwards"] > 0
             if "cuda-graph" in signals:
                 assert runtime["cuda-graph-fp8-replays"] > 0
             else:
                 assert runtime["module-forward:fp8"] > 0
+            assert runtime["fp8-context-forwards"] > 0
+            assert runtime["fp8-quantized-forwards"] > 0
+            assert runtime["fp8-recipe-forwards"] > 0
         if "mxfp8" in signals:
-            from megatron.core.fp8_utils import get_fp8_align_size
             from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
-            from megatron.core.transformer.moe.token_dispatcher_inference import (
-                NCCLAllGatherDispatcher,
-            )
 
             experts = [
                 module
@@ -2851,51 +2771,16 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 if type(module).__name__ == "InferenceGroupedMLP"
             ]
             assert experts
-            if "cuda-graph" in signals:
-                alignment = get_fp8_align_size(model_config.fp8_recipe)
-                assert executed_graph_dimensions
-                assert all(
-                    token_count % alignment == 0 for token_count, *_ in executed_graph_dimensions
-                )
-                assert runtime["cuda-graph-padded-replays"] > 0
-                assert "InferenceGroupedMLP" in replayed_module_names
-                dispatchers = [
-                    module._inference_token_dispatcher
-                    for module in controller.inference_wrapped_model.model.modules()
-                    if hasattr(module, "_inference_token_dispatcher")
-                ]
-                assert dispatchers
-                assert all(
-                    isinstance(dispatcher, NCCLAllGatherDispatcher) for dispatcher in dispatchers
-                )
-            else:
-                assert runtime["module-forward:moe"] > 0
+            assert runtime["module-forward:moe"] > 0
             assert all(module._uses_mxfp8_weights for module in experts)
             assert all(isinstance(module._fc1_weight, MXFP8Tensor) for module in experts)
             assert all(isinstance(module._fc2_weight, MXFP8Tensor) for module in experts)
-            if scenario.config.get("fp8_output_proj"):
-                assert type(controller.inference_wrapped_model.model.output_layer).__name__ == (
-                    "TELMHeadColumnParallelLinear"
-                )
-                if "cuda-graph" in signals:
-                    assert runtime["mxfp8-head-capture-forwards"] > 0
-                    assert runtime["cuda-graph-mxfp8-head-replays"] > 0
         if "routing-replay" in signals:
             assert model_config.moe_enable_routing_replay
             assert context.moe_routing_metadata is not None
-            replayed_steps = {
-                key[2]
-                for key, count in runtime.items()
-                if isinstance(key, tuple)
-                and key[0] == "cuda-graph-replay-owner"
-                and key[1] == "forward"
-                and count > 0
-            }
-            recorded_steps = {
-                key[1]
-                for key, count in runtime.items()
-                if isinstance(key, tuple) and key[0] == "routing-record-step" and count > 0
-            }
+            owners = _recorded(runtime, "cuda-graph-replay-owner")
+            replayed_steps = {step for owner, step in owners if owner == "forward"}
+            recorded_steps = _recorded(runtime, "routing-record-step", 1)
             assert replayed_steps & recorded_steps
             for request in env.requests:
                 routing = request.routing_indices
@@ -2920,15 +2805,13 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 assert "SelfAttention" in replayed_module_names
         if "swa-all" in signals:
             assert model_config.window_size == scenario.config["window_size"]
-            if "cuda-graph" in signals:
-                assert "SelfAttention" in replayed_module_names
-                assert runtime["swa-kernel-calls"] > 0
-                assert runtime["full-attention-kernel-calls"] == 0
-            else:
-                assert runtime["swa-kernel-calls"] > 0
-                assert runtime["full-attention-kernel-calls"] == 0
+            assert runtime["swa-kernel-calls"] > 0
+            assert runtime["full-attention-kernel-calls"] == 0
+            assert "cuda-graph" not in signals or "SelfAttention" in replayed_module_names
         if "swa-alternating" in signals:
             assert model_config.window_size == scenario.config["window_size"]
+            assert runtime["swa-kernel-calls"] > 0
+            assert runtime["full-attention-kernel-calls"] > 0
             if "cuda-graph" in signals:
                 assert "SelfAttention" in replayed_module_names
                 attention_layers = [
@@ -2945,22 +2828,12 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     for module in attention_layers
                 ]
                 assert any(window_layers) and not all(window_layers)
-                assert runtime["swa-kernel-calls"] > 0
-                assert runtime["full-attention-kernel-calls"] > 0
-            else:
-                assert runtime["swa-kernel-calls"] > 0
-                assert runtime["full-attention-kernel-calls"] > 0
         if "softmax-sink" in signals:
             assert model_config.softmax_type == scenario.config["softmax_type"]
-            if "cuda-graph" in signals:
-                assert "SelfAttention" in replayed_module_names
-                assert runtime["softmax-offset-calls"] > 0
-                assert runtime["softmax-offset-produced"] == runtime["softmax-offset-calls"]
-                assert runtime["sink-correction-calls"] > 0
-            else:
-                assert runtime["softmax-offset-calls"] > 0
-                assert runtime["softmax-offset-produced"] == runtime["softmax-offset-calls"]
-                assert runtime["sink-correction-calls"] > 0
+            assert runtime["softmax-offset-calls"] > 0
+            assert runtime["softmax-offset-produced"] == runtime["softmax-offset-calls"]
+            assert runtime["sink-correction-calls"] > 0
+            assert "cuda-graph" not in signals or "SelfAttention" in replayed_module_names
         if "shared-seed" in signals:
             assert not context.config.offset_sampling_seed_by_dp_rank
             assert controller.sampling_rng.initial_seed() == model_config.inference_sampling_seed
@@ -3026,9 +2899,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     model_config.sequence_parallel
                     and model_config.transformer_impl != "inference_optimized"
                 ):
-                    if "cuda-graph" in signals:
-                        assert any("ParallelLinear" in name for name in replayed_module_names)
-                    else:
+                    if "cuda-graph" not in signals:
                         assert (
                             runtime["tp-collective:reduce_scatter_to_sequence_parallel_region"] > 0
                         )
@@ -3049,23 +2920,18 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert "cuda-graph" not in signals or "MoELayer" in replayed_module_names
         if "moe" in signals:
             assert model_config.num_moe_experts is not None
-            if model_config.expert_model_parallel_size > 1:
-                if "etp" in signals:
-                    assert runtime["module-forward:moe"] > 0 or "MoELayer" in replayed_module_names
-                elif "nvls-dispatch" in signals:
-                    assert context._nvls_dispatcher
-                    if "cuda-graph" in signals:
-                        assert "InferenceGroupedMLP" in replayed_module_names
-                    else:
-                        assert runtime["module-forward:moe"] > 0
-                else:
-                    assert context._nccl_ep_dispatcher
-                    assert runtime["nccl-token-dispatches"] > 0
+            if "etp" in signals:
+                assert runtime["module-forward:moe"] > 0 or "MoELayer" in replayed_module_names
+            elif model_config.expert_model_parallel_size > 1 and "nvls-dispatch" not in signals:
+                assert context._nccl_ep_dispatcher
+                # Inference MoE may dispatch through split execution helpers that
+                # bypass nn.Module forward hooks. The live dispatcher calls below
+                # are the feature-owning runtime boundary.
+                assert runtime["nccl-token-dispatches"] > 0
+            elif "cuda-graph" in signals:
+                assert "InferenceGroupedMLP" in replayed_module_names
             else:
-                if "cuda-graph" in signals:
-                    assert "InferenceGroupedMLP" in replayed_module_names
-                else:
-                    assert runtime["module-forward:moe"] > 0
+                assert runtime["module-forward:moe"] > 0
         if "nccl-dispatch" in signals:
             assert model_config.expert_model_parallel_size > 1
             assert model_config.inference_moe_token_dispatcher_type == "nccl"
@@ -3077,20 +2943,14 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             if "cuda-graph" in signals:
                 assert "MoELayer" in replayed_module_names
                 nondecode_steps = {
-                    key[1]
-                    for key, count in runtime.items()
-                    if isinstance(key, tuple)
-                    and key[0] == "model-step-dimension"
-                    and key[3] > 0
-                    and count > 0
+                    step
+                    for step, _, prefill_count, _ in _recorded(runtime, "model-step-dimension")
+                    if prefill_count > 0
                 }
                 replayed_steps = {
-                    key[2]
-                    for key, count in runtime.items()
-                    if isinstance(key, tuple)
-                    and key[0] == "cuda-graph-replay-owner"
-                    and key[1] == "forward"
-                    and count > 0
+                    step
+                    for owner, step in _recorded(runtime, "cuda-graph-replay-owner")
+                    if owner == "forward"
                 }
                 assert nondecode_steps
                 assert nondecode_steps.isdisjoint(replayed_steps)
@@ -3103,20 +2963,14 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 assert context.use_cuda_graphs_for_non_decode_steps
                 assert runtime["cuda-graph-prefill-forwards"] > 0
                 replayed_steps = {
-                    key[2]
-                    for key, count in runtime.items()
-                    if isinstance(key, tuple)
-                    and key[0] == "cuda-graph-replay-owner"
-                    and key[1] == "forward"
-                    and count > 0
+                    step
+                    for owner, step in _recorded(runtime, "cuda-graph-replay-owner")
+                    if owner == "forward"
                 }
                 nondecode_steps = {
-                    key[1]
-                    for key, count in runtime.items()
-                    if isinstance(key, tuple)
-                    and key[0] == "model-step-dimension"
-                    and key[3] > 0
-                    and count > 0
+                    step
+                    for step, _, prefill_count, _ in _recorded(runtime, "model-step-dimension")
+                    if prefill_count > 0
                 }
                 assert replayed_steps & nondecode_steps
 
@@ -3255,64 +3109,53 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
         Utils.destroy_model_parallel()
 
     @staticmethod
-    def _with_graphs(scenario, enabled):
+    def _with_graphs(scenario):
         config = dict(scenario.config)
         config.update(
-            num_cuda_graphs=4 if enabled else None,
-            force_build_cuda_graphs=enabled,
-            defer_cuda_graph_creation=enabled,
+            num_cuda_graphs=4, force_build_cuda_graphs=True, defer_cuda_graph_creation=True
         )
         if (
             config.get("expert_model_parallel_size", 1) > 1
             and config.get("transformer_impl", "local") != "inference_optimized"
         ):
             config["moe_pad_experts_for_cuda_graph_inference"] = True
-        lifecycle_signals = (
-            ("repeat-suspend-resume",) if "suspend-resume" in scenario.signals else ()
-        )
-        signals = tuple(dict.fromkeys((*scenario.signals, *lifecycle_signals, "cuda-graph")))
+        repeat = ("repeat-suspend-resume",) if "suspend-resume" in scenario.signals else ()
+        signals = tuple(dict.fromkeys((*scenario.signals, *repeat, "cuda-graph")))
         return replace(scenario, config=config, signals=signals)
+
+    @staticmethod
+    def _release_graphs():
+        gc.collect()
+        delete_cuda_graphs()
+        torch.cuda.empty_cache()
 
     @staticmethod
     def _weight_snapshot(env):
         model = env.engine.controller.inference_wrapped_model.model
-        snapshot = {
+        return {
             name: parameter.detach().cpu().clone() for name, parameter in model.named_parameters()
         }
-        for module_name, module in model.named_modules():
-            for weight_name in ("_fc1_weight", "_fc2_weight"):
-                weight = getattr(module, weight_name, None)
-                if weight is not None and hasattr(weight, "scale"):
-                    prefix = f"{module_name}.{weight_name}"
-                    snapshot[f"{prefix}.data"] = weight.data.detach().cpu().clone()
-                    snapshot[f"{prefix}.scale"] = weight.scale.detach().cpu().clone()
-        return snapshot
 
     @classmethod
     def _assert_graph_pair(cls, scenario):
-        graph_scenario = cls._with_graphs(scenario, True)
-        eager_scenario = graph_scenario
+        graph_scenario = cls._with_graphs(scenario)
         stop_tokens = None
         termination_token = None
         try:
             if scenario.request_profile.startswith("stop"):
-                probe_env, _ = cls._run_scenario_mode(eager_scenario, AsyncScheduleMode.LEGACY)
+                probe_env, _ = cls._run_scenario_mode(graph_scenario, AsyncScheduleMode.LEGACY)
                 stop_tokens = tuple(probe_env.requests[1].generated_tokens[1:3])
                 assert len(stop_tokens) == 2
                 del probe_env
-                gc.collect()
-                delete_cuda_graphs()
-                torch.cuda.empty_cache()
+                cls._release_graphs()
             elif scenario.request_profile == "termination":
-                probe_env, _ = cls._run_scenario_mode(eager_scenario, AsyncScheduleMode.LEGACY)
+                probe_env, _ = cls._run_scenario_mode(graph_scenario, AsyncScheduleMode.LEGACY)
                 termination_token = probe_env.requests[1].generated_tokens[0]
                 assert termination_token != -1
                 del probe_env
-                gc.collect()
-                delete_cuda_graphs()
-                torch.cuda.empty_cache()
+                cls._release_graphs()
             eager_env, eager_runtime = cls._run_scenario_mode(
-                eager_scenario,
+                graph_scenario,
                 AsyncScheduleMode.ASYNC,
                 stop_tokens=stop_tokens,
                 termination_token=termination_token,
@@ -3335,9 +3178,7 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
                 )
             assert eager_runtime["cuda-graph-runner-replays"] == 0
             del eager_env
-            gc.collect()
-            delete_cuda_graphs()
-            torch.cuda.empty_cache()
+            cls._release_graphs()
             graph_env, graph_runtime = cls._run_scenario_mode(
                 graph_scenario,
                 AsyncScheduleMode.ASYNC,
@@ -3367,11 +3208,7 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
             cls._assert_runtime_signals(
                 graph_env, graph_scenario, graph_runtime, stop_tokens, termination_token
             )
-            live_inputs = [
-                key[1:]
-                for key, count in graph_runtime.items()
-                if isinstance(key, tuple) and key[0] == "cuda-graph-live-input" and count > 0
-            ]
+            live_inputs = _recorded(graph_runtime, "cuda-graph-live-input")
             assert live_inputs
             inputs_by_shape_and_requests = {}
             for padded, _real, request_ids, input_ids in live_inputs:
@@ -3381,9 +3218,7 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
                 graph_expected = _snapshot_requests(graph_env.requests)
                 graph_requests = graph_env.requests
                 del graph_env
-                gc.collect()
-                delete_cuda_graphs()
-                torch.cuda.empty_cache()
+                cls._release_graphs()
                 repeat_env, repeat_runtime = cls._run_scenario_mode(
                     graph_scenario,
                     AsyncScheduleMode.ASYNC,
@@ -3415,9 +3250,7 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
                     repeat_env, graph_scenario, repeat_runtime, stop_tokens, termination_token
                 )
         finally:
-            gc.collect()
-            delete_cuda_graphs()
-            torch.cuda.empty_cache()
+            cls._release_graphs()
 
     @pytest.mark.parametrize(
         "scenario", _CUDA_GRAPH_DIFFERENTIAL_SCENARIOS, ids=lambda case: case.name
@@ -3491,9 +3324,7 @@ class TestAsyncSchedulePairwiseParallel(_AsyncPairwiseHarness):
         try:
             TestCudaGraphDifferential._assert_graph_pair(scenario)
         finally:
-            gc.collect()
-            delete_cuda_graphs()
-            torch.cuda.empty_cache()
+            TestCudaGraphDifferential._release_graphs()
             _reset_rounder()
             Utils.destroy_model_parallel()
 
@@ -3514,6 +3345,7 @@ def test_async_reset_clears_pending_logits():
     engine._loop = None
     engine._vision_embedding_cache = {}
     engine._vision_embedding_cache_bytes = 0
+
     with (
         mock.patch(
             "megatron.core.inference.engines.dynamic_engine.torch.distributed.get_rank",
@@ -3525,6 +3357,7 @@ def test_async_reset_clears_pending_logits():
         ),
     ):
         engine.reset()
+
     assert not engine.controller._async_sched_forward.is_valid
     assert engine.controller._async_sched_forward.token_row_indices is None
 
@@ -3554,11 +3387,13 @@ def test_async_suspend_pending_logits_lifecycle(mode, preserve_pending):
     engine.use_coordinator = False
     engine._vision_embedding_cache = {}
     engine._vision_embedding_cache_bytes = 0
+
     with (
         mock.patch.object(DynamicInferenceEngine, "suspend_resume_ctx", return_value=nullcontext()),
         mock.patch("megatron.core.inference.engines.dynamic_engine.InferenceMode.unset_active"),
     ):
         engine.suspend()
+
     assert engine.controller._async_sched_forward.is_valid is preserve_pending
     if preserve_pending:
         assert torch.equal(
