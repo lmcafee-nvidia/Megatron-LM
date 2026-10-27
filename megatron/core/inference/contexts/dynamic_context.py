@@ -917,7 +917,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 use_cuda_graphs_for_non_decode_steps=self.use_cuda_graphs_for_non_decode_steps,
                 num_speculative_tokens=self.num_speculative_tokens,
                 sizing_distribution=inference_config.cuda_graph_sizing_distribution,
-                token_alignment=cuda_graph_token_alignment,
             )
         )
 
