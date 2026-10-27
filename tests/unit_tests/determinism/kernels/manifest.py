@@ -403,7 +403,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="moe_batch_invariant_unpermute",
         sources=("megatron/core/transformer/moe/batch_invariant.py",),
-        tests=("tests/unit_tests/transformer/moe/test_moe_batch_invariant.py",),
+        tests=(
+            "tests/unit_tests/transformer/moe/test_moe_batch_invariant.py",
+            K + "test_moe_kernels.py",
+        ),
         kind="torch-op",
     ),
     KernelEntry(

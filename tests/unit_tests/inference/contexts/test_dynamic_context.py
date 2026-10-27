@@ -135,6 +135,27 @@ def _token_major_activations(num_rows: int, contiguous: bool = True) -> torch.Te
 CONTIGUITY = pytest.mark.parametrize("contiguous", [True, False], ids=["kernel", "fallback"])
 
 
+def test_dynamic_context_rejects_context_parallelism_before_allocating_cache():
+    """A real CP=2 group must be rejected instead of building a CP-unaware KV cache."""
+    if Utils.world_size < 2:
+        pytest.skip("context parallelism needs at least two ranks")
+    Utils.initialize_model_parallel(context_parallel_size=2)
+    try:
+        model_config = TransformerConfig(
+            params_dtype=torch.bfloat16,
+            num_layers=1,
+            hidden_size=32,
+            kv_channels=8,
+            num_attention_heads=4,
+            context_parallel_size=2,
+        )
+
+        with pytest.raises(ValueError, match="does not support context parallelism"):
+            DynamicInferenceContext(model_config, InferenceConfig(buffer_size_gb=0.01))
+    finally:
+        Utils.destroy_model_parallel()
+
+
 def test_zero_padding_rows_module_supports_missing_triton(monkeypatch):
     """The torch fallback remains importable and functional without Triton installed."""
     module_name = f"{zero_padding_rows_kernel.__name__}_without_triton"
@@ -324,6 +345,76 @@ class TestDynamicContext:
     @classmethod
     def teardown_class(cls):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    def test_ep1_nvls_masks_cuda_graph_padding_routes(self, monkeypatch):
+        from megatron.core.activations import squared_relu
+        from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        monkeypatch.setattr(
+            NVLSAllGatherVDispatcher,
+            "_real_token_count_tensor",
+            NVLSAllGatherVDispatcher._real_token_count_tensor,
+        )
+        model_config = TransformerConfig(
+            params_dtype=torch.bfloat16,
+            num_layers=1,
+            hidden_size=32,
+            ffn_hidden_size=64,
+            moe_ffn_hidden_size=64,
+            kv_channels=8,
+            num_attention_heads=4,
+            normalization="RMSNorm",
+            add_bias_linear=False,
+            num_moe_experts=2,
+            moe_router_topk=1,
+            moe_router_pre_softmax=True,
+            moe_router_dtype="fp32",
+            activation_func=squared_relu,
+            transformer_impl="inference_optimized",
+            inference_grouped_gemm_backend="torch",
+            inference_moe_token_dispatcher_type="nvls",
+        )
+        context = DynamicInferenceContext(
+            model_config=model_config,
+            inference_config=InferenceConfig(
+                max_sequence_length=32,
+                buffer_size_gb=0.02,
+                block_size_tokens=8,
+                max_tokens=16,
+                max_requests=4,
+                unified_memory_level=0,
+            ),
+        )
+        assert context._nvls_dispatcher
+        assert not context._nvls_ep_dispatcher
+        assert (
+            NVLSAllGatherVDispatcher._real_token_count_tensor.data_ptr()
+            == context.gpu_view.real_token_count.data_ptr()
+        )
+
+        dispatcher = NVLSAllGatherVDispatcher(
+            num_local_experts=2,
+            local_expert_indices=[0, 1],
+            config=model_config,
+            pg_collection=get_default_pg_collection(),
+        )
+        hidden = torch.randn(8, 32, device="cuda", dtype=torch.bfloat16)
+        probs = torch.ones(8, 1, device="cuda", dtype=torch.float32)
+        original_routes = torch.arange(8, device="cuda", dtype=torch.int64).remainder(2)[:, None]
+        dispatcher.routing_map = original_routes.clone()
+        context.gpu_view.real_token_count.fill_(3)
+
+        dispatched_hidden, dispatched_probs = dispatcher.token_dispatch(hidden, probs)
+        torch.cuda.synchronize()
+
+        assert dispatched_hidden is hidden
+        assert dispatched_probs is probs
+        torch.testing.assert_close(dispatcher.routing_map[:3], original_routes[:3])
+        assert torch.all(dispatcher.routing_map[3:] == -1)
 
     @pytest.mark.internal
     def test_prefill_batch_never_advertises_max_seqlen_q_of_one(self):

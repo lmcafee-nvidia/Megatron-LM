@@ -45,6 +45,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
+from megatron.core.transformer.attention import HAVE_FMLA
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.utils import is_layer_window_attention
@@ -724,6 +725,24 @@ _ASYNC_PAIR_SCENARIOS = (
         atol=5.0e-3,
     ),
     _pair_scenario(
+        "mla-moe",
+        "model:mla-moe",
+        "attention:flashmla",
+        "implementation:inference-optimized",
+        config={
+            **_OPTIMIZED_MOE_CONFIG,
+            "multi_latent_attention": True,
+            "hidden_size": 256,
+            "context_block_size_tokens": 64,
+            "position_embedding_type": "rope",
+            "use_flashinfer_fused_rope": False,
+            "flash_attention_version": 3,
+        },
+        signals=("ep1-moe", "inference-optimized", "mla"),
+        prerequisite="flashmla",
+        atol=5.0e-3,
+    ),
+    _pair_scenario(
         "local-moe",
         "model:moe",
         "implementation:local",
@@ -1024,6 +1043,9 @@ def _check_scenario_prerequisite(scenario):
     elif scenario.prerequisite == "gdn":
         if not HAVE_FLA:
             pytest.skip("GDN dynamic inference requires flash-linear-attention")
+    elif scenario.prerequisite == "flashmla":
+        if not HAVE_FMLA:
+            pytest.skip("MLA dynamic decode requires FlashMLA")
     elif scenario.prerequisite == "transformer-engine":
         if not is_te_min_version("2.2.0"):
             pytest.skip("Transformer Engine 2.2.0 is required")
@@ -1579,6 +1601,37 @@ def _instrument_scenario_runtime(env, scenario, runtime):
         module_name = type(module).__module__
         if "softmax-sink" in scenario.signals and class_name == "SelfAttention":
             _instrument_attention_runtime(module, runtime)
+        if "mla" in scenario.signals and class_name == "MLASelfAttention":
+            original_mla_attention = module.flash_decode_and_prefill
+            original_prepare_for_absorption = module.prepare_for_absorption
+            norm_hook_state = {"installed": False}
+
+            def traced_prepare_for_absorption(
+                _original=original_prepare_for_absorption, _module=module, _state=norm_hook_state
+            ):
+                result = _original()
+                if not _state["installed"]:
+
+                    def trace_norm_input(_norm, args):
+                        runtime["mla-kv-norm-inputs"] += 1
+                        runtime["mla-kv-norm-device-mismatches"] += int(
+                            _norm.weight.device != args[0].device
+                        )
+
+                    _module.kv_layernorm.register_forward_pre_hook(trace_norm_input)
+                    _state["installed"] = True
+                return result
+
+            def traced_mla_attention(*args, _original=original_mla_attention, **kwargs):
+                result = _original(*args, **kwargs)
+                step = runtime["model-forward"] + 1
+                runtime[("mla-attention-step", step)] += 1
+                is_decode_only = kwargs.get("is_decode_only", args[9] if len(args) > 9 else False)
+                runtime["flash-mla-decode"] += int(is_decode_only)
+                return result
+
+            module.prepare_for_absorption = traced_prepare_for_absorption
+            module.flash_decode_and_prefill = traced_mla_attention
         if "parallel" in scenario.signals and (
             "ColumnParallelLinear" in class_name or "RowParallelLinear" in class_name
         ):
@@ -2213,6 +2266,24 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["mamba-state-commits"] > 0
             assert runtime["mamba-state-compactions"] > 0
             assert runtime["module-forward:hybrid"] > 0
+        if "mla" in signals:
+            assert model_config.multi_latent_attention
+            assert model_config.cache_mla_latents
+            assert context.cache_mla_latent
+            assert runtime["flash-mla-decode"] > 0
+            assert runtime["mla-kv-norm-inputs"] > 0
+            assert runtime["mla-kv-norm-device-mismatches"] == 0
+            mla_steps = {
+                key[1]
+                for key, count in runtime.items()
+                if isinstance(key, tuple) and key[0] == "mla-attention-step" and count > 0
+            }
+            expert_steps = {
+                key[1]
+                for key, count in runtime.items()
+                if isinstance(key, tuple) and key[0] == "moe-expert-step" and count > 0
+            }
+            assert mla_steps == expert_steps
         if "transformer-engine" in signals:
             assert model_config.transformer_impl == "transformer_engine"
             assert runtime["module-forward:transformer-engine"] > 0

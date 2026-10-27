@@ -380,6 +380,23 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
     def __init__(self, model_config: TransformerConfig, inference_config: InferenceConfig):
         super().__init__(inference_config=inference_config)
 
+        # Dynamic inference owns a replicated paged KV cache and feeds complete
+        # request sequences directly to FlashAttention. It does not partition or
+        # gather those sequences across a context-parallel group. Reject CP here,
+        # including the direct engine path that bypasses inference-shard parsing,
+        # rather than silently returning results from an unsupported layout.
+        pg_collection = inference_config.pg_collection
+        configured_cp_size = (
+            get_pg_size(pg_collection.cp)
+            if pg_collection is not None
+            else model_config.context_parallel_size
+        )
+        if model_config.context_parallel_size != 1 or configured_cp_size != 1:
+            raise ValueError(
+                "Dynamic inference does not support context parallelism; "
+                "context_parallel_size and the CP process group must both have size 1."
+            )
+
         # Prefix caching configuration
         self.enable_prefix_caching = inference_config.enable_prefix_caching
         self.prefix_caching_eviction_policy = inference_config.prefix_caching_eviction_policy
@@ -428,7 +445,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # Per partition num heads and hidden size.
         num_attention_heads = model_config.num_query_groups or model_config.num_attention_heads
         projection_size = model_config.kv_channels * num_attention_heads
-        pg_collection = inference_config.pg_collection
         if pg_collection is not None:
             tp_size = get_pg_size(pg_collection.tp)
             pp_size = get_pg_size(pg_collection.pp)
@@ -858,10 +874,16 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             and model_config.inference_moe_token_dispatcher_type == 'nccl'
         )
 
-        # are we using the inference_optimized nvls ep dispatcher for MoEs?
+        # Are optimized MoE layers using the NVLS dispatcher? Even EP=1 needs
+        # this flag so the dispatcher receives the real-token-count tensor and
+        # can mask CUDA-graph padding before its communication-free early return.
         self._nvls_dispatcher = (
-            get_pg_size(self.expert_model_parallel_group) > 1
+            model_config.num_moe_experts is not None
+            and model_config.transformer_impl == "inference_optimized"
             and model_config.inference_moe_token_dispatcher_type == 'nvls'
+        )
+        self._nvls_ep_dispatcher = (
+            get_pg_size(self.expert_model_parallel_group) > 1 and self._nvls_dispatcher
         )
 
         # are we using the training a2a dispatcher for MoEs?
@@ -919,8 +941,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # setup, which is harmless.
         InferenceAllGatherDispatcherBase.allocate_valid_tokens_tensor()
         if self._nccl_ep_dispatcher:
+            # The optimized dispatcher is process-global. Switching a replacement
+            # engine from NVLS to NCCL must release the prior symmetric generation.
+            NVLSAllGatherVDispatcher.release_buffers()
             NCCLAllGatherDispatcher.allocate_buffers()
-        elif self._nvls_dispatcher:
+        elif self._nvls_ep_dispatcher:
             # Use moe_latent_size if set (latent MoE: SuperV3, UltraV3), else hidden_size.
             moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
             NVLSAllGatherVDispatcher.allocate_buffers(
@@ -929,6 +954,16 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 hidden_size=moe_hidden_size,
                 ep_group=self.expert_model_parallel_group,
             )
+        elif self._nvls_dispatcher:
+            # Replacing an EP>1 engine with EP1 must not retain its symmetric
+            # allocation or process-group generation. EP1 needs only the route mask.
+            NVLSAllGatherVDispatcher.release_buffers()
+        elif (
+            model_config.num_moe_experts is not None
+            and model_config.transformer_impl == "inference_optimized"
+        ):
+            # EP1 NCCL likewise owns no symmetric storage.
+            NVLSAllGatherVDispatcher.release_buffers()
 
         # Pre-allocate the vLLM fused-MoE intermediates so no allocation happens
         # inside CUDA graph capture; one buffer set is shared by all MoE layers

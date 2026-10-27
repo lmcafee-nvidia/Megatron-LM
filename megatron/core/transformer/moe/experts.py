@@ -1397,13 +1397,17 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self._uses_mxfp8_weights: bool | None = None
         self._nvfp4_recipe = config.inference_moe_nvfp4_recipe
         self._nvfp4_weights = None
+        self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
 
         if HAVE_FLASHINFER:
             self._flashinfer_activation_type = self._resolve_flashinfer_activation_type()
 
-        self._mcore_activation_type = self._resolve_mcore_activation_type()
+        self._mcore_activation_type = (
+            None
+            if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+            else self._resolve_mcore_activation_type()
+        )
         self._activation_clamp_scale = config.activation_func_tanh_clamp_scale
-        self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
         self._nvls_dispatcher = config.inference_moe_token_dispatcher_type == 'nvls'
         self._flashinfer_mxfp8_token_capacity = config.inference_flashinfer_mxfp8_token_capacity
 
@@ -1608,6 +1612,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
         prepare_routed_nvfp4_weights(self._fc1_weight, self._fc2_weight, out=self._nvfp4_weights)
         return True
 
+    def refresh_cache(self) -> None:
+        """Refresh parameter-derived routed weights after an in-place refit."""
+        self.refresh_flashinfer_mxfp8_weights()
+        self.refresh_flashinfer_nvfp4_weights()
+
     @torch.inference_mode(False)  # needed for non-colocated inference.
     def _build_concatenated_weights(self):
         """Create big contiguous weight tensors that share storage with TE's per-expert parameters.
@@ -1725,6 +1734,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             disable_fused_quant_kernels=self.config.inference_moe_disable_fused_quant_kernels,
             out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
             activation_clamp_scale=self._activation_clamp_scale,
+            fused_weighted_squared_relu=self.config.use_fused_weighted_squared_relu,
         )
         return output, None
 
@@ -1744,6 +1754,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
             num_tokens_hint=InferenceAllGatherDispatcherBase._get_host_valid_tokens_estimate(),
             activation_clamp_scale=self._activation_clamp_scale,
+            fused_weighted_squared_relu=self.config.use_fused_weighted_squared_relu,
         )
         return output, None
 
