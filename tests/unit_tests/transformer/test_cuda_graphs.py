@@ -2269,6 +2269,7 @@ class TestInlineCaptureManager:
         config = self._make_config()
         module = _make_simple_module(config)
         x = torch.randn(4, config.hidden_size, device="cuda")
+        module.my_op(x)  # Initialize kernels and libraries before stream capture.
         mgr = CudaGraphManager(
             config,
             base_module=module,
