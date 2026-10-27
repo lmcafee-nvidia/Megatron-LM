@@ -22,6 +22,7 @@ from megatron.core.inference.config import (
     VideoProcessingConfig,
 )
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+from megatron.core.inference.engine_factory import build_dynamic_inference_engine
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.inference_request import (
     PREFIX_EXPANDED_TOKEN_COUNT_FIELD,
@@ -1175,8 +1176,14 @@ def test_real_media_executes_moe_router_with_configured_expert_topology(model_pa
 def test_dynamic_vlm_rejects_context_parallelism(model_parallel):
     model = _build_te_parallel_model(model_parallel)
     assert model.config.context_parallel_size == 2
+    # The production factory never calls prep_model_for_inference.
     with pytest.raises(NotImplementedError, match="Context parallelism is not supported"):
-        _build_engine("image", model=model)
+        build_dynamic_inference_engine(
+            model=model,
+            tokenizer=None,
+            inference_config=_inference_config(model),
+            inference_wrapper_cls=VLMInferenceWrapper,
+        )
 
 
 @pytest.mark.parametrize("model_parallel", ["tp", "dp", "ep", "etp", "opt"], indirect=True)
