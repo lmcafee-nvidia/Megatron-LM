@@ -1083,6 +1083,28 @@ _CUDA_GRAPH_VARIANT_SCENARIOS = (
         signals=("request-seed",),
     ),
     _variant("flashinfer-fused-rope", "flashinfer-fused-rope-exact", parity="exact"),
+    _variant(
+        "fp8-transformer-engine",
+        "fp8-transformer-engine-delayed",
+        "precision:fp8-delayed",
+        config={"fp8_recipe": "delayed"},
+        signals=("fixed-history-logits",),
+        atol=0.0,
+        parity="exact",
+    ),
+    # Current and block scaling replay through the runner's own recipe.
+    *(
+        _variant(
+            "fp8-transformer-engine",
+            f"fp8-transformer-engine-{recipe}",
+            f"precision:fp8-{recipe}",
+            config={"fp8_recipe": recipe},
+            signals=("fixed-history-logits",),
+            atol=0.0,
+            parity="exact",
+        )
+        for recipe in ("tensorwise", "blockwise")
+    ),
 )
 
 
@@ -1173,6 +1195,11 @@ def _check_scenario_prerequisite(scenario):
         available, reason = check_fp8_support()
         if not available:
             pytest.skip(reason)
+        if (
+            scenario.config.get("fp8_recipe") == "blockwise"
+            and torch.cuda.get_device_capability()[0] != 9
+        ):
+            pytest.skip("FP8 blockwise scaling is supported only on Hopper")
     elif scenario.prerequisite == "torch-memory-saver":
         pytest.importorskip("torch_memory_saver")
     elif scenario.prerequisite == "mxfp8":
@@ -1480,6 +1507,7 @@ def _instrument_cuda_graph_replays(model, context, runtime):
             replayed_module_names = tuple(
                 sorted({type(module).__name__ for module in replayed_modules})
             )
+            fp8_runtime_enabled = bool(runner.fp8_enabled)
 
             def traced_replay(
                 is_first_microbatch,
@@ -1488,6 +1516,7 @@ def _instrument_cuda_graph_replays(model, context, runtime):
                 _original=original_replay,
                 _runner=runner,
                 _module_names=replayed_module_names,
+                _fp8_runtime_enabled=fp8_runtime_enabled,
                 _owner=owner,
             ):
                 if runtime["cuda-graph-capture-active"]:
@@ -1497,6 +1526,7 @@ def _instrument_cuda_graph_replays(model, context, runtime):
                 dimension = (padded.token_count, padded.prefill_req_count, padded.decode_req_count)
                 step_key = ("cuda-graph-replay-step", context.step_count, *dimension)
                 runtime["cuda-graph-runner-replays"] += 1
+                runtime["cuda-graph-fp8-replays"] += int(_fp8_runtime_enabled)
                 runtime["cuda-graph-real-token-scalar-matches"] += int(
                     int(context.gpu_view.real_token_count.item()) == real.token_count
                 )
@@ -2185,7 +2215,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     isinstance(key, tuple)
                     and key[0] in ("cuda-graph-warmup-steps", "flash-attention-version")
                 )
-                or (isinstance(key, str) and key.startswith("nccl-"))
+                or (isinstance(key, str) and key.startswith(("nccl-", "fp8-")))
             }
             runtime.clear()
             runtime.update(capture_evidence)
@@ -2802,7 +2832,10 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             )
         if "fp8" in signals:
             assert model_config.fp8 is not None
-            assert runtime["module-forward:fp8"] > 0
+            if "cuda-graph" in signals:
+                assert runtime["cuda-graph-fp8-replays"] > 0
+            else:
+                assert runtime["module-forward:fp8"] > 0
             assert runtime["fp8-context-forwards"] > 0
             assert runtime["fp8-quantized-forwards"] > 0
             assert runtime["fp8-recipe-forwards"] > 0
