@@ -778,6 +778,19 @@ _ASYNC_SUSPEND_RESUME_SCENARIOS = (
         config={"kv_cache_management_mode": "recompute", "static_kv_memory_pointers": False},
         signals=("recompute", "suspend-resume"),
     ),
+    _pair_scenario(
+        "offload-graph-recapture-suspend-resume",
+        "kv:offload",
+        "graph:recapture",
+        config={
+            "kv_cache_management_mode": "offload",
+            "static_kv_memory_pointers": False,
+            "num_cuda_graphs": 4,
+            "force_build_cuda_graphs": True,
+            "use_cuda_graphs_for_non_decode_steps": False,
+        },
+        signals=("cuda-graph", "graph-recapture", "offload", "suspend-resume"),
+    ),
 )
 
 _ASYNC_PARALLEL_SCENARIOS = (
@@ -1580,7 +1593,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 assert runtime["pending-after-resume"] == 0
             else:
                 assert runtime["pending-after-suspend"] == 1
-                assert runtime["pending-after-resume"] == 1
+                # Recapture overwrites the graph buffers that the pending forward reads.
+                assert runtime["pending-after-resume"] == int("graph-recapture" not in signals)
             if "static-pointers" in signals:
                 assert runtime["static-pointer-preserved"] == 1
         if "dp-offset" in signals:
