@@ -4937,9 +4937,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if new_generation_epoch is not None:
             if new_generation_epoch != self._generation_epoch:
-                # Pending async logits were computed by the previous policy.
-                # Never allow sampling from them after a refit epoch boundary.
-                self.controller._async_sched_forward.clear()
                 self._invalidate_vision_state()
                 # Unlike suspend/resume, an epoch transition does not naturally
                 # re-admit requests. Refresh active request-local state here so
