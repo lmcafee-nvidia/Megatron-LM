@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import asyncio
+import copy
 import importlib
 import os
 import sys
@@ -244,11 +245,12 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
     )
     async def test_direct_and_real_adapter_greedy_outputs_match(self, feature_config):
         BatchedDataDict, mixin_cls = _load_nemo_rl_adapter()
+        stresses_chunking = feature_config.get("enable_chunked_prefill", False)
         stresses_prefix = feature_config.get("enable_prefix_caching", False)
         adapter_sampling = feature_config.get("adapter_sampling")
         uses_mxfp8 = feature_config.get("mxfp8", False)
         if stresses_prefix:
-            prefix_len, suffix_lens = 256, (2, 4)
+            prefix_len, suffix_lens = (256, (258, 260)) if stresses_chunking else (256, (2, 4))
             shared_prefix = [index % 89 + 1 for index in range(prefix_len)]
             prompts = [
                 shared_prefix + [(index + shift) % 89 + 1 for index in range(length)]
@@ -288,6 +290,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             "adapter_submissions": [],
             "model_request_ids": [],
             "sampler_request_ids": [],
+            "chunked_prefill_request_ids": [],
             "cuda_graph_request_ids": [],
             "mtp_request_ids": [],
             "fused_rope_request_ids": [],
@@ -357,6 +360,10 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             )
             for _ in prompts
         ]
+        if stresses_chunking:
+            warm_params = copy.deepcopy(direct_params[0])
+            warm_params.num_tokens_to_generate = 1
+            await _drive_engine(engine, [engine.add_request(90, shared_prefix, warm_params)])
         direct_futures = [
             engine.add_request(request_id, prompt, params)
             for request_id, prompt, params in zip(
@@ -364,9 +371,23 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             )
         ]
         direct = await _drive_engine(engine, direct_futures)
+        if stresses_chunking:
+            assert torch.is_inference(engine.context.request_ids)
+            engine.reset()
+            await _drive_engine(
+                engine, [engine.add_request(190, shared_prefix, copy.deepcopy(warm_params))]
+            )
         engine._prefill_tokens_skipped = 0
         witness["mtp_request_ids"].clear()
         witness["fused_rope_request_ids"].clear()
+        original_schedule = engine.schedule_waiting_requests
+
+        def traced_schedule():
+            original_schedule()
+            if (request_id := engine.context.chunked_prefill_request_id) >= 0:
+                witness["chunked_prefill_request_ids"].append(int(request_id))
+
+        engine.schedule_waiting_requests = traced_schedule
         adapter = object.__new__(mixin_cls)
         adapter.cfg = {
             "generation": {
@@ -457,6 +478,10 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             assert rows and all(row[0] == row[expected_index] for row in rows)
             assert any(padded > selected for _, padded, selected in rows)
         assert engine.context.async_sched_step_count > 0
+        if stresses_chunking:
+            assert witness["chunked_prefill_request_ids"]
+            assert set(witness["chunked_prefill_request_ids"]) <= adapter_ids
+            assert engine._prefill_tokens_skipped > 0
         if stresses_prefix:
             allocator = engine.context.kv_block_allocator
             assert engine._prefill_tokens_skipped > 0
