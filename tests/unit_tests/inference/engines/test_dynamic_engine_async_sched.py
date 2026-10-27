@@ -2291,7 +2291,6 @@ _DIAG_EP2_RECAPTURE = _pair_scenario(
         "use_moe_layer_spec": True,
         "inference_moe_token_dispatcher_type": "nccl",
         "transformer_impl": "inference_optimized",
-        "moe_pad_experts_for_cuda_graph_inference": True,
         "kv_cache_management_mode": "offload",
         "static_kv_memory_pointers": False,
         "num_cuda_graphs": 4,
