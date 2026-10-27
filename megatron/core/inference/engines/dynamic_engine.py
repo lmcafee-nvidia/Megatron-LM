@@ -1225,9 +1225,7 @@ class DynamicInferenceEngine(AbstractEngine):
                                 context.mtp_metadata.advance_decode_step()
                             context.mtp_metadata.end_forward()
 
-                context.reset(
-                    preserve_prefix_cache=not reset_context, preserve_counters=not reset_context
-                )
+                context.reset()
 
             # Per-iteration memory accounting, scoped to the CUDA-graph mempool.
             # This isolates pool growth from process-wide scratch churn (KV cache,
@@ -1733,26 +1731,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST
                 and not self.context.static_kv_memory_pointers
             ):
-                if (
-                    self.inference_cuda_graph_scope != InferenceCudaGraphScope.none
-                    and self.cuda_graph_impl == "local"
-                    and self.context.cuda_graph_batch_dimensions_list
-                ):
-                    # Capture overwrites the graph buffers that a pending async forward
-                    # reads, so recompute that step after resume instead of sampling it.
-                    self.controller._async_sched_forward.clear()
-                live_state = None
-                if (
-                    self.context.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
-                    and self.context.total_request_count > 0
-                ):
-                    live_state = self.context._snapshot_live_request_state_for_graph_recapture()
-                    self.context.reset(preserve_prefix_cache=True, preserve_counters=True)
-                try:
-                    self.create_cuda_graphs(reset_context=live_state is None)
-                finally:
-                    if live_state is not None:
-                        self.context._restore_live_request_state_after_graph_recapture(live_state)
+                self.create_cuda_graphs()
             capture_time = time.time() - capture_time
 
             # Request records outlive the context buffers. Refresh every stale
