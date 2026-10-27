@@ -3651,7 +3651,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 assert usage["total_tokens"] == sum(map(len, prompts)) + 36
                 assert usage["prompt_tokens_details"]["cached_tokens"] >= len(shared_prefix)
 
-                # Cross live Quart completion/chat; each nonstream response is the SSE oracle.
+                # Live Quart completions and chat: each non-streamed response is the reference
+                # for the matching stream.
                 quart = pytest.importorskip("quart")
                 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.chat_completions import (
                     bp as chat_completions_bp,
@@ -3749,7 +3750,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                             "cached_tokens"
                         ]
                         stream_cached = usage_records[0]["prompt_tokens_details"]["cached_tokens"]
-                        # The final-response oracle can warm blocks for the matching stream.
+                        # The non-streamed reference can warm blocks for the matching stream.
                         assert final_cached > 0
                         assert stream_cached >= final_cached
 
