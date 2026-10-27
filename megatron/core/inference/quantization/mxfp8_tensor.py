@@ -146,7 +146,7 @@ def get_mxfp8_scale_bytes(tensor: "MXFP8Tensor") -> torch.Tensor:
     scale = tensor.scale.view(torch.uint8).reshape(
         padded_rows // MXFP8_SCALE_ROW_BLOCK, padded_scale_cols // MXFP8_SCALE_COL_BLOCK, 32, 4, 4
     )
-    logical = scale.permute(0, 3, 2, 1, 4).contiguous().reshape(padded_rows, padded_scale_cols)
+    logical = tensor.scale.view(torch.uint8).reshape(padded_rows, padded_scale_cols)  # CONTROL
     return logical[:rows, :scale_cols]
 
 
