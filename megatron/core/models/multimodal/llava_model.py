@@ -1266,11 +1266,8 @@ class LLaVAModel(MegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        # Encoder-only calls explicitly refresh media embeddings; decoder KV metadata from a
-        # prior request must not suppress that work.
         use_inference_kv_cache = (
-            self.add_decoder
-            and inference_context is not None
+            inference_context is not None
             and hasattr(inference_context, 'key_value_memory_dict')
             and (
                 "image_tokens_count" in inference_context.key_value_memory_dict
