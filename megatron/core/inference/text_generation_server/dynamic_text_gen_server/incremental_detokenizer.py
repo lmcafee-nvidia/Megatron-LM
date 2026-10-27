@@ -6,7 +6,7 @@
 import logging
 from typing import Any
 
-from megatron.core.inference.utils import model_eos_token_ids
+from megatron.core.inference.utils import detokenize_tokens, model_eos_token_ids
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +21,8 @@ class HuggingFaceFastIncrementalDetokenizer:
     until equivalent incremental decoders exist for the other tokenizer backends.
     """
 
-    def __init__(self, tokenizer: Any, prompt_token_ids: list[int]) -> None:
+    def __init__(self, tokenizer: Any, prompt_token_ids: list[int], *, remove_eos=True) -> None:
+        del remove_eos  # control shim: the pre-fix detokenizer always drops EOS
         try:
             import tokenizers
             from transformers import PreTrainedTokenizerFast
@@ -66,6 +67,10 @@ class HuggingFaceFastIncrementalDetokenizer:
     def _kept(self, token_ids: list[int]) -> list[int]:
         return [token_id for token_id in token_ids if token_id not in self._skipped_token_ids]
 
+    def finish(self) -> str:
+        """Control shim: the pre-fix detokenizer has no end-of-stream flush."""
+        return ""
+
     def update(self, token_ids: list[int]) -> str:
         """Decode token IDs and return only newly stable text."""
         fragments = []
@@ -106,3 +111,9 @@ class HuggingFaceFastIncrementalDetokenizer:
     def text_length(self) -> int:
         """Return the number of emitted characters."""
         return self._text_length
+
+
+def detokenize_generated_tokens(tokenizer, prompt_token_ids, generated_token_ids, *, remove_eos=True):
+    """Control shim: the pre-fix completed-response decoding, without prompt context."""
+    del prompt_token_ids
+    return detokenize_tokens(tokenizer, generated_token_ids, remove_EOD=remove_eos)
