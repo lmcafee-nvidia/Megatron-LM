@@ -9,7 +9,7 @@ from megatron.core.inference.communication_utils import (
     is_pipeline_last_stage,
 )
 from megatron.core.inference.config import MediaPromptSpec, MultimodalPromptConfig
-from megatron.core.inference.contexts import BaseInferenceContext, StaticInferenceContext
+from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
@@ -36,24 +36,6 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         image_spec=_media_prompt_spec, video_spec=_media_prompt_spec
     )
 
-    def __init__(self, model, inference_context: Optional[BaseInferenceContext] = None):
-        super().__init__(model, inference_context)
-        # The dynamic engine never calls prep_model_for_inference, so reject unsupported
-        # models when the wrapper is built.
-        self._reject_dynamic_context_parallelism()
-
-    def _reject_dynamic_context_parallelism(self):
-        """Reject context parallelism, which dynamic VLM inference does not support."""
-        if (
-            self.inference_context.is_dynamic_batching()
-            and getattr(self.config, "context_parallel_size", 1) > 1
-        ):
-            raise NotImplementedError(
-                "Context parallelism is not supported for dynamic VLM inference: the "
-                "paged-attention request metadata describes the whole sequence, while LLaVA "
-                "shards the language sequence across context-parallel ranks."
-            )
-
     def get_preexpanded_media_token_id(self, modality: str) -> int:
         """Return LLaVA's internal sentinel without exposing it as a vocabulary ID."""
         del modality
@@ -75,8 +57,15 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
                 "This parameter will be removed in `megatron-core` 0.13."
             )
 
-        # The static engine swaps in a dynamic context and then calls this method.
-        self._reject_dynamic_context_parallelism()
+        if (
+            self.inference_context.is_dynamic_batching()
+            and getattr(self.config, "context_parallel_size", 1) > 1
+        ):
+            raise NotImplementedError(
+                "Context parallelism is not supported for dynamic VLM inference: the "
+                "paged-attention request metadata describes the whole sequence, while LLaVA "
+                "shards the language sequence across context-parallel ranks."
+            )
 
         super().prep_model_for_inference()
 
