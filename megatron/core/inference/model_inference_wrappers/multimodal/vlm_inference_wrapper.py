@@ -9,7 +9,7 @@ from megatron.core.inference.communication_utils import (
     is_pipeline_last_stage,
 )
 from megatron.core.inference.config import MediaPromptSpec, MultimodalPromptConfig
-from megatron.core.inference.contexts import StaticInferenceContext
+from megatron.core.inference.contexts import BaseInferenceContext, StaticInferenceContext
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
@@ -36,6 +36,28 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         image_spec=_media_prompt_spec, video_spec=_media_prompt_spec
     )
 
+    def __init__(self, model, inference_context: Optional[BaseInferenceContext] = None):
+        super().__init__(model, inference_context)
+        # The dynamic engine never calls prep_model_for_inference, so reject unsupported
+        # models when the wrapper is built.
+        self._reject_mrope()
+
+    def _reject_mrope(self):
+        """Reject mRoPE, whose three-axis positions LLaVA inference does not produce."""
+        try:
+            module = get_attr_wrapped_model(
+                self.model, "position_embedding_type", return_model_obj=True
+            )
+        except RuntimeError:
+            # Models without a position embedding type, such as MIMO, have no mRoPE to reject.
+            return
+        if module.position_embedding_type == "mrope":
+            raise NotImplementedError(
+                "LLaVA inference does not support mRoPE: media expansion produces scalar token "
+                "positions, but MultimodalRotaryEmbedding requires three-axis "
+                "temporal/height/width position IDs."
+            )
+
     def get_preexpanded_media_token_id(self, modality: str) -> int:
         """Return LLaVA's internal sentinel without exposing it as a vocabulary ID."""
         del modality
@@ -57,15 +79,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
                 "This parameter will be removed in `megatron-core` 0.13."
             )
 
-        module = get_attr_wrapped_model(
-            self.model, "position_embedding_type", return_model_obj=True
-        )
-        if module.position_embedding_type == "mrope":
-            raise NotImplementedError(
-                "LLaVA inference does not support mRoPE: media expansion produces scalar token "
-                "positions, but MultimodalRotaryEmbedding requires three-axis temporal/height/width "
-                "position IDs."
-            )
+        self._reject_mrope()
 
         super().prep_model_for_inference()
 

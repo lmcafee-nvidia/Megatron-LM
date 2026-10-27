@@ -22,6 +22,7 @@ from megatron.core.inference.config import (
     VideoProcessingConfig,
 )
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+from megatron.core.inference.engine_factory import build_dynamic_inference_engine
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.inference_request import (
     PREFIX_EXPANDED_TOKEN_COUNT_FIELD,
@@ -680,8 +681,20 @@ def test_mrope_contract_rejects_missing_three_axis_positions(model_parallel):
     mrope_model = _build_model(
         "image", language_position_embedding_type="mrope", mrope_section=[8, 12, 12]
     )
+    # The production factory never calls prep_model_for_inference.
     with pytest.raises(NotImplementedError, match="three-axis temporal/height/width"):
-        _build_engine("image", model=mrope_model)
+        build_dynamic_inference_engine(
+            model=mrope_model,
+            tokenizer=None,
+            inference_config=_inference_config(mrope_model),
+            inference_wrapper_cls=VLMInferenceWrapper,
+        )
+    # Models without a position embedding type, such as MIMO models, must still build.
+    plain_model = _build_model("image")
+    del plain_model.position_embedding_type
+    VLMInferenceWrapper(
+        plain_model, DynamicInferenceContext(plain_model.config, _inference_config(plain_model))
+    )
 
 
 @pytest.mark.parametrize("separate_video_embedder", [False, True])
