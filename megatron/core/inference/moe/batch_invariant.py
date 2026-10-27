@@ -69,16 +69,16 @@ def _squared_relu_with_probs_kernel(
     max_rows,
     clamp_scale,
     CLAMP: tl.constexpr,
-    FUSED_WEIGHTED: tl.constexpr,
     ZERO_PADDING: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
 ):
     """Apply squared ReLU and router probabilities in training order.
 
-    The fused training path keeps the square and routing multiply in FP32 and rounds
-    once. The unfused path materializes each activation in BF16 before the FP32 routing
-    multiply; its clamped form also materializes the soft-clamped pre-activation.
+    Matches the training fused weighted-squared-relu rounding, clamped (CLAMP) and
+    unclamped alike: the square and the routing probability are applied in FP32 with a
+    single BF16 round at the end. Rounding the square first, as the BF16 input dtype
+    invites, costs a routed element its last bit.
     """
     pid = tl.program_id(0)
     n_used = tl.load(n_used_ptr)
@@ -100,11 +100,7 @@ def _squared_relu_with_probs_kernel(
                     value = tl.maximum(value, 0.0)
                     if CLAMP:
                         value = clamp_scale * libdevice.tanh(value / clamp_scale)
-                        if not FUSED_WEIGHTED:
-                            value = value.to(tl.bfloat16).to(tl.float32)
                     value = value * value
-                    if not FUSED_WEIGHTED:
-                        value = value.to(tl.bfloat16).to(tl.float32)
                     value = (value * prob).to(tl.bfloat16)
                     tl.store(output_ptr + row_i64 * hidden_size + cols, value, mask=mask)
             elif ZERO_PADDING:
@@ -279,18 +275,14 @@ def squared_relu_with_probs(
     probs: torch.Tensor,
     clamp_scale: Optional[float] = None,
     zero_padding: bool = False,
-    fused_weighted: bool = True,
 ) -> torch.Tensor:
-    """Match the configured training squared-ReLU and probability rounding order.
+    """Match training's BF16 squared-ReLU rounding before the FP32 probability multiply.
 
     Args:
         clamp_scale: config.activation_func_tanh_clamp_scale. If set, precondition the
             input with the tanh soft clamp ``s * tanh(x / s)``.
         zero_padding: initialize aligned dummy rows because MXFP8 quantization and
             grouped GEMM have no permutation map with which to skip them.
-        fused_weighted: match ``use_fused_weighted_squared_relu=True`` when set. When
-            false, materialize the activation (and optional clamp) in BF16 at the same
-            points as the unfused training path.
     """
     num_rows, hidden_size = x.shape
     out = torch.empty_like(x)
@@ -306,7 +298,6 @@ def squared_relu_with_probs(
         num_rows,
         clamp_scale if clamp_scale is not None else 0.0,
         CLAMP=clamp_scale is not None,
-        FUSED_WEIGHTED=fused_weighted,
         ZERO_PADDING=zero_padding,
         BLOCK_SIZE=block_size,
         NUM_BLOCKS=num_blocks,

@@ -716,7 +716,6 @@ def vllm_fused_moe(
     out: Optional[torch.Tensor] = None,
     num_tokens_hint: Optional[int] = None,
     activation_clamp_scale: Optional[float] = None,
-    fused_weighted_squared_relu: bool = True,
 ) -> torch.Tensor:
     """Fused MoE using the vLLM Triton grouped-GEMM kernel (BF16).
 
@@ -744,8 +743,6 @@ def vllm_fused_moe(
             squared-ReLU pre-activation is soft-clamped with ``s * tanh(x / s)`` before
             the square, bounding the activation output by ``s ** 2``. Only supported for
             SQUARED_RELU; the gated SiTU-GLU form of the clamp is not implemented here.
-        fused_weighted_squared_relu: config.use_fused_weighted_squared_relu. In
-            batch-invariant mode, selects the corresponding training rounding order.
 
     Returns:
         [max_tokens, hidden_size] output (fp32 when out=None, else out's dtype).
@@ -855,7 +852,6 @@ def vllm_fused_moe(
                 live_rows,
                 topk_weights_flat,
                 activation_clamp_scale,
-                fused_weighted=fused_weighted_squared_relu,
             )
     elif is_swiglu:
         # intermediate1 is [num_valid, 2N] (gate | up); reduce to [num_valid, N] via
