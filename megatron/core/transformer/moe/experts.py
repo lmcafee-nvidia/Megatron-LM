@@ -1397,17 +1397,13 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self._uses_mxfp8_weights: bool | None = None
         self._nvfp4_recipe = config.inference_moe_nvfp4_recipe
         self._nvfp4_weights = None
-        self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
 
         if HAVE_FLASHINFER:
             self._flashinfer_activation_type = self._resolve_flashinfer_activation_type()
 
-        self._mcore_activation_type = (
-            None
-            if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
-            else self._resolve_mcore_activation_type()
-        )
+        self._mcore_activation_type = self._resolve_mcore_activation_type()
         self._activation_clamp_scale = config.activation_func_tanh_clamp_scale
+        self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
         self._nvls_dispatcher = config.inference_moe_token_dispatcher_type == 'nvls'
         self._flashinfer_mxfp8_token_capacity = config.inference_flashinfer_mxfp8_token_capacity
 
