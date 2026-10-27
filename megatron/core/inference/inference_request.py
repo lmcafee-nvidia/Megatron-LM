@@ -101,29 +101,6 @@ def _media_tensor_keys(modality: str) -> Tuple[str, ...]:
     raise ValueError(f"Unsupported media modality: {modality!r}.")
 
 
-def _update_video_timing_digest(digest, name: str, value: Any) -> None:
-    """Add canonical frame-index or FPS metadata to a media identity digest."""
-    if not isinstance(value, (list, tuple)):
-        raise TypeError(f"Video timing field {name!r} must be a list or tuple.")
-    digest.update(len(value).to_bytes(8, "big"))
-    if name == "video_frame_indices":
-        for indices in value:
-            if not isinstance(indices, (list, tuple)):
-                raise TypeError("video_frame_indices entries must be lists or tuples.")
-            digest.update(len(indices).to_bytes(8, "big"))
-            for index in indices:
-                if not isinstance(index, int) or isinstance(index, bool):
-                    raise TypeError("video_frame_indices values must be integers.")
-                digest.update(str(index).encode())
-                digest.update(b"\0")
-    else:
-        for fps in value:
-            if not isinstance(fps, (int, float)) or isinstance(fps, bool):
-                raise TypeError("video_fps values must be numbers.")
-            digest.update(float(fps).hex().encode())
-            digest.update(b"\0")
-
-
 def compute_media_cache_key(modality: str, modality_data: Any) -> str:
     """Return a stable content key for raw or preprocessed media.
 
@@ -132,7 +109,7 @@ def compute_media_cache_key(modality: str, modality_data: Any) -> str:
     prevent equal byte streams with different shapes or dtypes from colliding.
     """
     digest = hashlib.sha256()
-    digest.update(b"megatron-media-v3\0")
+    digest.update(b"megatron-media-v2\0")
     digest.update(modality.encode())
     digest.update(b"\0")
 
@@ -147,8 +124,6 @@ def compute_media_cache_key(modality: str, modality_data: Any) -> str:
     if isinstance(modality_data, dict):
         digest.update(b"preprocessed\0")
         cache_fields = set(_media_tensor_keys(modality)) | {"num_img_embeddings_per_tile"}
-        if modality == "video":
-            cache_fields.update(("video_frame_indices", "video_fps"))
         for name in sorted(set(modality_data) & cache_fields):
             value = modality_data[name]
             digest.update(name.encode())
@@ -165,8 +140,6 @@ def compute_media_cache_key(modality: str, modality_data: Any) -> str:
                 digest.update(tensor_bytes)
             elif name == "num_img_embeddings_per_tile":
                 digest.update(str(int(value)).encode())
-            elif name in ("video_frame_indices", "video_fps"):
-                _update_video_timing_digest(digest, name, value)
             else:
                 raise TypeError(
                     f"Cannot compute a media cache key from field {name!r} "
