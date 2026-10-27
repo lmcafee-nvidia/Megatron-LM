@@ -2171,17 +2171,6 @@ class TransformerConfig(ModelParallelConfig):
             )
 
             mxfp8_enabled = bool(self.fp8) and self.fp8_recipe == Fp8Recipe.mxfp8
-            if self.fp8_param and not mxfp8_enabled:
-                raise ValueError(
-                    "Inference-optimized MoE expert parameter storage supports only "
-                    "fp8_recipe='mxfp8'; use BF16 expert parameters for other FP8 recipes."
-                )
-            if self.fp4:
-                raise ValueError(
-                    "Inference-optimized MoE does not support Transformer Engine FP4 compute "
-                    "or parameter storage; use inference_moe_nvfp4_recipe with BF16 canonical "
-                    "expert parameters."
-                )
             if self.expert_tensor_parallel_size > 1:
                 raise ValueError(
                     "Inference-optimized MoE layers does not support expert tensor parallelism."
@@ -2197,58 +2186,6 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "--transformer-impl='inference_optimized' requires --moe-router-dtype=fp32 "
                     "to avoid costly dtype conversions during decode."
-                )
-            if self.moe_apply_probs_on_input:
-                raise ValueError(
-                    "Inference-optimized fused MoE experts do not support "
-                    "moe_apply_probs_on_input."
-                )
-            if (
-                self.inference_moe_token_dispatcher_type == "nvls"
-                and self.expert_model_parallel_size > 1
-                and (self.expert_model_parallel_size & (self.expert_model_parallel_size - 1))
-            ):
-                raise ValueError(
-                    "The NVLS inference MoE dispatcher requires a power-of-two "
-                    "expert_model_parallel_size for its Triton metadata barrier, got "
-                    f"{self.expert_model_parallel_size}."
-                )
-
-            plain_swiglu = self.gated_linear_unit and self.activation_func == F.silu
-            if self.inference_grouped_gemm_backend in (
-                InferenceGroupedGemmBackend.TORCH,
-                InferenceGroupedGemmBackend.VLLM,
-            ) and not (
-                (not self.gated_linear_unit and self.activation_func == squared_relu)
-                or plain_swiglu
-            ):
-                raise ValueError(
-                    "Inference-optimized torch and vLLM MoE experts support only "
-                    "non-gated squared ReLU or plain SwiGLU activations."
-                )
-            if (
-                self.inference_moe_nvfp4_recipe is None
-                and plain_swiglu
-                and (
-                    self.activation_func_clamp_value is not None
-                    or self.activation_func_tanh_clamp_scale is not None
-                    or self.activation_func_tanh_clamp_scale_linear is not None
-                    or self.glu_linear_offset != 0.0
-                    or self.moe_mlp_glu_interleave_size is not None
-                )
-            ):
-                raise ValueError(
-                    "Inference-optimized MoE kernels support only plain SwiGLU: "
-                    "activation clamp/offset and routed-expert GLU interleave options "
-                    "are not implemented."
-                )
-            if (
-                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
-                and self.inference_moe_nvfp4_recipe is None
-                and self.activation_func_tanh_clamp_scale is not None
-            ):
-                raise ValueError(
-                    "FlashInfer MoE backend does not support activation_func_tanh_clamp_scale."
                 )
 
             if self.inference_moe_nvfp4_recipe is not None:
@@ -2273,14 +2210,13 @@ class TransformerConfig(ModelParallelConfig):
                     )
                 if self.gated_linear_unit and (
                     self.activation_func_clamp_value is not None
-                    or self.activation_func_tanh_clamp_scale_linear is not None
                     or self.glu_linear_offset != 0.0
                     or self.moe_mlp_glu_interleave_size is not None
                 ):
                     raise ValueError(
                         "inference_moe_nvfp4_recipe supports only plain SwiGLU: "
-                        "activation clamp, glu_linear_offset and moe_mlp_glu_interleave_size "
-                        "must be unset."
+                        "activation_func_clamp_value, glu_linear_offset and "
+                        "moe_mlp_glu_interleave_size must be unset."
                     )
                 if self.fp8 or self.fp4_param:
                     raise ValueError(
@@ -2288,8 +2224,8 @@ class TransformerConfig(ModelParallelConfig):
                         "cannot be combined with FP8 inference or fp4_param."
                     )
 
-            # Plain SwiGLU is supported by the torch and vLLM grouped-GEMM backends,
-            # and by FlashInfer per-token NVFP4.
+            # Gated linear units (SwiGLU/GeGLU) are supported by the torch and vLLM
+            # grouped-GEMM backends, and SwiGLU by FlashInfer per-token NVFP4.
             if (
                 self.gated_linear_unit
                 and self.inference_grouped_gemm_backend
@@ -2297,9 +2233,9 @@ class TransformerConfig(ModelParallelConfig):
                 and self.inference_moe_nvfp4_recipe is None
             ):
                 raise ValueError(
-                    "--transformer-impl='inference_optimized' supports plain SwiGLU only with "
-                    "--inference-grouped-gemm-backend torch or vllm, or with "
-                    "inference_moe_nvfp4_recipe, "
+                    "--transformer-impl='inference_optimized' supports gated linear units "
+                    "(SwiGLU/GeGLU) only with --inference-grouped-gemm-backend torch or vllm, "
+                    "or with inference_moe_nvfp4_recipe, "
                     f"got '{self.inference_grouped_gemm_backend}'."
                 )
 
