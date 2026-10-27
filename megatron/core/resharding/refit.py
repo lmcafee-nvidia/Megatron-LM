@@ -11,7 +11,7 @@ High-level refit/reshard orchestration:
 import hashlib
 from dataclasses import dataclass
 from typing import Any, Literal, NamedTuple, Optional, Union
-from weakref import WeakKeyDictionary
+from weakref import WeakKeyDictionary, ref
 
 import torch
 
@@ -324,16 +324,31 @@ def _setup_mxfp8_transform_on_plan(plan, target_model) -> None:
       2. Derives the converted parameter set from those buffers.
       3. Attaches an ``MXFP8ReshardTransform`` to ``plan.transform``.
 
-    Idempotent: skips re-setup if ``plan.transform`` is already populated.
+    Idempotent per destination object. Equivalent replacement models can reuse
+    the plan, and returning to a previous target restores its persistent-buffer
+    transform. Explicit caller transforms are never replaced.
     """
-    if plan.transform is not None:
-        return
-
-    if not _needs_mxfp8_conversion(target_model):
+    if target_model is None:
         return
 
     lm = target_model[0] if isinstance(target_model, (list, tuple)) else target_model
     core = unwrap_model(lm)
+    auto_target_ref = plan._auto_transform_target_ref
+    if auto_target_ref is None and plan.transform is not None:
+        return
+    if auto_target_ref is not None and auto_target_ref() is core:
+        return
+    cached_transform = plan._auto_transforms.get(core)
+    if cached_transform is not None:
+        plan.transform = cached_transform
+        plan._auto_transform_target_ref = ref(core)
+        return
+    if not _needs_mxfp8_conversion(target_model):
+        if auto_target_ref is not None:
+            plan.transform = None
+            plan._auto_transform_target_ref = None
+        return
+
     decoder = core.decoder if hasattr(core, 'decoder') else core
 
     # 1. Quantize selected decoder weights -> persistent MXFP8Tensor buffers.
@@ -353,6 +368,8 @@ def _setup_mxfp8_transform_on_plan(plan, target_model) -> None:
         buffer_key_prefix="decoder.",
         backend=backend,
     )
+    plan._auto_transforms[core] = plan.transform
+    plan._auto_transform_target_ref = ref(core)
 
 
 def _validate_destination_pools(num_dst_pools: int, dst_pool_index: int) -> None:
@@ -513,6 +530,7 @@ def swap_model_weights(
                 pool_index=pool,
                 execution_batch_bytes=execution_batch_bytes,
             )
+            _setup_mxfp8_transform_on_plan(plan, target)
             pass_transform = plan.transform
 
         reshard_model_weights(

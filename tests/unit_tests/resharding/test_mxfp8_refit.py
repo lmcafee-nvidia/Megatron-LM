@@ -1,13 +1,23 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
+import torch.distributed as dist
 
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+from megatron.core.inference.quantization.utils import mm_mxfp8
 from megatron.core.resharding.copy_services.base import CopyService
 from megatron.core.resharding.execution import execute_reshard_plan
+from megatron.core.resharding.refit import (
+    clear_all_caches,
+    prepare_swap_model_weights,
+    swap_model_weights,
+)
 from megatron.core.resharding.transforms import MXFP8ReshardTransform
 from megatron.core.resharding.utils import ReshardPlan, TransferOp
+from tests.unit_tests.test_utilities import Utils
 
 _IS_BLACKWELL = torch.cuda.is_available() and (torch.cuda.get_device_properties(0).major >= 10)
 
@@ -713,6 +723,124 @@ class TestMXFP8RefitIntegration:
             expected = MXFP8Tensor.from_bf16(source_weight)
             assert torch.equal(actual.data, expected.data)
             assert torch.equal(actual.scale, expected.scale)
+
+    def test_public_refit_repeats_and_rebinds_equivalent_destination(self, request):
+        """A-B-C-A updates and a replacement target match fresh MXFP8 loads."""
+        Utils.initialize_model_parallel(1, 1)
+        request.addfinalizer(Utils.destroy_model_parallel)
+
+        class TinyModel(torch.nn.Module):
+            def __init__(self, seed, *, quantized):
+                super().__init__()
+                torch.manual_seed(seed)
+                self.decoder = torch.nn.Linear(
+                    128, 64, bias=False, device="cuda", dtype=torch.bfloat16
+                )
+                if quantized:
+                    _pre_quantize_linear(self.decoder)
+                group = dist.group.WORLD
+                self.pg_collection = SimpleNamespace(
+                    tp=group,
+                    pp=group,
+                    ep=group,
+                    dp=group,
+                    expt_tp=group,
+                    gtp_remat=None,
+                    expt_gtp_remat=None,
+                )
+                self.config = SimpleNamespace(
+                    num_moe_experts=None,
+                    transformer_impl="inference_optimized",
+                    fp8="hybrid",
+                    fp8_recipe="mxfp8",
+                    inference_grouped_gemm_backend="torch",
+                )
+
+            def forward(self, inputs):
+                weight = self.decoder.weight
+                if not isinstance(weight, MXFP8Tensor):
+                    weight = weight.data
+                assert isinstance(weight, MXFP8Tensor)
+                return mm_mxfp8(inputs, weight)
+
+        sources = [TinyModel(seed, quantized=False) for seed in (111, 222, 333)]
+        target = TinyModel(444, quantized=True)
+        inputs = torch.linspace(-1, 1, 256, device="cuda", dtype=torch.bfloat16).reshape(2, 1, 128)
+        source_weights = [source.decoder.weight.detach().clone() for source in sources]
+        references = [MXFP8Tensor.from_bf16(weight, backend="triton") for weight in source_weights]
+        expected_outputs = [mm_mxfp8(inputs, reference) for reference in references]
+        assert all(
+            not torch.equal(left.data, right.data)
+            for left, right in zip(references, references[1:])
+        )
+
+        clear_all_caches()
+        prepare_swap_model_weights([sources[0]], [target])
+        target_buffer = target.decoder.weight
+        assert isinstance(target_buffer, MXFP8Tensor)
+        target_pointers = (target_buffer.data.data_ptr(), target_buffer.scale.data_ptr())
+        # Compile before capture. The graph must continue reading these same
+        # persistent data/scale addresses after every public refit.
+        target(inputs)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_output = target(inputs)
+        graph_output_pointer = graph_output.data_ptr()
+        observed = []
+        for source_index in (0, 1, 2, 0):
+            swap_model_weights([sources[source_index]], [target], refit_method="nccl")
+            torch.cuda.synchronize()
+            reference = references[source_index]
+            assert (
+                target_buffer.data.data_ptr(),
+                target_buffer.scale.data_ptr(),
+            ) == target_pointers
+            assert torch.equal(target_buffer.data, reference.data)
+            assert torch.equal(target_buffer.scale, reference.scale)
+            graph.replay()
+            actual = graph_output.clone()
+            observed.append(actual)
+            assert graph_output.data_ptr() == graph_output_pointer
+            assert torch.equal(actual.argmax(dim=-1), expected_outputs[source_index].argmax(dim=-1))
+            torch.testing.assert_close(actual, expected_outputs[source_index], atol=0, rtol=0)
+        assert torch.equal(observed[0], observed[-1])
+        assert not torch.equal(observed[0], observed[1])
+        assert not torch.equal(observed[1], observed[2])
+
+        replacement = TinyModel(555, quantized=True)
+        prepare_swap_model_weights([sources[1]], [replacement])
+        replacement_buffer = replacement.decoder.weight
+        replacement_pointers = (
+            replacement_buffer.data.data_ptr(),
+            replacement_buffer.scale.data_ptr(),
+        )
+        assert replacement_buffer is not target_buffer
+        swap_model_weights([sources[1]], [replacement], refit_method="nccl")
+        torch.cuda.synchronize()
+        assert (
+            replacement_buffer.data.data_ptr(),
+            replacement_buffer.scale.data_ptr(),
+        ) == replacement_pointers
+        assert torch.equal(replacement_buffer.data, references[1].data)
+        assert torch.equal(replacement_buffer.scale, references[1].scale)
+        torch.testing.assert_close(replacement(inputs), expected_outputs[1], atol=0, rtol=0)
+        # The old target remains at A, proving the cached transform did not write through it.
+        assert torch.equal(target_buffer.data, references[0].data)
+        assert torch.equal(target_buffer.scale, references[0].scale)
+
+        # Return to the already-quantized first target. Its per-target transform
+        # must be restored rather than rediscovered from removed nn.Parameters.
+        swap_model_weights([sources[2]], [target], refit_method="nccl")
+        torch.cuda.synchronize()
+        assert (target_buffer.data.data_ptr(), target_buffer.scale.data_ptr()) == target_pointers
+        assert torch.equal(target_buffer.data, references[2].data)
+        assert torch.equal(target_buffer.scale, references[2].scale)
+        graph.replay()
+        torch.testing.assert_close(graph_output, expected_outputs[2], atol=0, rtol=0)
+        assert torch.equal(replacement_buffer.data, references[1].data)
+        assert torch.equal(replacement_buffer.scale, references[1].scale)
+        clear_all_caches()
 
 
 @pytest.mark.internal
