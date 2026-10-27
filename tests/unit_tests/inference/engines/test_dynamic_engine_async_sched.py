@@ -1628,6 +1628,9 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
     def _run_scenario_mode(
         cls, scenario, mode, stop_tokens=None, termination_token=None, streaming=False
     ):
+        # A streaming suspend/resume pair refits the same perturbed weights while
+        # suspended in both its legacy and async runs, so their outputs stay comparable.
+        refit = streaming and "suspend-resume" in scenario.signals
         # Streaming runs the async engine behind a mocked coordinator socket and checks
         # every partial reply; the default async run matches main's non-streaming path.
         streaming = streaming and mode == AsyncScheduleMode.ASYNC
@@ -1636,7 +1639,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         config["async_sched_mode"] = mode
         env = cls._build_test_env(_DynamicEngineTestConfig(**config))
         refit_source = None
-        if streaming and "suspend-resume" in scenario.signals:
+        if refit:
             model = env.engine.controller.inference_wrapped_model.model
             refit_env = cls._build_test_env(_DynamicEngineTestConfig(**config))
             refit_source = refit_env.engine.controller.inference_wrapped_model.model
@@ -2219,6 +2222,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             AsyncScheduleMode.LEGACY,
             stop_tokens=stop_tokens,
             termination_token=termination_token,
+            streaming=streaming,
         )
         expected = _snapshot_requests(legacy_env.requests)
         del legacy_env
