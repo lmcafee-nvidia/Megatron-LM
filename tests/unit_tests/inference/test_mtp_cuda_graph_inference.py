@@ -14,6 +14,7 @@ logic matches production code exactly.
 """
 
 import itertools
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -924,18 +925,66 @@ _STATE_DIMS = {
 def _reset_moe_layer_cache():
     """Drop the process-global MoE layer cache in `megatron.core.inference.utils`.
 
-    That cache is built once from the first model it is handed, which is correct in production
-    (one model per process) but wrong here, where every test builds a fresh model. With a stale
-    cache, `set_decode_expert_padding` flips `drop_and_pad` on the *previous* model's dispatchers
-    while writing `moe_expert_capacity_factor` onto the *current* model's config. The live
-    dispatchers then reach `preprocess` with `drop_and_pad=False` under a non-None capacity
-    factor, which lowers the sync point to "before_permutation_1" and trips the token
-    dispatcher's "cuda_sync_point must be after cuda_dtoh_point" assertion.
+    Production now refreshes the cache when model ownership changes. Tests also clear the owner
+    explicitly so no weak reference to a prior fixture affects isolation diagnostics.
     """
     from megatron.core.inference import utils as inference_utils
 
     inference_utils.moe_layer_cache = None
+    inference_utils._moe_layer_cache_owner = None
     inference_utils._moe_metadata_sync_initialized = False
+
+
+def test_base_and_mtp_forwards_have_independent_moe_metadata_owners(monkeypatch):
+    from megatron.core.inference import utils as inference_utils
+
+    dispatchers = [mock.Mock() for _ in range(4)]
+    layers = [
+        SimpleNamespace(is_mtp_layer=False, _inference_token_dispatcher=dispatchers[0]),
+        SimpleNamespace(is_mtp_layer=False, _inference_token_dispatcher=dispatchers[1]),
+        SimpleNamespace(is_mtp_layer=True, _inference_token_dispatcher=dispatchers[2]),
+        SimpleNamespace(is_mtp_layer=True, _inference_token_dispatcher=dispatchers[3]),
+    ]
+    monkeypatch.setattr(inference_utils, "moe_layer_cache", layers)
+    monkeypatch.setattr(inference_utils, "_moe_layer_cache_owner", None, raising=False)
+    monkeypatch.setattr(inference_utils, "_moe_metadata_sync_initialized", False)
+
+    inference_utils.set_moe_metadata_sync(mock.Mock())
+
+    assert [dispatcher._runs_metadata_sync for dispatcher in dispatchers] == [
+        True,
+        False,
+        True,
+        False,
+    ]
+
+
+def test_moe_metadata_owners_refresh_when_model_is_recreated(monkeypatch):
+    from megatron.core.inference import utils as inference_utils
+    from megatron.core.transformer.moe import moe_layer as moe_layer_module
+
+    class FakeMoELayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.is_mtp_layer = False
+            self._inference_token_dispatcher = SimpleNamespace(_runs_metadata_sync=False)
+
+    monkeypatch.setattr(moe_layer_module, "MoELayer", FakeMoELayer)
+    monkeypatch.setattr(inference_utils, "moe_layer_cache", None)
+    monkeypatch.setattr(inference_utils, "_moe_layer_cache_owner", None, raising=False)
+    monkeypatch.setattr(inference_utils, "_moe_metadata_sync_initialized", False)
+
+    first_layer = FakeMoELayer()
+    second_layer = FakeMoELayer()
+    first_model = torch.nn.Sequential(first_layer)
+    second_model = torch.nn.Sequential(second_layer)
+
+    inference_utils.set_moe_metadata_sync(first_model)
+    assert first_layer._inference_token_dispatcher._runs_metadata_sync
+    inference_utils.set_moe_metadata_sync(second_model)
+
+    assert second_layer._inference_token_dispatcher._runs_metadata_sync
+    assert inference_utils.moe_layer_cache == [second_layer]
 
 
 @pytest.mark.internal
@@ -1034,6 +1083,59 @@ class TestMTPCudaGraphExpertParallel:
         model.eval()
         return model
 
+    def _build_inference_optimized_gpt(self):
+        from megatron.core.activations import squared_relu
+        from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_inference_spec
+
+        _reset_moe_layer_cache()
+        model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
+        config = TransformerConfig(
+            num_layers=self.NUM_LAYERS,
+            hidden_size=self.HIDDEN_SIZE,
+            ffn_hidden_size=self.HIDDEN_SIZE,
+            moe_ffn_hidden_size=self.HIDDEN_SIZE,
+            num_attention_heads=self.NUM_ATTN_HEADS,
+            use_cpu_initialization=True,
+            attention_backend=AttnBackend.local,
+            params_dtype=torch.bfloat16,
+            expert_model_parallel_size=_EP_SIZE,
+            num_moe_experts=self.NUM_MOE_EXPERTS,
+            moe_router_topk=2,
+            moe_router_pre_softmax=True,
+            moe_router_score_function="softmax",
+            moe_router_load_balancing_type="none",
+            moe_router_dtype="fp32",
+            moe_token_dispatcher_type="alltoall",
+            moe_grouped_gemm=True,
+            activation_func=squared_relu,
+            normalization="RMSNorm",
+            add_bias_linear=False,
+            mtp_num_layers=1,
+            transformer_impl="inference_optimized",
+            inference_grouped_gemm_backend="vllm",
+            inference_moe_token_dispatcher_type="nccl",
+        )
+        layer_spec = get_gpt_layer_with_inference_spec(
+            num_experts=self.NUM_MOE_EXPERTS, moe_grouped_gemm=True
+        )
+        mtp_block_spec = get_gpt_mtp_block_spec(
+            config=config, spec=layer_spec, use_transformer_engine=False
+        )
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=layer_spec,
+            vocab_size=self.VOCAB_SIZE,
+            max_sequence_length=self.MAX_SEQ_LEN,
+            parallel_output=True,
+            pre_process=True,
+            post_process=True,
+            mtp_block_spec=mtp_block_spec,
+            position_embedding_type="none",
+        ).cuda()
+        for param in model.parameters():
+            param.data = param.data.to(config.params_dtype)
+        return model.eval()
+
     def _build_context(
         self,
         model,
@@ -1058,6 +1160,67 @@ class TestMTPCudaGraphExpertParallel:
         )
 
     # ---- Test 1: all EP ranks run MTP eager forward ----------------------- #
+
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_inference_optimized_mtp_refreshes_dispatcher_metadata(self):
+        from megatron.core.inference.utils import set_moe_metadata_sync
+        from megatron.core.transformer.moe.moe_layer import MoELayer
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            InferenceAllGatherDispatcherBase,
+            NCCLAllGatherDispatcher,
+        )
+
+        model = self._build_inference_optimized_gpt()
+        moe_layers = [module for module in model.modules() if isinstance(module, MoELayer)]
+        base_layers = [layer for layer in moe_layers if not layer.is_mtp_layer]
+        mtp_layers = [layer for layer in moe_layers if layer.is_mtp_layer]
+        assert base_layers and mtp_layers
+
+        base_layer = base_layers[0]
+        mtp_layer = mtp_layers[0]
+
+        NCCLAllGatherDispatcher.allocate_buffers()
+        NCCLAllGatherDispatcher._use_allgather_v = True
+        set_moe_metadata_sync(model)
+        assert base_layer._inference_token_dispatcher._runs_metadata_sync
+        assert mtp_layer._inference_token_dispatcher._runs_metadata_sync
+
+        base_hidden = torch.randn(5, 1, self.HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+        mtp_hidden = torch.randn(2, 1, self.HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+        mtp_reference, _ = mtp_layer(mtp_hidden.clone())
+
+        expert_rows = []
+        original_base_expert = base_layer.experts.forward
+        original_mtp_expert = mtp_layer.experts.forward
+
+        def tracked_base_expert(*args, **kwargs):
+            expert_rows.append(("base", args[0].shape[0]))
+            return original_base_expert(*args, **kwargs)
+
+        def tracked_mtp_expert(*args, **kwargs):
+            expert_rows.append(("mtp", args[0].shape[0]))
+            return original_mtp_expert(*args, **kwargs)
+
+        base_layer.experts.forward = tracked_base_expert
+        mtp_layer.experts.forward = tracked_mtp_expert
+        try:
+            with InferenceMode.active():
+                base_output, _ = base_layer(base_hidden)
+                base_valid_rows = int(InferenceAllGatherDispatcherBase._valid_tokens().item())
+                mtp_output, _ = mtp_layer(mtp_hidden)
+                mtp_valid_rows = int(InferenceAllGatherDispatcherBase._valid_tokens().item())
+        finally:
+            base_layer.experts.forward = original_base_expert
+            mtp_layer.experts.forward = original_mtp_expert
+
+        assert base_output.shape == base_hidden.shape
+        assert mtp_output.shape == mtp_hidden.shape
+        assert base_valid_rows == 5 * _EP_SIZE
+        assert mtp_valid_rows == 2 * _EP_SIZE
+        assert [domain for domain, _ in expert_rows] == ["base", "mtp"]
+        assert all(rows >= 2 * _EP_SIZE for _, rows in expert_rows)
+        torch.testing.assert_close(mtp_output, mtp_reference, atol=5e-2, rtol=5e-2)
 
     @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
     @pytest.mark.parametrize("batch_size", [2, 4, 8])

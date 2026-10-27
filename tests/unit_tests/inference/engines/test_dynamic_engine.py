@@ -910,6 +910,7 @@ class DynamicEngineTestConfig:
     # when a test explicitly owns that model behavior.
     use_moe_layer_spec: bool = False
     sequence_parallel: bool = False
+    inference_disable_triton_nvls_kernels: bool = False
 
     use_fixed_output_lengths: bool = False
     num_cuda_graphs: int = None
@@ -1269,6 +1270,9 @@ class DynamicInferenceEngineTestBase:
                     else InferenceCudaGraphScope.none
                 ),
                 transformer_impl=test_config.transformer_impl,
+                inference_disable_triton_nvls_kernels=test_config.inference_disable_triton_nvls_kernels,
+                inference_grouped_gemm_backend=test_config.inference_grouped_gemm_backend,
+                inference_moe_nvfp4_recipe=test_config.inference_moe_nvfp4_recipe,
                 activation_func=(
                     squared_relu
                     if test_config.transformer_impl == "inference_optimized"
