@@ -1026,10 +1026,12 @@ class TestDynamicMLARequiresFlashMLA:
         monkeypatch.setattr(mla_module, "HAVE_FMLA", False)
         attention = mock.Mock(training=False, cache_mla_latents=True)
         attention.config.cache_mla_latents = True
+        attention.prepare_for_absorption.side_effect = AssertionError(
+            "latent-cache setup ran before the FlashMLA check"
+        )
         context = mock.Mock()
         context.is_static_batching.return_value = False
         with pytest.raises(RuntimeError, match="requires the optional FlashMLA package"):
             mla_module.MultiLatentAttention.forward(
                 attention, torch.zeros(1, 1, 8), None, inference_context=context
             )
-        attention.prepare_for_absorption.assert_not_called()
