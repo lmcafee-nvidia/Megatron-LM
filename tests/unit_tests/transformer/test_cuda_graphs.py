@@ -2263,6 +2263,21 @@ class TestInlineCaptureManager:
         assert len(mgr.cudagraph_runners) == 1
         assert mgr.cudagraph_runners[0].fwd_graph_recorded
 
+    @torch.inference_mode()
+    def test_delete_releases_runner_buffers_and_recaptures_into_new_pool(self):
+        """Graph deletion frees a kept runner's buffers; its recapture uses a new shared pool."""
+        config = self._make_config()
+        module = _make_simple_module(config)
+        x = torch.randn(4, config.hidden_size, device="cuda")
+        mgr = CudaGraphManager(
+            config,
+            base_module=module,
+            function_name="my_op",
+            inline_capture=True,
+            num_warmup_steps=0,
+            need_backward=False,
+        )
+        module.my_op(x)
         runner = mgr.cudagraph_runners[0]
         old_mempool = runner.mempool
         buffer_metadata = cuda_graphs_module.CudagraphBufferMetadata(

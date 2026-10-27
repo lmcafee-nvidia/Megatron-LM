@@ -1493,6 +1493,19 @@ def _instrument_scenario_runtime(env, scenario, runtime):
             finally:
                 runtime["cuda-graph-capture-active"] -= 1
             _instrument_cuda_graph_replays(model, context, runtime)
+            live_runners = [
+                runner
+                for manager in model.modules()
+                if isinstance(manager, CudaGraphManager)
+                for runner in manager.cudagraph_runners
+                if runner.fwd_graph_recorded
+            ]
+            graph_pool = CudaGraphManager.global_mempool
+            runtime["cuda-graph-pool-rebinds"] += int(
+                bool(live_runners)
+                and graph_pool is not None
+                and all(runner.mempool == graph_pool for runner in live_runners)
+            )
             return result
 
         env.engine.create_cuda_graphs = traced_create_cuda_graphs
@@ -2021,6 +2034,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             _instrument_scenario_runtime(env, scenario, runtime)
         if env.config.defer_cuda_graph_creation:
             env.engine.create_cuda_graphs()
+            cold_pool_rebinds = runtime["cuda-graph-pool-rebinds"]
             capture_evidence = {
                 key: count
                 for key, count in runtime.items()
@@ -2041,6 +2055,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             }
             runtime.clear()
             runtime.update(capture_evidence)
+            runtime["cuda-graph-cold-pool-rebinds"] = cold_pool_rebinds
         if force_graph_eager:
             for module in model.modules():
                 module._should_call_local_cudagraph = lambda *_args, **_kwargs: False
