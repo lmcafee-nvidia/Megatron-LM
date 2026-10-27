@@ -3425,10 +3425,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    @pytest.mark.internal
-    @pytest.mark.skipif(
-        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
-    )
     def test_coordinator_abort_after_inference_mode_step(self) -> None:
         """An abort message may arrive outside inference mode after an inference-mode step."""
         with torch.inference_mode():
@@ -3453,6 +3449,10 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             context.request_kv_length_offsets[index] + context.request_query_lengths[index]
         )
 
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     def test_block_overflow(self, model_provider: str) -> None:
         """Test block overflow."""
