@@ -943,6 +943,7 @@ _CUDA_GRAPH_DIFFERENTIAL_SCENARIOS = (
             "hybrid-gdp",
             "transformer-engine",
             "inference-optimized",
+            "mxfp8-inference-optimized-moe",
             "flashinfer-fused-rope",
             "flash-attention-3",
             "flash-attention-4",
