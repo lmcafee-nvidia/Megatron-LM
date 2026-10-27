@@ -41,7 +41,7 @@ from megatron.core.transformer.moe.experts import (
 )
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.ops.virtual_expert_triton import VirtualExpertPlannerWorkspace
-from megatron.core.transformer.moe.router import TopKRouter
+from megatron.core.transformer.moe.router import InferenceTopKRouter, TopKRouter
 from megatron.core.transformer.moe.token_dispatcher import _VirtualExpertHybridEPManager
 from megatron.core.transformer.moe.virtual_expert_load_balancer import (
     VirtualExpertLoadBalancer,
@@ -919,17 +919,25 @@ class TestMoEModules:
         moe_utils.get_moe_metrics_tracker().clear()
 
     @pytest.mark.parametrize(
-        "balancing,score,expert_bias,hash_routing",
+        "balancing,score,expert_bias,hash_routing,inference",
         [
-            ("aux_loss", "softmax", False, False),
-            ("seq_aux_loss", "sigmoid", True, False),
-            ("sinkhorn", "softmax", False, False),
-            ("none", "sigmoid", False, True),
-            ("none", "softmax", False, True),
+            ("aux_loss", "softmax", False, False, False),
+            ("seq_aux_loss", "sigmoid", True, False, False),
+            ("sinkhorn", "softmax", False, False, False),
+            ("none", "sigmoid", False, True, False),
+            ("none", "softmax", False, True, False),
+            ("sinkhorn", "softmax", False, False, True),
         ],
-        ids=["aux_loss", "seq_aux_loss+sigmoid+bias", "sinkhorn", "hash+sigmoid", "hash+softmax"],
+        ids=[
+            "aux_loss",
+            "seq_aux_loss+sigmoid+bias",
+            "sinkhorn",
+            "hash+sigmoid",
+            "hash+softmax",
+            "sinkhorn+inference",
+        ],
     )
-    def test_topk_router_replays(self, balancing, score, expert_bias, hash_routing):
+    def test_topk_router_replays(self, balancing, score, expert_bias, hash_routing, inference):
         self._init()
         seeded()
         config = _moe_config(
@@ -943,11 +951,15 @@ class TestMoEModules:
             moe_num_hash_layers=int(hash_routing),
             hash_moe_vocab_size=128 if hash_routing else None,
         )
-        router = TopKRouter(
+        router_cls = InferenceTopKRouter if inference else TopKRouter
+        router = router_cls(
             config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
         ).cuda()
         router.set_layer_number(0)
-        hidden = torch.randn(2048, 4, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        if inference:
+            router = _InInferenceMode(router.eval())
+        shape = (8192, 1, 1024) if inference else (2048, 4, 1024)
+        hidden = torch.randn(*shape, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         inputs = (hidden,)
         if expert_bias:
             padding_mask = torch.arange(8192, device="cuda").reshape(2048, 4) % 3 == 0
