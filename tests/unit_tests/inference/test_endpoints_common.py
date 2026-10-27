@@ -690,6 +690,37 @@ async def test_disconnect_aborts_every_in_flight_request(path):
 
 
 @pytest.mark.asyncio
+@PATHS
+async def test_streaming_disconnect_aborts_every_open_stream(path, monkeypatch):
+    class PendingStreamingClient(ReplyingClient):
+        def add_request_streaming(
+            self, prompt_tokens, sampling_params, *, multi_modal_data=None, offload_params=None
+        ):
+            self.prompt_tokens.append(list(prompt_tokens))
+            self.sampling_params.append(sampling_params)
+            self.multi_modal_data.append(multi_modal_data)
+            self.offload_params.append(offload_params)
+            request_id = len(self.prompt_tokens)
+            self.streamed.append(request_id)
+            stream = AsyncStream(
+                request_id=request_id,
+                cancel=lambda request_id=request_id: self.aborted.append(request_id),
+            )
+            stream.put({"partial": {"request_id": request_id, "new_tokens": [12]}})
+            if request_id == 3:
+                self.drained.set()
+            return stream
+
+    client = PendingStreamingClient()
+    app = build_streaming_app(path, client, monkeypatch)
+
+    sent = await _post_then_disconnect(app, path, {**FAN_OUT_BODIES[path], "stream": True}, client)
+
+    assert client.aborted == [1, 2, 3]
+    assert not any(b"[DONE]" in message.get("body", b"") for message in sent)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("path", "expected_logs"),
     [
@@ -873,12 +904,7 @@ async def test_streaming_requires_a_fast_tokenizer(path):
 @pytest.mark.parametrize("include_usage", [False, True])
 async def test_streaming_fans_out_and_reports_usage_on_request(path, include_usage, monkeypatch):
     offload_params = {"store": "x"}
-    client = ReplyingClient(
-        [
-            completed_reply(f"req-{index}", [10, 11], [12, 13], num_cached_tokens=index)
-            for index in range(1, 4)
-        ]
-    )
+    client = ReplyingClient()
     app = build_streaming_app(path, client, monkeypatch)
     body = {
         **FAN_OUT_BODIES[path],
@@ -908,10 +934,31 @@ async def test_streaming_fans_out_and_reports_usage_on_request(path, include_usa
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": 6,
                 "total_tokens": prompt_tokens + 6,
-                "prompt_tokens_details": {"cached_tokens": 3 if path == CHAT_PATH else 6},
+                "prompt_tokens_details": {"cached_tokens": 0},
             }
         ]
         if include_usage
         else []
     )
     assert client.aborted == []
+
+
+@pytest.mark.asyncio
+@PATHS
+async def test_streaming_usage_counts_cached_tokens_per_prompt(path, monkeypatch):
+    """Completions sum cached tokens over their prompts; chat choices share one prompt."""
+    client = ReplyingClient(
+        [
+            completed_reply(f"req-{index}", [10, 11], [12, 13], num_cached_tokens=index)
+            for index in range(1, 4)
+        ]
+    )
+    app = build_streaming_app(path, client, monkeypatch)
+    body = {**FAN_OUT_BODIES[path], "stream": True, "stream_options": {"include_usage": True}}
+
+    response = await app.test_client().post(path, json=body)
+
+    payloads, done = await sse_payloads(response)
+    assert done
+    (usage,) = [p["usage"] for p in payloads if "usage" in p]
+    assert usage["prompt_tokens_details"] == {"cached_tokens": 3 if path == CHAT_PATH else 6}
