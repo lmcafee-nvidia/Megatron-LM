@@ -569,12 +569,23 @@ def test_real_encoder_cache_reuse_matches_uncached_and_separates_distinct_media(
     engine, wrapper = _build_engine(modality)
     trace = _install_forward_trace(engine)
     first_media, distinct_media = _media(modality, 0.0), _media(modality, 0.5)
+    timing_media = []
+    if modality == "video":
+        for field, value in (("video_frame_indices", [[1, 4]]), ("video_fps", [24.0])):
+            changed = copy.deepcopy(first_media)
+            changed[field] = value
+            changed["media_cache_key"] = compute_media_cache_key("video", changed)
+            timing_media.append((field, value, changed))
     with _encoder_patch(wrapper) as encoder:
         first, first_step, first_finished = _run_request(engine, 10, first_media, trace)
         reuse, reuse_step, reuse_finished = _run_request(
             engine, 11, {"media_cache_key": first_media["media_cache_key"]}, trace
         )
         distinct, distinct_step, distinct_finished = _run_request(engine, 12, distinct_media, trace)
+        timing_runs = [
+            (field, value, _run_request(engine, request_id, changed, trace))
+            for request_id, (field, value, changed) in enumerate(timing_media, 13)
+        ]
         if modality == "video":
             frame_paths = []
             for index, color in enumerate(((32, 64, 96), (96, 64, 32))):
@@ -613,7 +624,7 @@ def test_real_encoder_cache_reuse_matches_uncached_and_separates_distinct_media(
             tensor_args["media_cache_key"] = compute_media_cache_key("video", tensor_args)
             raw, raw_step, raw_finished = _run_request(engine, 15, raw_args, trace)
             tensor, tensor_step, tensor_finished = _run_request(engine, 16, tensor_args, trace)
-    assert encoder.call_count == (4 if modality == "video" else 2)
+    assert encoder.call_count == (6 if modality == "video" else 2)
     assert first["key"] == reuse["key"] != distinct["key"]
     _same(first, first_step, first_finished, reuse, reuse_step, reuse_finished)
     assert torch.equal(first_step["input_ids"], reuse_step["input_ids"])
@@ -623,6 +634,10 @@ def test_real_encoder_cache_reuse_matches_uncached_and_separates_distinct_media(
     assert not torch.equal(first["embeddings"], distinct["embeddings"])
     assert not torch.equal(first_step["logits"], distinct_step["logits"])
     if modality == "video":
+        assert len({first["key"], *(run[2][0]["key"] for run in timing_runs)}) == 3
+        for field, value, (timing, timing_step, timing_finished) in timing_runs:
+            assert getattr(engine._vision_embedding_cache[timing["key"]], field) == value
+            _same(first, first_step, first_finished, timing, timing_step, timing_finished)
         assert raw_args["video_frame_indices"] == [[0, 3]] and raw_args["video_fps"] == [30.0]
         assert raw["key"] != tensor["key"]
         assert torch.equal(raw["tokens"], tensor["tokens"])
