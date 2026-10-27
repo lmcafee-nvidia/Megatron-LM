@@ -9,6 +9,7 @@
 * ``vocab_parallel_cross_entropy``: the unfused path deterministic mode relies on.
 * ``ColumnParallelLinear`` / ``RowParallelLinear``: cuBLAS GEMMs under the pinned workspace,
   with and without apex ``fused_weight_gradient_mlp_cuda`` gradient-accumulation fusion.
+* local ``DotProductAttention`` with distinct MLA key and value channel widths.
 * ``ColumnParallelLinear`` with BF16 inputs and FP32 output: Transformer Engine
   ``general_gemm`` forward plus the corresponding input- and weight-gradient paths.
 * apex ``FusedLayerNorm`` (persistent and non-persistent) and ``FusedScaleMaskSoftmax``
@@ -16,6 +17,7 @@
 """
 
 import importlib.util
+import inspect
 
 import pytest
 import torch
@@ -35,6 +37,7 @@ from megatron.core.tensor_parallel.layers import (
     VocabParallelEmbedding,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import attention_mask_func
@@ -264,6 +267,54 @@ class TestTensorParallelLayers:
             module, (x,), replays=3, contention=True, what="column linear[bf16 input, fp32 output]"
         )
         assert outputs["out[0]"].dtype is torch.float32
+
+    def test_local_attention_distinct_kv_channels_replays(self):
+        seeded()
+        key_width, value_width, heads = 96, 48, 4
+        config = _config(
+            hidden_size=256,
+            num_attention_heads=heads,
+            attention_dropout=0.0,
+            masked_softmax_fusion=False,
+        )
+        supports_distinct_widths = (
+            "k_channels" in inspect.signature(DotProductAttention.__init__).parameters
+        )
+        width_args = (
+            {"k_channels": key_width, "v_channels": value_width} if supports_distinct_widths else {}
+        )
+        module = DotProductAttention(
+            config,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type="self",
+            **width_args,
+        ).cuda()
+        if not supports_distinct_widths:
+            # Let the exact production inverse exercise the same asymmetric forward/gradient
+            # geometry before the final interface assertion exposes the missing constructor API.
+            module.hidden_size_per_attention_head = key_width
+            module.hidden_size_per_partition = heads * value_width
+            module.softmax_scale = key_width**-0.5
+        assert module.hidden_size_per_attention_head == key_width
+        assert module.hidden_size_per_partition == heads * value_width
+        assert module.softmax_scale == pytest.approx(key_width**-0.5)
+
+        def rand(width):
+            return torch.randn(
+                32, 2, heads, width, device="cuda", dtype=torch.bfloat16, requires_grad=True
+            )
+
+        query, key, value = rand(key_width), rand(key_width), rand(value_width)
+
+        outputs, _ = assert_module_replays_bit_exact(
+            module,
+            (query, key, value, None),
+            replays=3,
+            what=f"DotProductAttention[k={key_width},v={value_width}]",
+        )
+        assert outputs["out"].shape == (32, 2, heads * value_width)
+        assert supports_distinct_widths, "local attention must accept distinct key/value widths"
 
 
 # --- apex fused layer norm ------------------------------------------------------------------

@@ -162,6 +162,46 @@ def reset_transient_process_state():
     inference_utils._moe_metadata_sync_initialized = False
 
 
+def test_moe_cache_follows_replaced_model(monkeypatch):
+    """A replacement model owns both the cached layers and metadata-sync assignment."""
+    from megatron.core.transformer.moe import moe_layer as moe_layer_module
+
+    class FakeMoELayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self._inference_token_dispatcher = type(
+                "Dispatcher", (), {"_runs_metadata_sync": True}
+            )()
+
+    class FakeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([FakeMoELayer(), FakeMoELayer()])
+
+    monkeypatch.setattr(moe_layer_module, "MoELayer", FakeMoELayer)
+    monkeypatch.setattr(inference_utils, "moe_layer_cache", None)
+    monkeypatch.setattr(inference_utils, "_moe_layer_cache_model", None, raising=False)
+    monkeypatch.setattr(inference_utils, "_moe_metadata_sync_initialized", False)
+
+    first = FakeModel()
+    inference_utils.set_moe_metadata_sync(first)
+    first_flags = [layer._inference_token_dispatcher._runs_metadata_sync for layer in first.layers]
+    assert first_flags == [True, False]
+
+    replacement = FakeModel()
+    inference_utils.set_moe_metadata_sync(replacement)
+    replacement_flags = [
+        layer._inference_token_dispatcher._runs_metadata_sync for layer in replacement.layers
+    ]
+    assert replacement_flags == [True, False]
+    assert inference_utils._moe_layer_cache_model() is replacement
+    assert inference_utils.moe_layer_cache == list(replacement.layers)
+    assert [layer._inference_token_dispatcher._runs_metadata_sync for layer in first.layers] == [
+        True,
+        False,
+    ]
+
+
 def is_nccl_ep_available():
     """NCCL EP built into TE, with the ``ep_bootstrap`` signature mcore actually calls.
 

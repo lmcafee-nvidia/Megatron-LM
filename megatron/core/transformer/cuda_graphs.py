@@ -824,6 +824,35 @@ def delete_cuda_graphs():
         runner.bwd_graph = None
         runner.mempool = None
         runner._gtp_fwd_params_to_ensure_ready = ()
+        runner._gtp_wgrad_ring_slots = []
+
+        # A retained manager reuses its runner objects after inference graph
+        # deletion. Release every captured pool buffer now, before empty_cache,
+        # while preserving only shape/type metadata used to match that runner
+        # for recapture. Some metadata objects also own shared inter-graph
+        # buffers, so clearing the visible argument tuples alone is insufficient.
+        for arg_meta in chain(
+            runner.fwd_graph_input_arg_metas, runner.fwd_graph_input_kwarg_metas.values()
+        ):
+            buffer_metadata = getattr(arg_meta, "cg_buffer_metadata", None)
+            if buffer_metadata is not None:
+                buffer_metadata.fwd_cudagraph_buffer = None
+                buffer_metadata.bwd_cudagraph_buffer = None
+
+        for name, empty_value in (
+            ("args", ()),
+            ("kwargs", {}),
+            ("outputs", None),
+            ("fwd_graph_input_args", ()),
+            ("fwd_graph_input_kwargs", {}),
+            ("fwd_graph_input_surface", ()),
+            ("fwd_graph_outputs", ()),
+            ("fwd_graph_output_surface", ()),
+            ("static_grad_inputs", ()),
+            ("static_grad_outputs", ()),
+        ):
+            if hasattr(runner, name):
+                setattr(runner, name, empty_value)
 
     # Reset global tracking state
     _CudagraphGlobalRecord.cudagraph_created = False
@@ -912,11 +941,13 @@ class _CudagraphReplayNode(torch.autograd.Function):
 
         ctx.runner = runner
         if runner.fp8_enabled or runner.fp4_enabled:
-            if isinstance(FP8GlobalStateManager.get_fp8_recipe(), te.common.recipe.DelayedScaling):
+            if runner.fp8_enabled and isinstance(
+                runner.fp8_recipe, te.common.recipe.DelayedScaling
+            ):
                 for m in runner.base_module.modules():
                     if isinstance(m, TransformerEngineBaseModule):
                         m.fp8_meta["fp8_group"] = FP8GlobalStateManager.get_fp8_group()
-                        m.fp8_meta["recipe"] = FP8GlobalStateManager.get_fp8_recipe()
+                        m.fp8_meta["recipe"] = runner.fp8_recipe
 
                         if is_te_min_version("1.13.0"):
                             FP8GlobalStateManager.add_fp8_tensors_to_global_buffer(m.fp8_meta)
@@ -984,9 +1015,7 @@ class _CudagraphReplayNode(torch.autograd.Function):
         runner.status = _GraphStatus.FWD_READY
 
         # Update FP8 scale factors if needed
-        if runner.fp8_enabled and isinstance(
-            FP8GlobalStateManager.get_fp8_recipe(), te.common.recipe.DelayedScaling
-        ):
+        if runner.fp8_enabled and isinstance(runner.fp8_recipe, te.common.recipe.DelayedScaling):
             FP8GlobalStateManager.reduce_and_update_fp8_tensors(forward=False)
 
         # DDP grad-ready hook is silenced at capture/replay, so fire it here (on each param's
@@ -1102,7 +1131,9 @@ class _CudaGraphRunner(torch.nn.Module):
                 _GTP_RUNNER_STREAMS.append(self.stream)
 
             if self.fp8_enabled:
-                self.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
+                from megatron.core.fp8_utils import get_fp8_recipe  # to avoid circular import
+
+                self.fp8_recipe = get_fp8_recipe(self.base_module.config)
                 _set_skip_fp8_weight_update_tensor(False)
 
             if self.fp4_enabled:
@@ -1986,6 +2017,17 @@ class CudaGraphManager(torch.nn.Module):
         # Therefore modules will always execute in the same order, so cudagraphs
         # can both be reused and share a single mempool.
         self.reuse_cudagraphs = self.pg_collection.pp.size() == 1
+        CudaGraphManager._ensure_global_mempool()
+
+        # Enable one hook for the eager recording phase. Repeated manager construction is
+        # idempotent, and graph creation removes the hook before capture begins.
+        if need_backward:
+            _CudagraphGlobalRecord._enable_saved_tensors_observer()
+
+    @staticmethod
+    def _ensure_global_mempool():
+        """Return the shared pool, recreating it after graph deletion."""
+
         if CudaGraphManager.global_mempool is None:
             CudaGraphManager.global_mempool = torch.cuda.graph_pool_handle()
             # Register the pool so GTP allocates GRAPHED-chain buffers + quantized
@@ -1995,11 +2037,7 @@ class CudaGraphManager(torch.nn.Module):
             # Cudagraph stream capture requires no operations on the default stream prior to the
             # capture, so change to a side stream.
             torch.cuda.set_stream(torch.cuda.Stream())
-
-        # Enable one hook for the eager recording phase. Repeated manager construction is
-        # idempotent, and graph creation removes the hook before capture begins.
-        if need_backward:
-            _CudagraphGlobalRecord._enable_saved_tensors_observer()
+        return CudaGraphManager.global_mempool
 
     def call_ddp_preforward_hook(self, module):
         """Call any DDP pre-forward hooks which are used to launch async data parallel
@@ -2023,6 +2061,7 @@ class CudaGraphManager(torch.nn.Module):
         length of 'self.cudagraph_runners'.
         Otherwise, we assign a mempool per microbatch, which allows cudagraphs to be reused
         over different microbatches by tracking their respective fwd and bwd passes.'''
+        mempool = CudaGraphManager._ensure_global_mempool()
         if reuse_cudagraphs:
             if cache_key is not None:
                 runner = self.custom_cudagraphs_lookup_table[cache_key]
@@ -2052,12 +2091,7 @@ class CudaGraphManager(torch.nn.Module):
                     )
                 else:
                     runner = _CudaGraphRunner(
-                        megatron_module,
-                        CudaGraphManager.global_mempool,
-                        args,
-                        kwargs,
-                        self.func,
-                        self.need_backward,
+                        megatron_module, mempool, args, kwargs, self.func, self.need_backward
                     )
                     if self._num_warmup_steps is not None:
                         runner.num_warmup_steps = self._num_warmup_steps
@@ -2072,15 +2106,12 @@ class CudaGraphManager(torch.nn.Module):
                 self.cudagraph_runners = self.cudagraph_runners[1:] + self.cudagraph_runners[:1]
             else:
                 runner = _CudaGraphRunner(
-                    megatron_module,
-                    CudaGraphManager.global_mempool,
-                    args,
-                    kwargs,
-                    self.func,
-                    self.need_backward,
+                    megatron_module, mempool, args, kwargs, self.func, self.need_backward
                 )
                 self.cudagraph_runners.append(runner)
 
+        if not runner.fwd_graph_recorded and runner.mempool != mempool:
+            runner.mempool = mempool
         return runner
 
     def __call__(self, megatron_module, args, kwargs, cache_key=None):

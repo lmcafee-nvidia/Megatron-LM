@@ -102,6 +102,83 @@ def _make_engine(
     return engine
 
 
+@pytest.mark.asyncio
+async def test_deferred_cuda_graph_recapture_waits_for_idle_boundary():
+    """Live work stays eager until one idle boundary can safely rebuild graphs."""
+    engine = _make_engine(engine_cls=StateHandoffDynamicInferenceEngine)
+    dimensions = [(2, 32)]
+    context = engine.context
+    context.cuda_graph_batch_dimensions_list = list(dimensions)
+    context.kv_cache_management_mode = KVCacheManagementMode.OFFLOAD
+    context.static_kv_memory_pointers = False
+    context.has_unfinished_requests = mock.Mock(return_value=True)
+    context.reinitialize_inference_state_buffers = mock.Mock()
+    engine.state = EngineState.SUSPENDED
+    engine._weight_epoch = 0
+    engine._resalt_unprefilled_requests = mock.Mock()
+    engine.unified_memory_level = 0
+    engine.cuda_graph_impl = "local"
+    engine.inference_cuda_graph_scope = InferenceCudaGraphScope.layer
+    engine._cuda_graph_recapture_dimensions = None
+    engine.resume_request_ids = []
+    engine.requests = {}
+    engine.waiting_request_ids = deque()
+    engine._deferred_kv_handoffs = []
+    engine._pending_kv_imports = []
+    engine._pending_kv_pushes = []
+    engine.controller._async_sched_forward = SimpleNamespace(is_valid=False)
+    engine.create_cuda_graphs = mock.Mock()
+    engine.use_coordinator = True
+    with (
+        mock.patch.object(DynamicInferenceEngine, "suspend_resume_ctx", return_value=nullcontext()),
+        mock.patch("torch.cuda.synchronize"),
+        mock.patch("megatron.core.inference.engines.dynamic_engine.InferenceMode.set_active"),
+    ):
+        engine.resume()
+    assert engine._cuda_graph_recapture_dimensions == dimensions
+    assert context.cuda_graph_batch_dimensions_list == []
+    engine.create_cuda_graphs.assert_not_called()
+    context.has_unfinished_requests.return_value = False
+    for blocked_state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
+        engine.state = blocked_state
+        assert not engine._recapture_cuda_graphs_if_idle()
+    engine.state = EngineState.RUNNING
+    blockers = (
+        (
+            lambda: setattr(context.has_unfinished_requests, "return_value", True),
+            lambda: setattr(context.has_unfinished_requests, "return_value", False),
+        ),
+        (lambda: engine.waiting_request_ids.append(1), engine.waiting_request_ids.clear),
+        (lambda: engine._pending_kv_imports.append(object()), engine._pending_kv_imports.clear),
+        (lambda: engine._pending_kv_pushes.append(object()), engine._pending_kv_pushes.clear),
+        (
+            lambda: setattr(engine.controller._async_sched_forward, "is_valid", True),
+            lambda: setattr(engine.controller._async_sched_forward, "is_valid", False),
+        ),
+    )
+    for block, clear in blockers:
+        block()
+        assert not engine._recapture_cuda_graphs_if_idle()
+        clear()
+    engine.create_cuda_graphs.assert_not_called()
+
+    engine.async_forward = mock.AsyncMock(return_value=())
+    engine.async_bookkeep = mock.AsyncMock(return_value={})
+    await engine.async_step()
+    await engine.async_step()
+    engine.create_cuda_graphs.assert_called_once_with()
+    assert engine._cuda_graph_recapture_dimensions is None
+    assert context.cuda_graph_batch_dimensions_list == dimensions
+
+    engine._defer_cuda_graph_recapture()
+    engine.create_cuda_graphs.reset_mock(side_effect=True)
+    engine.create_cuda_graphs.side_effect = RuntimeError("capture failed")
+    with pytest.raises(RuntimeError, match="capture failed"):
+        await engine.async_step()
+    assert engine._cuda_graph_recapture_dimensions == dimensions
+    assert context.cuda_graph_batch_dimensions_list == []
+
+
 @pytest.mark.parametrize(
     "overrides, should_raise",
     [
@@ -791,6 +868,40 @@ _ASYNC_PAIR_SCENARIOS = (
         "implementation:inference-optimized",
         config={"transformer_impl": "inference_optimized"},
         signals=("inference-optimized",),
+    ),
+    _pair_scenario(
+        "offload-static-uvm-suspend-resume",
+        "kv:offload",
+        "memory:uvm",
+        "kv:static-pointers",
+        config={
+            "kv_cache_management_mode": "offload",
+            "static_kv_memory_pointers": True,
+            "unified_memory_level": 1,
+        },
+        signals=("offload", "static-pointers", "suspend-resume", "uvm"),
+    ),
+    _pair_scenario(
+        "offload-static-uvm-hybrid-mamba-suspend-resume",
+        "model:hybrid-mamba",
+        "kv:offload",
+        "memory:uvm",
+        config={
+            "kv_cache_management_mode": "offload",
+            "model_provider": "hybrid",
+            "static_kv_memory_pointers": True,
+            "unified_memory_level": 1,
+        },
+        signals=(
+            "hybrid",
+            "metadata-compaction",
+            "offload",
+            "static-pointers",
+            "suspend-resume",
+            "uvm",
+        ),
+        prerequisite="mamba",
+        atol=5.0e-3,
     ),
     # Four heads of width 64 exercise FlashInfer's supported fused-RoPE kernel.
     # Width 16 crosses half-head boundaries in its vectorized NeoX rotation.
@@ -2059,6 +2170,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
 
         def step():
             context = env.engine.context
+            recapture_was_pending = env.engine._cuda_graph_recapture_dimensions is not None
             runtime["max_active"] = max(
                 runtime["max_active"], context.total_request_count - context.paused_request_count
             )
@@ -2066,6 +2178,9 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             result = env.engine.step_modern()
             runtime["steps"] += 1
             runtime["cuda_graph_steps"] += int(context.using_cuda_graph_this_step())
+            runtime["cuda-graph-deferred-eager-steps"] += int(
+                recapture_was_pending and not context.using_cuda_graph_this_step()
+            )
             runtime["max_paused"] = max(runtime["max_paused"], context.paused_request_count)
             for request in result["finished_requests"]:
                 env.requests[request.request_id] = request
@@ -2459,6 +2574,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         if "uvm" in signals:
             assert context.unified_memory_level == 1
             assert not context._uses_torch_memory_saver
+            assert not context._offloadable_tensor_names
+            assert not context._offloadable_cpu_backups
         if "tms" in signals:
             assert context._uses_torch_memory_saver
         if "suspend-resume" in signals:
@@ -2571,6 +2688,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["prefix-blocks-deregistered"] > 0
         if "cuda-graph" in signals:
             assert context.cuda_graph_batch_dimensions_list
+            assert runtime["cuda-graph-cold-pool-rebinds"] == 1
             assert runtime["cuda_graph_steps"] > 0
             assert runtime["cuda-graph-runner-replays"] > 0
             assert executed_graph_dimensions

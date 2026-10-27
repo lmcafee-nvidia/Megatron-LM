@@ -892,8 +892,15 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             if inference_config.cuda_graph_all_prefills
             else min(max(inference_config.cuda_graph_max_tokens, decode_bound), self.max_tokens)
         )
+        self._cuda_graph_max_real_tokens = cuda_graph_max_tokens
 
         # CUDA graph config list.
+        if model_config.fp8:
+            from megatron.core.fp8_utils import get_fp8_align_size
+
+            cuda_graph_token_alignment = get_fp8_align_size(model_config.fp8_recipe)
+        else:
+            cuda_graph_token_alignment = 1
         self.cuda_graph_batch_dimensions_list, self.cuda_graph_token_counts = (
             CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
                 tp_size=tp_size,
@@ -906,6 +913,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 use_cuda_graphs_for_non_decode_steps=self.use_cuda_graphs_for_non_decode_steps,
                 num_speculative_tokens=self.num_speculative_tokens,
                 sizing_distribution=inference_config.cuda_graph_sizing_distribution,
+                token_alignment=cuda_graph_token_alignment,
             )
         )
 
@@ -1112,8 +1120,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         if (
             self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
             and not self._uses_torch_memory_saver
+            and self.unified_memory_level == 0
         ):
-            assert self.unified_memory_level == 0
             self._offloadable_tensor_names.add("memory_buffer")
             self._offloadable_cpu_backups["memory_buffer"] = torch.empty_like(
                 self.memory_buffer, device="cpu"
@@ -1191,8 +1199,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             if (
                 self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
                 and not self._uses_torch_memory_saver
+                and self.unified_memory_level == 0
             ):
-                assert self.unified_memory_level == 0
                 self._offloadable_tensor_names.add("mamba_conv_states")
                 self._offloadable_cpu_backups["mamba_conv_states"] = torch.empty_like(
                     self.mamba_conv_states, device="cpu"
@@ -2617,9 +2625,15 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         self.batch_dimensions = batch_dimensions
 
+        graph_dimensions = self.cuda_graph_batch_dimensions_list
+        if (
+            construct_graph_dimensions is None
+            and batch_dimensions.token_count > self._cuda_graph_max_real_tokens
+        ):
+            graph_dimensions = []
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
             batch_dimensions,
-            self.cuda_graph_batch_dimensions_list,
+            graph_dimensions,
             strict=self.is_hybrid_model,
             ep_group=self.expert_model_parallel_group,
             match_ep_token_counts=self._nccl_ep_dispatcher or self._training_ep_dispatcher,
