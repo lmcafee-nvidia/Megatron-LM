@@ -5805,6 +5805,62 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert all(status == Status.COMPLETED for status, _ in expected)
         assert actual == expected
 
+    @pytest.mark.parametrize(
+        "variant", ["async", "legacy", "async-clear-at-suspend", "async-nographs"]
+    )
+    @torch.inference_mode()
+    def test_diag_offload_resume_variants(self, variant):
+        """Disposable diagnostic: localize OFFLOAD resume divergence (not for review)."""
+
+        def run(suspend_resume_interval):
+            graphs = variant != "async-nographs"
+            env = self._build_test_env(
+                DynamicEngineTestConfig(
+                    num_requests=4,
+                    num_tokens_to_generate=12,
+                    top_k=1,
+                    num_cuda_graphs=4 if graphs else None,
+                    force_build_cuda_graphs=graphs,
+                    use_cuda_graphs_for_non_decode_steps=False,
+                    kv_cache_management_mode="offload",
+                    static_kv_memory_pointers=False,
+                    suspend_resume_interval=suspend_resume_interval,
+                    async_sched_mode=(
+                        AsyncScheduleMode.LEGACY
+                        if variant == "legacy"
+                        else AsyncScheduleMode.ASYNC
+                    ),
+                )
+            )
+            pending_at_suspend = []
+            suspend = env.engine.suspend
+
+            def recording_suspend():
+                pending_at_suspend.append(
+                    env.engine.controller._async_sched_forward.is_valid
+                )
+                suspend()
+                if variant == "async-clear-at-suspend":
+                    env.engine.controller._async_sched_forward.clear()
+
+            env.engine.suspend = recording_suspend
+            for request in env.requests:
+                env.engine._add_request(request)
+            for _ in range(64):
+                self._run_step(env)
+                if not env.engine.has_unfinished_requests():
+                    break
+            outputs = [(request.status, list(request.output)) for request in env.requests]
+            return outputs, pending_at_suspend, env.engine.has_unfinished_requests()
+
+        expected, _, _ = run(None)
+        actual, pending, unfinished = run(3)
+        print(f"DIAG {variant} pending_at_suspend={pending} unfinished={unfinished}")
+        print(f"DIAG {variant} expected={expected}")
+        print(f"DIAG {variant} actual={actual}")
+        assert not unfinished, f"DIAG {variant}: requests stopped progressing"
+        assert actual == expected, f"DIAG {variant}: outputs diverged"
+
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
