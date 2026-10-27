@@ -334,7 +334,6 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     _symm_agv_routing: Optional[dict] = None
     _symm_agv_probs: Optional[dict] = None
     _symm_rsv: Optional[dict] = None
-    _BUFFER_KEYS = ("ep_agv_h", "ep_agv_r", "ep_agv_p", "ep_rsv", "ep_meta")
 
     @classmethod
     def _get_rsv_tensor(cls) -> Optional[torch.Tensor]:
@@ -387,15 +386,6 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         cls._real_token_count_tensor = None
 
     @classmethod
-    def release_buffers(cls) -> None:
-        """Release the current symmetric-memory generation before engine replacement."""
-        if any(SymmetricMemoryManager.is_initialized(key) for key in cls._BUFFER_KEYS):
-            torch.cuda.synchronize()
-        cls._delete_buffers()
-        for key in cls._BUFFER_KEYS:
-            SymmetricMemoryManager.destroy(key)
-
-    @classmethod
     def allocate_buffers(
         cls,
         per_rank_worst_case_token_count: int,
@@ -417,12 +407,6 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             ep_group: Expert parallel process group.
         """
         ep_size = get_pg_size(ep_group)
-        # These registry keys describe one dispatcher generation, including its
-        # process group and capacity. A replacement engine may change either;
-        # retaining name-matched buffers would silently preserve stale storage
-        # and rendezvous handles. Allocation is a cold-path collective, so make
-        # ownership explicit and fresh for every generation.
-        cls.release_buffers()
         cls._per_rank_worst_case_token_count = per_rank_worst_case_token_count
         global_max = per_rank_worst_case_token_count * ep_size
         device = torch.cuda.current_device()
