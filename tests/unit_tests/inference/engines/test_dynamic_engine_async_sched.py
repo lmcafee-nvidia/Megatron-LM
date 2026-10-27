@@ -874,6 +874,13 @@ _ASYNC_PARALLEL_SCENARIOS = (
         parity="reproducible",
     ),
     _nccl_moe_scenario(
+        "moe-ep2-mtp-nccl",
+        "speculation:mtp-depth-one",
+        "interaction:moe-mtp-accept-rewind",
+        config={"expert_model_parallel_size": 2, "num_speculative_tokens": 1},
+        signals=("mtp", "mtp-accept-rewind"),
+    ),
+    _nccl_moe_scenario(
         "moe-ep2-pp2-nccl",
         "topology:pp",
         "interaction:moe-pp",
@@ -1762,6 +1769,30 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         env.requests = _make_scenario_requests(
             env, scenario, stop_tokens=stop_tokens, termination_token=termination_token
         )
+        if "mtp-accept-rewind" in scenario.signals:
+            language_model = env.engine.controller._language_model
+            real_forward = language_model.forward
+            real_mtp_forward = language_model.compute_mtp_single_step
+
+            def controlled_forward(*args, **kwargs):
+                logits = real_forward(*args, **kwargs)
+                logits.zero_()
+                logits[..., 0] = 100.0
+                return logits
+
+            def controlled_mtp_forward(
+                hidden_states, next_token_ids, position_ids, depth, **kwargs
+            ):
+                hidden_states, logits = real_mtp_forward(
+                    hidden_states, next_token_ids, position_ids, depth, **kwargs
+                )
+                preferred = position_ids.reshape(-1).remainder(2)
+                logits.zero_()
+                logits[torch.arange(logits.shape[0], device=logits.device), 0, preferred] = 100.0
+                return hidden_states, logits
+
+            language_model.forward = controlled_forward
+            language_model.compute_mtp_single_step = controlled_mtp_forward
         runtime = Counter()
         if mode == AsyncScheduleMode.ASYNC:
             _instrument_scenario_runtime(env, scenario, runtime)
