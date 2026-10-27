@@ -1733,14 +1733,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST
                 and not self.context.static_kv_memory_pointers
             ):
-                if (
-                    self.inference_cuda_graph_scope != InferenceCudaGraphScope.none
-                    and self.cuda_graph_impl == "local"
-                    and self.context.cuda_graph_batch_dimensions_list
-                ):
-                    # Capture overwrites the graph buffers that a pending async forward
-                    # reads, so recompute that step after resume instead of sampling it.
-                    self.controller._async_sched_forward.clear()
+                pending_inputs = self.controller._snapshot_async_sched_pending_inputs()
                 live_state = None
                 if (
                     self.context.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
@@ -1753,6 +1746,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 finally:
                     if live_state is not None:
                         self.context._restore_live_request_state_after_graph_recapture(live_state)
+                    if pending_inputs is not None:
+                        self.controller._restore_async_sched_pending_inputs(pending_inputs)
             capture_time = time.time() - capture_time
 
             # Request records outlive the context buffers. Refresh every stale
