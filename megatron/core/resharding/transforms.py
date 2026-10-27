@@ -305,9 +305,7 @@ class MXFP8ReshardTransform(ReshardTransform):
         else:
             # 2D scale: each scale row covers exactly one data row, so partial
             # row-wise updates are independent and can be applied immediately.
-            mxfp8 = MXFP8Tensor.from_bf16(
-                recv_buffers[0], backend=buf.backend, scale_layout="linear"
-            )
+            mxfp8 = MXFP8Tensor.from_bf16(recv_buffers[0], backend=buf.backend)
             buf.data[dst_slice].copy_(mxfp8.data)
             scale_slice = _scale_slice_from_data_slice(dst_slice)
             buf.scale[scale_slice].view(torch.uint8).copy_(mxfp8.scale.view(torch.uint8))
