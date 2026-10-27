@@ -892,7 +892,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             if inference_config.cuda_graph_all_prefills
             else min(max(inference_config.cuda_graph_max_tokens, decode_bound), self.max_tokens)
         )
-        self._cuda_graph_max_real_tokens = cuda_graph_max_tokens
 
         # CUDA graph config list.
         if model_config.fp8:
@@ -901,6 +900,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             cuda_graph_token_alignment = get_fp8_align_size(model_config.fp8_recipe)
         else:
             cuda_graph_token_alignment = 1
+        # Model alignment pads capture sizes above cuda_graph_max_tokens, so steps past
+        # that ceiling must run eagerly. Unaligned ladders keep their historical matching.
+        self._cuda_graph_max_real_tokens = (
+            cuda_graph_max_tokens if cuda_graph_token_alignment > 1 else None
+        )
         self.cuda_graph_batch_dimensions_list, self.cuda_graph_token_counts = (
             CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
                 tp_size=tp_size,
@@ -2628,6 +2632,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         graph_dimensions = self.cuda_graph_batch_dimensions_list
         if (
             construct_graph_dimensions is None
+            and self._cuda_graph_max_real_tokens is not None
             and batch_dimensions.token_count > self._cuda_graph_max_real_tokens
         ):
             graph_dimensions = []

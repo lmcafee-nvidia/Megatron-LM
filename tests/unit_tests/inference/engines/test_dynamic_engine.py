@@ -1175,6 +1175,7 @@ class DynamicInferenceEngineTestBase:
                 prefix_caching_mamba_gb=test_config.prefix_caching_mamba_gb,
                 prefix_caching_eviction_policy=test_config.prefix_caching_eviction_policy,
                 use_flashinfer_fused_rope=test_config.use_flashinfer_fused_rope,
+                # this is for compatibility with the LTS environment
                 unified_memory_level=test_config.unified_memory_level,
                 allow_stale_multimodal_embeddings=(test_config.allow_stale_multimodal_embeddings),
                 track_generated_token_events=test_config.track_generated_token_events,
@@ -1394,6 +1395,7 @@ class DynamicInferenceEngineTestBase:
                     config=transformer_config, spec=layer_spec, use_transformer_engine=use_te
                 )
 
+            # GPT model.
             if test_config.model_provider == "gpt":
                 model = GPTModel(
                     config=transformer_config,
@@ -1590,6 +1592,7 @@ class DynamicInferenceEngineTestBase:
 
         delete_cuda_graphs()
 
+        # Inference engine.
         if test_config.defer_cuda_graph_creation:
             with mock.patch.object(
                 test_config.engine_cls, "create_cuda_graphs", autospec=True, return_value=None
