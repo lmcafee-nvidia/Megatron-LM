@@ -735,6 +735,21 @@ _ASYNC_PAIR_SCENARIOS = (
         exact_top_n=False,
     ),
     _pair_scenario(
+        "mla-latent-kv",
+        "attention:mla",
+        "kv:latent",
+        config={
+            "cache_mla_latents": True,
+            "context_block_size_tokens": 64,
+            "flash_attention_version": 3,
+            "hidden_size": 256,
+            "multi_latent_attention": True,
+        },
+        signals=("mla",),
+        prerequisite="flash-mla",
+        atol=5.0e-3,
+    ),
+    _pair_scenario(
         "vlm-precomputed-media",
         "model:vlm",
         "interaction:live-image-embedding-injection",
@@ -792,6 +807,55 @@ _ASYNC_PAIR_SCENARIOS = (
         config={"transformer_impl": "inference_optimized"},
         signals=("inference-optimized",),
     ),
+    *(
+        _pair_scenario(
+            "fp8-transformer-engine" + (f"-{recipe}" if recipe != "tensorwise" else ""),
+            f"precision:fp8-{recipe}",
+            config={"fp8": True, "fp8_recipe": recipe, "hidden_size": 128},
+            signals=("fp8", "fixed-history-logits"),
+            prerequisite="fp8",
+            atol=0.0,
+        )
+        for recipe in ("tensorwise", "delayed", "blockwise")
+    ),
+    _pair_scenario(
+        "mxfp8-inference-optimized-moe",
+        "precision:mxfp8",
+        "model:moe",
+        "implementation:inference-optimized",
+        config={
+            "fp8": True,
+            "fp8_recipe": "mxfp8",
+            "hidden_size": 128,
+            "num_moe_experts": 2,
+            "moe_grouped_gemm": True,
+            "use_moe_layer_spec": True,
+            "transformer_impl": "inference_optimized",
+        },
+        signals=("inference-optimized", "moe", "mxfp8", "fixed-history-logits"),
+        prerequisite="mxfp8",
+        atol=0.0,
+        graph_parity="reproducible",
+    ),
+    _pair_scenario(
+        "mxfp8-inference-topk1",
+        config={
+            "fp8": True,
+            "fp8_recipe": "mxfp8",
+            "hidden_size": 128,
+            "num_moe_experts": 2,
+            "moe_grouped_gemm": True,
+            "use_moe_layer_spec": True,
+            "transformer_impl": "inference_optimized",
+            "moe_router_topk": 1,
+            "moe_router_pre_softmax": True,
+            "fp8_output_proj": True,
+        },
+        signals=("inference-optimized", "moe", "mxfp8", "fixed-history-logits"),
+        prerequisite="mxfp8",
+        atol=0.0,
+        graph_parity="reproducible",
+    ),
     # Four heads of width 64 exercise FlashInfer's supported fused-RoPE kernel.
     # Width 16 crosses half-head boundaries in its vectorized NeoX rotation.
     _pair_scenario(
@@ -834,6 +898,22 @@ _ASYNC_PAIR_SCENARIOS = (
         signals=("softmax-sink", "swa-alternating"),
     ),
 )
+
+_ASYNC_SUSPEND_RESUME_SCENARIOS = (
+    _pair_scenario(
+        "offload-suspend-resume",
+        "kv:offload",
+        config={"kv_cache_management_mode": "offload", "static_kv_memory_pointers": False},
+        signals=("offload", "suspend-resume"),
+    ),
+    _pair_scenario(
+        "recompute-suspend-resume",
+        "kv:recompute",
+        config={"kv_cache_management_mode": "recompute", "static_kv_memory_pointers": False},
+        signals=("recompute", "suspend-resume"),
+    ),
+)
+
 
 _CUDA_GRAPH_LIFECYCLE_SCENARIOS = (
     _pair_scenario(
@@ -958,6 +1038,20 @@ _ASYNC_PARALLEL_SCENARIOS = (
             "transformer_impl": "inference_optimized",
         },
         signals=("inference-optimized", "moe", "nvls-dispatch", "parallel"),
+    ),
+    _pair_scenario(
+        "moe-ep2-etp2-local-allgather",
+        "model:moe",
+        "topology:ep",
+        "topology:etp",
+        "dispatcher:allgather",
+        config={
+            "expert_model_parallel_size": 2,
+            "expert_tensor_parallel_size": 2,
+            "num_moe_experts": 4,
+            "use_moe_layer_spec": True,
+        },
+        signals=("etp", "moe", "parallel"),
     ),
     _pair_scenario(
         "optimized-tp2-sp",
@@ -2245,7 +2339,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     )
                 else:
                     runtime["cuda-graph-recapture-deferred"] += int(
-                        env.engine._cuda_graph_recapture_dimensions is not None
+                        getattr(env.engine, "_cuda_graph_recapture_dimensions", None) is not None
                     )
                     runtime["cuda-graph-eager-fallback-armed"] += int(
                         not env.engine.context.cuda_graph_batch_dimensions_list
@@ -3194,6 +3288,19 @@ class TestAsyncSchedulePairwise(_AsyncPairwiseHarness):
     @torch.inference_mode()
     def test_async_matches_legacy_for_owned_pair(self, scenario):
         _check_scenario_prerequisite(scenario)
+        try:
+            self._assert_scenario_pair(scenario)
+        finally:
+            gc.collect()
+            delete_cuda_graphs()
+            torch.cuda.empty_cache()
+
+    @pytest.mark.parametrize(
+        "scenario", _ASYNC_SUSPEND_RESUME_SCENARIOS, ids=lambda case: case.name
+    )
+    @torch.inference_mode()
+    def test_async_suspend_resume_mode_matches_legacy(self, scenario):
+        """Real OFFLOAD and RECOMPUTE cycles preserve output parity."""
         try:
             self._assert_scenario_pair(scenario)
         finally:
