@@ -145,6 +145,67 @@ def _boundary_input(rows: int, cols: int) -> torch.Tensor:
     return result
 
 
+def test_boundary_payload_scales_and_padding_match_independent_reference():
+    """Stress 32-column groups plus 128-row/4-column scale-tile tails."""
+    x = _boundary_input(129, 160)
+    data, scale = mxfp8_quantize(x)
+    expected_data, logical_scale = _reference_quantize(x)
+    expected_scale = _swizzle_scales(logical_scale)
+
+    assert torch.unique(logical_scale).numel() > 10
+    assert torch.count_nonzero(data.view(torch.uint8)) > 0
+    assert logical_scale[32, 1].item() == 0
+    assert torch.count_nonzero(expected_data[32, 32:64].view(torch.uint8)) == 32
+    assert torch.equal(data.view(torch.uint8), expected_data.view(torch.uint8))
+    assert torch.equal(scale.view(torch.uint8), expected_scale)
+
+
+def test_conversion_verifier_decodes_e8m0_byte_zero_as_finite_scale():
+    x = torch.full(
+        (1, MXFP8_BLOCK_SIZE),
+        torch.finfo(torch.float32).tiny / 4,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    quantized = MXFP8Tensor.from_bf16(x, backend="triton")
+
+    assert quantized.scale.view(torch.uint8)[0].item() == 0
+    assert torch.all(quantized.data.float() == 0.5)
+    quantization_utils._verify_te_to_mcore_mxfp8_conversion(x, quantized)
+
+
+def test_odd_live_rows_graph_replay_clears_stale_swizzled_scales():
+    """Changing graph-time row tails must update targets and clear former targets."""
+    rows, cols = 257, 160
+    x = _boundary_input(rows, cols).to(torch.bfloat16)
+    n_rows = torch.tensor([129], device="cuda", dtype=torch.int32)
+    side_stream = torch.cuda.Stream()
+    side_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side_stream):
+        mxfp8_quantize_rows(x, n_rows)
+    torch.cuda.current_stream().wait_stream(side_stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        data, scale = mxfp8_quantize_rows(x, n_rows, max_programs=7)
+    data_ptr, scale_ptr = data.data_ptr(), scale.data_ptr()
+
+    for live_rows in (129, 33, 128, 1, 257):
+        data_before_replay = data.view(torch.uint8).clone()
+        n_rows.fill_(live_rows)
+        graph.replay()
+        expected_data, logical_scale = _reference_quantize(x[:live_rows])
+        expected_logical = torch.zeros(
+            (rows, cols // MXFP8_BLOCK_SIZE), device="cuda", dtype=torch.uint8
+        )
+        expected_logical[:live_rows] = logical_scale
+        assert torch.equal(data[:live_rows].view(torch.uint8), expected_data.view(torch.uint8))
+        assert torch.equal(
+            scale.view(torch.uint8), _swizzle_scales(expected_logical, storage_rows=rows)
+        )
+        assert torch.equal(data[live_rows:].view(torch.uint8), data_before_replay[live_rows:])
+        assert (data.data_ptr(), scale.data_ptr()) == (data_ptr, scale_ptr)
+
+
 def test_from_bf16_rejects_nonstandard_group_size():
     x = torch.randn(8, 128, device="cuda", dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="group size 32"):
@@ -158,6 +219,61 @@ def test_public_quantizers_document_finite_input_contract(api):
     """NaN/Inf are an explicit precondition, not backend-dependent output promises."""
     documentation = (api.__doc__ or "").lower()
     assert "finite" in documentation
+
+
+def test_quantize_into_honors_offset_views_without_touching_sentinels():
+    """Exact-sized output views may safely reuse larger persistent allocations."""
+    x = _boundary_input(129, 160).to(torch.bfloat16)
+    expected_data, logical_scale = _reference_quantize(x)
+    expected_scale = _swizzle_scales(logical_scale)
+    data_storage_bytes = torch.full(
+        (x.shape[0] + 2, x.shape[1]), 0xA5, device="cuda", dtype=torch.uint8
+    )
+    data_storage = data_storage_bytes.view(torch.float8_e4m3fn)
+    scale_storage = torch.full(
+        (expected_scale.numel() + 16,), 0xA5, device="cuda", dtype=torch.uint8
+    )
+    out_data = data_storage[1:-1]
+    out_scale = scale_storage[8:-8].view(torch.float8_e8m0fnu)
+
+    mxfp8_quantize_into(x, out_data, out_scale)
+
+    assert torch.equal(out_data.view(torch.uint8), expected_data.view(torch.uint8))
+    assert torch.equal(out_scale.view(torch.uint8), expected_scale)
+    assert torch.all(data_storage_bytes[[0, -1]] == 0xA5)
+    assert torch.all(scale_storage[:8] == 0xA5)
+    assert torch.all(scale_storage[-8:] == 0xA5)
+
+
+@pytest.mark.parametrize(
+    ("backend", "scale_dtype"), (("triton", torch.float8_e8m0fnu), ("flashinfer", torch.uint8))
+)
+def test_logical_2d_scale_validation_and_gemm_boundary(backend, scale_dtype):
+    """Logical storage remains valid, while physical GEMM inputs stay swizzled."""
+    data = torch.empty((64, 128), device="cuda", dtype=torch.float8_e4m3fn)
+    logical_scale = torch.empty((64, 4), device="cuda", dtype=scale_dtype)
+    tensor = MXFP8Tensor(data=data, scale=logical_scale, backend=backend, dtype=torch.bfloat16)
+
+    validate_mxfp8_tensor(tensor)
+    with pytest.raises(ValueError, match="swizzled storage at the GEMM boundary"):
+        quantization_utils.mm_mxfp8(
+            torch.ones(1, 1, 128, device="cuda", dtype=torch.bfloat16), tensor
+        )
+
+    from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+    grouped = SimpleNamespace(num_local_experts=1, linear_fc1=SimpleNamespace(weight0=tensor))
+    with pytest.raises(ValueError, match="swizzled storage at the GEMM boundary"):
+        InferenceGroupedMLP._stack_mxfp8_linear_weight(grouped, "linear_fc1", backend)
+
+    invalid = MXFP8Tensor(
+        data=data,
+        scale=torch.empty((64, 5), device="cuda", dtype=scale_dtype),
+        backend=backend,
+        dtype=torch.bfloat16,
+    )
+    with pytest.raises(ValueError, match="2D scale has shape"):
+        validate_mxfp8_tensor(invalid)
 
 
 def test_hopper_mxfp8_gemm_fails_and_bf16_path_executes(monkeypatch):

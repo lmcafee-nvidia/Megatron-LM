@@ -9,6 +9,7 @@ import torch
 from megatron.core.inference.quantization.mxfp8_tensor import (
     MXFP8Backend,
     MXFP8Tensor,
+    validate_mxfp8_gemm_tensor,
     validate_mxfp8_tensor,
 )
 
@@ -50,11 +51,11 @@ def _verify_te_to_mcore_mxfp8_conversion(te_dequantized, fi_quantized: MXFP8Tens
     # Extract the scale. Logical block (0, 0) is always at physical index 0,
     # bypassing any scale swizzling layout complexity (like SWIZZLED_128x4)
     fi_scale_byte = fi_quantized.scale.contiguous().flatten()[0:1].view(torch.uint8).to(torch.int32)
-    fi_scale_f32 = (fi_scale_byte << 23).view(torch.float32)
+    # E8M0 byte zero is 2^-127, not IEEE float zero. ldexp reconstructs directly
+    # from the unbiased exponent and preserves subnormal dequantized values.
+    fi_block = torch.ldexp(fi_data_e4m3, fi_scale_byte - 127)
 
-    fi_block = fi_data_e4m3 * fi_scale_f32
-
-    if not torch.allclose(te_block, fi_block):
+    if not torch.equal(te_block, fi_block):
         diff_norm = torch.norm(te_block - fi_block)
         raise ValueError(f"MXFP8 sanity check failed. Diff norm: {diff_norm}")
 
@@ -353,6 +354,7 @@ def mm_mxfp8(x: torch.Tensor, weight: MXFP8Tensor, out: torch.Tensor = None):
     assert (
         backend is not None
     ), "weight.backend is None — was the weight created via MXFP8Tensor.from_bf16?"
+    validate_mxfp8_gemm_tensor(weight, tensor_name="MXFP8 linear weight")
     if x.ndim != 3 or x.shape[1] != 1:
         raise ValueError(
             "MXFP8 inference linear input must have shape [tokens, 1, hidden], "
