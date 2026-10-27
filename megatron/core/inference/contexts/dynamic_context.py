@@ -1097,7 +1097,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 device=torch.cuda.current_device(),
             )
         else:
-            self.memory_buffer = torch.empty(
+            # FA3 paged attention can load the physical tail of the final KV page even when
+            # seqused_k excludes it. Keep every unwritten cache location finite so those loads
+            # cannot contaminate valid query rows before a page is fully populated.
+            self.memory_buffer = torch.zeros(
                 (
                     2,  # key and value
                     self.num_attention_layers,
