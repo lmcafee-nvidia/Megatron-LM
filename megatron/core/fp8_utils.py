@@ -1000,16 +1000,22 @@ if HAVE_TE:
                 # all-gather and reduce-scatter externally
                 module.sequence_parallel = False
 
-            seq_len, batch_size, hidden_size = input_tensor.shape
+            if input_tensor.ndim < 2:
+                raise ValueError(
+                    "FP8 inference linear inputs must have at least token and hidden dimensions"
+                )
+            input_shape = input_tensor.shape
+            seq_len = input_shape[0]
             # Reshape to (S, B*H) to pad sequence dimension
             input_2d = input_tensor.reshape(seq_len, -1)
             # Pad the sequence dimension
             padded_input_2d, _ = _pad_func(input_2d, [seq_len])
             padded_seq_len = padded_input_2d.shape[0]
 
-            # Reshape back to (padded_S, B, H)
-            padded_input_3d = padded_input_2d.view(padded_seq_len, batch_size, hidden_size)
-            output = original_forward(padded_input_3d, *args, **kwargs)
+            # Restore all non-sequence dimensions. Linear inputs can be either
+            # [S, B, H] transformer states or [tokens, H] packed media states.
+            padded_input = padded_input_2d.reshape(padded_seq_len, *input_shape[1:])
+            output = original_forward(padded_input, *args, **kwargs)
 
             # Handle output
             if isinstance(output, tuple):
@@ -1020,10 +1026,10 @@ if HAVE_TE:
                 other_outputs = ()
 
             # Unpad output - reshape to 2D, unpad, reshape back
-            _, _, output_hidden_size = output_tensor.shape
+            output_shape = output_tensor.shape
             output_2d = output_tensor.reshape(padded_seq_len, -1)
             unpadded_output_2d = _unpad_func(output_2d, [seq_len])
-            unpadded_output = unpadded_output_2d.reshape(seq_len, batch_size, output_hidden_size)
+            unpadded_output = unpadded_output_2d.reshape(seq_len, *output_shape[1:])
 
             if is_sequence_parallel:
                 # Reduce-scatter after unpadding
