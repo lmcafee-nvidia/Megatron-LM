@@ -62,6 +62,7 @@ if HAVE_TE:
         TENorm,
         TERowParallelGroupedLinear,
         TERowParallelLinear,
+        split_te_layernorm_column_parallel_linear,
         te_cross_entropy,
     )
 
@@ -538,6 +539,28 @@ class TestTEWrappers:
             replays=3,
             contention=True,
             what=f"TELayerNormColumnParallelLinear[{normalization}]",
+        )
+
+    def test_split_layernorm_column_parallel_linear_keeps_source_device(self):
+        """MLA latent caching splits the fused KV up projection; both parts must stay on its device."""
+        seeded()
+        config = _config(normalization="RMSNorm", use_cpu_initialization=True)
+        module = TELayerNormColumnParallelLinear(
+            HIDDEN,
+            3 * HIDDEN,
+            config=config,
+            init_method=init_method_normal(0.02),
+            gather_output=False,
+            bias=True,
+            skip_bias_add=False,
+            is_expert=False,
+        ).cuda()
+        norm, linear = split_te_layernorm_column_parallel_linear(module, config)
+        split = torch.nn.Sequential(norm, linear)
+        assert {parameter.device for parameter in split.parameters()} == {module.weight.device}
+        x = torch.randn(TOKENS, 2, HIDDEN, device="cuda", dtype=torch.bfloat16)
+        assert_module_replays_bit_exact(
+            split, (x,), replays=3, contention=True, what="split TE MLA up projection"
         )
 
     @pytest.mark.parametrize("normalization", ["LayerNorm", "RMSNorm"])
