@@ -314,6 +314,7 @@ class TestBatchInvariantMambaPrefixCaching:
                         assert context.request_ids[: context.total_request_count].tolist() == [5999]
                         assert context.mamba_metadata.request_to_mamba_state_idx[0] >= 0
                 else:
+                    # Old cached states must not be reused after a weight update.
                     engine.suspend()
                     for parameter in model.parameters():
                         parameter.mul_(1.03)
@@ -362,19 +363,10 @@ class TestBatchInvariantMambaPrefixCaching:
                     assert post_refit_chunked_steps > 0
         if lifecycle is not None:
             lifecycle.__exit__(None, None, None)
-        if sampling_backend == "torch":
-            if not exercise_real_refit:
-                for first_id, repeated_id in ((1, 11), (2, 12)):
-                    first_tokens, first_log_probs = outputs[first_id]
-                    repeated_tokens, repeated_log_probs = outputs[repeated_id]
-                    assert first_tokens == repeated_tokens
-                    assert len(first_log_probs) == len(repeated_log_probs)
-                    for first, repeated in zip(first_log_probs, repeated_log_probs):
-                        if math.isnan(first) or math.isnan(repeated):
-                            assert math.isnan(first) and math.isnan(repeated)
-                        else:
-                            assert first == repeated
-
+        if not exercise_real_refit:
+            assert outputs[1] == outputs[11]
+            assert outputs[2] == outputs[12]
+        elif sampling_backend == "torch":
             before_tokens, before_log_probs = outputs[1]
             after_tokens, after_log_probs = outputs[61]
             assert len(before_log_probs) == len(after_log_probs)
@@ -480,7 +472,8 @@ class TestBatchInvariantMambaPrefixCaching:
         from types import SimpleNamespace
 
         from megatron.core.inference.inference_client import InferenceClient
-        from megatron.rl import rl_utils
+
+        rl_utils = pytest.importorskip("megatron.rl.rl_utils")
         from megatron.rl.inference.megatron import MegatronLocal
         from megatron.training.config import RLConfig
 
