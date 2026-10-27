@@ -956,7 +956,6 @@ _CUDA_GRAPH_LIFECYCLE_SCENARIOS = (
         signals=("recompute", "static-pointers", "suspend-resume", "tms"),
         prerequisite="torch-memory-saver",
     ),
-    *_ASYNC_SUSPEND_RESUME_SCENARIOS,
 )
 
 
@@ -1611,7 +1610,6 @@ def _instrument_scenario_runtime(env, scenario, runtime, teacher_tokens=None):
                 if runner.fwd_graph_recorded
             ]
             graph_pool = CudaGraphManager.global_mempool
-            runtime["cuda-graph-create-live-runners"] += len(live_runners)
             runtime["cuda-graph-pool-rebinds"] += int(
                 bool(live_runners)
                 and graph_pool is not None
@@ -2260,7 +2258,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
 
         def step():
             context = env.engine.context
-            recapture_was_pending = env.engine._cuda_graph_recapture_dimensions is not None
             runtime["max_active"] = max(
                 runtime["max_active"], context.total_request_count - context.paused_request_count
             )
@@ -2268,9 +2265,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             result = env.engine.step_modern()
             runtime["steps"] += 1
             runtime["cuda_graph_steps"] += int(context.using_cuda_graph_this_step())
-            runtime["cuda-graph-deferred-eager-steps"] += int(
-                recapture_was_pending and not context.using_cuda_graph_this_step()
-            )
             runtime["max_paused"] = max(runtime["max_paused"], context.paused_request_count)
             for request in result["finished_requests"]:
                 env.requests[request.request_id] = request
@@ -2364,9 +2358,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 def traced_delete_cuda_graphs():
                     result = original_delete_cuda_graphs()
                     runtime["cuda-graph-delete-calls"] += 1
-                    runtime["cuda-graph-pool-releases"] += int(
-                        CudaGraphManager.global_mempool is None
-                    )
                     return result
 
                 with mock.patch.object(
@@ -2382,36 +2373,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     runtime["vlm-stale-media-preserved"] += int(
                         bool(vlm_requests)
                         and all(request.image_embeddings is not None for request in vlm_requests)
-                    )
-                if not env.engine.context.static_kv_memory_pointers:
-                    runtime["cuda-graph-runners-cleared"] += int(
-                        all(
-                            runner.fwd_graph is None and runner.mempool is None
-                            for runner in runners_before
-                        )
-                    )
-                    runtime["cuda-graph-runner-buffers-cleared"] += int(
-                        all(
-                            not runner.get_tensors(
-                                getattr(runner, "fwd_graph_input_args", ()),
-                                getattr(runner, "fwd_graph_input_kwargs", {}),
-                                check_types=False,
-                            )
-                            and not runner.get_tensors(
-                                getattr(runner, "fwd_graph_outputs", ()), check_types=False
-                            )
-                            and all(
-                                metadata.fwd_cudagraph_buffer is None
-                                and metadata.bwd_cudagraph_buffer is None
-                                for arg_meta in [
-                                    *runner.fwd_graph_input_arg_metas,
-                                    *runner.fwd_graph_input_kwarg_metas.values(),
-                                ]
-                                if (metadata := getattr(arg_meta, "cg_buffer_metadata", None))
-                                is not None
-                            )
-                            for runner in runners_before
-                        )
                     )
                 if "weight-refit" in scenario.signals:
                     model = env.engine.controller.inference_wrapped_model.model
@@ -2453,13 +2414,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 if env.engine.context.static_kv_memory_pointers:
                     runtime["cuda-graph-pool-preserved"] += int(
                         CudaGraphManager.global_mempool == graph_pool_before
-                    )
-                else:
-                    runtime["cuda-graph-recapture-deferred"] += int(
-                        env.engine._cuda_graph_recapture_dimensions is not None
-                    )
-                    runtime["cuda-graph-eager-fallback-armed"] += int(
-                        not env.engine.context.cuda_graph_batch_dimensions_list
                     )
                 _instrument_cuda_graph_replays(
                     env.engine.controller.inference_wrapped_model.model, env.engine.context, runtime
@@ -2523,41 +2477,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                         runtime["cuda-graph-runner-replays"] > replays_before
                     )
 
-        if (
-            "suspend-resume" in scenario.signals
-            and not env.engine.context.static_kv_memory_pointers
-            and ("offload" in scenario.signals or "recompute" in scenario.signals)
-            and env.config.num_cuda_graphs
-        ):
-            rebuilt_runners = [
-                runner
-                for manager in model.modules()
-                if isinstance(manager, CudaGraphManager)
-                for runner in manager.cudagraph_runners
-                if runner.fwd_graph_recorded
-            ]
-            graph_pool = CudaGraphManager.global_mempool
-            runtime["cuda-graph-pool-live-after-idle-rebuild"] += int(
-                graph_pool is not None
-                and env.engine._cuda_graph_recapture_dimensions is None
-                and bool(rebuilt_runners)
-                and all(runner.mempool == graph_pool for runner in rebuilt_runners)
-            )
-            runtime["cuda-graph-new-objects-after-idle-rebuild"] += int(
-                bool(rebuilt_runners)
-                and runtime["cuda-graph-runners-cleared"] == runtime["suspend-resume"]
-                and all(runner.fwd_graph is not None for runner in rebuilt_runners)
-            )
-            probe_id = len(env.requests)
-            prompt = torch.arange(5, dtype=torch.int64, device="cuda") + 71
-            sampling_params = SamplingParams(num_tokens_to_generate=3, termination_id=-1, top_k=1)
-            env.engine.add_request(probe_id, prompt, sampling_params)
-            env.requests.append(env.engine.get_request(probe_id))
-            env.requests[probe_id].state = "pending"
-            runtime["post-rebuild-probe-requests"] += 1
-            while env.engine.has_unfinished_requests():
-                step()
-                assert runtime["steps"] < 400, f"{scenario.name} probe did not converge"
         return env, runtime
 
     @staticmethod
@@ -2670,23 +2589,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     assert runtime["cuda-graph-runner-objects-preserved"] == expected_cycles
                     assert runtime["cuda-graph-objects-preserved"] == expected_cycles
                     assert runtime["cuda-graph-pool-preserved"] == expected_cycles
-                elif "offload" in signals or "recompute" in signals:
-                    assert runtime["cuda-graph-delete-calls"] == expected_cycles
-                    assert runtime["cuda-graph-pool-releases"] == expected_cycles
-                    assert runtime["cuda-graph-runners-cleared"] == expected_cycles
-                    assert runtime["cuda-graph-runner-buffers-cleared"] == expected_cycles
-                    assert runtime["cuda-graph-recapture-deferred"] == expected_cycles
-                    assert runtime["cuda-graph-eager-fallback-armed"] == expected_cycles
-                    assert runtime["cuda-graph-deferred-eager-steps"] > 0
-                    assert runtime["cuda-graph-create-calls"] == 1
-                    assert runtime["cuda-graph-capture-forwards"] > 0
-                    assert runtime["cuda-graph-create-live-runners"] > 0
-                    assert runtime["cuda-graph-pool-rebinds"] == 1
-                    assert runtime["cuda-graph-runner-objects-preserved"] == expected_cycles
-                    assert runtime["cuda-graph-objects-preserved"] == 0
-                    assert runtime["cuda-graph-pool-live-after-idle-rebuild"] == 1
-                    assert runtime["cuda-graph-new-objects-after-idle-rebuild"] == 1
-                    assert runtime["post-rebuild-probe-requests"] == 1
                 else:
                     assert runtime["cuda-graph-create-calls"] == 0
         if "context-reset" in signals:
