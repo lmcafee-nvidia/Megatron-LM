@@ -42,7 +42,7 @@ try:
         tokenizer = current_app.config['tokenizer']
 
         req = await request.get_json(force=True)
-        if not isinstance(req, dict):
+        if req is None:
             return "Invalid or missing JSON body", 400
 
         # Opaque metadata forwarded to the engine's payload stager. Keys starting
@@ -195,17 +195,13 @@ try:
                 termination_id=-1 if ignore_eos else None,
                 streaming_interval=int(req.get("streaming_interval", 1)),
             )
-        except (TypeError, ValueError) as e:
+        except ValueError as e:
             return f"Invalid sampling parameter: {e}", 400
 
         # --- 3. Send Requests to Engine ---
         stream_requested = bool(req.get("stream", False))
-        stream_options = req.get("stream_options")
-        if stream_requested and stream_options is not None and not isinstance(stream_options, dict):
-            return "'stream_options' must be an object", 400
         incremental_detokenizers = []
         if stream_requested:
-            include_usage = bool((stream_options or {}).get("include_usage", False))
             # Streaming currently supports only Hugging Face fast tokenizers.
             try:
                 incremental_detokenizers = [
@@ -282,6 +278,7 @@ try:
             return f"Error submitting request: {e}", 500
 
         if stream_requested:
+            include_usage = bool((req.get("stream_options") or {}).get("include_usage", False))
             response = Response(
                 openai_stream(
                     tasks,
