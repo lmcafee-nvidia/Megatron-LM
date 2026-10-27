@@ -620,9 +620,6 @@ def split_te_layernorm_column_parallel_linear(
 
     # Create the norm layer
     norm_layer = TENorm(config=config, hidden_size=in_features, eps=fused_layer.eps)
-    # Absorption splits this layer after the enclosing model has moved to its runtime device.
-    # Do not let the initialization-only CPU setting strand the replacement modules on CPU.
-    norm_layer.to(device=fused_layer.layer_norm_weight.device)
 
     with torch.no_grad():
         # Copy layer norm weight
@@ -646,7 +643,6 @@ def split_te_layernorm_column_parallel_linear(
         tp_comm_buffer_name=fused_layer.ub_name,
         tp_group=tp_group or fused_layer.tp_group,
     )
-    linear_layer.to(device=fused_layer.weight.device)
 
     with torch.no_grad():
         # Copy weight
