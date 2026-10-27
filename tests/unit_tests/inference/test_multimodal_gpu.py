@@ -414,7 +414,7 @@ def _build_fp8_model(recipe):
     projection_config = TransformerConfig(
         num_layers=1,
         hidden_size=128,
-        num_attention_heads=1,
+        num_attention_heads=4,
         ffn_hidden_size=256,
         params_dtype=torch.bfloat16,
         pipeline_dtype=torch.bfloat16,
