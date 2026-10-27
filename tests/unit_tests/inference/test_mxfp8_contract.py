@@ -160,6 +160,27 @@ def test_public_quantizers_document_finite_input_contract(api):
     assert "finite" in documentation
 
 
+def test_from_bf16_rejects_invalid_dtype_and_geometry():
+    """Unsupported inputs fail with explicit errors before any quantization kernel runs."""
+    with pytest.raises(TypeError, match="requires BF16, FP16, or FP32"):
+        MXFP8Tensor.from_bf16(
+            torch.ones(8, 128, device="cuda", dtype=torch.int32), backend="triton"
+        )
+    with pytest.raises(ValueError, match="dimensions must be nonzero"):
+        MXFP8Tensor.from_bf16(
+            torch.empty(0, 128, device="cuda", dtype=torch.bfloat16), backend="triton"
+        )
+    with pytest.raises(ValueError, match="divisible"):
+        MXFP8Tensor.from_bf16(
+            torch.empty(8, 130, device="cuda", dtype=torch.bfloat16), backend="triton"
+        )
+    if HAVE_FLASHINFER:
+        with pytest.raises(TypeError, match="accepts BF16 or FP16"):
+            MXFP8Tensor.from_bf16(
+                torch.randn(8, 128, device="cuda", dtype=torch.float32), backend="flashinfer"
+            )
+
+
 @pytest.mark.launch_on_gb200
 @pytest.mark.parametrize(
     "backend,dispatch_name",
