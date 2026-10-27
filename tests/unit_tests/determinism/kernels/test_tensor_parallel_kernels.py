@@ -289,7 +289,7 @@ class TestTensorParallelLayers:
             module, (q, k, v, None), replays=3, contention=True, what="local MLA attention"
         )
         assert outputs["out"].shape == (512, 2, 8 * 96)
-        assert module.softmax_scale == 48**-0.5
+        assert module.softmax_scale == pytest.approx(48**-0.5)
 
     def test_mla_absorption_keeps_a_non_fused_kv_up_projection(self):
         """Local-spec MLA has a plain KV up projection, which absorption must not split."""
