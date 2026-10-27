@@ -504,7 +504,6 @@ class MultiLatentAttention(Attention):
             assert (
                 self.config.cache_mla_latents
             ), "currently to use dynamic backend for MLA cache mla latents must be true"
-            _require_flash_mla()
 
         if self.config.cache_mla_latents:
             self.prepare_for_absorption()
