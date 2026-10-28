@@ -820,6 +820,31 @@ _ASYNC_SUSPEND_RESUME_SCENARIOS = (
         signals=("cuda-graph", "offload", "suspend-resume"),
         atol=5.0e-3,
     ),
+    _pair_scenario(
+        "diag-hybrid-mtp-offload-graph-recapture",
+        "model:hybrid-mamba",
+        config={"model_provider": "hybrid", "num_speculative_tokens": 1,
+            "kv_cache_management_mode": "offload",
+            "static_kv_memory_pointers": False,
+            "num_cuda_graphs": 4,
+            "force_build_cuda_graphs": True,
+            "use_cuda_graphs_for_non_decode_steps": False,
+        },
+        signals=("cuda-graph", "mtp", "offload", "suspend-resume"),
+        atol=5.0e-3,
+    ),
+    _pair_scenario(
+        "diag-gpt-mtp-offload-graph-recapture",
+        "speculation:mtp-depth-one",
+        config={"num_speculative_tokens": 1,
+            "kv_cache_management_mode": "offload",
+            "static_kv_memory_pointers": False,
+            "num_cuda_graphs": 4,
+            "force_build_cuda_graphs": True,
+            "use_cuda_graphs_for_non_decode_steps": False,
+        },
+        signals=("cuda-graph", "mtp", "offload", "suspend-resume"),
+    ),
 )
 
 _ASYNC_PARALLEL_SCENARIOS = (
@@ -2310,3 +2335,54 @@ def test_disagg_engine_resolves_handoff_methods_from_mixin():
             engine_cls.add_request_with_kv_handoff
             is InferenceStateHandoffMixin.add_request_with_kv_handoff
         )
+
+
+_DIAG_EP2_RECAPTURE = _pair_scenario(
+    "diag-moe-ep2-offload-graph-recapture",
+    "model:moe",
+    "topology:ep",
+    "kv:offload",
+    "graph:recapture",
+    config={
+        "expert_model_parallel_size": 2,
+        "use_moe_layer_spec": True,
+        "inference_moe_token_dispatcher_type": "nccl",
+        "transformer_impl": "inference_optimized",
+        "kv_cache_management_mode": "offload",
+        "static_kv_memory_pointers": False,
+        "num_cuda_graphs": 4,
+        "force_build_cuda_graphs": True,
+        "use_cuda_graphs_for_non_decode_steps": False,
+    },
+    signals=(
+        "cuda-graph",
+        "graph-recapture",
+        "inference-optimized",
+        "moe",
+        "nccl-dispatch",
+        "offload",
+        "suspend-resume",
+    ),
+)
+
+
+@pytest.mark.internal
+class TestDiagEp2Recapture(_AsyncPairwiseHarness):
+    """Disposable diagnostic (not for review): EP2 lockstep recapture with live state."""
+
+    @torch.inference_mode()
+    def test_diag_ep2_offload_graph_recapture(self):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=2,
+            expert_tensor_parallel_size=1,
+        )
+        try:
+            self._assert_scenario_pair(_DIAG_EP2_RECAPTURE)
+        finally:
+            gc.collect()
+            delete_cuda_graphs()
+            torch.cuda.empty_cache()
+            _reset_rounder()
+            Utils.destroy_model_parallel()
