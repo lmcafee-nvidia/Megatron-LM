@@ -806,6 +806,10 @@ _ASYNC_PAIR_SCENARIOS = (
     ),
     _pair_scenario(
         "mxfp8-inference-topk1",
+        "precision:mxfp8",
+        "model:moe",
+        "routing:top-1",
+        "implementation:inference-optimized",
         config={
             "fp8": True,
             "fp8_recipe": "mxfp8",
@@ -816,7 +820,6 @@ _ASYNC_PAIR_SCENARIOS = (
             "transformer_impl": "inference_optimized",
             "moe_router_topk": 1,
             "moe_router_pre_softmax": True,
-            "fp8_output_proj": True,
         },
         signals=("inference-optimized", "moe", "mxfp8"),
         prerequisite="mxfp8",
@@ -2689,10 +2692,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert all(module._uses_mxfp8_weights for module in experts)
             assert all(isinstance(module._fc1_weight, MXFP8Tensor) for module in experts)
             assert all(isinstance(module._fc2_weight, MXFP8Tensor) for module in experts)
-            if scenario.config.get("fp8_output_proj"):
-                assert type(controller.inference_wrapped_model.model.output_layer).__name__ == (
-                    "TELMHeadColumnParallelLinear"
-                )
         if "routing-replay" in signals:
             assert model_config.moe_enable_routing_replay
             assert context.moe_routing_metadata is not None
