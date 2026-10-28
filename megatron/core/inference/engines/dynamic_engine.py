@@ -1610,7 +1610,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # A coordinator drains at pause. Direct callers drain here, and the requests
         # this finishes reach them with the next step.
-        if self.state != EngineState.PAUSED:
+        if self.state != EngineState.PAUSED and self._async_drain_runs_forward():
             drained = self._run_coroutine_sync(self._async_drain_pending_forward())
             if drained is not None:
                 self._drained_finished_requests.extend(drained["finished_requests"])
@@ -4586,17 +4586,25 @@ class DynamicInferenceEngine(AbstractEngine):
             Optional[DynamicInferenceEngineStepResult]: The drained step, if a forward
                 was pending.
         """
-        if self.context.config.async_sched_mode != AsyncScheduleMode.ASYNC:
+        if not self._async_drain_runs_forward():
             return None
         if self.controller._async_sched_forward.is_valid:
             return await self.async_step(finish_pending_only=True)
-        if (
+        self.controller._run_dummy_serial_mtp_forward()
+        return None
+
+    def _async_drain_runs_forward(self) -> bool:
+        """Whether draining before pause or suspend runs a forward on this rank.
+
+        A rank with nothing pending still runs one under EP > 1 with MTP: draining peers
+        run MTP draft forwards whose expert all-to-alls need every rank.
+        """
+        if self.context.config.async_sched_mode != AsyncScheduleMode.ASYNC:
+            return False
+        return self.controller._async_sched_forward.is_valid or (
             self.controller.num_speculative_tokens > 0
             and self.controller.model_config.expert_model_parallel_size > 1
-        ):
-            # Draining peers run MTP draft forwards whose expert all-to-alls need every rank.
-            self.controller._run_dummy_serial_mtp_forward()
-        return None
+        )
 
     def _run_coroutine_sync(self, coro):
         """Run a coroutine synchronously, handling the case when already in an event loop.
