@@ -356,6 +356,11 @@ class TestBatchInvariantMambaPrefixCaching:
         else:
             assert post_refit_sampling_start is not None
             assert flashinfer_sampling_calls > post_refit_sampling_start
+            import flashinfer
+            print("DEBUG flashinfer", flashinfer.__version__, torch.cuda.get_device_name(), flush=True)
+            for request_id in sorted(outputs):
+                tokens, log_probs = outputs[request_id]
+                print("DEBUG", request_id, tokens, [float(x) for x in log_probs], flush=True)
             for request_id in (61, 5999, 6000):
                 tokens, log_probs = outputs[request_id]
                 assert len(tokens) == len(log_probs) == 8
