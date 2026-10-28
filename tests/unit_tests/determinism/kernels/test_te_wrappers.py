@@ -543,8 +543,9 @@ class TestTEWrappers:
 
     @pytest.mark.parametrize("normalization", ["LayerNorm", "RMSNorm"])
     @pytest.mark.parametrize("skip_bias_add", [False, True])
+    @pytest.mark.parametrize("init_device", ["cpu", "meta"])
     def test_te_layernorm_column_parallel_linear_split_keeps_device_mode_and_output(
-        self, normalization, skip_bias_add
+        self, normalization, skip_bias_add, init_device
     ):
         """Splitting a fused norm+linear keeps its device, eval mode, parameters, and output."""
         seeded()
@@ -567,11 +568,13 @@ class TestTEWrappers:
         x = torch.randn(TOKENS, 2, HIDDEN, device="cuda", dtype=torch.bfloat16)
         with torch.no_grad():
             fused_output, fused_bias = module(x)
-        # CPU initialization is what built the split modules on the CPU before the fix.
-        config.use_cpu_initialization = True
+        # CPU or meta initialization built the split modules off the fused device before the fix.
+        config.use_cpu_initialization = init_device == "cpu"
+        config.init_model_with_meta_device = init_device == "meta"
+        assert TENorm(config=config, hidden_size=HIDDEN).weight.device.type == init_device
         norm, linear = split_te_layernorm_column_parallel_linear(module, config)
-        assert norm.weight.is_cuda and not norm.training
-        assert linear.weight.is_cuda and not linear.training
+        assert norm.weight.device == module.weight.device and not norm.training
+        assert linear.weight.device == module.weight.device and not linear.training
         assert torch.equal(norm.weight, module.layer_norm_weight)
         if getattr(module, "layer_norm_bias", None) is not None:
             assert torch.equal(norm.bias, module.layer_norm_bias)
