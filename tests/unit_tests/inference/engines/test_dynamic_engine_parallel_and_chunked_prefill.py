@@ -208,7 +208,6 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
                 min_prompt_length=4,
                 max_prompt_length=4,
                 num_tokens_to_generate=6,
-                use_fixed_output_lengths=True,
                 model_provider="hybrid",
                 expert_model_parallel_size=2,
                 num_speculative_tokens=1,
