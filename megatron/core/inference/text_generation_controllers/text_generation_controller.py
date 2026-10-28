@@ -2149,7 +2149,7 @@ class TextGenerationController(MTPControllerMixin):
     def _snapshot_async_sched_pending_inputs(self) -> Optional[dict]:
         """Copy what sampling the pending async forward reads, before CUDA graph capture.
 
-        Capture warmup writes the same logits, GPU bookkeeping, MTP and routing buffers.
+        Capture warmup writes the same logits, GPU bookkeeping, MTP and routing state.
         Keeping the pending forward avoids re-running it, which would apply its tokens to
         recurrent (Mamba) state twice.
 
@@ -2164,6 +2164,7 @@ class TextGenerationController(MTPControllerMixin):
             "logits": self._all_logits_cuda[:, :rows].clone(),
             "gpu_view": context.gpu_view._buf.clone(),
             "routing_buffer_index": self._async_sched_routing_buffer_index,
+            "mtp_resolved_padded_count": self._mtp_resolved_padded_count,
         }
         if self._sampled_mtp_tokens_cuda is not None:
             snapshot["mtp_tokens"] = self._sampled_mtp_tokens_cuda.clone()
@@ -2192,6 +2193,7 @@ class TextGenerationController(MTPControllerMixin):
             hidden_states = snapshot["mtp_hidden_states"]
             context.mtp_decoder_hidden_states[: hidden_states.shape[0]].copy_(hidden_states)
         self._async_sched_routing_buffer_index = snapshot["routing_buffer_index"]
+        self._mtp_resolved_padded_count = snapshot["mtp_resolved_padded_count"]
         routing_record = self._async_sched_forward.routing_record
         if routing_record is not None and routing_record.buffer_slot is not None:
             routing_record.buffer_slot.in_use = True
