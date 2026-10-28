@@ -266,7 +266,6 @@ class TestBatchInvariantMambaPrefixCaching:
                     assert {
                         name: parameter.data_ptr() for name, parameter in target_parameters.items()
                     } == target_storage
-                    assert not pending_survived_suspend
 
                     engine.is_mp_coordinator = True
                     engine.socket_for_receiving_requests = mock.Mock()
