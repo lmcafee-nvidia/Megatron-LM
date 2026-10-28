@@ -48,8 +48,6 @@ class TestShortcutMoECudaGraphE2E(_GDPGraphTest):
             super().teardown_class()
 
     def _create_model(self):
-        from megatron.core.transformer.moe.experts import InferenceGroupedMLP
-
         torch.manual_seed(1234)
         config = TransformerConfig(
             params_dtype=torch.bfloat16,
@@ -105,6 +103,21 @@ class TestShortcutMoECudaGraphE2E(_GDPGraphTest):
         for module in model.modules():
             if isinstance(module, Attention):
                 module.batch_invariant_mode = True
+        return model
+
+
+class TestShortcutMoECudaGraphEP1Padding(TestShortcutMoECudaGraphE2E):
+    """At EP=1 the NVLS dispatcher must still mask CUDA-graph padding routes."""
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_distributed()
+        Utils.initialize_model_parallel(expert_model_parallel_size=1)
+
+    def _create_model(self):
+        from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+        model = super()._create_model()
         model.moe_eager_counter = torch.zeros(1, dtype=torch.int32, device="cuda")
         model.moe_graph_counter = torch.zeros(1, dtype=torch.int32, device="cuda")
         model.moe_graph_padding_counter = torch.zeros(1, dtype=torch.int32, device="cuda")
@@ -145,10 +158,11 @@ class TestShortcutMoECudaGraphE2E(_GDPGraphTest):
 
     @pytest.mark.parametrize("stagger", [False, True], ids=["uniform", "mixed_steps"])
     @torch.inference_mode()
-    def test_cuda_graph_padding_routes_are_masked(self, stagger):
+    def test_cuda_graphs_do_not_change_generated_tokens(self, stagger):
         super().test_cuda_graphs_do_not_change_generated_tokens(stagger)
 
         model = self._last_model
+        assert parallel_state.get_expert_model_parallel_world_size() == 1
         assert model.moe_backend_witnesses == {model.config.inference_grouped_gemm_backend.value}
         assert model.moe_eager_counter.item() > 0
         assert model.moe_graph_counter.item() > self._moe_graph_counter_before_run
