@@ -361,6 +361,39 @@ class TestDynamicContext:
         assert max_seqlen_q >= 2
 
     @pytest.mark.internal
+    def test_prefill_padding_stays_within_max_tokens(self):
+        """A prefill step is padded up to the token rounder, but never past max_tokens."""
+        ctx = self._get_dynamic_context(
+            params_dtype=torch.bfloat16,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=256,
+            buffer_size_gb=0.01,
+            block_size_tokens=16,
+            max_tokens=8,
+            max_requests=8,
+        )
+        ctx.add_request(
+            DynamicInferenceRequest(
+                request_id=1,
+                prompt_tokens=torch.arange(0, 5, device='cpu'),
+                sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=9),
+            )
+        )
+        assert ctx.round_up_tokens(ctx.active_token_count) > ctx.max_tokens
+        clear_input_id_padding = ctx._clear_input_id_padding
+
+        def check_padding_then_clear():
+            # Check as soon as the padded count is set, before any padded GPU work runs.
+            assert ctx.padded_active_token_count <= ctx.max_tokens
+            clear_input_id_padding()
+
+        ctx._clear_input_id_padding = check_padding_then_clear
+        ctx.initialize_attention_state()
+        assert ctx.padded_active_token_count == ctx.max_tokens
+
+    @pytest.mark.internal
     @pytest.mark.parametrize("flash_attention_version", [2, 4])
     def test_one_token_prefill_metadata_is_correct_under_flash_attention(
         self, flash_attention_version
