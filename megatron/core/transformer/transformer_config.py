@@ -2171,12 +2171,12 @@ class TransformerConfig(ModelParallelConfig):
             )
 
             mxfp8_enabled = bool(self.fp8) and self.fp8_recipe == Fp8Recipe.mxfp8
-            if self.fp8_param and not mxfp8_enabled:
+            if self.quant_recipe is None and self.fp8_param and not mxfp8_enabled:
                 raise ValueError(
                     "Inference-optimized MoE expert parameter storage supports only "
                     "fp8_recipe='mxfp8'; use BF16 expert parameters for other FP8 recipes."
                 )
-            if self.fp4:
+            if self.quant_recipe is None and self.fp4:
                 raise ValueError(
                     "Inference-optimized MoE does not support Transformer Engine FP4 compute "
                     "or parameter storage; use inference_moe_nvfp4_recipe with BF16 canonical "
@@ -2232,7 +2232,6 @@ class TransformerConfig(ModelParallelConfig):
                 and (
                     self.activation_func_clamp_value is not None
                     or self.activation_func_tanh_clamp_scale is not None
-                    or self.activation_func_tanh_clamp_scale_linear is not None
                     or self.glu_linear_offset != 0.0
                     or self.moe_mlp_glu_interleave_size is not None
                 )
@@ -2273,14 +2272,13 @@ class TransformerConfig(ModelParallelConfig):
                     )
                 if self.gated_linear_unit and (
                     self.activation_func_clamp_value is not None
-                    or self.activation_func_tanh_clamp_scale_linear is not None
                     or self.glu_linear_offset != 0.0
                     or self.moe_mlp_glu_interleave_size is not None
                 ):
                     raise ValueError(
                         "inference_moe_nvfp4_recipe supports only plain SwiGLU: "
-                        "activation clamp, glu_linear_offset and moe_mlp_glu_interleave_size "
-                        "must be unset."
+                        "activation_func_clamp_value, glu_linear_offset and "
+                        "moe_mlp_glu_interleave_size must be unset."
                     )
                 if self.fp8 or self.fp4_param:
                     raise ValueError(

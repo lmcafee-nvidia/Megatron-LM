@@ -141,12 +141,6 @@ def test_config_rejects_non_power_of_two_nvls_expert_parallelism():
             "activation_func": torch.nn.functional.silu,
             "activation_func_tanh_clamp_scale": 2.0,
         },
-        {
-            "inference_grouped_gemm_backend": "torch",
-            "gated_linear_unit": True,
-            "activation_func": torch.nn.functional.silu,
-            "activation_func_tanh_clamp_scale_linear": 2.0,
-        },
         {"inference_grouped_gemm_backend": "flashinfer", "activation_func_tanh_clamp_scale": 2.0},
     ],
 )
