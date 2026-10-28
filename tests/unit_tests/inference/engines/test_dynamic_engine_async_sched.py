@@ -470,6 +470,7 @@ class _AsyncPairScenario:
     prerequisite: str | None = None
     atol: float = 1.0e-3
     parity: str = "exact"
+    graph_parity: str | None = None
     exact_top_n: bool = True
 
 
@@ -792,9 +793,10 @@ _ASYNC_PAIR_SCENARIOS = (
             "use_moe_layer_spec": True,
             "transformer_impl": "inference_optimized",
         },
-        signals=("inference-optimized", "moe", "mxfp8"),
+        signals=("inference-optimized", "moe", "mxfp8", "fixed-history-logits"),
         prerequisite="mxfp8",
         atol=0.0,
+        graph_parity="reproducible",
     ),
     # Four heads of width 64 exercise FlashInfer's supported fused-RoPE kernel.
     # Width 16 crosses half-head boundaries in its vectorized NeoX rotation.
@@ -1068,6 +1070,7 @@ _CUDA_GRAPH_DIFFERENTIAL_SCENARIOS = (
             "hybrid-gdp",
             "transformer-engine",
             "inference-optimized",
+            "mxfp8-inference-optimized-moe",
             "flash-attention-3",
             "flash-attention-4",
             "swa-off-by-one-sink",
@@ -2732,7 +2735,11 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["fp8-quantized-forwards"] > 0
             assert runtime["fp8-recipe-forwards"] > 0
         if "mxfp8" in signals:
+            from megatron.core.fp8_utils import get_fp8_align_size
             from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+            from megatron.core.transformer.moe.token_dispatcher_inference import (
+                NCCLAllGatherDispatcher,
+            )
 
             experts = [
                 module
@@ -2740,7 +2747,25 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 if type(module).__name__ == "InferenceGroupedMLP"
             ]
             assert experts
-            assert runtime["module-forward:moe"] > 0
+            if "cuda-graph" in signals:
+                alignment = get_fp8_align_size(model_config.fp8_recipe)
+                assert executed_graph_dimensions
+                assert all(
+                    token_count % alignment == 0 for token_count, *_ in executed_graph_dimensions
+                )
+                assert runtime["cuda-graph-padded-replays"] > 0
+                assert "InferenceGroupedMLP" in replayed_module_names
+                dispatchers = [
+                    module._inference_token_dispatcher
+                    for module in controller.inference_wrapped_model.model.modules()
+                    if hasattr(module, "_inference_token_dispatcher")
+                ]
+                assert dispatchers
+                assert all(
+                    isinstance(dispatcher, NCCLAllGatherDispatcher) for dispatcher in dispatchers
+                )
+            else:
+                assert runtime["module-forward:moe"] > 0
             assert all(module._uses_mxfp8_weights for module in experts)
             assert all(isinstance(module._fc1_weight, MXFP8Tensor) for module in experts)
             assert all(isinstance(module._fc2_weight, MXFP8Tensor) for module in experts)
@@ -3095,9 +3120,17 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
     @staticmethod
     def _weight_snapshot(env):
         model = env.engine.controller.inference_wrapped_model.model
-        return {
+        snapshot = {
             name: parameter.detach().cpu().clone() for name, parameter in model.named_parameters()
         }
+        for module_name, module in model.named_modules():
+            for weight_name in ("_fc1_weight", "_fc2_weight"):
+                weight = getattr(module, weight_name, None)
+                if weight is not None and hasattr(weight, "scale"):
+                    prefix = f"{module_name}.{weight_name}"
+                    snapshot[f"{prefix}.data"] = weight.data.detach().cpu().clone()
+                    snapshot[f"{prefix}.scale"] = weight.scale.detach().cpu().clone()
+        return snapshot
 
     @classmethod
     def _assert_graph_pair(cls, scenario):
@@ -3155,7 +3188,7 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
                 torch.equal(expected_weights[name], actual_weights[name])
                 for name in expected_weights
             )
-            graph_parity = scenario.parity
+            graph_parity = scenario.graph_parity or scenario.parity
             graph_logits = {}
             if "fixed-history-logits" in scenario.signals:
                 graph_logits = graph_runtime.get("fixed-history-logit-snapshots", {})
