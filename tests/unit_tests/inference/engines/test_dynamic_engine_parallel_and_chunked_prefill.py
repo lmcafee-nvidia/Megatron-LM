@@ -195,10 +195,9 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
     )
     @torch.inference_mode()
     def test_suspend_drains_mtp_forward_with_an_idle_ep_rank(self):
-        """An idle EP rank joins the MTP draft collectives of a peer draining at suspend.
+        """An idle EP rank joins the expert dispatch of a peer's MoE draft forward at suspend.
 
-        A missing collective does not raise; the expert dispatch blocks, so this test
-        asserts by completing.
+        A missing dispatch blocks rather than raising, so this test asserts by completing.
         """
         skip_if_mamba_sequence_packing_not_available("hybrid")
         if int(os.environ.get("WORLD_SIZE", "1")) < 2:
@@ -213,7 +212,6 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
                 model_provider="hybrid",
                 expert_model_parallel_size=2,
                 num_speculative_tokens=1,
-                # An MoE draft head gives every MTP draft forward an expert dispatch.
                 mtp_layer_pattern="E",
                 top_k=1,
                 context_max_requests=8,
