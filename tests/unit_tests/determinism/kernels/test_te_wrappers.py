@@ -19,6 +19,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.activations import squared_relu
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE, TEFusedMLP
 from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor
@@ -661,7 +662,7 @@ class TestTEWrappers:
                 },
             }
         )
-        config = _config(
+        config_kwargs = dict(
             num_layers=3,
             hidden_size=128,
             ffn_hidden_size=256,
@@ -672,6 +673,7 @@ class TestTEWrappers:
             moe_router_topk=2,
             moe_grouped_gemm=True,
             add_bias_linear=False,
+            activation_func=squared_relu,
             fp8="hybrid",
             fp8_recipe=global_recipe,
             fp8_param=True,
@@ -683,6 +685,12 @@ class TestTEWrappers:
             num_layers_at_start_in_bf16=1,
             num_layers_at_end_in_bf16=1,
         )
+        if transformer_impl == "inference_optimized" and global_recipe != Fp8Recipe.mxfp8:
+            # Optimized inference experts accept FP8 parameter storage only with MXFP8.
+            with pytest.raises(ValueError, match="supports only fp8_recipe='mxfp8'"):
+                _config(**config_kwargs)
+            return
+        config = _config(**config_kwargs)
 
         def build(layer_number, module_path="mlp.experts.linear_fc1"):
             name = f"decoder.layers.{layer_number}.{module_path}"
