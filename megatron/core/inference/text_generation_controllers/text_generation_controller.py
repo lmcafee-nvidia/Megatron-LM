@@ -2146,56 +2146,6 @@ class TextGenerationController(MTPControllerMixin):
         finally:
             routing_record.release()
 
-    def _snapshot_async_sched_pending_inputs(self) -> Optional[dict]:
-        """Copy what sampling the pending async forward reads, before CUDA graph capture.
-
-        Capture warmup writes the same logits, GPU bookkeeping, MTP and routing buffers.
-        Keeping the pending forward avoids re-running it, which would apply its tokens to
-        recurrent (Mamba) state twice.
-
-        Returns:
-            Optional[dict]: Saved buffers, or ``None`` when no forward is pending.
-        """
-        if not self._async_sched_forward.is_valid or self._all_logits_cuda is None:
-            return None
-        context = self.inference_wrapped_model.inference_context
-        rows = context.padded_active_token_count
-        snapshot = {
-            "logits": self._all_logits_cuda[:, :rows].clone(),
-            "gpu_view": context.gpu_view._buf.clone(),
-            "routing_buffer_index": self._async_sched_routing_buffer_index,
-        }
-        if self._sampled_mtp_tokens_cuda is not None:
-            snapshot["mtp_tokens"] = self._sampled_mtp_tokens_cuda.clone()
-        if context.mtp_decoder_hidden_states is not None:
-            snapshot["mtp_hidden_states"] = context.mtp_decoder_hidden_states[:rows].clone()
-        routing_record = self._async_sched_forward.routing_record
-        if routing_record is not None and routing_record.buffer_slot is not None:
-            # Once its pinned CPU copy completes, capture may reuse the GPU routing bank.
-            routing_record.cpu_ready_event.synchronize()
-            routing_record.buffer_slot.in_use = False
-        return snapshot
-
-    def _restore_async_sched_pending_inputs(self, snapshot: dict) -> None:
-        """Restore what sampling the pending async forward reads, after CUDA graph capture.
-
-        Args:
-            snapshot (dict): Buffers saved by ``_snapshot_async_sched_pending_inputs``.
-        """
-        context = self.inference_wrapped_model.inference_context
-        logits = snapshot["logits"]
-        self._all_logits_cuda[:, : logits.shape[1]].copy_(logits)
-        context.gpu_view._buf.copy_(snapshot["gpu_view"])
-        if "mtp_tokens" in snapshot:
-            self._sampled_mtp_tokens_cuda.copy_(snapshot["mtp_tokens"])
-        if "mtp_hidden_states" in snapshot:
-            hidden_states = snapshot["mtp_hidden_states"]
-            context.mtp_decoder_hidden_states[: hidden_states.shape[0]].copy_(hidden_states)
-        self._async_sched_routing_buffer_index = snapshot["routing_buffer_index"]
-        routing_record = self._async_sched_forward.routing_record
-        if routing_record is not None and routing_record.buffer_slot is not None:
-            routing_record.buffer_slot.in_use = True
-
     def _compact_async_sched_forward(self, survivor_idxs: Tensor) -> None:
         """Compact pending forward outputs into survivor order.
 

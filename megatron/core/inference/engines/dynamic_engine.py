@@ -1225,9 +1225,7 @@ class DynamicInferenceEngine(AbstractEngine):
                                 context.mtp_metadata.advance_decode_step()
                             context.mtp_metadata.end_forward()
 
-                context.reset(
-                    preserve_prefix_cache=not reset_context, preserve_counters=not reset_context
-                )
+                context.reset()
 
             # Per-iteration memory accounting, scoped to the CUDA-graph mempool.
             # This isolates pool growth from process-wide scratch churn (KV cache,
@@ -1733,21 +1731,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST
                 and not self.context.static_kv_memory_pointers
             ):
-                pending_inputs = self.controller._snapshot_async_sched_pending_inputs()
-                live_state = None
-                if (
-                    self.context.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
-                    and self.context.total_request_count > 0
-                ):
-                    live_state = self.context._snapshot_live_request_state_for_graph_recapture()
-                    self.context.reset(preserve_prefix_cache=True, preserve_counters=True)
-                try:
-                    self.create_cuda_graphs(reset_context=live_state is None)
-                finally:
-                    if live_state is not None:
-                        self.context._restore_live_request_state_after_graph_recapture(live_state)
-                    if pending_inputs is not None:
-                        self.controller._restore_async_sched_pending_inputs(pending_inputs)
+                self.create_cuda_graphs()
             capture_time = time.time() - capture_time
 
             # Request records outlive the context buffers. Refresh every stale
