@@ -101,6 +101,7 @@ class KernelEntry:
 # Test-file prefixes used below.
 K = "tests/unit_tests/determinism/kernels/"
 C = "tests/unit_tests/determinism/correctness/"
+MM = "tests/unit_tests/inference/test_multimodal_gpu.py"
 
 KERNELS: Tuple[KernelEntry, ...] = (
     # ---------------------------------------------------------------- fused elementwise (jit_fuser / torch.compile)
@@ -315,11 +316,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
             K + "test_te_wrappers.py",
             C + "test_fp8_determinism.py",
             K + "test_runtime_cp_attention.py",
+            MM,
         ),
         kind="te-wrapper",
         notes="TE Linear / LayerNormLinear / Norm / GroupedLinear / DotProductAttention / fused RoPE replayed standalone; "
         "FP8/FP4 recipes in the model-level suite. Runtime CP binding and restoration are "
         "replayed through packed SelfAttention in test_runtime_cp_attention.py. "
+        "Splitting a fused norm+linear keeps its device, eval mode, parameters, and output, "
+        "and the lazy MLA latent-cache split replays exact media reuse. "
         "QB-capable TE routing replays probabilities, gradients, and atomic histograms.",
     ),
     KernelEntry(
