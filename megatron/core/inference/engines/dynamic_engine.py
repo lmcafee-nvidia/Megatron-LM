@@ -512,6 +512,8 @@ class DynamicInferenceEngine(AbstractEngine):
     _staging_tasks_peak: int = 0
     # Under async scheduling, pause and suspend finish the pending forward.
     _drains_async_forward: bool = False
+    # Immutable like _staging_tasks; reset() installs the list a drain at suspend fills.
+    _drained_finished_requests: Tuple[DynamicInferenceRequest, ...] = ()
 
     @deprecate_args(
         *DEPRECATED_ARGS,
@@ -4112,8 +4114,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 "schedule_waiting_requests": (
                     None if run_async_overlap else self.schedule_waiting_requests
                 ),
-                "finish_pending_only": finish_pending_only,
             }
+            if finish_pending_only:
+                controller_kwargs["finish_pending_only"] = True
         else:
             raise AssertionError(f"Unexpected async scheduling mode: {mode}")
 
