@@ -45,7 +45,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
-from megatron.core.transformer.attention import HAVE_FMLA
+from megatron.core.transformer.attention import HAVE_FA3, HAVE_FMLA
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.utils import is_layer_window_attention
@@ -977,8 +977,8 @@ def _check_scenario_prerequisite(scenario):
         if not HAVE_FLA:
             pytest.skip("GDN dynamic inference requires flash-linear-attention")
     elif scenario.prerequisite == "flashmla":
-        if not HAVE_FMLA:
-            pytest.skip("MLA dynamic decode requires FlashMLA")
+        if not (HAVE_FA3 and HAVE_FMLA):
+            pytest.skip("MLA dynamic decode requires FlashAttention 3 and FlashMLA")
     elif scenario.prerequisite == "transformer-engine":
         if not is_te_min_version("2.2.0"):
             pytest.skip("Transformer Engine 2.2.0 is required")
@@ -2116,24 +2116,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["mamba-state-commits"] > 0
             assert runtime["mamba-state-compactions"] > 0
             assert runtime["module-forward:hybrid"] > 0
-        if "mla" in signals:
-            assert model_config.multi_latent_attention
-            assert model_config.cache_mla_latents
-            assert context.cache_mla_latent
-            assert runtime["flash-mla-decode"] > 0
-            assert runtime["mla-kv-norm-inputs"] > 0
-            assert runtime["mla-kv-norm-device-mismatches"] == 0
-            mla_steps = {
-                key[1]
-                for key, count in runtime.items()
-                if isinstance(key, tuple) and key[0] == "mla-attention-step" and count > 0
-            }
-            expert_steps = {
-                key[1]
-                for key, count in runtime.items()
-                if isinstance(key, tuple) and key[0] == "moe-expert-step" and count > 0
-            }
-            assert mla_steps == expert_steps
         if "transformer-engine" in signals:
             assert model_config.transformer_impl == "transformer_engine"
             assert runtime["module-forward:transformer-engine"] > 0
@@ -2269,6 +2251,14 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert observed_steps("moe-kernel-step", kernel) == expert_steps
             return expert_steps
 
+        if "mla" in signals:
+            assert model_config.multi_latent_attention
+            assert model_config.cache_mla_latents
+            assert context.cache_mla_latent
+            assert runtime["flash-mla-decode"] > 0
+            assert runtime["mla-kv-norm-inputs"] > 0
+            assert runtime["mla-kv-norm-device-mismatches"] == 0
+            assert observed_steps("mla-attention-step") == observed_steps("moe-expert-step")
         if "moe" in signals:
             assert model_config.num_moe_experts is not None
             assert context._nccl_ep_dispatcher
