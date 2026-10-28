@@ -824,35 +824,6 @@ def delete_cuda_graphs():
         runner.bwd_graph = None
         runner.mempool = None
         runner._gtp_fwd_params_to_ensure_ready = ()
-        runner._gtp_wgrad_ring_slots = []
-
-        # A retained manager reuses its runner objects after inference graph
-        # deletion. Release every captured pool buffer now, before empty_cache,
-        # while preserving only shape/type metadata used to match that runner
-        # for recapture. Some metadata objects also own shared inter-graph
-        # buffers, so clearing the visible argument tuples alone is insufficient.
-        for arg_meta in chain(
-            runner.fwd_graph_input_arg_metas, runner.fwd_graph_input_kwarg_metas.values()
-        ):
-            buffer_metadata = getattr(arg_meta, "cg_buffer_metadata", None)
-            if buffer_metadata is not None:
-                buffer_metadata.fwd_cudagraph_buffer = None
-                buffer_metadata.bwd_cudagraph_buffer = None
-
-        for name, empty_value in (
-            ("args", ()),
-            ("kwargs", {}),
-            ("outputs", None),
-            ("fwd_graph_input_args", ()),
-            ("fwd_graph_input_kwargs", {}),
-            ("fwd_graph_input_surface", ()),
-            ("fwd_graph_outputs", ()),
-            ("fwd_graph_output_surface", ()),
-            ("static_grad_inputs", ()),
-            ("static_grad_outputs", ()),
-        ):
-            if hasattr(runner, name):
-                setattr(runner, name, empty_value)
 
     # Reset global tracking state
     _CudagraphGlobalRecord.cudagraph_created = False
