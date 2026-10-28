@@ -1829,11 +1829,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self.kv_block_allocator.block_routing.clear()
         self.kv_block_allocator.block_routing.update(allocator_state["routing"])
         for name, value in state["attrs"].items():
-            setattr(self, name, value)
-        for mha, state_data, max_seqlen_q, max_seqlen_k in state["mha_state"]:
-            mha.state_data = state_data
-            mha._max_seqlen_q = max_seqlen_q
-            mha._max_seqlen_k = max_seqlen_k
+            if name != "active_attn_metadata":
+                setattr(self, name, value)
         if "mamba_free_slots" in state:
             assert self.mamba_metadata is not None
             self.mamba_metadata.request_to_mamba_state_idx.copy_(state["mamba_request_slots"])
