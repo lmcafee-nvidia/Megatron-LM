@@ -31,7 +31,12 @@ class TestProbeDynamicContextParallel(harness.DynamicInferenceEngineTestBase):
                 "TransformerConfig",
                 lambda **kwargs: TransformerConfig(**{**kwargs, "context_parallel_size": cp_size}),
             )
-            env = self._run_test(num_requests=4, num_tokens_to_generate=8, num_gap_steps=0)
+            env = self._run_test(
+                num_requests=4,
+                num_tokens_to_generate=8,
+                num_gap_steps=0,
+                transformer_impl="transformer_engine",
+            )
             model = env.engine.controller.inference_wrapped_model.model
             checksum = sum(p.double().sum().item() for p in model.parameters())
             return [list(r.generated_tokens) for r in env.requests], checksum
