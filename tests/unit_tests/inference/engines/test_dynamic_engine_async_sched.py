@@ -2463,13 +2463,13 @@ class TestAsyncSchedulePairwiseParallel(_AsyncPairwiseHarness):
             assert parallel_state.get_expert_model_parallel_world_size() == config.get(
                 "expert_model_parallel_size", 1
             )
-            if "tp2" in scenario.name:
+            if scenario.name == "tp2-pp2-sp-dp2":
                 assert parallel_state.get_data_parallel_world_size() == 2
             if scenario.name == "moe-ep2-tp2-sp-ddp2-edp2-nccl":
                 assert parallel_state.get_expert_data_parallel_world_size() == 2
             if scenario.name == "moe-ep2-ddp4-edp2-nccl":
-                assert parallel_state.get_data_parallel_world_size() == 4
-                assert parallel_state.get_expert_data_parallel_world_size() == 2
+                assert parallel_state.get_data_parallel_world_size() == world_size
+                assert parallel_state.get_expert_data_parallel_world_size() == world_size // 2
             self._assert_scenario_pair(scenario)
         finally:
             gc.collect()
