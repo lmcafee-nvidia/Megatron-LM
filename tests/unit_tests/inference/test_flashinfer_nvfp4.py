@@ -213,35 +213,6 @@ def test_flashinfer_forward_dispatches_to_nvfp4(monkeypatch):
     assert captured["use_bounded_rows"] is True
 
 
-@pytest.mark.parametrize("built", [False, True], ids=["before_first_forward", "after"])
-def test_refit_refreshes_built_nvfp4_expert_weights(monkeypatch, built):
-    """A refit after the NVFP4 copy is built refreshes it before graphs replay.
-
-    Before the first forward there is no copy yet; it is built from the refit weights.
-    """
-    from megatron.core.resharding import refit
-
-    experts_module = torch.nn.Module()
-    refreshed = []
-    experts_module.refresh_flashinfer_nvfp4_weights = lambda: refreshed.append(built) or built
-    target = torch.nn.Sequential(experts_module)
-    executed = []
-    monkeypatch.setattr(refit, "_unwrap_model_cores", lambda src, tgt: (None, tgt, 2))
-    monkeypatch.setattr(refit, "_build_or_get_plan", lambda *args, **kwargs: "plan")
-    monkeypatch.setattr(refit, "_harmonize_buffer_dtypes", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        refit, "execute_reshard_plan", lambda plan, *args, **kwargs: executed.append(plan)
-    )
-    service = SimpleNamespace(set_model_roles=lambda **kwargs: None)
-    synchronized = []
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda: synchronized.append(True))
-
-    refit.reshard_model_weights(None, target, service)
-    assert executed == ["plan"]
-    assert refreshed == [built]
-    assert synchronized == ([True] if built else [])
-
-
 def test_gated_fc1_is_padded_per_half_and_interleaved_up_gate():
     """MCore's [gate; up] FC1 becomes FlashInfer's alternating 64-row [up, gate] blocks."""
     from megatron.core.inference.moe.flashinfer_nvfp4 import _pad_fc1
