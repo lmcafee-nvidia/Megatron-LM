@@ -18,7 +18,6 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-import megatron.core.transformer.moe.batch_invariant as b
 from megatron.core import parallel_state
 from megatron.core.activations import squared_relu
 from megatron.core.fp8_utils import get_fp8_context
@@ -35,6 +34,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe import moe_utils
+from megatron.core.transformer.moe.batch_invariant import build_inverse_permutation_map
 from megatron.core.transformer.moe.experts import (
     SequentialMLP,
     TEGroupedMLP,
@@ -845,7 +845,7 @@ class TestMoEModules:
 
     def test_empty_inverse_permutation_map_replays(self):
         idx = torch.empty(0, dtype=torch.long, device="cuda")
-        inverse = b.build_inverse_permutation_map(idx.reshape(0, 4).bool(), idx, idx, 0)
+        inverse = build_inverse_permutation_map(idx.reshape(0, 4).bool(), idx, idx, 0)
         assert inverse.shape == (2, 0, 0) and inverse.dtype == torch.long
 
     @pytest.mark.parametrize("dispatcher", ["allgather", "alltoall"])
