@@ -131,6 +131,63 @@ def test_bf16_config_ignores_inactive_mxfp8_recipe_gates():
     assert config.fp8 is None
 
 
+@pytest.mark.internal
+@pytest.mark.parametrize(
+    "activation_func", [F.gelu, F.relu, F.silu, squared_relu], ids=["gelu", "relu", "silu", "relu2"]
+)
+@torch.inference_mode()
+def test_flashinfer_bf16_activation_layer_matches_training_reference(activation_func):
+    pytest.importorskip("flashinfer")
+    from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+    from megatron.core.transformer.moe.token_dispatcher_inference import (
+        InferenceAllGatherDispatcherBase,
+    )
+    from tests.unit_tests.test_utilities import Utils
+
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        config = _make_bounded_mxfp8_config(
+            fp8=None,
+            fp8_param=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            activation_func=activation_func,
+            inference_flashinfer_mxfp8_token_capacity=None,
+            inference_moe_token_dispatcher_type="nccl",
+            expert_model_parallel_size=1,
+            moe_router_topk=2,
+            moe_router_score_function="softmax",
+            moe_router_pre_softmax=True,
+        )
+        InferenceAllGatherDispatcherBase.allocate_valid_tokens_tensor()
+        layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+
+        flashinfer_calls = []
+        original_flashinfer = layer.experts._flashinfer_forward
+
+        def tracked_flashinfer(hidden, routing_map, probs):
+            flashinfer_calls.append((hidden.shape[0], routing_map.shape[0]))
+            return original_flashinfer(hidden, routing_map, probs)
+
+        layer.experts._flashinfer_forward = tracked_flashinfer
+        hidden = torch.randn(64, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        reference, _ = layer(hidden.clone())
+        with InferenceMode.active():
+            output, _ = layer(hidden.clone())
+        assert layer.experts._mcore_activation_type is None
+        assert torch.isfinite(output).all() and torch.isfinite(reference).all()
+        assert flashinfer_calls == [(hidden.shape[0], hidden.shape[0])]
+        reference_float = reference.float()
+        error = (output.float() - reference_float).abs()
+        reference_norm, reference_scale = reference_float.norm(), reference_float.abs().max()
+        assert reference_scale > 0 or not error.any()
+        relative_l2 = error.norm().div(reference_norm) if reference_norm else error.norm()
+        relative_linf = error.max().div(reference_scale) if reference_scale else error.max()
+        assert max(relative_l2, relative_linf) <= 3 * 2**-8, (relative_l2, relative_linf)
+    finally:
+        Utils.destroy_model_parallel()
+
+
 def test_vllm_backend_accepts_mxfp8_config_for_per_layer_dispatch():
     config = _make_bounded_mxfp8_config(
         inference_grouped_gemm_backend="vllm",
