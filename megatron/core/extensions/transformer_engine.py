@@ -619,8 +619,6 @@ def split_te_layernorm_column_parallel_linear(
     out_features = fused_layer.out_features * fused_layer.tp_size
 
     def move_to_fused_device(module):
-        if module.weight.is_meta:
-            return module.to_empty(device=fused_layer.weight.device)
         return module.to(fused_layer.weight.device)
 
     # Create the norm layer
