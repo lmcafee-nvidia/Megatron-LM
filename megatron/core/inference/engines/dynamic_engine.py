@@ -1610,12 +1610,6 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             return
 
-        # A coordinator drains at pause. Direct callers drain here, and the requests
-        # this finishes reach them with the next step.
-        if self.state != EngineState.PAUSED and self._async_drain_runs_forward():
-            drained = self._run_coroutine_sync(self._async_drain_pending_forward())
-            if drained is not None:
-                self._drained_finished_requests.extend(drained["finished_requests"])
 
         # A suspend may be followed by an in-place weight refit. Invalidate
         # shared and request-local projected media unless explicitly permitted.
@@ -5304,7 +5298,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
                     if all_pausing:
                         # All EP peers are PAUSING: finish any pending forward, then pause.
-                        await self._async_drain_pending_forward()
                         await self._world_barrier()
                         self.state = EngineState.PAUSED
                         self._state_events[EngineState.PAUSED].set()
