@@ -36,7 +36,7 @@ from megatron.core.tensor_parallel.mappings import (
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
 )
-from megatron.core.transformer.attention import Attention, LinearProjBuilder
+from megatron.core.transformer.attention import HAVE_FMLA, Attention, LinearProjBuilder
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mla_qk_norm_config import QKNormConfigResolver
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -123,6 +123,13 @@ else:
 if TYPE_CHECKING:
     from megatron.core.inference.contexts import BaseInferenceContext
     from megatron.core.packed_seq_params import PackedSeqParams
+
+
+def _require_flash_mla():
+    if not HAVE_FMLA:
+        raise RuntimeError(
+            "Dynamic MLA latent-cache decoding requires the optional FlashMLA package."
+        )
 
 
 class _QuantizeKVForFusedAttn(torch.autograd.Function):
@@ -497,6 +504,7 @@ class MultiLatentAttention(Attention):
             assert (
                 self.config.cache_mla_latents
             ), "currently to use dynamic backend for MLA cache mla latents must be true"
+            _require_flash_mla()
 
         if self.config.cache_mla_latents:
             self.prepare_for_absorption()
