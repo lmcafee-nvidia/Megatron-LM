@@ -437,6 +437,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             {"adapter_sampling": {"temperature": 0.73, "top_k": 1, "top_p": 0.91}},
             {"logprobs_mode": "processed_logprobs", "materialize_only_last_token_logits": False},
             dict(hidden_size=256, position_embedding_type="rope", use_flashinfer_fused_rope=True),
+            {"position_embedding_type": "rope", "use_flashinfer_fused_rope": True},
         ],
         ids=[
             "dense",
@@ -455,6 +456,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             "non-greedy-parameters",
             "processed-logprobs",
             "flashinfer-fused-rope",
+            "flashinfer-fused-rope-small-head-fallback",
         ],
     )
     async def test_direct_and_real_adapter_greedy_outputs_match(self, feature_config):
