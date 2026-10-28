@@ -244,6 +244,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             {"logprobs_mode": "processed_logprobs", "materialize_only_last_token_logits": False},
             {"mla": True, "context_block_size_tokens": 64, "position_embedding_type": "rope"},
             dict(hidden_size=256, position_embedding_type="rope", use_flashinfer_fused_rope=True),
+            {"position_embedding_type": "rope", "use_flashinfer_fused_rope": True},
         ],
         ids=[
             "dense",
@@ -264,6 +265,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             "processed-logprobs",
             "mla-local-latent-cache",
             "flashinfer-fused-rope",
+            "flashinfer-fused-rope-small-head-fallback",
         ],
     )
     async def test_direct_and_real_adapter_greedy_outputs_match(self, feature_config, monkeypatch):
