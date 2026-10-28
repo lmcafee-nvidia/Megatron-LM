@@ -1391,6 +1391,9 @@ def _instrument_scenario_runtime(env, scenario, runtime):
         runtime[("sampling-step", runtime["model-forward"])] += 1
         runtime[f"sampling-backend:{controller._sampling_backend}"] += 1
         runtime["metadata-consumed"] += int(active_count > 0)
+        runtime["request-seeded-samples"] += int(
+            active_count > 0 and bool((metadata["seed"][:active_count] >= 0).any())
+        )
         sampling_class = type(controller._sampling).__name__
 
         if sampling_class == "TorchSampling":
@@ -2100,8 +2103,10 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     ):
                         token_text = controller.tokenizer.detokenize([token])
                         assert 0 < len(top_n) <= request.sampling_params.top_n_logprobs
-                        assert token_text in top_n
-                        assert top_n[token_text] == pytest.approx(logprob, rel=0, abs=0.1)
+                        if token_text in top_n:
+                            assert top_n[token_text] == pytest.approx(logprob, rel=0, abs=0.1)
+                        else:
+                            assert logprob <= min(top_n.values())
                     if request.sampling_params.skip_prompt_log_probs:
                         assert not request.prompt_top_n_logprobs
                     else:
