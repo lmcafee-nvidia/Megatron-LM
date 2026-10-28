@@ -1016,3 +1016,22 @@ class TestFlashMLASoftcapRejected:
                 block_table=torch.zeros(2, 4, dtype=torch.int32),
                 is_decode_only=True,
             )
+
+
+class TestDynamicMLARequiresFlashMLA:
+    def test_dynamic_forward_without_flash_mla_has_an_explicit_error(self, monkeypatch):
+        """Dynamic MLA decoding needs FlashMLA, so the forward pass must say so up front."""
+        from megatron.core.transformer import multi_latent_attention as mla_module
+
+        monkeypatch.setattr(mla_module, "HAVE_FMLA", False)
+        attention = mock.Mock(training=False, cache_mla_latents=True)
+        attention.config.cache_mla_latents = True
+        attention.prepare_for_absorption.side_effect = AssertionError(
+            "latent-cache setup ran before the FlashMLA check"
+        )
+        context = mock.Mock()
+        context.is_static_batching.return_value = False
+        with pytest.raises(RuntimeError, match="requires the optional FlashMLA package"):
+            mla_module.MultiLatentAttention.forward(
+                attention, torch.zeros(1, 1, 8), None, inference_context=context
+            )
