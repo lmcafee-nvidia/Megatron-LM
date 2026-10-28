@@ -327,6 +327,47 @@ def _replay_flash_dispatch(path, flash_version, sink):
         )
         assert torch.isfinite(scaled[0]["out"]).all()
 
+        if flash_version == 4:
+            # FA4 needs a BF16 sink even for FP16 attention, so run its exact reference in FP16.
+            fp16_inputs = {
+                name: (
+                    value.to(torch.float16) if name in {"q", "k", "v", "softmax_offset"} else value
+                )
+                for name, value in inputs.items()
+            }
+            actual = fn(**fp16_inputs)
+            references = []
+            q = fp16_inputs["q"].squeeze(1).float()
+            q_offset = 0
+            for request, length_k in enumerate(lengths_k):
+                length_q = int(
+                    fp16_inputs["cu_seqlens_q"][request + 1] - fp16_inputs["cu_seqlens_q"][request]
+                )
+                query = q[q_offset : q_offset + length_q]
+                page = int(fp16_inputs["block_table"][request, 0])
+                key, value = (
+                    fp16_inputs[name][page, :length_k]
+                    .float()
+                    .repeat_interleave(heads // kv_heads, dim=1)
+                    for name in ("k", "v")
+                )
+                scores = torch.einsum("thd,shd->hts", query, key) * 0.25
+                visible = length_k - length_q + torch.arange(length_q, device="cuda")
+                masked = torch.arange(length_k, device="cuda").unsqueeze(0) > visible.unsqueeze(1)
+                scores.masked_fill_(masked.unsqueeze(0), float("-inf"))
+                sink = fp16_inputs["softmax_offset"].bfloat16().float().view(heads, 1, 1)
+                maximum = torch.maximum(scores.amax(dim=-1, keepdim=True), sink)
+                unnormalized = torch.exp(scores - maximum)
+                weights = unnormalized / (
+                    unnormalized.sum(dim=-1, keepdim=True) + torch.exp(sink - maximum)
+                )
+                references.append(torch.einsum("hts,shd->thd", weights, value))
+                q_offset += length_q
+            reference = torch.cat(references).unsqueeze(1)
+            torch.testing.assert_close(actual.float(), reference, rtol=2e-2, atol=2e-2)
+            no_sink = dict(fp16_inputs, softmax_offset=None)
+            assert not torch.equal(actual, fn(**no_sink))
+
         # Drop back to the default scale; the kernel output must change, proving the config-driven
         # value actually reached the kernel.
         module.config.softmax_scale = None
@@ -359,13 +400,16 @@ def test_flash_decode_dispatch_config_softmax_scale_replays(path):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and flash-attn")
 @pytest.mark.parametrize("path", ["prefill", "decode"])
-def test_flash_decode_dispatch_learnable_sink_replays(path):
+@pytest.mark.parametrize("flash_version", [2, 4])
+def test_flash_decode_dispatch_learnable_sink_replays(path, flash_version):
     """The dynamic-inference attention dispatch applies a per-head sink deterministically."""
     from megatron.core.transformer import attention as attention_module
 
-    if (
+    if flash_version == 4 and not attention_module.HAVE_FA4:
+        pytest.skip("requires flash-attn 4")
+    if flash_version == 2 and (
         attention_module.flash_attn_varlen_func is None
         or attention_module.flash_attn_with_kvcache is None
     ):
         pytest.skip("requires flash-attn")
-    _replay_flash_dispatch(path, flash_version=2, sink=True)
+    _replay_flash_dispatch(path, flash_version, sink=True)
