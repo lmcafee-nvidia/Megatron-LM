@@ -5,6 +5,7 @@ import contextlib
 import logging
 import multiprocessing
 import sys
+import weakref
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 
@@ -184,23 +185,30 @@ def get_attention_mask(seq_length: int) -> torch.Tensor:
     return attention_mask
 
 
-# Initialize cache for sequence parallel modules
+# Cache MoE layers for the active inference model.
 moe_layer_cache = None
+_moe_layer_cache_owner = None
 _moe_metadata_sync_initialized = False
 
 
 def _init_moe_expert_cache(model):
     """
-    Initialize the cache of MoE layers once
+    Initialize the cache of MoE layers for the current model.
     """
     from megatron.core.transformer.moe.moe_layer import MoELayer
 
-    global moe_layer_cache
-    if moe_layer_cache is not None:
-        return  # already initialized
+    global moe_layer_cache, _moe_layer_cache_owner, _moe_metadata_sync_initialized
+    if (
+        moe_layer_cache is not None
+        and _moe_layer_cache_owner is not None
+        and _moe_layer_cache_owner() is model
+    ):
+        return
 
     # Cache for moe layers.
     moe_layer_cache = []
+    _moe_layer_cache_owner = weakref.ref(model)
+    _moe_metadata_sync_initialized = False
     seen_modules = set()
 
     def walk(module):
@@ -224,10 +232,9 @@ def set_moe_metadata_sync(model) -> None:
     Must be called once after the model is built and put into eval mode.
     """
     global moe_layer_cache, _moe_metadata_sync_initialized
+    _init_moe_expert_cache(model)
     if _moe_metadata_sync_initialized:
         return
-    if moe_layer_cache is None:
-        _init_moe_expert_cache(model)
     for i, moe_layer in enumerate(moe_layer_cache):
         dispatcher = getattr(moe_layer, '_inference_token_dispatcher', None)
         if dispatcher is not None:
@@ -250,8 +257,7 @@ def set_decode_expert_padding(model, set_to: bool = False, capacity_factor: int 
     - capacity_factor: Capacity scaling shared by router and dispatchers.
     """
     global moe_layer_cache
-    if moe_layer_cache is None:
-        _init_moe_expert_cache(model)
+    _init_moe_expert_cache(model)
 
     cfg = get_model_config(model)
 
