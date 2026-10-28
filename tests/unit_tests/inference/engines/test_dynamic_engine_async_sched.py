@@ -1084,7 +1084,7 @@ _CUDA_GRAPH_DIFFERENTIAL_SCENARIOS = (
 _ASYNC_PARALLEL_GRAPH_SCENARIOS = tuple(
     scenario
     for scenario in _ASYNC_PARALLEL_SCENARIOS
-    if scenario.name not in {"tp2-pp2-sp-dp2", "moe-ep2-nccl", "moe-ep2-etp2-local-allgather"}
+    if scenario.name not in {"moe-ep2-nccl", "moe-ep2-etp2-local-allgather"}
 ) + (
     _variant(
         "moe-ep2-nccl",
@@ -1508,6 +1508,19 @@ def _instrument_scenario_runtime(env, scenario, runtime, teacher_tokens=None):
             finally:
                 runtime["cuda-graph-capture-active"] -= 1
             _instrument_cuda_graph_replays(model, context, runtime)
+            live_runners = [
+                runner
+                for manager in model.modules()
+                if isinstance(manager, CudaGraphManager)
+                for runner in manager.cudagraph_runners
+                if runner.fwd_graph_recorded
+            ]
+            graph_pool = CudaGraphManager.global_mempool
+            runtime["cuda-graph-pool-rebinds"] += int(
+                bool(live_runners)
+                and graph_pool is not None
+                and all(runner.mempool == graph_pool for runner in live_runners)
+            )
             return result
 
         env.engine.create_cuda_graphs = traced_create_cuda_graphs
@@ -2107,6 +2120,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             _instrument_scenario_runtime(env, scenario, runtime, teacher_tokens)
         if env.config.defer_cuda_graph_creation:
             env.engine.create_cuda_graphs()
+            cold_pool_rebinds = runtime["cuda-graph-pool-rebinds"]
             capture_evidence = {
                 key: count
                 for key, count in runtime.items()
@@ -2127,6 +2141,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             }
             runtime.clear()
             runtime.update(capture_evidence)
+            runtime["cuda-graph-cold-pool-rebinds"] = cold_pool_rebinds
         if force_graph_eager:
             for module in model.modules():
                 module._should_call_local_cudagraph = lambda *_args, **_kwargs: False
@@ -2232,6 +2247,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     if runner.fwd_graph_recorded
                 ]
                 graph_ids_before = [id(runner.fwd_graph) for runner in runners_before]
+                graph_pool_before = CudaGraphManager.global_mempool
                 runtime["pending-before-suspend"] += int(pending_before_suspend)
                 from megatron.core.inference.engines import dynamic_engine as dynamic_engine_module
 
@@ -2293,6 +2309,11 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                         for runner, graph_id in zip(runners_after, graph_ids_before)
                     )
                 )
+                if env.engine.context.static_kv_memory_pointers:
+                    runtime["cuda-graph-pool-preserved"] += int(
+                        graph_pool_before is not None
+                        and CudaGraphManager.global_mempool == graph_pool_before
+                    )
                 _instrument_cuda_graph_replays(
                     env.engine.controller.inference_wrapped_model.model, env.engine.context, runtime
                 )
@@ -2315,6 +2336,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         if "context-reset" in scenario.signals:
             for _ in range(2):
                 memory_ptr = env.engine.context.memory_buffer.data_ptr()
+                graph_pool = CudaGraphManager.global_mempool
                 graph_runners = [
                     (runner, runner.fwd_graph)
                     for manager in model.modules()
@@ -2331,6 +2353,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 if env.config.num_cuda_graphs:
                     runtime["context-reset-graphs-preserved"] += int(
                         bool(graph_runners)
+                        and graph_pool is not None
+                        and CudaGraphManager.global_mempool == graph_pool
                         and all(
                             runner.fwd_graph_recorded and runner.fwd_graph is graph
                             for runner, graph in graph_runners
@@ -2452,6 +2476,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     assert runtime["cuda-graph-create-calls"] == 0
                     assert runtime["cuda-graph-runner-objects-preserved"] == expected_cycles
                     assert runtime["cuda-graph-objects-preserved"] == expected_cycles
+                    assert runtime["cuda-graph-pool-preserved"] == expected_cycles
                 else:
                     assert runtime["cuda-graph-create-calls"] == 0
         if "context-reset" in signals:
@@ -2506,6 +2531,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["prefix-blocks-deregistered"] > 0
         if "cuda-graph" in signals:
             assert context.cuda_graph_batch_dimensions_list
+            if env.config.defer_cuda_graph_creation:
+                assert runtime["cuda-graph-cold-pool-rebinds"] == 1
             assert runtime["cuda_graph_steps"] > 0
             assert runtime["cuda-graph-runner-replays"] > 0
             assert executed_graph_dimensions
@@ -3273,6 +3300,8 @@ class TestAsyncSchedulePairwiseParallel(_AsyncPairwiseHarness):
     @torch.inference_mode()
     def test_eager_matches_actual_replay_for_parallel_pair(self, scenario):
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        if scenario.name == "tp2-pp2-sp-dp2" and world_size != 8:
+            pytest.skip("the TP2/PP2/DP2 owner requires exactly eight GPUs")
         if world_size < 4:
             pytest.skip("parallel CUDA-graph pair owners require at least four GPUs")
         config = scenario.config

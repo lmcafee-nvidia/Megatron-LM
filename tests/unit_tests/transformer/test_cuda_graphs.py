@@ -2264,6 +2264,67 @@ class TestInlineCaptureManager:
         assert mgr.cudagraph_runners[0].fwd_graph_recorded
 
     @torch.inference_mode()
+    def test_delete_releases_runner_buffers_and_recaptures_into_new_pool(self):
+        """Graph deletion frees a kept runner's buffers; its recapture uses a new shared pool."""
+        config = self._make_config()
+        module = _make_simple_module(config)
+        x = torch.randn(4, config.hidden_size, device="cuda")
+        module.my_op(x)  # Initialize kernels and libraries before stream capture.
+        mgr = CudaGraphManager(
+            config,
+            base_module=module,
+            function_name="my_op",
+            inline_capture=True,
+            num_warmup_steps=0,
+            need_backward=False,
+        )
+        module.my_op(x)
+        runner = mgr.cudagraph_runners[0]
+        old_mempool = runner.mempool
+        buffer_metadata = cuda_graphs_module.CudagraphBufferMetadata(
+            fwd_cudagraph_buffer=runner.fwd_graph_input_surface[0],
+            bwd_cudagraph_buffer=runner.fwd_graph_output_surface[0],
+        )
+        runner.fwd_graph_input_arg_metas[0].cg_buffer_metadata = buffer_metadata
+        runner.static_grad_inputs = runner.fwd_graph_input_surface
+        runner.static_grad_outputs = runner.fwd_graph_output_surface
+
+        delete_cuda_graphs()
+
+        assert mgr.cudagraph_runners[0] is runner
+        assert buffer_metadata.fwd_cudagraph_buffer is None
+        assert buffer_metadata.bwd_cudagraph_buffer is None
+        for name in (
+            "fwd_graph_input_surface",
+            "fwd_graph_output_surface",
+            "static_grad_inputs",
+            "static_grad_outputs",
+        ):
+            assert not getattr(runner, name)
+
+        x.add_(1)
+        eager_after_delete = module.my_op(x, eager=True).clone()
+        for graph_out in (module.my_op(x), module.my_op(x)):
+            assert torch.equal(eager_after_delete, graph_out)
+        assert mgr.cudagraph_runners[0] is runner
+        assert runner.fwd_graph_recorded
+        assert runner.mempool == CudaGraphManager.global_mempool is not None
+        assert runner.mempool != old_mempool
+
+    def test_pool_recreation_orders_side_stream_after_queued_work(self):
+        """Work issued after the shared pool is recreated must not overtake queued work."""
+        CudaGraphManager.global_mempool = None
+        x = torch.zeros(1 << 20, device="cuda")
+        torch.cuda._sleep(int(2e9))  # Keep the current stream busy.
+        x.fill_(1.0)  # Queued behind the sleep.
+        try:
+            CudaGraphManager._ensure_global_mempool()  # Switches to a side stream.
+            assert torch.all(x.clone() == 1.0)
+        finally:
+            torch.cuda.synchronize()
+            torch.cuda.set_stream(torch.cuda.default_stream())
+
+    @torch.inference_mode()
     def test_eager_bypass(self):
         """eager=True must bypass graph capture entirely."""
         config = self._make_config()
