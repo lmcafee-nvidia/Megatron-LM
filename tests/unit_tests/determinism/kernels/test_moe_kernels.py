@@ -843,7 +843,7 @@ class TestMoEModules:
         Utils.initialize_model_parallel(expert_model_parallel_size=ep)
         model_parallel_cuda_manual_seed(123)
 
-    def test_empty_inverse_permutation_map_replays(self):
+    def test_empty_inverse_permutation_map_has_empty_shape(self):
         idx = torch.empty(0, dtype=torch.long, device="cuda")
         inverse = build_inverse_permutation_map(idx.reshape(0, 4).bool(), idx, idx, 0)
         assert inverse.shape == (2, 0, 0) and inverse.dtype == torch.long
