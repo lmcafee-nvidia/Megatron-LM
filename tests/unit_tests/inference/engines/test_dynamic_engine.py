@@ -84,7 +84,7 @@ from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.inference.engines.ssm_test_helpers import (
     hybrid_mixer_kwargs,
@@ -924,6 +924,7 @@ class DynamicEngineTestConfig:
     fp8: bool = False
     hidden_size: Optional[int] = None
     model_provider: str = "gpt"
+    multi_latent_attention: bool = False
     flash_attention_version: Optional[int] = 2
     # Which linear-attention mixer a hybrid stack uses ("mamba", "gdp", or
     # "gdn"). Ignored unless model_provider == "hybrid": all three build a
@@ -1205,7 +1206,10 @@ class DynamicInferenceEngineTestBase:
 
         if test_config.model_provider == "gpt":
             # Transformer config.
-            transformer_config = TransformerConfig(
+            transformer_config_cls = (
+                MLATransformerConfig if test_config.multi_latent_attention else TransformerConfig
+            )
+            transformer_config = transformer_config_cls(
                 params_dtype=torch.bfloat16,
                 flash_attention_version=test_config.flash_attention_version,
                 num_layers=4,
@@ -1236,7 +1240,7 @@ class DynamicInferenceEngineTestBase:
                     if test_config.hidden_size is not None
                     else (128 if test_config.fp8 else 32)
                 ),
-                num_attention_heads=4,
+                num_attention_heads=16 if test_config.multi_latent_attention else 4,
                 use_cpu_initialization=True,
                 cuda_graph_impl=effective_cuda_graph_impl,
                 inference_rng_tracker=True,
@@ -1293,9 +1297,23 @@ class DynamicInferenceEngineTestBase:
                     else "LayerNorm"
                 ),
                 softmax_type=test_config.softmax_type,
+                qk_layernorm=test_config.multi_latent_attention,
                 # inference optimized currently only supports RMS Norm
                 window_size=test_config.window_size,
                 window_attn_skip_freq=test_config.window_attn_skip_freq,
+                **(
+                    {
+                        "q_lora_rank": 64,
+                        "kv_lora_rank": 512,
+                        "qk_head_dim": 128,
+                        "qk_pos_emb_head_dim": 64,
+                        "v_head_dim": 128,
+                        "rope_type": "rope",
+                        "cache_mla_latents": True,
+                    }
+                    if test_config.multi_latent_attention
+                    else {}
+                ),
             )
             # Layer-spec factories do not receive TransformerConfig. Forward num_moe_experts
             # explicitly for MoE test cases so they build MoE layers instead of a dense MLP.
@@ -1304,12 +1322,23 @@ class DynamicInferenceEngineTestBase:
             )
             if test_config.fp8 or test_config.transformer_impl == "transformer_engine":
                 layer_spec = get_gpt_layer_with_transformer_engine_spec(
-                    num_experts=num_experts, moe_grouped_gemm=test_config.use_moe_layer_spec
+                    num_experts=num_experts,
+                    moe_grouped_gemm=test_config.use_moe_layer_spec,
+                    multi_latent_attention=test_config.multi_latent_attention,
+                    qk_layernorm=test_config.multi_latent_attention,
                 )
             elif test_config.transformer_impl == "local":
-                layer_spec = get_gpt_layer_local_spec(num_experts=num_experts)
+                layer_spec = get_gpt_layer_local_spec(
+                    num_experts=num_experts,
+                    multi_latent_attention=test_config.multi_latent_attention,
+                    qk_layernorm=test_config.multi_latent_attention,
+                )
             elif test_config.transformer_impl == "inference_optimized":
-                layer_spec = get_gpt_layer_with_inference_spec(num_experts=num_experts)
+                layer_spec = get_gpt_layer_with_inference_spec(
+                    num_experts=num_experts,
+                    multi_latent_attention=test_config.multi_latent_attention,
+                    qk_layernorm=test_config.multi_latent_attention,
+                )
 
             # MTP block spec (needed for speculative decoding).
             mtp_block_spec = None
