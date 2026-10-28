@@ -3,6 +3,7 @@
 import asyncio
 import gc
 import hashlib
+import json
 import logging
 import math
 import os
@@ -78,6 +79,9 @@ from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
+)
+from megatron.core.inference.text_generation_server.dynamic_text_gen_server.openai_streaming import (
+    openai_stream,
 )
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -917,6 +921,64 @@ class _StreamingTransportTokenizer:
 
     def detokenize(self, tokens, **_kwargs):
         return "".join(f"<{token}>" for token in tokens)
+
+
+class _FastEndpointTokenizer:
+    """Small real HF-fast tokenizer for live Quart endpoint coverage."""
+
+    def __init__(self):
+        from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+        from transformers import PreTrainedTokenizerFast
+
+        vocab = {f"t{token}": token for token in range(100)}
+        backend = Tokenizer(models.WordPiece(vocab=vocab, unk_token="t0"))
+        backend.pre_tokenizer = pre_tokenizers.Whitespace()
+        backend.decoder = decoders.WordPiece(prefix="##", cleanup=False)
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=backend, unk_token="t0", eos_token="t99"
+        )
+        tokenizer.chat_template = (
+            "{% for message in messages %}{{ message['content'] }} {% endfor %}"
+        )
+        self._tokenizer = types.SimpleNamespace(tokenizer=tokenizer, include_special_tokens=True)
+        self.vocab_size = 100
+        self.unk_token_id = 0
+        self.bos = None
+        self.eod = 99
+        self.eos_id = 99
+
+    def tokenize(self, text):
+        return self._tokenizer.tokenizer.encode(text, add_special_tokens=False)
+
+    def detokenize(self, tokens, **kwargs):
+        tokens = list(tokens)
+        if kwargs.get("remove_EOD", False) and tokens and tokens[-1] == self.eod:
+            tokens.pop()
+        return self._tokenizer.tokenizer.decode(
+            tokens, skip_special_tokens=kwargs.get("skip_special_tokens", False)
+        )
+
+    def convert_tokens_to_ids(self, token):
+        return self._tokenizer.tokenizer.convert_tokens_to_ids(token)
+
+
+class _TokenTextDetokenizer:
+    """Deterministic incremental text boundary for real engine SSE records."""
+
+    def __init__(self):
+        self.text = ""
+
+    @property
+    def text_length(self):
+        return len(self.text)
+
+    def update(self, token_ids):
+        delta = "".join(f"<{token}>" for token in token_ids)
+        self.text += delta
+        return delta
+
+    def finish(self):
+        return ""
 
 
 @dataclass
@@ -3532,6 +3594,204 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 for client in clients:
                     assert client.streams == {}
                     assert client.request_submission_times == {}
+
+                sse_params = [
+                    SamplingParams(
+                        num_tokens_to_generate=length,
+                        termination_id=-1,
+                        top_k=1,
+                        streaming_interval=2,
+                    )
+                    for length in (24, 12)
+                ]
+                sse_streams = [
+                    client.add_request_streaming(prompt, params)
+                    for client, prompt, params in zip(clients, prompts, sse_params, strict=True)
+                ]
+                sse_generator = openai_stream(
+                    sse_streams,
+                    env.engine.controller.tokenizer,
+                    [_TokenTextDetokenizer(), _TokenTextDetokenizer()],
+                    chat=False,
+                    include_usage=True,
+                )
+                first_sse = await asyncio.wait_for(anext(sse_generator), timeout=30)
+                assert any(not stream.finished for stream in sse_streams)
+                sse_frames = [first_sse]
+                async for frame in sse_generator:
+                    sse_frames.append(frame)
+                payloads = [
+                    json.loads(frame.removeprefix("data: ").strip())
+                    for frame in sse_frames
+                    if frame != "data: [DONE]\n\n"
+                ]
+                assert sse_frames[-1] == "data: [DONE]\n\n"
+                reconstructed = ["", ""]
+                terminals = [[], []]
+                for payload in payloads:
+                    for choice in payload["choices"]:
+                        if choice["finish_reason"] is None:
+                            reconstructed[choice["index"]] += choice["text"]
+                        else:
+                            terminals[choice["index"]].append(choice)
+                expected_sse_tokens = [baseline_tokens[0][:24], baseline_tokens[1][:12]]
+                assert reconstructed == [
+                    env.engine.controller.tokenizer.detokenize(tokens)
+                    for tokens in expected_sse_tokens
+                ]
+                assert [len(choices) for choices in terminals] == [1, 1]
+                for index, choices in enumerate(terminals):
+                    assert choices[0]["generation_token_ids"] == expected_sse_tokens[index]
+                    assert choices[0]["generated_text"] == reconstructed[index]
+                    assert choices[0]["finish_reason"] == "length"
+                usage_payloads = [payload for payload in payloads if "usage" in payload]
+                assert len(usage_payloads) == 1
+                usage = usage_payloads[0]["usage"]
+                assert usage["prompt_tokens"] == sum(map(len, prompts))
+                assert usage["completion_tokens"] == 36
+                assert usage["total_tokens"] == sum(map(len, prompts)) + 36
+                assert usage["prompt_tokens_details"]["cached_tokens"] >= len(shared_prefix)
+
+                # Live Quart completions and chat: each non-streamed response is the reference
+                # for the matching stream.
+                quart = pytest.importorskip("quart")
+                from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.chat_completions import (
+                    bp as chat_completions_bp,
+                )
+                from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.completions import (
+                    bp as completions_bp,
+                )
+
+                endpoint_tokenizer = _FastEndpointTokenizer()
+                endpoint_app = quart.Quart(__name__)
+                endpoint_app.register_blueprint(completions_bp)
+                endpoint_app.register_blueprint(chat_completions_bp)
+                endpoint_app.config.update(
+                    client=primary_client,
+                    tokenizer=endpoint_tokenizer,
+                    parsers=[],
+                    multimodal_prompt_config=MultimodalPromptConfig(),
+                    verbose=False,
+                    TESTING=True,
+                )
+
+                async def assert_endpoint_stream_matches_final(path, body, *, chat):
+                    endpoint_client = endpoint_app.test_client()
+                    final_response = await endpoint_client.post(path, json=body)
+                    assert final_response.status_code == 200, await final_response.get_data(
+                        as_text=True
+                    )
+                    final_payload = await final_response.get_json()
+                    final_choices = sorted(
+                        final_payload["choices"], key=lambda choice: choice["index"]
+                    )
+                    if chat:
+                        final_texts = [choice["message"]["content"] for choice in final_choices]
+                        final_token_ids = [
+                            choice["message"]["generation_token_ids"] for choice in final_choices
+                        ]
+                        assert all(
+                            len(choice["logprobs"]["content"]) == len(token_ids)
+                            for choice, token_ids in zip(
+                                final_choices, final_token_ids, strict=True
+                            )
+                        )
+                    else:
+                        final_texts = [choice["text"] for choice in final_choices]
+                        final_token_ids = [
+                            choice["generation_token_ids"] for choice in final_choices
+                        ]
+                        assert all(
+                            len(choice["logprobs"]["token_logprobs"]) == len(token_ids)
+                            for choice, token_ids in zip(
+                                final_choices, final_token_ids, strict=True
+                            )
+                        )
+
+                    streaming_response = await endpoint_client.post(
+                        path,
+                        json={**body, "stream": True, "stream_options": {"include_usage": True}},
+                    )
+                    assert streaming_response.status_code == 200
+                    records = [
+                        record
+                        for record in (await streaming_response.get_data(as_text=True)).split(
+                            "\n\n"
+                        )
+                        if record
+                    ]
+                    assert records[-1] == "data: [DONE]"
+                    stream_payloads = [
+                        json.loads(record.removeprefix("data: ")) for record in records[:-1]
+                    ]
+                    reconstructed = [""] * len(final_choices)
+                    terminal_choices = [[] for _ in final_choices]
+                    for payload in stream_payloads:
+                        for choice in payload["choices"]:
+                            index = choice["index"]
+                            if choice["finish_reason"] is None:
+                                reconstructed[index] += (
+                                    choice["delta"].get("content", "") if chat else choice["text"]
+                                )
+                            else:
+                                terminal_choices[index].append(choice)
+                    assert reconstructed == final_texts
+                    assert all(len(choices) == 1 for choices in terminal_choices)
+                    for index, choices in enumerate(terminal_choices):
+                        assert choices[0]["finish_reason"] == "length"
+                        assert choices[0]["generation_token_ids"] == final_token_ids[index]
+                    usage_records = [
+                        payload["usage"] for payload in stream_payloads if "usage" in payload
+                    ]
+                    assert len(usage_records) == 1
+                    for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                        assert usage_records[0][field] == final_payload["usage"][field]
+                    if "prompt_tokens_details" in final_payload["usage"]:
+                        final_cached = final_payload["usage"]["prompt_tokens_details"][
+                            "cached_tokens"
+                        ]
+                        stream_cached = usage_records[0]["prompt_tokens_details"]["cached_tokens"]
+                        # The non-streamed reference can warm blocks for the matching stream.
+                        assert final_cached > 0
+                        assert stream_cached >= final_cached
+
+                endpoint_prompt = " ".join(f"t{token}" for token in prompts[0])
+                await assert_endpoint_stream_matches_final(
+                    "/v1/completions",
+                    {
+                        "prompt": [endpoint_prompt, " ".join(f"t{token}" for token in prompts[1])],
+                        "max_tokens": 12,
+                        "temperature": 0,
+                        "ignore_eos": True,
+                        "logprobs": 2,
+                    },
+                    chat=False,
+                )
+                await assert_endpoint_stream_matches_final(
+                    "/v1/completions",
+                    {
+                        "prompt": prompts[0],
+                        "max_tokens": 8,
+                        "temperature": 0,
+                        "ignore_eos": True,
+                        "logprobs": 2,
+                    },
+                    chat=False,
+                )
+                await assert_endpoint_stream_matches_final(
+                    "/v1/chat/completions",
+                    {
+                        "messages": [{"role": "user", "content": endpoint_prompt}],
+                        "max_tokens": 12,
+                        "temperature": 0,
+                        "ignore_eos": True,
+                        "logprobs": True,
+                        "top_logprobs": 2,
+                        "return_tokenized_data": True,
+                        "n": 2,
+                    },
+                    chat=True,
+                )
 
                 class CurrentLoopBridge:
                     def __init__(self, loop):
