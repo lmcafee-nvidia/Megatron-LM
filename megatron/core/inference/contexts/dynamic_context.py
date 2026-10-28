@@ -1826,10 +1826,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.mamba_metadata.request_to_mamba_state_idx.copy_(state["mamba_request_slots"])
             self.mamba_metadata.mamba_state_free_slots.copy_(state["mamba_free_slots"])
             self.mamba_metadata.mamba_state_free_slot_count = state["mamba_free_slot_count"]
-        # Capture flushes the Mamba op queue, which reset() leaves intact. Requeue the live
-        # requests' ops so they run after the state backups below are reapplied.
-        self._pending_mamba_zeros[:] = state["pending_mamba_ops"][0]
-        self._pending_mamba_restores[:] = state["pending_mamba_ops"][1]
         for name, value in state["vlm_maps"].items():
             target = getattr(self, name)
             target.clear()
