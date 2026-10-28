@@ -1,8 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Bitwise cache-hit parity, including chunked prefill, graph replay and refit."""
 
+import asyncio
 import gc
 import math
+from contextlib import nullcontext
 from unittest import mock
 
 import msgpack
@@ -88,6 +90,9 @@ class TestBatchInvariantMambaPrefixCaching:
         exercise_real_refit=True,
         target_seed=321,
         source_seed=654,
+        refit_callback=None,
+        lifecycle_callback=None,
+        target_alloc_context=None,
         async_sched_mode=AsyncScheduleMode.ASYNC,
     ):
         model_parallel_cuda_manual_seed(321, inference_rng_tracker=True, force_reset_rng=True)
@@ -115,6 +120,12 @@ class TestBatchInvariantMambaPrefixCaching:
             cuda_graph_impl="local" if graphs else "none",
             inference_rng_tracker=True,
             mtp_num_layers=1 if speculative else None,
+            num_moe_experts=8 if lifecycle_callback else None,
+            moe_router_topk=2,
+            moe_grouped_gemm=bool(lifecycle_callback),
+            moe_token_dispatcher_type="alltoall",
+            moe_pad_experts_for_cuda_graph_inference=bool(lifecycle_callback),
+            inference_moe_token_dispatcher_type="nccl",
         )
 
         def build_model(seed):
@@ -124,16 +135,20 @@ class TestBatchInvariantMambaPrefixCaching:
                 HybridModel(
                     config=cfg,
                     hybrid_stack_spec=hybrid_stack_spec,
-                    hybrid_layer_pattern="M*-/*" if speculative else "M*-",
+                    hybrid_layer_pattern=(
+                        "M*E/*" if lifecycle_callback else ("M*-/*" if speculative else "M*-")
+                    ),
                     vocab_size=128,
                     max_sequence_length=1024,
+                    position_embedding_type="rope" if lifecycle_callback else "none",
                 )
                 .cuda()
                 .eval()
             )
 
-        target_core = build_model(target_seed)
-        model = Float16Module(cfg, target_core).cuda().eval()
+        with target_alloc_context() if target_alloc_context else nullcontext():
+            target_core = build_model(target_seed)
+            model = Float16Module(cfg, target_core).cuda().eval()
         source_core = build_model(source_seed) if exercise_real_refit else None
         mamba_config = MambaInferenceStateConfig.from_model(target_core)
         assert mamba_config.ssm_states_dtype == (torch.bfloat16 if speculative else torch.float32)
@@ -209,7 +224,7 @@ class TestBatchInvariantMambaPrefixCaching:
         prompts = [[i % 120 + 1 for i in range(n)] for n in (600, 650, 512, 513, 768, 769)]
         outputs = {}
         graph_steps = post_refit_graph_steps = post_refit_chunked_steps = 0
-        post_refit_sampling_start = post_refit_speculative_start = None
+        post_refit_sampling_start = post_refit_speculative_start = lifecycle = None
         torch_top_k = int(exercise_real_refit and sampling_backend == "torch")
         for wave, order in enumerate(([0, 1], [1, 0], [2], [3], [4], [5], [0])):
             if wave == 6:
@@ -258,7 +273,10 @@ class TestBatchInvariantMambaPrefixCaching:
                     post_refit_speculative_start = int(engine._spec_tokens_proposed_per_pos.sum())
                     engine.suspend()
                     pending_survived_suspend = engine.controller._async_sched_forward.is_valid
-                    swap_model_weights([source_model], [model], refit_method="nccl")
+                    if refit_callback is None:
+                        swap_model_weights([source_model], [model], refit_method="nccl")
+                    else:
+                        refit_callback(source_model, model)
                     assert all(
                         torch.equal(source_parameters[name], target_parameters[name])
                         for name in source_parameters
@@ -268,16 +286,20 @@ class TestBatchInvariantMambaPrefixCaching:
                     } == target_storage
                     assert not pending_survived_suspend
 
-                    engine.is_mp_coordinator = True
-                    engine.socket_for_receiving_requests = mock.Mock()
-                    engine.model_parallel_publisher_socket = mock.Mock()
-                    epoch_payload = msgpack.packb([Headers.SET_GENERATION_EPOCH.value, 1])
-                    engine.socket_for_receiving_requests.recv_multipart.side_effect = [
-                        [epoch_payload],
-                        dynamic_engine.zmq.Again,
-                    ]
-                    assert engine.schedule_requests() == 1
-                    engine.resume()
+                    if lifecycle_callback is None:
+                        engine.is_mp_coordinator = True
+                        engine.socket_for_receiving_requests = mock.Mock()
+                        engine.model_parallel_publisher_socket = mock.Mock()
+                        epoch_payload = msgpack.packb([Headers.SET_GENERATION_EPOCH.value, 1])
+                        engine.socket_for_receiving_requests.recv_multipart.side_effect = [
+                            [epoch_payload],
+                            dynamic_engine.zmq.Again,
+                        ]
+                        assert engine.schedule_requests() == 1
+                        engine.resume()
+                    else:
+                        lifecycle = lifecycle_callback(engine, model, source_model)
+                        lifecycle.__enter__()
                     assert not engine.controller._async_sched_forward.is_valid
                     assert engine._generation_epoch == 1
                     assert all(
@@ -291,6 +313,9 @@ class TestBatchInvariantMambaPrefixCaching:
                         assert resumed_resident_salt == queued.block_hash_salt
                     else:
                         assert resumed_resident_salt == resident_salt
+                    if kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
+                        assert context.request_ids[: context.total_request_count].tolist() == [5999]
+                        assert context.mamba_metadata.request_to_mamba_state_idx[0] >= 0
                 else:
                     # Old cached states must not be reused after a weight update.
                     engine.suspend()
@@ -339,6 +364,8 @@ class TestBatchInvariantMambaPrefixCaching:
                     assert post_refit_graph_steps > 0
                 if chunked:
                     assert post_refit_chunked_steps > 0
+        if lifecycle is not None:
+            lifecycle.__exit__(None, None, None)
         if not exercise_real_refit:
             assert outputs[1] == outputs[11]
             assert outputs[2] == outputs[12]
@@ -400,7 +427,12 @@ class TestBatchInvariantMambaPrefixCaching:
         assert cached == baseline
 
     @pytest.mark.parametrize(
-        "kv_cache_management_mode", [KVCacheManagementMode.PERSIST, KVCacheManagementMode.RECOMPUTE]
+        "kv_cache_management_mode",
+        [
+            KVCacheManagementMode.PERSIST,
+            KVCacheManagementMode.OFFLOAD,
+            KVCacheManagementMode.RECOMPUTE,
+        ],
     )
     @pytest.mark.parametrize("chunked", [False, True])
     @torch.inference_mode()
@@ -445,6 +477,123 @@ class TestBatchInvariantMambaPrefixCaching:
                             assert math.isnan(actual) and math.isnan(expected)
                         else:
                             assert actual == expected
+
+    @pytest.mark.parametrize(
+        "training_graphs", [False, True], ids=["runtime-toggle", "training-moe"]
+    )
+    @torch.inference_mode()
+    def test_rl_refit_boundary_owns_live_lifecycle(self, monkeypatch, training_graphs):
+        from types import SimpleNamespace
+
+        from megatron.core.inference.inference_client import InferenceClient
+
+        rl_utils = pytest.importorskip("megatron.rl.rl_utils")
+        from megatron.rl.inference.megatron import MegatronLocal
+        from megatron.training.config import RLConfig
+
+        self._set_env(monkeypatch)
+        monkeypatch.setattr("megatron.core.inference.utils.moe_layer_cache", None)
+        monkeypatch.setattr("megatron.core.inference.utils._moe_metadata_sync_initialized", False)
+        config = RLConfig(
+            refit_method="nccl",
+            refit_execution_batch_bytes=4096,
+            rl_offload_inference_model_weights=True,
+            rl_inference_model_unified_memory_level=1,
+            rl_training_cuda_graphs=training_graphs,
+        )
+        args = SimpleNamespace(
+            inference_shards=None, world_size=torch.distributed.get_world_size(), num_experts=8
+        )
+        client = InferenceClient.__new__(InferenceClient)
+        client.socket = mock.Mock()
+        adapter = MegatronLocal(host="localhost", port=0)
+        adapter._client = client
+        interface, retained_models, spies = None, [], {}
+        for name in (
+            "_maybe_prefetch_separate_inference_model_weights",
+            "toggle_cuda_graphs",
+            "set_decode_expert_padding",
+            "transition_moe_cudagraphs",
+        ):
+            spies[name] = mock.Mock(wraps=getattr(rl_utils, name))
+            monkeypatch.setattr(rl_utils, name, spies[name])
+
+        def refit(source, target):
+            rl_utils._maybe_prefetch_separate_inference_model_weights(target.module, to_cpu=True)
+            rl_utils._maybe_prefetch_separate_inference_model_weights(target.module, to_cpu=False)
+            assert rl_utils.refit_inference_model([source], [target], args) == 1
+
+        def lifecycle(engine, target, source):
+            nonlocal interface
+            retained_models.append(target)
+            args.cuda_graph_impl = target.module.config.cuda_graph_impl
+            args.cuda_graph_modules = list(target.module.config.cuda_graph_modules)
+            args.inference_cuda_graph_scope = target.module.config.inference_cuda_graph_scope
+            target.module.rotary_pos_emb(2)
+
+            def set_generation_epoch(epoch):
+                adapter.set_generation_epoch(epoch)
+                engine.is_mp_coordinator = True
+                engine.socket_for_receiving_requests = mock.Mock()
+                engine.model_parallel_publisher_socket = mock.Mock()
+                engine.socket_for_receiving_requests.recv_multipart.side_effect = [
+                    [client.socket.send.call_args.args[0]],
+                    dynamic_engine.zmq.Again,
+                ]
+                assert engine.schedule_requests() == 1
+
+            def suspend():
+                rl_utils.set_decode_expert_padding(target.module, set_to=True, capacity_factor=4)
+                engine.suspend()
+
+            interface = SimpleNamespace(
+                set_generation_epoch=set_generation_epoch,
+                resume=mock.AsyncMock(side_effect=engine.resume),
+                suspend=mock.AsyncMock(side_effect=suspend),
+            )
+            return rl_utils.megatron_rl_inference_mode(
+                [target], None, "local", False, training_model=[source]
+            )
+
+        monkeypatch.setattr(rl_utils, "get_args", lambda: args)
+        monkeypatch.setattr(rl_utils, "get_train_state", lambda: SimpleNamespace(iteration=1))
+        monkeypatch.setattr(
+            rl_utils, "get_asyncio_loop", lambda: SimpleNamespace(run_until_complete=asyncio.run)
+        )
+        monkeypatch.setattr(rl_utils, "get_inference_interface", lambda *_args: interface)
+        monkeypatch.setattr(rl_utils, "get_nvtx_range", lambda: lambda *_a, **_k: nullcontext())
+
+        with (
+            mock.patch.object(rl_utils, "get_run_config", return_value=SimpleNamespace(rl=config)),
+            set_batch_invariant_mode(False),
+        ):
+            self._run(
+                prefix=True,
+                graphs=True,
+                chunked=True,
+                kv_cache_management_mode=KVCacheManagementMode.OFFLOAD,
+                refit_callback=refit,
+                lifecycle_callback=lifecycle,
+                target_alloc_context=rl_utils.inference_model_alloc_context,
+            )
+        prefetch = spies["_maybe_prefetch_separate_inference_model_weights"]
+        expected_prefetch = (True, False, False, True)
+        assert tuple(c.kwargs["to_cpu"] for c in prefetch.call_args_list) == expected_prefetch
+        toggles = [call.args[1] for call in spies["toggle_cuda_graphs"].call_args_list]
+        transitions = [call.args[1] for call in spies["transition_moe_cudagraphs"].call_args_list]
+        assert toggles == ([] if training_graphs else ["local", "none"])
+        assert transitions == (["full", "partial"] if training_graphs else [])
+        assert [
+            call.kwargs["set_to"] for call in spies["set_decode_expert_padding"].call_args_list
+        ] == [True, False]
+        assert retained_models[0].module.rotary_pos_emb.forward.cache_info().currsize == 0
+        assert not retained_models[0].module.config.moe_pad_expert_input_to_capacity
+        moe_layers = [m for m in retained_models[0].modules() if getattr(m, "is_moe_layer", False)]
+        assert moe_layers and all(
+            not layer.mlp.token_dispatcher.drop_and_pad
+            and layer.use_partial_cudagraphs is training_graphs
+            for layer in moe_layers
+        )
 
     @torch.inference_mode()
     def test_refit_executes_flashinfer_sampling(self, monkeypatch):
