@@ -2086,6 +2086,9 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert int(env.engine._spec_tokens_proposed_per_pos.sum()) > 0
             assert runtime["mtp-rewind-calls"] > 0
             assert runtime["mtp-acceptance-decisions"] > 0
+            if "mtp-accept-rewind" in signals:
+                assert runtime["mtp-accepted-tokens"] > 0
+                assert runtime["mtp-rejected-tokens"] > 0
         if "metadata-compaction" in signals:
             assert runtime["non-prefix-survivor-compactions"] > 0
         if "hybrid" in signals:
