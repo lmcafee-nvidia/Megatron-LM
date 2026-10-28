@@ -816,6 +816,10 @@ _ASYNC_PAIR_SCENARIOS = (
     ),
     _pair_scenario(
         "mxfp8-inference-topk1",
+        "precision:mxfp8",
+        "model:moe",
+        "routing:top-1",
+        "implementation:inference-optimized",
         config={
             "fp8": True,
             "fp8_recipe": "mxfp8",
@@ -1043,14 +1047,12 @@ _ASYNC_PARALLEL_SCENARIOS = (
 )
 
 
-_UPSTREAM_SCENARIOS = {
-    case.name: case for case in _ASYNC_PAIR_SCENARIOS + _ASYNC_PARALLEL_SCENARIOS
-}
+_SCENARIOS_BY_NAME = {case.name: case for case in _ASYNC_PAIR_SCENARIOS + _ASYNC_PARALLEL_SCENARIOS}
 
 
 def _variant(base_name, name, *pairs, config=None, signals=(), **changes):
     """Derive a new case from an upstream one, leaving the upstream definition unchanged."""
-    base = _UPSTREAM_SCENARIOS[base_name]
+    base = _SCENARIOS_BY_NAME[base_name]
     return replace(
         base,
         name=name,
@@ -1067,7 +1069,7 @@ _CUDA_GRAPH_HANDOFF_SCENARIOS = (
     _pair_scenario(
         "disagg-decode-handoff",
         "disaggregation:decode-handoff",
-        "kv:transferred-prefix",
+        "kv:synthetic-import",
         config={"enable_prefix_caching": True, "engine_cls": StateHandoffDynamicInferenceEngine},
         signals=("disagg-handoff",),
         request_profile="handoff",
@@ -2217,12 +2219,13 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         config.update(scenario.config)
         config["async_sched_mode"] = mode
         env = cls._build_test_env(_DynamicEngineTestConfig(**config))
-        if env.engine.controller.inference_wrapped_model.model.config.fp8:
+        # New FP8 cases round eager steps to the recipe's alignment; main's own FP8 case
+        # keeps the upstream test rounder.
+        model_config = env.engine.controller.inference_wrapped_model.model.config
+        if model_config.fp8 and scenario.name != "fp8-transformer-engine":
             from megatron.core.fp8_utils import get_fp8_align_size
 
-            DynamicInferenceContext.TOKEN_ROUNDER = get_fp8_align_size(
-                env.engine.controller.inference_wrapped_model.model.config.fp8_recipe
-            )
+            DynamicInferenceContext.TOKEN_ROUNDER = get_fp8_align_size(model_config.fp8_recipe)
         env.requests = _make_scenario_requests(
             env, scenario, stop_tokens=stop_tokens, termination_token=termination_token
         )
@@ -2423,7 +2426,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 )
                 if env.engine.context.static_kv_memory_pointers:
                     runtime["cuda-graph-pool-preserved"] += int(
-                        CudaGraphManager.global_mempool == graph_pool_before
+                        graph_pool_before is not None
+                        and CudaGraphManager.global_mempool == graph_pool_before
                     )
                 _instrument_cuda_graph_replays(
                     env.engine.controller.inference_wrapped_model.model, env.engine.context, runtime
@@ -2464,6 +2468,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 if env.config.num_cuda_graphs:
                     runtime["context-reset-graphs-preserved"] += int(
                         bool(graph_runners)
+                        and graph_pool is not None
                         and CudaGraphManager.global_mempool == graph_pool
                         and all(
                             runner.fwd_graph_recorded and runner.fwd_graph is graph
