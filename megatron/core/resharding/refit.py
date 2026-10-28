@@ -445,8 +445,7 @@ def swap_model_weights(
     If *transform* is not explicitly provided, the function automatically uses
     any ``MXFP8ReshardTransform`` that was created and cached by a prior
     ``prepare_swap_model_weights`` call for the same model pair.  This makes
-    MXFP8 handling transparent to callers. Built per-token NVFP4 expert weights
-    are likewise requantized in place after every successful transfer.
+    MXFP8 handling transparent to callers.
 
     Args:
         refit_method: a string backend name (one of the supported refit
@@ -654,18 +653,3 @@ def reshard_model_weights(
     execute_reshard_plan(
         plan, src_core, tgt_core, service=service, group=group, transform=transform
     )
-    if tgt_core is not None:
-        refreshed = False
-        for module in tgt_core.modules():
-            refresh = getattr(module, "refresh_flashinfer_nvfp4_weights", None)
-            if refresh is not None:
-                refreshed = bool(refresh()) or refreshed
-        if isinstance(transform, MXFP8ReshardTransform):
-            for module in tgt_core.modules():
-                refresh = getattr(module, "refresh_flashinfer_mxfp8_weights", None)
-                if refresh is not None:
-                    refreshed = bool(refresh()) or refreshed
-        if refreshed:
-            # Repacking is asynchronous. Synchronize before another stream replays graphs
-            # that read these derived weight buffers.
-            torch.cuda.synchronize()
