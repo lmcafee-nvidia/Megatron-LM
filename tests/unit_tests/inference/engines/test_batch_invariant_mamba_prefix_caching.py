@@ -5,6 +5,7 @@ import asyncio
 import gc
 import math
 from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest import mock
 
 import msgpack
@@ -482,8 +483,6 @@ class TestBatchInvariantMambaPrefixCaching:
     )
     @torch.inference_mode()
     def test_rl_refit_boundary_owns_live_lifecycle(self, monkeypatch, training_graphs):
-        from types import SimpleNamespace
-
         from megatron.core.inference.inference_client import InferenceClient
 
         rl_utils = pytest.importorskip("megatron.rl.rl_utils")
@@ -532,11 +531,12 @@ class TestBatchInvariantMambaPrefixCaching:
 
             def set_generation_epoch(epoch):
                 adapter.set_generation_epoch(epoch)
+                assert client.socket.send.called == (torch.distributed.get_rank() == 0)
                 engine.is_mp_coordinator = True
                 engine.socket_for_receiving_requests = mock.Mock()
                 engine.model_parallel_publisher_socket = mock.Mock()
                 engine.socket_for_receiving_requests.recv_multipart.side_effect = [
-                    [client.socket.send.call_args.args[0]],
+                    [msgpack.packb([Headers.SET_GENERATION_EPOCH.value, epoch])],
                     dynamic_engine.zmq.Again,
                 ]
                 assert engine.schedule_requests() == 1
