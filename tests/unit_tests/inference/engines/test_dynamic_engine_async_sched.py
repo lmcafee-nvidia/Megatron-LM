@@ -821,6 +821,7 @@ _ASYNC_SUSPEND_RESUME_SCENARIOS = (
         },
         signals=("cuda-graph", "offload", "suspend-resume"),
         atol=5.0e-3,
+        prerequisite="mamba",
     ),
 )
 
