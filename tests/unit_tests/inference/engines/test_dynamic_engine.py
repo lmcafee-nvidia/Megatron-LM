@@ -8507,3 +8507,58 @@ class TestGDNDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         staggered = self._run_test(**common, num_gap_steps=3)
 
         assert self._generated_tokens(staggered) == self._generated_tokens(dense)
+
+
+class TestDiagMtpResumeVariants(DynamicInferenceEngineTestBase):
+    """Disposable diagnostic (not for review): GPT MTP async resume with and without recapture."""
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+        )
+
+    @classmethod
+    def teardown_class(cls):
+        delete_cuda_graphs()
+        reset_rounder()
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize(
+        "variant", ["recapture", "no-graphs", "static-pointers", "persist", "recapture-interval-2"]
+    )
+    @torch.inference_mode()
+    def test_diag_mtp_resume_variants(self, variant):
+        def run(interval):
+            graphs = variant != "no-graphs"
+            env = self._build_test_env(
+                DynamicEngineTestConfig(
+                    num_requests=4,
+                    num_tokens_to_generate=12,
+                    top_k=1,
+                    num_cuda_graphs=4 if graphs else None,
+                    force_build_cuda_graphs=graphs,
+                    use_cuda_graphs_for_non_decode_steps=False,
+                    kv_cache_management_mode="persist" if variant == "persist" else "offload",
+                    static_kv_memory_pointers=variant == "static-pointers",
+                    suspend_resume_interval=interval,
+                    async_sched_mode=AsyncScheduleMode.ASYNC,
+                    num_speculative_tokens=1,
+                )
+            )
+            for request in env.requests:
+                env.engine._add_request(request)
+            for _ in range(64):
+                self._run_step(env)
+                if not env.engine.has_unfinished_requests():
+                    break
+            return [list(request.output) for request in env.requests]
+
+        expected = run(None)
+        actual = run(2 if variant == "recapture-interval-2" else 3)
+        print(f"DIAG mtp {variant} expected={expected}")
+        print(f"DIAG mtp {variant} actual={actual}")
+        assert actual == expected
