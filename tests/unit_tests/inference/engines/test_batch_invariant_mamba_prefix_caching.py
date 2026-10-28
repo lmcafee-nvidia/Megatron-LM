@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from megatron.core.inference.config import (
+    AsyncScheduleMode,
     InferenceConfig,
     KVCacheManagementMode,
     MambaInferenceStateConfig,
@@ -87,6 +88,7 @@ class TestBatchInvariantMambaPrefixCaching:
         exercise_real_refit=True,
         target_seed=321,
         source_seed=654,
+        async_sched_mode=AsyncScheduleMode.ASYNC,
     ):
         model_parallel_cuda_manual_seed(321, inference_rng_tracker=True, force_reset_rng=True)
         torch.manual_seed(321)
@@ -172,6 +174,7 @@ class TestBatchInvariantMambaPrefixCaching:
                 unified_memory_level=0,
                 sampling_backend=sampling_backend,
                 num_speculative_tokens=int(speculative),
+                async_sched_mode=async_sched_mode,
             ),
         )
         engine = DynamicInferenceEngine(
@@ -228,7 +231,9 @@ class TestBatchInvariantMambaPrefixCaching:
                     for _ in range(2):
                         pre_refit_result = engine.step_modern()
                         assert not pre_refit_result["finished_requests"]
-                    assert engine.controller._async_sched_forward.is_valid
+                    assert engine.controller._async_sched_forward.is_valid is (
+                        async_sched_mode == AsyncScheduleMode.ASYNC
+                    )
                     resident = engine.get_request(5999)
                     assert resident.finished_chunk_token_count > 0 or resident.generated_tokens
                     resident_salt = resident.block_hash_salt
@@ -261,9 +266,7 @@ class TestBatchInvariantMambaPrefixCaching:
                     assert {
                         name: parameter.data_ptr() for name, parameter in target_parameters.items()
                     } == target_storage
-                    assert pending_survived_suspend is (
-                        kv_cache_management_mode != KVCacheManagementMode.RECOMPUTE
-                    )
+                    assert not pending_survived_suspend
 
                     engine.is_mp_coordinator = True
                     engine.socket_for_receiving_requests = mock.Mock()
@@ -412,6 +415,17 @@ class TestBatchInvariantMambaPrefixCaching:
                 chunked=chunked,
                 kv_cache_management_mode=kv_cache_management_mode,
             )
+            if kv_cache_management_mode != KVCacheManagementMode.RECOMPUTE and not chunked:
+                # The resident request crossed the refit with a forward pending. Draining it
+                # at suspend matches legacy scheduling, which had already sampled that token.
+                legacy = self._run(
+                    prefix=True,
+                    graphs=True,
+                    chunked=False,
+                    kv_cache_management_mode=kv_cache_management_mode,
+                    async_sched_mode=AsyncScheduleMode.LEGACY,
+                )
+                assert outputs[5999][0] == legacy[5999][0]
             if kv_cache_management_mode == KVCacheManagementMode.PERSIST and not chunked:
                 fresh = self._run(
                     prefix=True,

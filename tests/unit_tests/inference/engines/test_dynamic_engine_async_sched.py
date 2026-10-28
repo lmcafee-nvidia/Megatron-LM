@@ -1577,12 +1577,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert context.static_kv_memory_pointers
         if "suspend-resume" in signals:
             assert runtime["suspend-resume"] == runtime["pending-before-suspend"] == 1
-            if "recompute" in signals:
-                assert runtime["pending-after-suspend"] == 0
-                assert runtime["pending-after-resume"] == 0
-            else:
-                assert runtime["pending-after-suspend"] == 1
-                assert runtime["pending-after-resume"] == 1
+            assert runtime["pending-after-suspend"] == runtime["pending-after-resume"] == 0
             if "static-pointers" in signals:
                 assert runtime["static-pointer-preserved"] == 1
         if "dp-offset" in signals:
@@ -1981,6 +1976,35 @@ class TestAsyncSchedulePairwise(_AsyncPairwiseHarness):
             delete_cuda_graphs()
             torch.cuda.empty_cache()
 
+    @torch.inference_mode()
+    def test_suspend_drains_pending_forward_under_the_old_epoch(self):
+        """The drained token belongs to the epoch whose weights computed it."""
+        env = self._build_test_env(
+            _DynamicEngineTestConfig(num_requests=1, num_tokens_to_generate=8, top_k=1)
+        )
+        engine, request_id = env.engine, env.requests[0].request_id
+        engine._generation_epoch = 0
+        engine._add_request(env.requests[0])
+        while not engine.controller._async_sched_forward.is_valid:
+            engine.step_modern()
+        request = engine.get_request(request_id)
+        token_count = len(request.prompt_tokens) + len(request.generated_tokens)
+        engine.suspend()
+        assert not engine.controller._async_sched_forward.is_valid
+        request = engine.get_request(request_id)
+        assert len(request.prompt_tokens) + len(request.generated_tokens) == token_count + 1
+        engine.is_mp_coordinator = True
+        engine.model_parallel_publisher_socket = mock.Mock()
+        engine.socket_for_receiving_requests = mock.Mock()
+        engine.socket_for_receiving_requests.recv_multipart.side_effect = [
+            [msgpack.packb([Headers.SET_GENERATION_EPOCH.value, 1])],
+            dynamic_engine.zmq.Again,
+        ]
+        engine.schedule_requests()
+        # Logits from the last position before the boundary produced the drained token.
+        assert engine.get_request(request_id).policy_epoch[-1] == (token_count, 1)
+        engine.resume()
+
     @pytest.mark.parametrize(
         "scenario", _ASYNC_SUSPEND_RESUME_SCENARIOS, ids=lambda case: case.name
     )
@@ -2073,18 +2097,15 @@ def test_async_reset_clears_pending_logits():
 
 
 @pytest.mark.parametrize(
-    ("mode", "preserve_pending"),
-    [
-        pytest.param(KVCacheManagementMode.PERSIST, True, id="persist-preserves"),
-        pytest.param(KVCacheManagementMode.OFFLOAD, True, id="offload-preserves"),
-        pytest.param(KVCacheManagementMode.RECOMPUTE, False, id="recompute-clears"),
-    ],
+    "mode",
+    [KVCacheManagementMode.PERSIST, KVCacheManagementMode.OFFLOAD, KVCacheManagementMode.RECOMPUTE],
 )
-def test_async_suspend_pending_logits_lifecycle(mode, preserve_pending):
-    """Only recomputation invalidates a forward result pending across suspend."""
+def test_async_suspend_pending_logits_lifecycle(mode):
+    """Suspend finishes a forward result pending in every KV-cache mode."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.controller = _controller_with_pending_logits()
     engine.context = SimpleNamespace(
+        config=SimpleNamespace(async_sched_mode=AsyncScheduleMode.ASYNC),
         deallocate_inference_state_buffers=mock.Mock(),
         dynamo_helper=None,
         kv_cache_management_mode=mode,
@@ -2097,27 +2118,29 @@ def test_async_suspend_pending_logits_lifecycle(mode, preserve_pending):
     engine.use_coordinator = False
     engine._vision_embedding_cache = {}
     engine._vision_embedding_cache_bytes = 0
+    engine._loop = asyncio.new_event_loop()
+    engine._drained_finished_requests = []
+    finished = object()
+
+    async def finish_pending_forward(finish_pending_only):
+        assert finish_pending_only
+        engine.controller._async_sched_forward.clear()
+        return {"finished_requests": [finished]}
 
     with (
         mock.patch.object(DynamicInferenceEngine, "suspend_resume_ctx", return_value=nullcontext()),
         mock.patch("megatron.core.inference.engines.dynamic_engine.InferenceMode.unset_active"),
+        mock.patch.object(engine, "async_step", side_effect=finish_pending_forward),
     ):
         engine.suspend()
+    engine._loop.close()
 
-    assert engine.controller._async_sched_forward.is_valid is preserve_pending
-    if preserve_pending:
-        assert torch.equal(
-            engine.controller._async_sched_forward.token_row_indices, torch.tensor([0, 1, 2])
-        )
-    else:
-        assert engine.controller._async_sched_forward.token_row_indices is None
+    assert not engine.controller._async_sched_forward.is_valid
+    assert engine._drained_finished_requests == [finished]
 
 
-@pytest.mark.parametrize("new_epoch,expect_pending", [(7, True), (8, False)])
-def test_generation_epoch_change_discards_pending_logits_from_prior_weights(
-    new_epoch, expect_pending
-):
-    """An RL weight epoch cannot sample logits computed by the previous policy."""
+def test_generation_epoch_change_keeps_pending_forward():
+    """An epoch change keeps a pending forward; pause and suspend drain one before refits."""
     pending = AsyncScheduleForwardState()
     pending.set_pending(4, torch.tensor([0, 1, 2]))
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
@@ -2135,17 +2158,14 @@ def test_generation_epoch_change_discards_pending_logits_from_prior_weights(
     engine.model_parallel_publisher_socket = mock.Mock()
     engine.socket_for_receiving_requests = mock.Mock()
     engine.socket_for_receiving_requests.recv_multipart.side_effect = [
-        [msgpack.packb([Headers.SET_GENERATION_EPOCH.value, new_epoch])],
+        [msgpack.packb([Headers.SET_GENERATION_EPOCH.value, 8])],
         dynamic_engine.zmq.Again,
     ]
 
     assert engine.schedule_requests() == 1
-    assert pending.is_valid is expect_pending
-    assert engine._generation_epoch == new_epoch
-    if new_epoch == 7:
-        engine._invalidate_vision_state.assert_not_called()
-    else:
-        engine._invalidate_vision_state.assert_called_once_with()
+    assert pending.is_valid
+    assert engine._generation_epoch == 8
+    engine._invalidate_vision_state.assert_called_once_with()
 
 
 @pytest.mark.parametrize(

@@ -43,6 +43,7 @@ from tests.unit_tests.inference.engines.ssm_test_helpers import (
     hybrid_stack_spec_for,
 )
 from tests.unit_tests.inference.engines.test_dynamic_engine import (
+    DynamicEngineTestConfig,
     DynamicInferenceEngineTestBase,
     reset_rounder,
     set_rounder,
@@ -187,6 +188,65 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             len(request.generated_log_probs) == len(request.generated_tokens)
             for request in env.requests
         )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_suspend_drains_mtp_forward_with_an_idle_ep_rank(self):
+        """An idle EP rank joins the MTP draft collectives of a peer draining at suspend.
+
+        A missing collective does not raise; the expert all-to-all blocks, so this test
+        asserts by completing.
+        """
+        skip_if_mamba_sequence_packing_not_available("hybrid")
+        if int(os.environ.get("WORLD_SIZE", "1")) < 2:
+            pytest.skip("Test requires at least 2 GPUs")
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=2,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=6,
+                use_fixed_output_lengths=True,
+                model_provider="hybrid",
+                expert_model_parallel_size=2,
+                num_speculative_tokens=1,
+                top_k=1,
+                context_max_requests=8,
+                async_sched_mode=AsyncScheduleMode.ASYNC,
+            )
+        )
+        engine = env.engine
+        active = parallel_state.get_expert_model_parallel_rank() == 0
+        if active:
+            for request in env.requests:
+                engine._add_request(request)
+
+        def step():
+            # The production run loop keeps an idle EP rank in step with dummy forwards.
+            if active:
+                for request in engine.step_modern()["finished_requests"]:
+                    env.requests[request.request_id].status = request.status
+            else:
+                engine.controller.dummy_forward()
+            work = torch.tensor([int(engine.has_unfinished_requests())], device="cuda")
+            torch.distributed.all_reduce(
+                work, group=parallel_state.get_expert_model_parallel_group()
+            )
+            return bool(work.item())
+
+        step()
+        step()
+        assert engine.controller._async_sched_forward.is_valid is active
+        engine.suspend()
+        assert not engine.controller._async_sched_forward.is_valid
+        engine.resume()
+        while step():
+            pass
+        if active:
+            assert all(request.status == Status.COMPLETED for request in env.requests)
 
     @pytest.mark.internal
     @pytest.mark.skipif(
