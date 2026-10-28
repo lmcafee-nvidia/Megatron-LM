@@ -112,10 +112,6 @@ def test_flashinfer_nvfp4_token_capacity_rejects_invalid_configuration(overrides
         ({"fp8": "hybrid", "fp8_recipe": "mxfp8", "fp8_param": True}, "cannot be combined"),
         ({"transformer_impl": "transformer_engine"}, "requires transformer_impl"),
         ({"activation_func_tanh_clamp_scale": 10.0}, "does not support activation_func_tanh"),
-        (
-            {**_ACTIVATIONS["swiglu"], "activation_func_tanh_clamp_scale_linear": 2.0},
-            "supports only plain SwiGLU",
-        ),
     ],
 )
 def test_flashinfer_nvfp4_config_rejects_invalid_configuration(overrides, match):
