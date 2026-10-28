@@ -233,6 +233,20 @@ def test_refit_accepts_built_nvfp4_expert_weights(monkeypatch, built):
     assert executed == ["plan"]
 
 
+def test_refresh_module_caches_rebuilds_routed_expert_weights(monkeypatch):
+    """The generic post-refit hook must rebuild both FlashInfer copies of the expert weights."""
+    from megatron.core.resharding import refresh_module_caches
+    from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+    refreshed = []
+    for name in ("refresh_flashinfer_mxfp8_weights", "refresh_flashinfer_nvfp4_weights"):
+        monkeypatch.setattr(InferenceGroupedMLP, name, lambda _, name=name: refreshed.append(name))
+    experts = InferenceGroupedMLP.__new__(InferenceGroupedMLP)
+    torch.nn.Module.__init__(experts)
+    refresh_module_caches(torch.nn.Sequential(experts))
+    assert refreshed == ["refresh_flashinfer_mxfp8_weights", "refresh_flashinfer_nvfp4_weights"]
+
+
 def test_gated_fc1_is_padded_per_half_and_interleaved_up_gate():
     """MCore's [gate; up] FC1 becomes FlashInfer's alternating 64-row [up, gate] blocks."""
     from megatron.core.inference.moe.flashinfer_nvfp4 import _pad_fc1
@@ -798,9 +812,7 @@ class TestNVFP4MoELayer:
                 stale, _ = layer(hidden_states.clone())
             torch.testing.assert_close(stale, before, atol=0, rtol=0)
 
-            from megatron.core.resharding.execution import refresh_module_caches
-
-            refresh_module_caches(layer)
+            assert layer.experts.refresh_flashinfer_nvfp4_weights() is True
             with InferenceMode.active():
                 refreshed, _ = layer(hidden_states.clone())
 
@@ -847,9 +859,7 @@ class TestNVFP4MoELayer:
             before_refresh = graph_output.clone()
 
             layer.experts._fc1_weight.mul_(-1)
-            from megatron.core.resharding.execution import refresh_module_caches
-
-            refresh_module_caches(layer)
+            assert layer.experts.refresh_flashinfer_nvfp4_weights() is True
             graph.replay()
             torch.testing.assert_close(graph_output, _eager(static_hidden), atol=0, rtol=0)
 
