@@ -49,6 +49,7 @@ from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, delete_cuda_graphs
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay
+from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.transformer.utils import is_layer_window_attention
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.inference.engines.test_dynamic_engine import (
@@ -721,6 +722,21 @@ _ASYNC_PAIR_SCENARIOS = (
         exact_top_n=False,
     ),
     _pair_scenario(
+        "mla-latent-kv",
+        "attention:mla",
+        "kv:latent",
+        config={
+            "cache_mla_latents": True,
+            "context_block_size_tokens": 64,
+            "flash_attention_version": 3,
+            "hidden_size": 256,
+            "multi_latent_attention": True,
+        },
+        signals=("mla",),
+        prerequisite="flash-mla",
+        atol=5.0e-3,
+    ),
+    _pair_scenario(
         "vlm-precomputed-media",
         "model:vlm",
         "interaction:live-image-embedding-injection",
@@ -814,10 +830,12 @@ _ASYNC_PAIR_SCENARIOS = (
             "transformer_impl": "inference_optimized",
             "moe_router_topk": 1,
             "moe_router_pre_softmax": True,
+            "fp8_output_proj": True,
         },
-        signals=("inference-optimized", "moe", "mxfp8"),
+        signals=("inference-optimized", "moe", "mxfp8", "fixed-history-logits"),
         prerequisite="mxfp8",
         atol=0.0,
+        graph_parity="reproducible",
     ),
     _pair_scenario(
         "offload-static-uvm-suspend-resume",
@@ -1132,6 +1150,7 @@ _CUDA_GRAPH_DIFFERENTIAL_SCENARIOS = (
             "mtp-depth-one",
             "mtp-repeated-all-accept",
             "mtp-graph-heterogeneous-logprobs",
+            "mla-latent-kv",
             "vlm-precomputed-media",
             "hybrid-mamba",
             "hybrid-gdn",
@@ -1139,6 +1158,7 @@ _CUDA_GRAPH_DIFFERENTIAL_SCENARIOS = (
             "transformer-engine",
             "inference-optimized",
             "mxfp8-inference-optimized-moe",
+            "mxfp8-inference-topk1",
             "offload-static-uvm-suspend-resume",
             "flash-attention-3",
             "flash-attention-4",
@@ -1152,11 +1172,9 @@ _CUDA_GRAPH_DIFFERENTIAL_SCENARIOS = (
 )
 
 
-# Main's plain EP2 NCCL case and the all-gather ETP case run eagerly here.
+# Main's plain EP2 NCCL case runs eagerly only.
 _ASYNC_PARALLEL_GRAPH_SCENARIOS = tuple(
-    scenario
-    for scenario in _ASYNC_PARALLEL_SCENARIOS
-    if scenario.name not in {"moe-ep2-nccl", "moe-ep2-etp2-local-allgather"}
+    scenario for scenario in _ASYNC_PARALLEL_SCENARIOS if scenario.name != "moe-ep2-nccl"
 ) + (
     _variant(
         "moe-ep2-nccl",
@@ -1174,6 +1192,8 @@ _REQUEST_WAVES = ((0, 1, 2), (3, 4), (5, 6))
 def _check_scenario_prerequisite(scenario):
     if scenario.prerequisite == "flashinfer":
         pytest.importorskip("flashinfer")
+    elif scenario.prerequisite == "flash-mla":
+        pytest.importorskip("flash_mla")
     elif scenario.prerequisite == "mamba":
         available, reason = _check_mamba_sequence_packing_support()
         if not available:
@@ -1509,6 +1529,11 @@ def _instrument_cuda_graph_replays(model, context, runtime):
                 sorted({type(module).__name__ for module in replayed_modules})
             )
             fp8_runtime_enabled = bool(runner.fp8_enabled)
+            # Inference omits output_processor, so an owning forward runner must invoke its head.
+            owns_mxfp8_head = (
+                any(module is getattr(model, "output_layer", None) for module in replayed_modules)
+                and type(getattr(runner, "fp8_recipe", None)).__name__ == "MXFP8BlockScaling"
+            )
 
             def traced_replay(
                 is_first_microbatch,
@@ -1518,6 +1543,7 @@ def _instrument_cuda_graph_replays(model, context, runtime):
                 _runner=runner,
                 _module_names=replayed_module_names,
                 _fp8_runtime_enabled=fp8_runtime_enabled,
+                _owns_mxfp8_head=owns_mxfp8_head,
                 _owner=owner,
             ):
                 if runtime["cuda-graph-capture-active"]:
@@ -1528,6 +1554,9 @@ def _instrument_cuda_graph_replays(model, context, runtime):
                 step_key = ("cuda-graph-replay-step", context.step_count, *dimension)
                 runtime["cuda-graph-runner-replays"] += 1
                 runtime["cuda-graph-fp8-replays"] += int(_fp8_runtime_enabled)
+                runtime["cuda-graph-mxfp8-head-replays"] += int(
+                    _owns_mxfp8_head and _owner == "forward" and "output_processor" not in kwargs
+                )
                 runtime["cuda-graph-real-token-scalar-matches"] += int(
                     int(context.gpu_view.real_token_count.item()) == real.token_count
                 )
@@ -1983,7 +2012,9 @@ def _instrument_scenario_runtime(env, scenario, runtime, teacher_tokens=None):
         "hybrid": (
             lambda name, module: name in {"MambaMixer", "GatedDeltaNet", "GatedDeltaProductMixer"}
         ),
+        "mla": lambda name, module: name == "MLASelfAttention",
         "moe": lambda name, module: name in {"MoELayer", "InferenceTopKRouter"},
+        "mxfp8": lambda name, module: name == "TELMHeadColumnParallelLinear",
         "parallel": (
             lambda name, module: "ParallelLinear" in name
             or name in {"ColumnParallelLinear", "RowParallelLinear"}
@@ -2006,7 +2037,11 @@ def _instrument_scenario_runtime(env, scenario, runtime, teacher_tokens=None):
 
                 def record_module(_module, _inputs, _tag=tag):
                     runtime[f"module-forward:{_tag}"] += 1
-                    if _tag == "fp8":
+                    if _tag == "mxfp8":
+                        runtime["mxfp8-head-capture-forwards"] += int(
+                            runtime["cuda-graph-capture-active"] > 0
+                        )
+                    elif _tag == "fp8":
                         fp8_enabled = FP8GlobalStateManager.is_fp8_enabled()
                         runtime["fp8-context-forwards"] += int(fp8_enabled)
                         runtime["fp8-recipe-forwards"] += int(
@@ -2214,7 +2249,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     isinstance(key, tuple)
                     and key[0] in ("cuda-graph-warmup-steps", "flash-attention-version")
                 )
-                or (isinstance(key, str) and key.startswith(("nccl-", "fp8-")))
+                or (isinstance(key, str) and key.startswith(("nccl-", "fp8-", "mxfp8-")))
             }
             runtime.clear()
             runtime.update(capture_evidence)
@@ -2496,6 +2531,12 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert not context.cuda_graph_batch_dimensions_list
         if "gpt" in signals:
             assert runtime["module-forward:gpt"] > 0
+        if "mla" in signals:
+            assert isinstance(model_config, MLATransformerConfig)
+            assert model_config.cache_mla_latents
+            assert context.cache_mla_latent
+            assert context.block_size_tokens == 64
+            assert runtime["module-forward:mla"] > 0 or "MLASelfAttention" in replayed_module_names
         if "vlm" in signals:
             assert runtime["vlm-image-forwards"] > 0
             assert runtime["vlm-image-token-count"] > 0
@@ -2875,6 +2916,13 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert all(module._uses_mxfp8_weights for module in experts)
             assert all(isinstance(module._fc1_weight, MXFP8Tensor) for module in experts)
             assert all(isinstance(module._fc2_weight, MXFP8Tensor) for module in experts)
+            if scenario.config.get("fp8_output_proj"):
+                assert type(controller.inference_wrapped_model.model.output_layer).__name__ == (
+                    "TELMHeadColumnParallelLinear"
+                )
+                if "cuda-graph" in signals:
+                    assert runtime["mxfp8-head-capture-forwards"] > 0
+                    assert runtime["cuda-graph-mxfp8-head-replays"] > 0
         if "routing-replay" in signals:
             assert model_config.moe_enable_routing_replay
             assert context.moe_routing_metadata is not None
@@ -3017,10 +3065,11 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 if type(module).__name__ == "MoELayer"
             }
             assert dispatchers == {"MoEAllGatherTokenDispatcher"}
+            assert "cuda-graph" not in signals or "MoELayer" in replayed_module_names
         if "moe" in signals:
             assert model_config.num_moe_experts is not None
             if "etp" in signals:
-                assert runtime["module-forward:moe"] > 0
+                assert runtime["module-forward:moe"] > 0 or "MoELayer" in replayed_module_names
             elif model_config.expert_model_parallel_size > 1 and "nvls-dispatch" not in signals:
                 assert context._nccl_ep_dispatcher
                 # Inference MoE may dispatch through split execution helpers that
@@ -3213,6 +3262,11 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
         config.update(
             num_cuda_graphs=4, force_build_cuda_graphs=True, defer_cuda_graph_creation=True
         )
+        if (
+            config.get("expert_model_parallel_size", 1) > 1
+            and config.get("transformer_impl", "local") != "inference_optimized"
+        ):
+            config["moe_pad_experts_for_cuda_graph_inference"] = True
         repeat = ("repeat-suspend-resume",) if "suspend-resume" in scenario.signals else ()
         signals = tuple(dict.fromkeys((*scenario.signals, *repeat, "cuda-graph")))
         return replace(scenario, config=config, signals=signals)
