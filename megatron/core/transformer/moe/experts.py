@@ -1608,11 +1608,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
         prepare_routed_nvfp4_weights(self._fc1_weight, self._fc2_weight, out=self._nvfp4_weights)
         return True
 
-    def refresh_cache(self) -> None:
-        """Refresh parameter-derived routed weights after an in-place refit."""
-        self.refresh_flashinfer_mxfp8_weights()
-        self.refresh_flashinfer_nvfp4_weights()
-
     @torch.inference_mode(False)  # needed for non-colocated inference.
     def _build_concatenated_weights(self):
         """Create big contiguous weight tensors that share storage with TE's per-expert parameters.
