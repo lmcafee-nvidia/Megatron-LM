@@ -153,7 +153,7 @@ class TestRoutingMetadata:
             num_tokens: Number of token rows written by the router.
         """
         monkeypatch.setattr(RouterReplay, "global_router_replay_instances", [])
-        base_router = RouterReplay()
+        base_router = RouterReplay()  # Keep alive: the registry holds weak references.
         mtp = RouterReplay(is_mtp_layer=True)
         router = RouterReplay()
         ctx = _make_context(active_token_count=num_tokens, using_cuda_graph=execution == "graph")
