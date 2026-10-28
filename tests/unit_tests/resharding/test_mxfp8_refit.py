@@ -1,6 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -31,6 +30,8 @@ except ImportError:
 
 def _skip_without_linear_flashinfer_scales():
     """Skip only when the installed FlashInfer cannot emit linear MXFP8 scales."""
+    import inspect
+
     if not _HAVE_FLASHINFER:
         pytest.skip("test requires FlashInfer")
     if "is_sf_swizzled_layout" not in inspect.signature(mxfp8_quantize).parameters:
@@ -88,8 +89,8 @@ class TestMXFP8ReshardTransform:
         from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
         _skip_without_linear_flashinfer_scales()
-        # 128 rows and 4 scale columns give swizzled and linear scales the same byte
-        # count, so a layout mix-up shows up in the bytes rather than as a shape error.
+        # 128 rows and 4 scale columns need no padding in either scale layout, so the
+        # swizzled and linear scales hold the same number of bytes.
         buf = MXFP8Tensor.from_bf16(
             torch.randn(128, 128, dtype=torch.bfloat16, device="cuda"), scale_layout="linear"
         )
@@ -653,6 +654,83 @@ class TestMXFP8RefitIntegration:
         assert torch.equal(dst_buf.data, expected.data)
         assert torch.equal(dst_buf.scale, expected.scale)
 
+    def test_public_refit_native_linear_scales_preserve_graph_storage(self, request):
+        """A real NCCL refit updates native 2D scales and captured consumer output."""
+        Utils.initialize_model_parallel(1, 1)
+        request.addfinalizer(Utils.destroy_model_parallel)
+
+        class TinyModel(torch.nn.Module):
+            def __init__(self, seed):
+                super().__init__()
+                torch.manual_seed(seed)
+                self.decoder = torch.nn.Linear(
+                    128, 64, bias=False, device="cuda", dtype=torch.bfloat16
+                )
+                group = dist.group.WORLD
+                self.pg_collection = SimpleNamespace(
+                    tp=group,
+                    pp=group,
+                    ep=group,
+                    dp=group,
+                    expt_tp=group,
+                    gtp_remat=None,
+                    expt_gtp_remat=None,
+                )
+                self.config = SimpleNamespace(num_moe_experts=None)
+
+            def forward(self, inputs):
+                weight = self.decoder.weight
+                scale_bits = weight.scale.to(torch.int32) << 23
+                scales = scale_bits.view(torch.float32).repeat_interleave(32, dim=1)
+                dequantized = weight.data.float() * scales
+                return torch.matmul(inputs.float(), dequantized.t()).to(torch.bfloat16)
+
+        source = TinyModel(111)
+        target = TinyModel(222)
+        _skip_without_linear_flashinfer_scales()
+        target_buffer = MXFP8Tensor.from_bf16(
+            target.decoder.weight.detach(), backend="flashinfer", scale_layout="linear"
+        )
+        assert target_buffer.scale.ndim == 2
+        clear_all_caches()
+        prepare_swap_model_weights([source], [target])
+        del target.decoder._parameters["weight"]
+        target.decoder.weight = target_buffer
+        transform = MXFP8ReshardTransform(
+            convertible_params={"decoder.weight"},
+            persistent_buffers={"weight": target_buffer},
+            buffer_key_prefix="decoder.",
+        )
+        source_weight = source.decoder.weight.detach().clone()
+        reference = MXFP8Tensor.from_bf16(
+            source_weight, backend="flashinfer", scale_layout="linear"
+        )
+        reference_model = TinyModel(333)
+        del reference_model.decoder._parameters["weight"]
+        reference_model.decoder.weight = reference
+        inputs = torch.linspace(-1, 1, 256, device="cuda", dtype=torch.bfloat16).reshape(2, 1, 128)
+        expected = reference_model(inputs)
+        pointers = (target_buffer.data.data_ptr(), target_buffer.scale.data_ptr())
+
+        target(inputs)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_output = target(inputs)
+        output_pointer = graph_output.data_ptr()
+        swap_model_weights([source], [target], refit_method="nccl", transform=transform)
+        torch.cuda.synchronize()
+
+        assert (target_buffer.data.data_ptr(), target_buffer.scale.data_ptr()) == pointers
+        assert torch.equal(target_buffer.data, reference.data)
+        assert torch.equal(target_buffer.scale, reference.scale)
+        graph.replay()
+        actual = graph_output.clone()
+        assert graph_output.data_ptr() == output_pointer
+        assert torch.equal(actual.argmax(dim=-1), expected.argmax(dim=-1))
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        clear_all_caches()
+
     def test_multi_batch_plan_quantizes_complete_parameters(self):
         """Each batch assembles every slice before quantizing its MXFP8 parameter."""
         from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
@@ -752,83 +830,6 @@ class TestMXFP8RefitIntegration:
             expected = MXFP8Tensor.from_bf16(source_weight)
             assert torch.equal(actual.data, expected.data)
             assert torch.equal(actual.scale, expected.scale)
-
-    def test_public_refit_native_linear_scales_preserve_graph_storage(self, request):
-        """A real NCCL refit updates native 2D scales and captured consumer output."""
-        Utils.initialize_model_parallel(1, 1)
-        request.addfinalizer(Utils.destroy_model_parallel)
-
-        class TinyModel(torch.nn.Module):
-            def __init__(self, seed):
-                super().__init__()
-                torch.manual_seed(seed)
-                self.decoder = torch.nn.Linear(
-                    128, 64, bias=False, device="cuda", dtype=torch.bfloat16
-                )
-                group = dist.group.WORLD
-                self.pg_collection = SimpleNamespace(
-                    tp=group,
-                    pp=group,
-                    ep=group,
-                    dp=group,
-                    expt_tp=group,
-                    gtp_remat=None,
-                    expt_gtp_remat=None,
-                )
-                self.config = SimpleNamespace(num_moe_experts=None)
-
-            def forward(self, inputs):
-                weight = self.decoder.weight
-                scale_bits = weight.scale.to(torch.int32) << 23
-                scales = scale_bits.view(torch.float32).repeat_interleave(32, dim=1)
-                dequantized = weight.data.float() * scales
-                return torch.matmul(inputs.float(), dequantized.t()).to(torch.bfloat16)
-
-        source = TinyModel(111)
-        target = TinyModel(222)
-        _skip_without_linear_flashinfer_scales()
-        target_buffer = MXFP8Tensor.from_bf16(
-            target.decoder.weight.detach(), backend="flashinfer", scale_layout="linear"
-        )
-        assert target_buffer.scale.ndim == 2
-        clear_all_caches()
-        prepare_swap_model_weights([source], [target])
-        del target.decoder._parameters["weight"]
-        target.decoder.weight = target_buffer
-        transform = MXFP8ReshardTransform(
-            convertible_params={"decoder.weight"},
-            persistent_buffers={"weight": target_buffer},
-            buffer_key_prefix="decoder.",
-        )
-        source_weight = source.decoder.weight.detach().clone()
-        reference = MXFP8Tensor.from_bf16(
-            source_weight, backend="flashinfer", scale_layout="linear"
-        )
-        reference_model = TinyModel(333)
-        del reference_model.decoder._parameters["weight"]
-        reference_model.decoder.weight = reference
-        inputs = torch.linspace(-1, 1, 256, device="cuda", dtype=torch.bfloat16).reshape(2, 1, 128)
-        expected = reference_model(inputs)
-        pointers = (target_buffer.data.data_ptr(), target_buffer.scale.data_ptr())
-
-        target(inputs)
-        torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            graph_output = target(inputs)
-        output_pointer = graph_output.data_ptr()
-        swap_model_weights([source], [target], refit_method="nccl", transform=transform)
-        torch.cuda.synchronize()
-
-        assert (target_buffer.data.data_ptr(), target_buffer.scale.data_ptr()) == pointers
-        assert torch.equal(target_buffer.data, reference.data)
-        assert torch.equal(target_buffer.scale, reference.scale)
-        graph.replay()
-        actual = graph_output.clone()
-        assert graph_output.data_ptr() == output_pointer
-        assert torch.equal(actual.argmax(dim=-1), expected.argmax(dim=-1))
-        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-        clear_all_caches()
 
 
 @pytest.mark.internal
