@@ -125,7 +125,7 @@ class TestRoutingMetadata:
         """An unrecorded MTP router does not invalidate base-model routing."""
         monkeypatch.setattr(RouterReplay, "global_router_replay_instances", [])
         base_1 = RouterReplay()
-        RouterReplay(is_mtp_layer=True)
+        _mtp_router = RouterReplay(is_mtp_layer=True)  # Keep alive: weak registry.
         base_2 = RouterReplay()
         base_1_indices = torch.zeros(7, TOPK, dtype=torch.int64, device="cuda")
         base_2_indices = torch.ones(7, TOPK, dtype=torch.int64, device="cuda")
