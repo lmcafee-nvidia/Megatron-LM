@@ -1514,6 +1514,80 @@ class TestNVLSAllGatherVDispatcher:
 
         assert scenario_counts[0][0] == 0 and sum(scenario_counts[0]) > 0
 
+    def test_nvls_reallocation_grows_capacity_and_preserves_output(self):
+        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+        from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+        from megatron.core.parallel_state import get_expert_model_parallel_group
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            set_batch_invariant_mode,
+        )
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        if Utils.world_size < 2:
+            pytest.skip("NVLS lifecycle coverage requires expert parallelism.")
+        if Utils.world_size & (Utils.world_size - 1):
+            pytest.skip("NVLS metadata barriers require power-of-two EP size.")
+        config = _make_base_config(
+            expert_model_parallel_size=Utils.world_size,
+            inference_grouped_gemm_backend="vllm",
+            inference_moe_token_dispatcher_type="nvls",
+            batch_invariant_mode=True,
+            batch_invariant_backend="te_native",
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=4,
+            attention_dropout=0.0,
+            moe_shared_expert_intermediate_size=None,
+        )
+        ep_group = get_expert_model_parallel_group()
+
+        def allocate(capacity):
+            NVLSAllGatherVDispatcher.allocate_buffers(
+                per_rank_worst_case_token_count=capacity,
+                topk=config.moe_router_topk,
+                hidden_size=config.hidden_size,
+                ep_group=ep_group,
+            )
+
+        allocate(8)
+        first_layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+        hidden = torch.randn(3, 1, config.hidden_size, dtype=torch.bfloat16, device="cuda")
+        with (
+            torch.no_grad(),
+            InferenceMode.active(),
+            set_batch_invariant_mode(True, backend="te_native"),
+        ):
+            first_output, _ = first_layer(hidden)
+        state = {
+            name: value.detach().clone() if torch.is_tensor(value) else value
+            for name, value in first_layer.state_dict().items()
+        }
+        del first_layer
+        gc.collect()
+
+        # 4,096 rows per rank at hidden 128 outgrow the 1 MiB the first generation reserved.
+        allocate(4096)
+        second_layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+        second_layer.load_state_dict(state)
+        with (
+            torch.no_grad(),
+            InferenceMode.active(),
+            set_batch_invariant_mode(True, backend="te_native"),
+        ):
+            second_output, _ = second_layer(hidden)
+
+        assert NVLSAllGatherVDispatcher._symm_agv_hidden["tensor"].shape == (
+            4096 * Utils.world_size,
+            config.hidden_size,
+        )
+        torch.testing.assert_close(second_output, first_output, atol=0, rtol=0)
+        NVLSAllGatherVDispatcher.release_buffers()
+        assert not any(
+            SymmetricMemoryManager.is_initialized(key)
+            for key in NVLSAllGatherVDispatcher._BUFFER_KEYS
+        )
+
     def test_nvls_shared_expert_overlap_matches_synchronous_inference_output(self):
         evidence = self.test_batch_invariant_moe_matches_training(
             "vllm", None, False, False, collect_inference_evidence=True, shared_expert_overlap=True

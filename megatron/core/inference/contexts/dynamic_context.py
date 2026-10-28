@@ -925,6 +925,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # setup, which is harmless.
         InferenceAllGatherDispatcherBase.allocate_valid_tokens_tensor()
         if self._nccl_ep_dispatcher:
+            # The optimized dispatcher is process-global. Switching a replacement
+            # engine from NVLS to NCCL must release the prior symmetric generation.
+            NVLSAllGatherVDispatcher.release_buffers()
             NCCLAllGatherDispatcher.allocate_buffers()
         elif self._nvls_ep_dispatcher:
             # Use moe_latent_size if set (latent MoE: SuperV3, UltraV3), else hidden_size.
@@ -935,6 +938,16 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 hidden_size=moe_hidden_size,
                 ep_group=self.expert_model_parallel_group,
             )
+        elif self._nvls_dispatcher:
+            # Replacing an EP>1 engine with EP1 must not retain its symmetric
+            # allocation or process-group generation. EP1 needs only the route mask.
+            NVLSAllGatherVDispatcher.release_buffers()
+        elif (
+            model_config.num_moe_experts is not None
+            and model_config.transformer_impl == "inference_optimized"
+        ):
+            # EP1 NCCL likewise owns no symmetric storage.
+            NVLSAllGatherVDispatcher.release_buffers()
 
         # Pre-allocate the vLLM fused-MoE intermediates so no allocation happens
         # inside CUDA graph capture; one buffer set is shared by all MoE layers
