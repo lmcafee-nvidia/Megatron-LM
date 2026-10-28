@@ -1726,6 +1726,117 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.is_tensor_state_allocated = False
             self.initialize_all_tensors()
 
+    def _snapshot_live_request_state_for_graph_recapture(self) -> dict[str, Any]:
+        """Save OFFLOAD bookkeeping while CUDA graphs use the live context as scratch."""
+
+        state = {
+            "bookkeeping": self._cpu_bookkeeping_buf.clone(),
+            "request_tensors": {
+                name: getattr(self, name).clone()
+                for name in (
+                    "request_ids",
+                    "request_query_lengths",
+                    "request_in_prefill_status_tensor",
+                    "request_output_lengths",
+                    "request_kv_length_offsets",
+                    "request_kv_block_counts",
+                    "request_last_kv_block_id",
+                    "request_last_kv_block_offset",
+                    "request_to_kv_block_ids",
+                )
+            },
+            "request_metadata": {
+                name: tensor.clone() for name, tensor in self.request_metadata.items()
+            },
+            "active_request_metadata": {
+                name: tensor.clone() for name, tensor in self.active_request_metadata.items()
+            },
+            "block_allocator": {
+                "block_bag": self.kv_block_allocator.block_bag.clone(),
+                "pool_avail": self.kv_block_allocator.pool_avail,
+                "routing": dict(self.kv_block_allocator.block_routing),
+            },
+            "attrs": {
+                name: getattr(self, name)
+                for name in (
+                    "total_request_count",
+                    "active_token_count",
+                    "paused_request_count",
+                    "batch_dimensions",
+                    "padded_batch_dimensions",
+                    "padded_active_token_count",
+                    "padded_active_request_count",
+                    "paused_tokens",
+                    "paused_speculative_tokens",
+                    "chunked_prefill_request_id",
+                    "num_prefill_requests",
+                    "_using_cuda_graph_this_step",
+                    "is_creating_cuda_graphs",
+                )
+            },
+            "vlm_maps": {
+                name: dict(getattr(self, name))
+                for name in (
+                    "_request_to_image_embeddings",
+                    "_request_to_image_token_mask",
+                    "_request_to_image_token_count",
+                )
+                if hasattr(self, name)
+            },
+        }
+        if self.mamba_metadata is not None:
+            state["mamba_request_slots"] = self.mamba_metadata.request_to_mamba_state_idx.clone()
+            state["mamba_free_slots"] = self.mamba_metadata.mamba_state_free_slots.clone()
+            state["mamba_free_slot_count"] = self.mamba_metadata.mamba_state_free_slot_count
+        if self.mtp_metadata.enabled:
+            state["mtp_request_rows"] = self.mtp_metadata.request_matched_prefix_blocks.clone()
+            state["mtp_boundary"] = {
+                "valid": self.mtp_metadata.chunk_boundary_valid,
+                "request_id": self.mtp_metadata.chunk_boundary_req_id,
+                "position": self.mtp_metadata.chunk_boundary_position,
+                "hidden": self.mtp_metadata.chunk_boundary_hidden.clone(),
+            }
+        return state
+
+    def _restore_live_request_state_after_graph_recapture(self, state: dict[str, Any]) -> None:
+        """Restore OFFLOAD bookkeeping and state buffers after graph recapture."""
+
+        self._cpu_bookkeeping_buf.copy_(state["bookkeeping"])
+        for name, value in state["request_tensors"].items():
+            getattr(self, name).copy_(value)
+        for name, value in state["request_metadata"].items():
+            self.request_metadata[name].copy_(value)
+        for name, value in state["active_request_metadata"].items():
+            self.active_request_metadata[name].copy_(value)
+        allocator_state = state["block_allocator"]
+        self.kv_block_allocator.block_bag.copy_(allocator_state["block_bag"])
+        self.kv_block_allocator.pool_avail = allocator_state["pool_avail"]
+        self.kv_block_allocator.block_routing.clear()
+        self.kv_block_allocator.block_routing.update(allocator_state["routing"])
+        for name, value in state["attrs"].items():
+            setattr(self, name, value)
+        if "mamba_free_slots" in state:
+            assert self.mamba_metadata is not None
+            self.mamba_metadata.request_to_mamba_state_idx.copy_(state["mamba_request_slots"])
+            self.mamba_metadata.mamba_state_free_slots.copy_(state["mamba_free_slots"])
+            self.mamba_metadata.mamba_state_free_slot_count = state["mamba_free_slot_count"]
+        for name, value in state["vlm_maps"].items():
+            target = getattr(self, name)
+            target.clear()
+            target.update(value)
+        if "mtp_boundary" in state:
+            self.mtp_metadata.request_matched_prefix_blocks.copy_(state["mtp_request_rows"])
+            boundary = state["mtp_boundary"]
+            self.mtp_metadata.chunk_boundary_valid = boundary["valid"]
+            self.mtp_metadata.chunk_boundary_req_id = boundary["request_id"]
+            self.mtp_metadata.chunk_boundary_position = boundary["position"]
+            self.mtp_metadata.chunk_boundary_hidden.copy_(boundary["hidden"])
+
+        # Graph warmup writes the same large buffers that OFFLOAD just restored.
+        # Reapply their CPU backups after capture while retaining the new addresses.
+        for name in self._offloadable_tensor_names:
+            getattr(self, name).copy_(self._offloadable_cpu_backups[name], non_blocking=True)
+
     def deallocate_inference_state_buffers(self):
         """Deallocate large tensors (KV cache, Mamba states) during suspend.
 
