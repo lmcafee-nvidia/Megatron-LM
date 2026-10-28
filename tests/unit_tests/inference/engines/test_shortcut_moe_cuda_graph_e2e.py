@@ -145,7 +145,7 @@ class TestShortcutMoECudaGraphE2E(_GDPGraphTest):
 
     @pytest.mark.parametrize("stagger", [False, True], ids=["uniform", "mixed_steps"])
     @torch.inference_mode()
-    def test_cuda_graphs_do_not_change_generated_tokens(self, stagger):
+    def test_cuda_graph_padding_routes_are_masked(self, stagger):
         super().test_cuda_graphs_do_not_change_generated_tokens(stagger)
 
         model = self._last_model
