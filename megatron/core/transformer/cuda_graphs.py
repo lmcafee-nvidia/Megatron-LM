@@ -2033,11 +2033,8 @@ class CudaGraphManager(torch.nn.Module):
             if HAVE_GTP:
                 set_cuda_graph_mempool(torch.cuda.current_device(), CudaGraphManager.global_mempool)
             # Cudagraph stream capture requires no operations on the default stream prior to the
-            # capture, so change to a side stream. Callers may be mid-forward, so order the side
-            # stream after work already queued on the current stream.
-            side_stream = torch.cuda.Stream()
-            side_stream.wait_stream(torch.cuda.current_stream())
-            torch.cuda.set_stream(side_stream)
+            # capture, so change to a side stream.
+            torch.cuda.set_stream(torch.cuda.Stream())
         return CudaGraphManager.global_mempool
 
     def call_ddp_preforward_hook(self, module):
