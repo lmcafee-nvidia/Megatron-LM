@@ -242,6 +242,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             },
             {"adapter_sampling": {"temperature": 0.73, "top_k": 1, "top_p": 0.91}},
             {"logprobs_mode": "processed_logprobs", "materialize_only_last_token_logits": False},
+            {"mla": True, "context_block_size_tokens": 64, "position_embedding_type": "rope"},
             dict(hidden_size=256, position_embedding_type="rope", use_flashinfer_fused_rope=True),
         ],
         ids=[
@@ -261,6 +262,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             "mla-te-latent-cache",
             "non-greedy-parameters",
             "processed-logprobs",
+            "mla-local-latent-cache",
             "flashinfer-fused-rope",
         ],
     )
