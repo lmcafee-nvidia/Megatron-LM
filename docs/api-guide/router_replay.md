@@ -165,7 +165,7 @@ torch.save(routing_output.top_k_idx, "/tmp/replay.pt")
 
 # Load indices from file and set as target for replay
 replay_indices = torch.load("/tmp/replay.pt")
-for router_instance in RouterReplay.global_router_replay_instances:
+for router_instance in RouterReplay.get_instances():
     router_instance.target_topk_idx = replay_indices
 
 # Set global router replay action to REPLAY_FORWARD
