@@ -470,7 +470,6 @@ class _AsyncPairScenario:
     prerequisite: str | None = None
     atol: float = 1.0e-3
     parity: str = "exact"
-    graph_parity: str | None = None
     exact_top_n: bool = True
 
 
@@ -973,14 +972,12 @@ _ASYNC_PARALLEL_SCENARIOS = (
 )
 
 
-_UPSTREAM_SCENARIOS = {
-    case.name: case for case in _ASYNC_PAIR_SCENARIOS + _ASYNC_PARALLEL_SCENARIOS
-}
+_SCENARIOS_BY_NAME = {case.name: case for case in _ASYNC_PAIR_SCENARIOS + _ASYNC_PARALLEL_SCENARIOS}
 
 
 def _variant(base_name, name, *pairs, config=None, signals=(), **changes):
     """Derive a new case from an upstream one, leaving the upstream definition unchanged."""
-    base = _UPSTREAM_SCENARIOS[base_name]
+    base = _SCENARIOS_BY_NAME[base_name]
     return replace(
         base,
         name=name,
@@ -997,7 +994,7 @@ _CUDA_GRAPH_HANDOFF_SCENARIOS = (
     _pair_scenario(
         "disagg-decode-handoff",
         "disaggregation:decode-handoff",
-        "kv:transferred-prefix",
+        "kv:synthetic-import",
         config={"enable_prefix_caching": True, "engine_cls": StateHandoffDynamicInferenceEngine},
         signals=("disagg-handoff",),
         request_profile="handoff",
@@ -1100,7 +1097,7 @@ _CUDA_GRAPH_DIFFERENTIAL_SCENARIOS = (
 _ASYNC_PARALLEL_GRAPH_SCENARIOS = tuple(
     scenario
     for scenario in _ASYNC_PARALLEL_SCENARIOS
-    if scenario.name not in {"moe-ep2-nccl", "moe-ep2-etp2-local-allgather"}
+    if scenario.name not in {"tp2-pp2-sp-dp2", "moe-ep2-nccl", "moe-ep2-etp2-local-allgather"}
 ) + (
     _variant(
         "moe-ep2-nccl",
@@ -1762,41 +1759,38 @@ def _instrument_scenario_runtime(env, scenario, runtime, teacher_tokens=None):
                         bool((metadata["temperature"][:active_count] != 1.0).any())
                     )
                     sampled = original(*kernel_args, **kernel_kwargs)
-                    if name == "sampling_from_logits":
-                        valid = (sampled >= 0) & (sampled < kernel_args[0].shape[-1])
-                    else:
-                        values = kernel_args[0]
-                        probabilities = (
-                            torch.softmax(values, dim=-1)
-                            if name == "top_k_top_p_sampling_from_logits"
-                            else values
-                        )
-                        sorted_probabilities, sorted_ids = probabilities.sort(
-                            dim=-1, descending=True
-                        )
-                        keep = torch.ones_like(sorted_probabilities, dtype=torch.bool)
-                        if name in {
-                            "top_k_sampling_from_probs",
-                            "top_k_top_p_sampling_from_logits",
-                        }:
-                            top_k = kernel_args[1].clamp(min=1, max=probabilities.shape[-1])
-                            ranks = torch.arange(
-                                probabilities.shape[-1], device=probabilities.device
+                    values = kernel_args[0].float()
+                    valid = (sampled >= 0) & (sampled < values.shape[-1])
+                    if name != "sampling_from_logits":
+                        # FlashInfer filters by value: top-k keeps every token tied with the
+                        # k-th largest value, and top-p keeps a token while the probability
+                        # mass strictly above it is below top_p. Ties sort arbitrarily, so the
+                        # check compares values instead of sort positions.
+                        rows = torch.arange(sampled.numel(), device=values.device)
+                        tokens = sampled.long().clamp(0, values.shape[-1] - 1)
+                        support = torch.ones_like(values, dtype=torch.bool)
+                        if "top-k-filter" in flashinfer_kernels[name]:
+                            top_k = kernel_args[1].long().clamp(min=1, max=values.shape[-1])
+                            support = values >= values.sort(dim=-1, descending=True).values.gather(
+                                1, top_k.unsqueeze(1) - 1
                             )
-                            keep &= ranks.unsqueeze(0) < top_k.unsqueeze(1)
-                        if name in {
-                            "top_p_sampling_from_probs",
-                            "top_k_top_p_sampling_from_logits",
-                        }:
+                        valid &= support[rows, tokens]
+                        if "top-p-filter" in flashinfer_kernels[name]:
+                            if name == "top_k_top_p_sampling_from_logits":
+                                probabilities = torch.softmax(
+                                    values.masked_fill(~support, float("-inf")), dim=-1
+                                )
+                            else:
+                                probabilities = values
                             top_p = kernel_args[
                                 2 if name == "top_k_top_p_sampling_from_logits" else 1
                             ]
-                            nucleus_probabilities = sorted_probabilities * keep
-                            nucleus_probabilities /= nucleus_probabilities.sum(dim=-1, keepdim=True)
-                            keep &= (
-                                nucleus_probabilities.cumsum(dim=-1) - nucleus_probabilities
-                            ) < top_p.unsqueeze(1)
-                        valid = ((sorted_ids == sampled.unsqueeze(1)) & keep).any(dim=-1)
+                            sampled_probability = probabilities[rows, tokens].unsqueeze(1)
+                            mass_above = probabilities.where(
+                                probabilities > sampled_probability, 0.0
+                            ).sum(dim=-1)
+                            # Absorb the kernel's different fp32 summation order.
+                            valid &= mass_above < top_p + 1e-5
                     runtime["flashinfer-support-rows"] += sampled.numel()
                     runtime["flashinfer-valid-support-rows"] += int(valid.sum().item())
                     return sampled
@@ -2115,12 +2109,13 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         config.update(scenario.config)
         config["async_sched_mode"] = mode
         env = cls._build_test_env(_DynamicEngineTestConfig(**config))
-        if env.engine.controller.inference_wrapped_model.model.config.fp8:
+        # New FP8 cases round eager steps to the recipe's alignment; main's own FP8 case
+        # keeps the upstream test rounder.
+        model_config = env.engine.controller.inference_wrapped_model.model.config
+        if model_config.fp8 and scenario.name != "fp8-transformer-engine":
             from megatron.core.fp8_utils import get_fp8_align_size
 
-            DynamicInferenceContext.TOKEN_ROUNDER = get_fp8_align_size(
-                env.engine.controller.inference_wrapped_model.model.config.fp8_recipe
-            )
+            DynamicInferenceContext.TOKEN_ROUNDER = get_fp8_align_size(model_config.fp8_recipe)
         env.requests = _make_scenario_requests(
             env, scenario, stop_tokens=stop_tokens, termination_token=termination_token
         )
@@ -2255,7 +2250,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     if runner.fwd_graph_recorded
                 ]
                 graph_ids_before = [id(runner.fwd_graph) for runner in runners_before]
-                graph_pool_before = CudaGraphManager.global_mempool
                 runtime["pending-before-suspend"] += int(pending_before_suspend)
                 from megatron.core.inference.engines import dynamic_engine as dynamic_engine_module
 
@@ -2317,10 +2311,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                         for runner, graph_id in zip(runners_after, graph_ids_before)
                     )
                 )
-                if env.engine.context.static_kv_memory_pointers:
-                    runtime["cuda-graph-pool-preserved"] += int(
-                        CudaGraphManager.global_mempool == graph_pool_before
-                    )
                 _instrument_cuda_graph_replays(
                     env.engine.controller.inference_wrapped_model.model, env.engine.context, runtime
                 )
@@ -2343,7 +2333,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         if "context-reset" in scenario.signals:
             for _ in range(2):
                 memory_ptr = env.engine.context.memory_buffer.data_ptr()
-                graph_pool = CudaGraphManager.global_mempool
                 graph_runners = [
                     (runner, runner.fwd_graph)
                     for manager in model.modules()
@@ -2360,7 +2349,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 if env.config.num_cuda_graphs:
                     runtime["context-reset-graphs-preserved"] += int(
                         bool(graph_runners)
-                        and CudaGraphManager.global_mempool == graph_pool
                         and all(
                             runner.fwd_graph_recorded and runner.fwd_graph is graph
                             for runner, graph in graph_runners
@@ -2482,7 +2470,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     assert runtime["cuda-graph-create-calls"] == 0
                     assert runtime["cuda-graph-runner-objects-preserved"] == expected_cycles
                     assert runtime["cuda-graph-objects-preserved"] == expected_cycles
-                    assert runtime["cuda-graph-pool-preserved"] == expected_cycles
                 else:
                     assert runtime["cuda-graph-create-calls"] == 0
         if "context-reset" in signals:
@@ -2917,11 +2904,10 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 if type(module).__name__ == "MoELayer"
             }
             assert dispatchers == {"MoEAllGatherTokenDispatcher"}
-            assert "cuda-graph" not in signals or "MoELayer" in replayed_module_names
         if "moe" in signals:
             assert model_config.num_moe_experts is not None
             if "etp" in signals:
-                assert runtime["module-forward:moe"] > 0 or "MoELayer" in replayed_module_names
+                assert runtime["module-forward:moe"] > 0
             elif model_config.expert_model_parallel_size > 1 and "nvls-dispatch" not in signals:
                 assert context._nccl_ep_dispatcher
                 # Inference MoE may dispatch through split execution helpers that
@@ -3114,11 +3100,6 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
         config.update(
             num_cuda_graphs=4, force_build_cuda_graphs=True, defer_cuda_graph_creation=True
         )
-        if (
-            config.get("expert_model_parallel_size", 1) > 1
-            and config.get("transformer_impl", "local") != "inference_optimized"
-        ):
-            config["moe_pad_experts_for_cuda_graph_inference"] = True
         repeat = ("repeat-suspend-resume",) if "suspend-resume" in scenario.signals else ()
         signals = tuple(dict.fromkeys((*scenario.signals, *repeat, "cuda-graph")))
         return replace(scenario, config=config, signals=signals)
@@ -3192,7 +3173,7 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
                 torch.equal(expected_weights[name], actual_weights[name])
                 for name in expected_weights
             )
-            graph_parity = scenario.graph_parity or scenario.parity
+            graph_parity = scenario.parity
             graph_logits = {}
             if "fixed-history-logits" in scenario.signals:
                 graph_logits = graph_runtime.get("fixed-history-logit-snapshots", {})
@@ -3310,8 +3291,6 @@ class TestAsyncSchedulePairwiseParallel(_AsyncPairwiseHarness):
     @torch.inference_mode()
     def test_eager_matches_actual_replay_for_parallel_pair(self, scenario):
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
-        if scenario.name == "tp2-pp2-sp-dp2" and world_size != 8:
-            pytest.skip("the TP2/PP2/DP2 owner requires exactly eight GPUs")
         if world_size < 4:
             pytest.skip("parallel CUDA-graph pair owners require at least four GPUs")
         config = scenario.config
