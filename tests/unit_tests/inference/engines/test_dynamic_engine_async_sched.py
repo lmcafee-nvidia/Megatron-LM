@@ -865,6 +865,25 @@ _ASYNC_PARALLEL_SCENARIOS = (
         prerequisite="nvfp4",
     ),
     _nccl_moe_scenario(
+        "moe-ep2-tp2-sp-ddp2-edp2-nccl",
+        "topology:tp",
+        "topology:sp",
+        "interaction:moe-tp-sp",
+        config={
+            "tensor_model_parallel_size": 2,
+            "expert_model_parallel_size": 2,
+            "expert_tensor_parallel_size": 1,
+            "sequence_parallel": True,
+            "moe_router_topk": 1,
+            "moe_router_load_balancing_type": "quantile_balancing",
+            "moe_router_score_function": "sigmoid",
+            "inference_disable_triton_nvls_kernels": True,
+        },
+        sampling=({"temperature": 0.8, "top_k": 8},),
+        signals=("dp-offset", "quantile-routing", "sampled", "temperature-filter", "top-k-filter"),
+        parity="reproducible",
+    ),
+    _nccl_moe_scenario(
         "moe-ep2-ddp4-edp2-nccl",
         "topology:dense-dp4-expert-dp2",
         "seed:offset-by-dp-rank",
@@ -1183,6 +1202,7 @@ def _instrument_parallel_runtime(module, runtime):
         def traced_all_gather(*args, **kwargs):
             input_ = args[0]
             output = original_all_gather(*args, **kwargs)
+            runtime["tp-nvls-disabled-calls"] += int(not module.triton_nvls_kernels_allowed)
             runtime["tp-collective:optimized-all-gather"] += 1
             runtime["tp-sp-gather-dimensions"] += int(output.shape[0] == input_.shape[0] * tp_size)
             return output
@@ -1195,6 +1215,7 @@ def _instrument_parallel_runtime(module, runtime):
         def traced_reduce_scatter(*args, **kwargs):
             input_ = args[0]
             output = original_reduce_scatter(*args, **kwargs)
+            runtime["tp-nvls-disabled-calls"] += int(not module.triton_nvls_kernels_allowed)
             runtime["tp-collective:optimized-reduce-scatter"] += 1
             runtime["tp-sp-reduce-scatter-dimensions"] += int(
                 output.shape[0] * tp_size == input_.shape[0]
@@ -1552,6 +1573,16 @@ def _instrument_scenario_runtime(env, scenario, runtime):
                 runtime["hash-route-forwards"] += 1
 
             module.register_forward_hook(record_hash_route, with_kwargs=True)
+        if class_name == "InferenceTopKRouter" and "quantile-routing" in scenario.signals:
+
+            def record_quantile_route(router, inputs, _kwargs, output):
+                logits = router.gating(inputs[0]).squeeze(1)
+                assert torch.count_nonzero(router.qb_beta)
+                expected = (logits - router.qb_beta).topk(router.topk, dim=1).indices
+                assert torch.equal(output[1], expected)
+                runtime["quantile-route-forwards"] += 1
+
+            module.register_forward_hook(record_quantile_route, with_kwargs=True)
         if class_name == "TopKRouter" and "fp8-reference" in scenario.signals:
             route_state = {}
             original_gating = module.gating
@@ -1760,6 +1791,10 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         runtime = Counter()
         if mode == AsyncScheduleMode.ASYNC:
             _instrument_scenario_runtime(env, scenario, runtime)
+        if "quantile-routing" in scenario.signals:
+            for module in env.engine.controller.inference_wrapped_model.model.modules():
+                if type(module).__name__ == "InferenceTopKRouter":
+                    module.qb_beta.copy_(torch.arange(module.num_experts, device="cuda") * 0.25)
 
         def step():
             context = env.engine.context
@@ -2170,8 +2205,12 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     assert runtime["tp-collective:reduce_from_tensor_model_parallel_region"] > 0
             if model_config.pipeline_model_parallel_size > 1:
                 assert runtime["pipeline-logits-broadcasts"] > 0
+            if model_config.inference_disable_triton_nvls_kernels:
+                assert runtime["tp-nvls-disabled-calls"] > 0
         if "hash-routing" in signals:
             assert runtime["hash-route-forwards"] > 0
+        if "quantile-routing" in signals:
+            assert runtime["quantile-route-forwards"] > 0
 
         def observed_steps(kind, backend=None):
             return {
@@ -2401,6 +2440,8 @@ class TestAsyncSchedulePairwiseParallel(_AsyncPairwiseHarness):
             )
             if scenario.name == "tp2-pp2-sp-dp2":
                 assert parallel_state.get_data_parallel_world_size() == 2
+            if scenario.name == "moe-ep2-tp2-sp-ddp2-edp2-nccl":
+                assert parallel_state.get_expert_data_parallel_world_size() == world_size // 2
             if scenario.name == "moe-ep2-ddp4-edp2-nccl":
                 assert parallel_state.get_data_parallel_world_size() == world_size
                 assert parallel_state.get_expert_data_parallel_world_size() == world_size // 2
