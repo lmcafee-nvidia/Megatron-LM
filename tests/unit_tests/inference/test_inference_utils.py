@@ -83,7 +83,7 @@ class TestInferenceUtils:
 
         monkeypatch.setattr(moe_layer_module, "MoELayer", FakeMoELayer)
         monkeypatch.setattr(inference_utils, "moe_layer_cache", None)
-        monkeypatch.setattr(inference_utils, "_moe_layer_cache_model", None)
+        monkeypatch.setattr(inference_utils, "_moe_layer_cache_owner", None)
         monkeypatch.setattr(inference_utils, "_moe_metadata_sync_initialized", False)
 
         first, replacement = FakeModel(), FakeModel()
@@ -93,7 +93,7 @@ class TestInferenceUtils:
                 layer._inference_token_dispatcher._runs_metadata_sync for layer in model.layers
             ]
             assert flags == [True, False]
-        assert inference_utils._moe_layer_cache_model() is replacement
+        assert inference_utils._moe_layer_cache_owner() is replacement
         assert inference_utils.moe_layer_cache == list(replacement.layers)
 
         inference_utils.set_decode_expert_padding(replacement, set_to=True, capacity_factor=2)
