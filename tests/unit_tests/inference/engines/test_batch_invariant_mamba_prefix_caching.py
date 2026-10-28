@@ -448,8 +448,8 @@ class TestBatchInvariantMambaPrefixCaching:
                 kv_cache_management_mode=kv_cache_management_mode,
             )
             if kv_cache_management_mode != KVCacheManagementMode.RECOMPUTE and not chunked:
-                # The resident request crossed the refit with a forward pending. Draining it
-                # at suspend matches legacy scheduling, which had already sampled that token.
+                # The resident request crossed the refit with a forward pending. Its tokens
+                # must match legacy scheduling, which dropping and re-running that forward broke.
                 legacy = self._run(
                     prefix=True,
                     graphs=True,
