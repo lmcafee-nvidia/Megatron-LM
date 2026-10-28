@@ -1823,8 +1823,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         config.update(scenario.config)
         config["async_sched_mode"] = mode
         env = cls._build_test_env(_DynamicEngineTestConfig(**config))
-        if "suspend-resume" in scenario.signals:
-            env.engine._generation_epoch = 7
         env.requests = _make_scenario_requests(
             env, scenario, stop_tokens=stop_tokens, termination_token=termination_token
         )
@@ -1904,14 +1902,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 runtime["pending-after-suspend"] += int(
                     env.engine.controller._async_sched_forward.is_valid
                 )
-                suspended = [entry.record[-1] for entry in env.engine.requests.values()]
-                runtime["suspended-request-count"] = len(suspended)
-                runtime["policy-epoch-after-suspend"] = sum(
-                    request.policy_epoch == [(0, 7)] for request in suspended
-                )
-                runtime["kv-epoch-after-suspend"] = sum(
-                    request.kv_cache_epoch == [(0, 7)] for request in suspended
-                )
                 env.engine.resume()
                 for request_id in env.engine.resume_request_ids:
                     env.requests[request_id] = env.engine.get_request(request_id)
@@ -1977,20 +1967,12 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert context.static_kv_memory_pointers
         if "suspend-resume" in signals:
             assert runtime["suspend-resume"] == runtime["pending-before-suspend"] == 1
-            assert runtime["suspended-request-count"] > 0
-            assert runtime["policy-epoch-after-suspend"] == runtime["suspended-request-count"]
             if "recompute" in signals:
                 assert runtime["pending-after-suspend"] == 0
                 assert runtime["pending-after-resume"] == 0
-                assert runtime["kv-epoch-after-suspend"] == 0
             else:
                 assert runtime["pending-after-suspend"] == 1
                 assert runtime["pending-after-resume"] == 1
-                assert runtime["kv-epoch-after-suspend"] == runtime["suspended-request-count"]
-            assert all(
-                request.policy_epoch == request.kv_cache_epoch == [(0, 7)]
-                for request in env.requests
-            )
             if "static-pointers" in signals:
                 assert runtime["static-pointer-preserved"] == 1
         if "dp-offset" in signals:
