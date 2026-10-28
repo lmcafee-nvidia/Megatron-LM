@@ -1859,7 +1859,26 @@ def _instrument_scenario_runtime(env, scenario, runtime, teacher_tokens=None):
                     runtime["temperature-filter"] += int(
                         bool((metadata["temperature"][:active_count] != 1.0).any())
                     )
-                    sampled = original(*kernel_args, **kernel_kwargs)
+                    if name == "top_k_top_p_sampling_from_logits":
+                        # NEGATIVE CONTROL (top-k-only): sample without one or both filters.
+                        _values = kernel_args[0].float()
+                        _probs = torch.softmax(_values, dim=-1)
+                        if "top-k-only" == "top-k-only":
+                            _kth = _values.sort(dim=-1, descending=True).values.gather(
+                                1, kernel_args[1].long().unsqueeze(1) - 1
+                            )
+                            _probs = torch.softmax(
+                                _values.masked_fill(_values < _kth, float("-inf")), dim=-1
+                            )
+                        elif "top-k-only" == "top-p-only":
+                            _above = (_probs.unsqueeze(1) * (_probs.unsqueeze(1) > _probs.unsqueeze(2))).sum(-1)
+                            _probs = _probs * (_above < kernel_args[2].unsqueeze(1))
+                            _probs = _probs / _probs.sum(dim=-1, keepdim=True)
+                        _gen = torch.Generator(device=_values.device)
+                        _gen.manual_seed(runtime[f"flashinfer-kernel:{name}"])
+                        sampled = torch.multinomial(_probs, 1, generator=_gen).squeeze(1).int()
+                    else:
+                        sampled = original(*kernel_args, **kernel_kwargs)
                     values = kernel_args[0].float()
                     valid = (sampled >= 0) & (sampled < values.shape[-1])
                     if name != "sampling_from_logits":
