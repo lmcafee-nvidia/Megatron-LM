@@ -872,6 +872,7 @@ _ASYNC_PARALLEL_SCENARIOS = (
         config={
             "tensor_model_parallel_size": 2,
             "expert_model_parallel_size": 2,
+            "expert_tensor_parallel_size": 1,
             "sequence_parallel": True,
             "moe_router_topk": 1,
             "moe_router_load_balancing_type": "quantile_balancing",

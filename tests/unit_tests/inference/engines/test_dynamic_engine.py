@@ -956,6 +956,7 @@ class DynamicEngineTestConfig:
     inference_moe_token_dispatcher_type: str = "nccl"
     moe_enable_routing_replay: bool = False
     moe_router_topk: int = 2
+    moe_router_load_balancing_type: str = "aux_loss"
     moe_router_score_function: str = "softmax"
     moe_num_hash_layers: int = 0
     moe_apply_probs_on_input: bool = False
@@ -1285,6 +1286,7 @@ class DynamicInferenceEngineTestBase:
                 ),
                 moe_enable_routing_replay=test_config.moe_enable_routing_replay,
                 moe_router_topk=test_config.moe_router_topk,
+                moe_router_load_balancing_type=test_config.moe_router_load_balancing_type,
                 moe_router_score_function=test_config.moe_router_score_function,
                 moe_apply_probs_on_input=test_config.moe_apply_probs_on_input,
                 moe_latent_size=test_config.moe_latent_size,
