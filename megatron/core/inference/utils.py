@@ -187,7 +187,7 @@ def get_attention_mask(seq_length: int) -> torch.Tensor:
 
 # Cache MoE layers for the active inference model.
 moe_layer_cache = None
-_moe_layer_cache_model = None
+_moe_layer_cache_owner = None
 _moe_metadata_sync_initialized = False
 
 
@@ -197,17 +197,17 @@ def _init_moe_expert_cache(model):
     """
     from megatron.core.transformer.moe.moe_layer import MoELayer
 
-    global moe_layer_cache, _moe_layer_cache_model, _moe_metadata_sync_initialized
+    global moe_layer_cache, _moe_layer_cache_owner, _moe_metadata_sync_initialized
     if (
         moe_layer_cache is not None
-        and _moe_layer_cache_model is not None
-        and _moe_layer_cache_model() is model
+        and _moe_layer_cache_owner is not None
+        and _moe_layer_cache_owner() is model
     ):
         return
 
     # Cache for moe layers.
     moe_layer_cache = []
-    _moe_layer_cache_model = weakref.ref(model)
+    _moe_layer_cache_owner = weakref.ref(model)
     _moe_metadata_sync_initialized = False
     seen_modules = set()
 
