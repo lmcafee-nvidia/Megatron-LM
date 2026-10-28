@@ -9,6 +9,7 @@ import torch
 from megatron.core.inference.quantization.mxfp8_tensor import (
     MXFP8Backend,
     MXFP8Tensor,
+    validate_mxfp8_gemm_tensor,
     validate_mxfp8_tensor,
 )
 
@@ -353,6 +354,7 @@ def mm_mxfp8(x: torch.Tensor, weight: MXFP8Tensor, out: torch.Tensor = None):
     assert (
         backend is not None
     ), "weight.backend is None — was the weight created via MXFP8Tensor.from_bf16?"
+    validate_mxfp8_gemm_tensor(weight, tensor_name="MXFP8 linear weight")
 
     x_squeezed = x.squeeze(1)
     x_mxfp8 = MXFP8Tensor.from_bf16(x_squeezed, backend=backend)

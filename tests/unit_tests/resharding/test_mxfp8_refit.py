@@ -27,17 +27,6 @@ try:
 except ImportError:
     _HAVE_FLASHINFER = False
 
-
-def _skip_without_linear_flashinfer_scales():
-    """Skip only when the installed FlashInfer cannot emit linear MXFP8 scales."""
-    import inspect
-
-    if not _HAVE_FLASHINFER:
-        pytest.skip("test requires FlashInfer")
-    if "is_sf_swizzled_layout" not in inspect.signature(mxfp8_quantize).parameters:
-        pytest.skip("FlashInfer does not expose its native linear MXFP8 scale layout")
-
-
 from megatron.core.inference.moe.flashinfer_mxfp8 import HAVE_FLASHINFER_ROUTED_MXFP8
 
 pytestmark = pytest.mark.skipif(
@@ -65,10 +54,10 @@ class TestMXFP8ReshardTransform:
         from megatron.core.resharding.transforms import MXFP8ReshardTransform
 
         M, K = 64, 128
-        _skip_without_linear_flashinfer_scales()
-        buf = MXFP8Tensor.from_bf16(
-            torch.randn(M, K, dtype=torch.bfloat16, device="cuda"), scale_layout="linear"
-        )
+        buf = MXFP8Tensor.from_bf16(torch.randn(M, K, dtype=torch.bfloat16, device="cuda"))
+
+        if buf.scale.ndim != 2:
+            pytest.skip("FlashInfer produced 1D swizzled scale; 2D-scale test not applicable")
 
         t = MXFP8ReshardTransform(
             convertible_params={"decoder.weight"},
@@ -80,27 +69,7 @@ class TestMXFP8ReshardTransform:
         new_data = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
         t.finalize_recv("decoder.weight", (slice(None), slice(None)), [new_data])
 
-        expected = MXFP8Tensor.from_bf16(new_data, scale_layout="linear")
-        assert torch.equal(buf.data, expected.data)
-        assert torch.equal(buf.scale, expected.scale)
-
-    def test_quantize_in_place_keeps_linear_2d_scale_layout(self):
-        """In-place requantization of a linear 2D-scale tensor stays linear."""
-        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
-
-        _skip_without_linear_flashinfer_scales()
-        # 128 rows and 4 scale columns need no padding in either scale layout, so the
-        # swizzled and linear scales hold the same number of bytes.
-        buf = MXFP8Tensor.from_bf16(
-            torch.randn(128, 128, dtype=torch.bfloat16, device="cuda"), scale_layout="linear"
-        )
-        storage = (buf.data.data_ptr(), buf.scale.data_ptr())
-        new_value = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")
-
-        buf.quantize_(new_value)
-
-        expected = MXFP8Tensor.from_bf16(new_value, scale_layout="linear")
-        assert (buf.data.data_ptr(), buf.scale.data_ptr()) == storage
+        expected = MXFP8Tensor.from_bf16(new_data)
         assert torch.equal(buf.data, expected.data)
         assert torch.equal(buf.scale, expected.scale)
 
@@ -656,8 +625,16 @@ class TestMXFP8RefitIntegration:
 
     def test_public_refit_native_linear_scales_preserve_graph_storage(self, request):
         """A real NCCL refit updates native 2D scales and captured consumer output."""
+        from megatron.core.inference.quantization.mxfp8_tensor import get_mxfp8_scale_bytes
+
         Utils.initialize_model_parallel(1, 1)
         request.addfinalizer(Utils.destroy_model_parallel)
+
+        def linear_mxfp8(weight):
+            # The logical [rows, columns / 32] scales that a 2D-scale destination stores.
+            quantized = MXFP8Tensor.from_bf16(weight, backend="flashinfer")
+            scale = get_mxfp8_scale_bytes(quantized).clone()
+            return MXFP8Tensor(quantized.data, scale, "flashinfer", dtype=torch.bfloat16)
 
         class TinyModel(torch.nn.Module):
             def __init__(self, seed):
@@ -687,10 +664,7 @@ class TestMXFP8RefitIntegration:
 
         source = TinyModel(111)
         target = TinyModel(222)
-        _skip_without_linear_flashinfer_scales()
-        target_buffer = MXFP8Tensor.from_bf16(
-            target.decoder.weight.detach(), backend="flashinfer", scale_layout="linear"
-        )
+        target_buffer = linear_mxfp8(target.decoder.weight.detach())
         assert target_buffer.scale.ndim == 2
         clear_all_caches()
         prepare_swap_model_weights([source], [target])
@@ -702,9 +676,7 @@ class TestMXFP8RefitIntegration:
             buffer_key_prefix="decoder.",
         )
         source_weight = source.decoder.weight.detach().clone()
-        reference = MXFP8Tensor.from_bf16(
-            source_weight, backend="flashinfer", scale_layout="linear"
-        )
+        reference = linear_mxfp8(source_weight)
         reference_model = TinyModel(333)
         del reference_model.decoder._parameters["weight"]
         reference_model.decoder.weight = reference

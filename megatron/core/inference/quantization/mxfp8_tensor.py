@@ -57,7 +57,7 @@ def validate_mxfp8_tensor(
     expected_backend: Optional[MXFP8Backend] = None,
     tensor_name: str = "MXFP8 tensor",
 ) -> None:
-    """Thorough MXFP8 validation for GEMM consumers, courtesy of Codex."""
+    """Validate logical MXFP8 storage shared by conversion and compute consumers."""
     if tensor.data.ndim != 2:
         raise ValueError(
             f"{tensor_name} data must be 2D before grouped-weight stacking; "
@@ -116,6 +116,38 @@ def validate_mxfp8_tensor(
             f"{tensor_name} scale must be a 1D swizzled tensor or a 2D unswizzled "
             f"tensor, got shape {tuple(tensor.scale.shape)}."
         )
+
+
+def validate_mxfp8_gemm_tensor(
+    tensor: "MXFP8Tensor",
+    *,
+    expected_backend: Optional[MXFP8Backend] = None,
+    tensor_name: str = "MXFP8 tensor",
+) -> None:
+    """Validate MXFP8 storage for kernels that require cuBLAS-swizzled scales."""
+    validate_mxfp8_tensor(tensor, expected_backend=expected_backend, tensor_name=tensor_name)
+    if tensor.scale.ndim != 1:
+        backend = expected_backend if expected_backend is not None else tensor.backend
+        raise ValueError(
+            f"{tensor_name} scales for backend {backend!r} must use 1D "
+            f"swizzled storage at the GEMM boundary; got shape {tuple(tensor.scale.shape)}."
+        )
+
+
+def get_mxfp8_scale_bytes(tensor: "MXFP8Tensor") -> torch.Tensor:
+    """Return logical ``[M, K // 32]`` E8M0 bytes without requantizing data."""
+    rows, cols = tensor.data.shape
+    scale_cols = cols // MXFP8_BLOCK_SIZE
+    if tensor.scale.ndim == 2:
+        return tensor.scale.view(torch.uint8)
+
+    padded_rows = _ceil_div(rows, MXFP8_SCALE_ROW_BLOCK) * MXFP8_SCALE_ROW_BLOCK
+    padded_scale_cols = _ceil_div(scale_cols, MXFP8_SCALE_COL_BLOCK) * MXFP8_SCALE_COL_BLOCK
+    scale = tensor.scale.view(torch.uint8).reshape(
+        padded_rows // MXFP8_SCALE_ROW_BLOCK, padded_scale_cols // MXFP8_SCALE_COL_BLOCK, 32, 4, 4
+    )
+    logical = scale.permute(0, 3, 2, 1, 4).contiguous().reshape(padded_rows, padded_scale_cols)
+    return logical[:rows, :scale_cols]
 
 
 @dataclass
@@ -196,14 +228,17 @@ class MXFP8Tensor:
         ):
             mcore_mxfp8_quantize_into(value, self.data, self.scale)
         else:
-            if self.backend == "flashinfer" and self.scale.ndim == 2:
-                quantized = MXFP8Tensor.from_bf16(
-                    value, backend=self.backend, scale_layout="linear"
-                )
-            else:
-                quantized = MXFP8Tensor.from_bf16(value, backend=self.backend)
+            quantized = MXFP8Tensor.from_bf16(value, backend=self.backend)
             self.data.copy_(quantized.data)
-            self.scale.view(torch.uint8).copy_(quantized.scale.view(torch.uint8))
+            if self.scale.shape == quantized.scale.shape:
+                self.scale.view(torch.uint8).copy_(quantized.scale.view(torch.uint8))
+            elif self.scale.ndim == 2:
+                self.scale.view(torch.uint8).copy_(get_mxfp8_scale_bytes(quantized))
+            else:
+                raise ValueError(
+                    "Cannot update 1D MXFP8 scale storage from a producer with shape "
+                    f"{tuple(quantized.scale.shape)}."
+                )
         if self.dtype is None:
             self.dtype = value.dtype
         return self
@@ -220,14 +255,7 @@ class MXFP8Tensor:
         return self.quantize_(value)
 
     @classmethod
-    def from_bf16(
-        cls,
-        x: torch.Tensor,
-        group_size: int = 32,
-        backend: MXFP8Backend = "flashinfer",
-        *,
-        scale_layout: Literal["swizzled", "linear"] = "swizzled",
-    ):
+    def from_bf16(cls, x: torch.Tensor, group_size: int = 32, backend: MXFP8Backend = "flashinfer"):
         """Quantize a floating-point CUDA tensor to MXFP8.
 
         The historical method name is retained for compatibility. The Triton
@@ -239,30 +267,17 @@ class MXFP8Tensor:
             group_size: MXFP8 group size (default 32).
             backend: 'triton' (fused quantize + swizzle Triton kernel) or
                      'flashinfer' (single fused FlashInfer CUDA kernel).
-            scale_layout: FlashInfer scale layout. ``linear`` retains the native
-                          logical ``[M, K / 32]`` layout; the default preserves
-                          the historical 1D 128x4-swizzled representation.
         """
         assert x.is_cuda and x.dim() == 2
         assert x.shape[-1] % group_size == 0
         if backend == "flashinfer":
             assert HAVE_FLASHINFER, "FlashInfer not available"
-            if scale_layout == "linear":
-                data, scale = flashinfer_mxfp8_quantize(x, is_sf_swizzled_layout=False)
-                scale = scale.view(x.shape[0], x.shape[1] // group_size)
-            elif scale_layout == "swizzled":
-                # Avoid passing the newer layout keyword on the default path so
-                # supported older FlashInfer releases retain compatibility.
-                data, scale = flashinfer_mxfp8_quantize(x)
-            else:
-                raise ValueError(f"Unknown MXFP8 scale layout: {scale_layout!r}.")
+            data, scale = flashinfer_mxfp8_quantize(x)
             if scale.dtype == torch.float8_e8m0fnu:
                 scale = scale.view(torch.uint8)
             elif scale.dtype != torch.uint8:
                 raise TypeError(f"FlashInfer MXFP8 scales must be uint8 bytes, got {scale.dtype}.")
         elif backend == "triton":
-            if scale_layout != "swizzled":
-                raise ValueError("The Triton MXFP8 backend supports only swizzled scales.")
             data, scale = mcore_mxfp8_quantize(x)
             scale = ensure_mxfp8_scale_dtype(scale)
         else:
