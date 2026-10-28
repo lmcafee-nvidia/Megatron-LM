@@ -4590,7 +4590,6 @@ class DynamicInferenceEngine(AbstractEngine):
             return None
         if self.controller._async_sched_forward.is_valid:
             return await self.async_step(finish_pending_only=True)
-        self.controller._run_dummy_serial_mtp_forward()
         return None
 
     def _async_drain_runs_forward(self) -> bool:
