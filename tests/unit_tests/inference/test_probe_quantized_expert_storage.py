@@ -84,7 +84,12 @@ def _expert_params(layer):
 
 @pytest.mark.parametrize("case", list(CASES))
 def test_probe_quantized_expert_storage(case):
+    from megatron.core.transformer.moe.token_dispatcher_inference import (
+        InferenceAllGatherDispatcherBase,
+    )
+
     Utils.initialize_model_parallel(1, 1)
+    InferenceAllGatherDispatcherBase.allocate_valid_tokens_tensor()
     try:
         if case.startswith("fp4") and torch.cuda.get_device_capability()[0] < 10:
             pytest.skip("TE NVFP4 needs Blackwell")
