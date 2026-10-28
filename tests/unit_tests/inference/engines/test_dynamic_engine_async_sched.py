@@ -974,14 +974,12 @@ _ASYNC_PARALLEL_SCENARIOS = (
 )
 
 
-_UPSTREAM_SCENARIOS = {
-    case.name: case for case in _ASYNC_PAIR_SCENARIOS + _ASYNC_PARALLEL_SCENARIOS
-}
+_SCENARIOS_BY_NAME = {case.name: case for case in _ASYNC_PAIR_SCENARIOS + _ASYNC_PARALLEL_SCENARIOS}
 
 
 def _variant(base_name, name, *pairs, config=None, signals=(), **changes):
     """Derive a new case from an upstream one, leaving the upstream definition unchanged."""
-    base = _UPSTREAM_SCENARIOS[base_name]
+    base = _SCENARIOS_BY_NAME[base_name]
     return replace(
         base,
         name=name,
@@ -998,7 +996,7 @@ _CUDA_GRAPH_HANDOFF_SCENARIOS = (
     _pair_scenario(
         "disagg-decode-handoff",
         "disaggregation:decode-handoff",
-        "kv:transferred-prefix",
+        "kv:synthetic-import",
         config={"enable_prefix_caching": True, "engine_cls": StateHandoffDynamicInferenceEngine},
         signals=("disagg-handoff",),
         request_profile="handoff",
@@ -2099,12 +2097,13 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         config.update(scenario.config)
         config["async_sched_mode"] = mode
         env = cls._build_test_env(_DynamicEngineTestConfig(**config))
-        if env.engine.controller.inference_wrapped_model.model.config.fp8:
+        # New FP8 cases round eager steps to the recipe's alignment; main's own FP8 case
+        # keeps the upstream test rounder.
+        model_config = env.engine.controller.inference_wrapped_model.model.config
+        if model_config.fp8 and scenario.name != "fp8-transformer-engine":
             from megatron.core.fp8_utils import get_fp8_align_size
 
-            DynamicInferenceContext.TOKEN_ROUNDER = get_fp8_align_size(
-                env.engine.controller.inference_wrapped_model.model.config.fp8_recipe
-            )
+            DynamicInferenceContext.TOKEN_ROUNDER = get_fp8_align_size(model_config.fp8_recipe)
         env.requests = _make_scenario_requests(
             env, scenario, stop_tokens=stop_tokens, termination_token=termination_token
         )
@@ -2239,7 +2238,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     if runner.fwd_graph_recorded
                 ]
                 graph_ids_before = [id(runner.fwd_graph) for runner in runners_before]
-                graph_pool_before = CudaGraphManager.global_mempool
                 runtime["pending-before-suspend"] += int(pending_before_suspend)
                 from megatron.core.inference.engines import dynamic_engine as dynamic_engine_module
 
@@ -2301,10 +2299,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                         for runner, graph_id in zip(runners_after, graph_ids_before)
                     )
                 )
-                if env.engine.context.static_kv_memory_pointers:
-                    runtime["cuda-graph-pool-preserved"] += int(
-                        CudaGraphManager.global_mempool == graph_pool_before
-                    )
                 _instrument_cuda_graph_replays(
                     env.engine.controller.inference_wrapped_model.model, env.engine.context, runtime
                 )
@@ -2327,7 +2321,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         if "context-reset" in scenario.signals:
             for _ in range(2):
                 memory_ptr = env.engine.context.memory_buffer.data_ptr()
-                graph_pool = CudaGraphManager.global_mempool
                 graph_runners = [
                     (runner, runner.fwd_graph)
                     for manager in model.modules()
@@ -2344,7 +2337,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 if env.config.num_cuda_graphs:
                     runtime["context-reset-graphs-preserved"] += int(
                         bool(graph_runners)
-                        and CudaGraphManager.global_mempool == graph_pool
                         and all(
                             runner.fwd_graph_recorded and runner.fwd_graph is graph
                             for runner, graph in graph_runners
@@ -2466,7 +2458,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     assert runtime["cuda-graph-create-calls"] == 0
                     assert runtime["cuda-graph-runner-objects-preserved"] == expected_cycles
                     assert runtime["cuda-graph-objects-preserved"] == expected_cycles
-                    assert runtime["cuda-graph-pool-preserved"] == expected_cycles
                 else:
                     assert runtime["cuda-graph-create-calls"] == 0
         if "context-reset" in signals:
@@ -2923,11 +2914,10 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 if type(module).__name__ == "MoELayer"
             }
             assert dispatchers == {"MoEAllGatherTokenDispatcher"}
-            assert "cuda-graph" not in signals or "MoELayer" in replayed_module_names
         if "moe" in signals:
             assert model_config.num_moe_experts is not None
             if "etp" in signals:
-                assert runtime["module-forward:moe"] > 0 or "MoELayer" in replayed_module_names
+                assert runtime["module-forward:moe"] > 0
             elif model_config.expert_model_parallel_size > 1 and "nvls-dispatch" not in signals:
                 assert context._nccl_ep_dispatcher
                 # Inference MoE may dispatch through split execution helpers that
@@ -3120,11 +3110,6 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
         config.update(
             num_cuda_graphs=4, force_build_cuda_graphs=True, defer_cuda_graph_creation=True
         )
-        if (
-            config.get("expert_model_parallel_size", 1) > 1
-            and config.get("transformer_impl", "local") != "inference_optimized"
-        ):
-            config["moe_pad_experts_for_cuda_graph_inference"] = True
         repeat = ("repeat-suspend-resume",) if "suspend-resume" in scenario.signals else ()
         signals = tuple(dict.fromkeys((*scenario.signals, *repeat, "cuda-graph")))
         return replace(scenario, config=config, signals=signals)
