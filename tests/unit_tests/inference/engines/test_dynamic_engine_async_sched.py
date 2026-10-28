@@ -39,6 +39,7 @@ from megatron.core.inference.inference_request import (
     Status,
 )
 from megatron.core.inference.sampling_params import MIN_SAMPLING_TEMPERATURE, SamplingParams
+from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     AsyncScheduleForwardState,
     DecodeOnly,
@@ -49,6 +50,7 @@ from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, delete_cuda_graphs
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay
+from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.utils import is_layer_window_attention
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.inference.engines.test_dynamic_engine import (
@@ -3227,6 +3229,12 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
         self._assert_graph_pair(scenario)
 
 
+def _release_nvls_buffers():
+    """Drop NVLS symmetric-memory handles before the groups they were registered on go away."""
+    NVLSAllGatherVDispatcher._delete_buffers()
+    SymmetricMemoryManager.destroy()
+
+
 @pytest.mark.internal
 @pytest.mark.skipif(
     not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
@@ -3264,6 +3272,7 @@ class TestAsyncSchedulePairwiseParallel(_AsyncPairwiseHarness):
                 assert parallel_state.get_data_parallel_world_size() == 2
             self._assert_scenario_pair(scenario)
         finally:
+            _release_nvls_buffers()
             gc.collect()
             delete_cuda_graphs()
             torch.cuda.empty_cache()
@@ -3290,6 +3299,7 @@ class TestAsyncSchedulePairwiseParallel(_AsyncPairwiseHarness):
         try:
             TestCudaGraphDifferential._assert_graph_pair(scenario)
         finally:
+            _release_nvls_buffers()
             TestCudaGraphDifferential._release_graphs()
             _reset_rounder()
             Utils.destroy_model_parallel()
