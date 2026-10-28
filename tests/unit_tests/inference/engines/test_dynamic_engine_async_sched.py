@@ -2151,13 +2151,13 @@ def test_async_suspend_pending_logits_lifecycle(mode):
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.controller = _controller_with_pending_logits()
     engine.context = SimpleNamespace(
-        config=SimpleNamespace(async_sched_mode=AsyncScheduleMode.ASYNC),
         deallocate_inference_state_buffers=mock.Mock(),
         dynamo_helper=None,
         kv_cache_management_mode=mode,
         static_kv_memory_pointers=True,
     )
     engine.state = EngineState.RUNNING
+    engine._drains_async_forward = True
     engine.unified_memory_level = 0
     engine.waiting_request_ids = deque()
     engine.requests = {}

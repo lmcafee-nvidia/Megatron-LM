@@ -204,7 +204,7 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             pytest.skip("Test requires at least 2 GPUs")
         env = self._build_test_env(
             DynamicEngineTestConfig(
-                num_requests=2,
+                num_requests=1,  # The allgather dispatcher needs the idle rank's batch size.
                 min_prompt_length=4,
                 max_prompt_length=4,
                 num_tokens_to_generate=6,

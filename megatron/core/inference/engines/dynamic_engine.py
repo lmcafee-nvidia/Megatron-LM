@@ -510,6 +510,8 @@ class DynamicInferenceEngine(AbstractEngine):
     # Immutable so instances never share one task set; __init__ installs a mutable one.
     _staging_tasks: Set[asyncio.Task] = frozenset()
     _staging_tasks_peak: int = 0
+    # Under async scheduling, pause and suspend finish the pending forward.
+    _drains_async_forward: bool = False
 
     @deprecate_args(
         *DEPRECATED_ARGS,
@@ -535,6 +537,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Initialization options.
         self.controller = controller
         self.context = context
+        self._drains_async_forward = context.config.async_sched_mode == AsyncScheduleMode.ASYNC
 
         self.num_speculative_tokens = inference_config.num_speculative_tokens
         self.materialize_only_last_token_logits = (
@@ -4616,7 +4619,7 @@ class DynamicInferenceEngine(AbstractEngine):
         A rank with nothing pending still runs one under EP > 1 with MTP: draining peers
         run MTP draft forwards whose expert all-to-alls need every rank.
         """
-        if self.context.config.async_sched_mode != AsyncScheduleMode.ASYNC:
+        if not self._drains_async_forward:
             return False
         return self.controller._async_sched_forward.is_valid or (
             self.controller.num_speculative_tokens > 0
