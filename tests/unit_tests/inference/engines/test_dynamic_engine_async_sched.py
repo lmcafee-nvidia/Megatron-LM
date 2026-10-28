@@ -2250,6 +2250,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     if runner.fwd_graph_recorded
                 ]
                 graph_ids_before = [id(runner.fwd_graph) for runner in runners_before]
+                graph_pool_before = CudaGraphManager.global_mempool
                 runtime["pending-before-suspend"] += int(pending_before_suspend)
                 from megatron.core.inference.engines import dynamic_engine as dynamic_engine_module
 
@@ -2311,6 +2312,11 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                         for runner, graph_id in zip(runners_after, graph_ids_before)
                     )
                 )
+                if env.engine.context.static_kv_memory_pointers:
+                    runtime["cuda-graph-pool-preserved"] += int(
+                        graph_pool_before is not None
+                        and CudaGraphManager.global_mempool == graph_pool_before
+                    )
                 _instrument_cuda_graph_replays(
                     env.engine.controller.inference_wrapped_model.model, env.engine.context, runtime
                 )
@@ -2333,6 +2339,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         if "context-reset" in scenario.signals:
             for _ in range(2):
                 memory_ptr = env.engine.context.memory_buffer.data_ptr()
+                graph_pool = CudaGraphManager.global_mempool
                 graph_runners = [
                     (runner, runner.fwd_graph)
                     for manager in model.modules()
@@ -2349,6 +2356,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 if env.config.num_cuda_graphs:
                     runtime["context-reset-graphs-preserved"] += int(
                         bool(graph_runners)
+                        and graph_pool is not None
+                        and CudaGraphManager.global_mempool == graph_pool
                         and all(
                             runner.fwd_graph_recorded and runner.fwd_graph is graph
                             for runner, graph in graph_runners
@@ -2470,6 +2479,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     assert runtime["cuda-graph-create-calls"] == 0
                     assert runtime["cuda-graph-runner-objects-preserved"] == expected_cycles
                     assert runtime["cuda-graph-objects-preserved"] == expected_cycles
+                    assert runtime["cuda-graph-pool-preserved"] == expected_cycles
                 else:
                     assert runtime["cuda-graph-create-calls"] == 0
         if "context-reset" in signals:
