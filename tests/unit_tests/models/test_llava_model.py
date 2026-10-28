@@ -460,6 +460,25 @@ class TestLLaVAModel:
             )
 
     @pytest.mark.internal
+    def test_encoder_only_forward_ignores_previous_request_cache_metadata(self):
+        """An encoder-only call must compute embeddings even after a decoder request ran."""
+        self.model.cuda()
+        inference_context = StaticInferenceContext(1, 1024)
+        # A previous decoder request leaves its media token count in the shared context.
+        inference_context.key_value_memory_dict["image_tokens_count"] = 577
+        self.model.add_decoder = False
+        image_embeddings, _ = self.model.forward(
+            torch.randn((1, 3, 336, 336), device="cuda"),
+            torch.empty((1, 0), dtype=torch.long, device="cuda"),
+            position_ids=None,
+            attention_mask=None,
+            inference_context=inference_context,
+            num_image_tiles=torch.ones(1, dtype=torch.int, device="cuda"),
+        )
+        assert image_embeddings is not None
+        assert image_embeddings.shape[-1] == self.language_hidden_size
+
+    @pytest.mark.internal
     def test_forward_passes_expanded_loss_mask_to_language_model(self):
         """The decoder needs the expanded mask to exclude vision positions from MTP loss."""
         self.model.cuda()
