@@ -4590,12 +4590,6 @@ class DynamicInferenceEngine(AbstractEngine):
             return None
         if self.controller._async_sched_forward.is_valid:
             return await self.async_step(finish_pending_only=True)
-        if (
-            self.controller.num_speculative_tokens > 0
-            and self.controller.model_config.expert_model_parallel_size > 1
-        ):
-            # Draining peers run MTP draft forwards whose expert all-to-alls need every rank.
-            self.controller._run_dummy_serial_mtp_forward()
         return None
 
     def _run_coroutine_sync(self, coro):
