@@ -254,6 +254,29 @@ class TestInferenceTopKRouter:
         # Same expert selections
         assert training_experts == inference_experts
 
+    @pytest.mark.parametrize("topk", [1, NANOV3_BASE["moe_router_topk"]])
+    def test_sinkhorn_inference_matches_evaluation_probabilities(self, topk):
+        router = self._make_router(
+            moe_router_load_balancing_type="sinkhorn",
+            moe_aux_loss_coeff=0.0,
+            moe_router_score_function="softmax",
+            moe_router_enable_expert_bias=False,
+            moe_router_topk=topk,
+        )
+        router.eval()
+        input_tensor = torch.randn(
+            16, NANOV3_BASE["hidden_size"], device="cuda", dtype=torch.bfloat16
+        )
+
+        reference_probs, reference_map = router(input_tensor.clone())
+        with InferenceMode.active():
+            inference_probs, inference_indices = router(input_tensor.clone())
+
+        selected_reference = reference_probs.gather(1, inference_indices)
+        selected_by_reference = reference_map.gather(1, inference_indices)
+        assert selected_by_reference.all()
+        torch.testing.assert_close(inference_probs, selected_reference, atol=0, rtol=0)
+
 
 # ──────────────────────────────────────────────────────────────────────
 # NCCLAllGatherDispatcher
@@ -548,6 +571,29 @@ class TestNVLSAllGatherVDispatcher:
 
         expected_combined = (global_hidden[start:end].float() * ep_size).bfloat16()
         torch.testing.assert_close(graph_combined, expected_combined, atol=0, rtol=0)
+
+    def test_sinkhorn_vllm_moe_matches_evaluation_layer(self):
+        evidence = self.test_batch_invariant_moe_matches_training(
+            "vllm",
+            None,
+            False,
+            False,
+            config_overrides={
+                "moe_router_load_balancing_type": "sinkhorn",
+                "moe_aux_loss_coeff": 0.0,
+                "moe_router_score_function": "softmax",
+                "moe_router_enable_expert_bias": False,
+                "moe_router_topk_scaling_factor": None,
+            },
+            base_local_tokens=5,
+            collect_inference_evidence=True,
+        )
+
+        assert len(evidence["dispatch"]) == 1
+        assert len(evidence["expert"]) == 1
+        assert len(evidence["combine"]) == 1
+        assert evidence["dispatch"][0]["valid_rows"] > 0
+        assert evidence["expert"][0]["input_rows"] >= evidence["dispatch"][0]["valid_rows"]
 
     def test_cuda_graph_batch_invariant_combine_uses_ordered_symmetric_memory(self, monkeypatch):
         """Batch-invariant mode should use ordered peer loads on NVLS dispatcher.

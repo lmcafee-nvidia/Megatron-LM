@@ -1459,6 +1459,17 @@ class InferenceTopKRouter(TopKRouter):
         # Preserve the compiled inference router's established single-batch layout.
         logits = logits.squeeze(1)  # [num_tokens, num_experts]
 
+        if self.routing_type == "sinkhorn":
+            # Sinkhorn affects expert assignment only while training. Evaluation
+            # selects directly from the activated logits and retains their full-
+            # expert normalization, rather than renormalizing over the selected
+            # top-k experts. Return that same result in dense inference form.
+            if self.topk == 1:
+                scores = torch.sigmoid(logits)
+            else:
+                scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
+            return torch.topk(scores, k=self.topk, dim=1)
+
         # Micro-batch QB selects on (logits - qb_beta). Global-batch QB passes its
         # fixed additive bias through the normal score-function route.
         precomputed_indices = None
