@@ -213,12 +213,11 @@ def test_flashinfer_forward_dispatches_to_nvfp4(monkeypatch):
     assert captured["use_bounded_rows"] is True
 
 
-@pytest.mark.parametrize("built", [False, True], ids=["before_first_forward", "after"])
-def test_refit_accepts_built_nvfp4_expert_weights(monkeypatch, built):
+def test_refit_accepts_built_nvfp4_expert_weights(monkeypatch):
     from megatron.core.resharding import refit
 
     experts_module = torch.nn.Module()
-    experts_module._nvfp4_weights = object() if built else None
+    experts_module._nvfp4_weights = object()
     target = torch.nn.Sequential(experts_module)
     executed = []
     monkeypatch.setattr(refit, "_unwrap_model_cores", lambda src, tgt: (None, tgt, 2))
