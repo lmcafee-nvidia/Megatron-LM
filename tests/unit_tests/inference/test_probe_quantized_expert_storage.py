@@ -33,6 +33,8 @@ BASE = dict(
     moe_token_dispatcher_type="alltoall",
     inference_moe_token_dispatcher_type="nccl",
     activation_func=squared_relu,
+    normalization="RMSNorm",
+    num_query_groups=2,
     add_bias_linear=False,
     bf16=True,
     params_dtype=torch.bfloat16,
@@ -90,8 +92,8 @@ def test_probe_quantized_expert_storage(case):
         report = {"case": case}
         try:
             config, layer = _layer(**CASES[case])
-        except Exception as error:  # noqa: BLE001
-            print(f"PROBE {report} build-error={error!r}")
+        except Exception:  # noqa: BLE001
+            print(f"PROBE {report} build-error\n{traceback.format_exc()}")
             return
         ref_config, ref = _layer()
         params = dict(layer.named_parameters())
