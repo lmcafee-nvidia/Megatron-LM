@@ -137,6 +137,7 @@ def test_bf16_config_ignores_inactive_mxfp8_recipe_gates():
 )
 @torch.inference_mode()
 def test_flashinfer_bf16_gelu_layer_matches_training_reference(activation_func):
+    pytest.importorskip("flashinfer")
     from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
     from megatron.core.transformer.moe.token_dispatcher_inference import (
         InferenceAllGatherDispatcherBase,
