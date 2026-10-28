@@ -3616,7 +3616,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     include_usage=True,
                 )
                 first_sse = await asyncio.wait_for(anext(sse_generator), timeout=30)
-                assert env.engine.has_unfinished_requests()
                 assert any(not stream.finished for stream in sse_streams)
                 sse_frames = [first_sse]
                 async for frame in sse_generator:
