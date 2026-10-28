@@ -268,6 +268,17 @@ def test_inference_parameters_alias_warns_and_copies():
     assert req.sampling_params is sp
 
 
+def test_dynamic_request_epoch_boundaries_stay_tuples_through_msgpack():
+    """Epoch boundaries are (start, end) tuples; msgpack must not hand them back as lists."""
+    request = _make_dynamic_request(request_id=31)
+    request.policy_epoch = [(0, 3), (3, 5)]
+    request.kv_cache_epoch = [(1, 4)]
+    data = msgpack.unpackb(msgpack.packb(request.serialize()), raw=False)
+    restored = DynamicInferenceRequest.deserialize(data)
+    assert restored.policy_epoch == [(0, 3), (3, 5)]
+    assert restored.kv_cache_epoch == [(1, 4)]
+
+
 def test_inference_request_serialize_round_trip_through_msgpack():
     """The full serialize → msgpack → deserialize cycle: tensor fields are
     wrapped as ('tensor', payload), msgpack converts the tuple to a list, and
