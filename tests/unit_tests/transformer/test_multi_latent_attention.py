@@ -194,7 +194,10 @@ class TestParallelMLAAttention:
         inference_context.cu_query_lengths.return_value = (cu_seqlens, 1)
         inference_context.cu_kv_lengths.return_value = (cu_seqlens, sequence_lengths, 1)
 
+        # This test checks decode routing, not the FlashMLA dependency, so it runs as if
+        # FlashMLA were installed.
         with (
+            mock.patch.object(mla_module, "HAVE_FMLA", True),
             mock.patch.object(attention, "prepare_for_absorption"),
             mock.patch.object(
                 attention,
