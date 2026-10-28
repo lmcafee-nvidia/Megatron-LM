@@ -906,6 +906,10 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
     async def test_real_client_coordinator_adapter_matches_direct(
         self, kv_cache_management_mode, mxfp8
     ):
+        if Utils.world_size != 1:
+            # Each launched rank would be a data-parallel replica of one coordinator, so
+            # requests and lifecycle commands would reach engines this rank cannot inspect.
+            pytest.skip("the client/coordinator lifecycle contract needs a one-rank launch")
         BatchedDataDict, mixin_cls = _load_nemo_rl_adapter()
         config = DynamicEngineTestConfig(
             num_requests=0,
@@ -1284,7 +1288,7 @@ async def test_real_noncolocated_consumer_refit_then_adapter_output():
                 adapter.inference_client = _InProcessInferenceClient(
                     engine, expected_requests=1, first_request_id=400 + version, witness=witness
                 )
-                with mock.patch.object(torch.distributed, "get_rank", return_value=0):
+                with _as_adapter_client_rank():
                     replies = await adapter._generate_with_persistent_engine(
                         prompts, media, sampling_params
                     )
