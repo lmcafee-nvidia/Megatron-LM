@@ -975,6 +975,7 @@ class DynamicEngineTestConfig:
     suspend_resume_interval: Optional[int] = None
     kv_cache_management_mode: str = "persist"
     static_kv_memory_pointers: bool = True
+    unified_memory_level: int = 0
     allow_stale_multimodal_embeddings: bool = False
     track_generated_token_events: bool = False
     track_paused_request_events: bool = False
@@ -1170,7 +1171,7 @@ class DynamicInferenceEngineTestBase:
                 prefix_caching_eviction_policy=test_config.prefix_caching_eviction_policy,
                 use_flashinfer_fused_rope=test_config.use_flashinfer_fused_rope,
                 # this is for compatibility with the LTS environment
-                unified_memory_level=0,  # unit tests currently broken with UVM
+                unified_memory_level=test_config.unified_memory_level,
                 allow_stale_multimodal_embeddings=(test_config.allow_stale_multimodal_embeddings),
                 track_generated_token_events=test_config.track_generated_token_events,
                 track_paused_request_events=test_config.track_paused_request_events,

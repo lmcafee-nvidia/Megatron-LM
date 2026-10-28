@@ -796,6 +796,40 @@ _ASYNC_PAIR_SCENARIOS = (
         prerequisite="mxfp8",
         atol=0.0,
     ),
+    _pair_scenario(
+        "offload-static-uvm-suspend-resume",
+        "kv:offload",
+        "memory:uvm",
+        "kv:static-pointers",
+        config={
+            "kv_cache_management_mode": "offload",
+            "static_kv_memory_pointers": True,
+            "unified_memory_level": 1,
+        },
+        signals=("offload", "static-pointers", "suspend-resume", "uvm"),
+    ),
+    _pair_scenario(
+        "offload-static-uvm-hybrid-mamba-suspend-resume",
+        "model:hybrid-mamba",
+        "kv:offload",
+        "memory:uvm",
+        config={
+            "kv_cache_management_mode": "offload",
+            "model_provider": "hybrid",
+            "static_kv_memory_pointers": True,
+            "unified_memory_level": 1,
+        },
+        signals=(
+            "hybrid",
+            "metadata-compaction",
+            "offload",
+            "static-pointers",
+            "suspend-resume",
+            "uvm",
+        ),
+        prerequisite="mamba",
+        atol=5.0e-3,
+    ),
     # Four heads of width 64 exercise FlashInfer's supported fused-RoPE kernel.
     # Width 16 crosses half-head boundaries in its vectorized NeoX rotation.
     _pair_scenario(
@@ -1068,6 +1102,7 @@ _CUDA_GRAPH_DIFFERENTIAL_SCENARIOS = (
             "hybrid-gdp",
             "transformer-engine",
             "inference-optimized",
+            "offload-static-uvm-suspend-resume",
             "flash-attention-3",
             "flash-attention-4",
             "swa-off-by-one-sink",
@@ -2428,6 +2463,11 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert context.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE
         if "static-pointers" in signals:
             assert context.static_kv_memory_pointers
+        if "uvm" in signals:
+            assert context.unified_memory_level == 1
+            assert not context._uses_torch_memory_saver
+            assert not context._offloadable_tensor_names
+            assert not context._offloadable_cpu_backups
         if "tms" in signals:
             assert context._uses_torch_memory_saver
         if "suspend-resume" in signals:
