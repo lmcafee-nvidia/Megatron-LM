@@ -385,6 +385,71 @@ def _variant_llava_model(language_config, language_spec, position_embedding_type
     )
 
 
+def _build_fp8_model(recipe):
+    language_config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        kv_channels=64,
+        params_dtype=torch.bfloat16,
+        pipeline_dtype=torch.bfloat16,
+        tensor_model_parallel_size=parallel_state.get_tensor_model_parallel_world_size(),
+        use_cpu_initialization=True,
+        transformer_impl="transformer_engine",
+        fp8="hybrid",
+        fp8_recipe=recipe,
+        inference_rng_tracker=True,
+        inference_sampling_seed=123,
+    )
+    language_config.language_model_type = "dummy"
+    vision_config = TransformerConfig(
+        num_layers=1,
+        hidden_size=32,
+        num_attention_heads=4,
+        kv_channels=64,
+        params_dtype=torch.bfloat16,
+        pipeline_dtype=torch.bfloat16,
+        tensor_model_parallel_size=parallel_state.get_tensor_model_parallel_world_size(),
+        use_cpu_initialization=True,
+        transformer_impl="transformer_engine",
+        fp8="hybrid",
+        fp8_recipe=recipe,
+    )
+    vision_config.vision_model_type = "clip"
+    projection_config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        ffn_hidden_size=256,
+        params_dtype=torch.bfloat16,
+        pipeline_dtype=torch.bfloat16,
+        tensor_model_parallel_size=parallel_state.get_tensor_model_parallel_world_size(),
+        use_cpu_initialization=True,
+        transformer_impl="transformer_engine",
+        fp8="hybrid",
+        fp8_recipe=recipe,
+    )
+    te_spec = get_gpt_layer_with_transformer_engine_spec()
+    model = LLaVAModel(
+        language_transformer_config=language_config,
+        language_transformer_layer_spec=te_spec,
+        language_vocab_size=VOCAB_SIZE,
+        language_max_sequence_length=64,
+        vision_transformer_config=vision_config,
+        vision_transformer_layer_spec=copy.deepcopy(te_spec),
+        drop_vision_class_token=True,
+        vision_projection_config=projection_config,
+        vision_projection_layer_spec=copy.deepcopy(get_submodules(te_spec.submodules.mlp)),
+        img_h=8,
+        img_w=8,
+        patch_dim=4,
+        image_token_index=-200,
+    ).cuda()
+    model.bfloat16()
+    model.eval()
+    return model
+
+
 def _inference_config(model, **overrides):
     config_kwargs = dict(
         block_size_tokens=4,
@@ -1545,3 +1610,41 @@ def test_real_media_eos_and_explicit_stop_end_at_first_greedy_token(model_parall
     )
     assert torch.equal(baseline_steps[0]["logits"], eos_steps[0]["logits"])
     assert torch.equal(baseline_steps[0]["logits"], explicit_steps[0]["logits"])
+
+
+@pytest.mark.parametrize("recipe", ["tensorwise", "mxfp8"])
+def test_real_media_executes_fp8_context_and_reuses_exact_embedding(model_parallel, recipe):
+    if recipe == "mxfp8" and torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("MXFP8 requires Blackwell")
+    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+    model = _build_fp8_model(recipe)
+    engine, wrapper = _build_engine("image", model=model)
+    trace = _install_forward_trace(engine)
+    media = _media("image", offset=0.0)
+    quant_events = []
+    handle = model.vision_projection.encoder.linear_fc1.register_forward_pre_hook(
+        lambda _module, _args: quant_events.append(
+            (
+                FP8GlobalStateManager.is_fp8_enabled(),
+                model.vision_projection.config.fp8_recipe,
+                tuple(_args[0].shape),
+            )
+        )
+    )
+    try:
+        with _encoder_patch(wrapper) as encoder:
+            first, first_step, first_finished = _run_request(engine, 160, media, trace)
+            reuse, reuse_step, reuse_finished = _run_request(
+                engine, 161, {"media_cache_key": media["media_cache_key"]}, trace
+            )
+            engine.clear_vision_embedding_cache()
+            recomputed, recomputed_step, _ = _run_request(engine, 162, media, trace)
+    finally:
+        handle.remove()
+    assert encoder.call_count == len(quant_events) == 2
+    assert all(enabled and observed == recipe for enabled, observed, _ in quant_events)
+    assert {shape for _, _, shape in quant_events} == {((16 if recipe == "tensorwise" else 32), 32)}
+    _same(first, first_step, first_finished, reuse, reuse_step, reuse_finished)
+    assert torch.equal(first["embeddings"], recomputed["embeddings"])
+    assert torch.equal(first_step["logits"], recomputed_step["logits"])
