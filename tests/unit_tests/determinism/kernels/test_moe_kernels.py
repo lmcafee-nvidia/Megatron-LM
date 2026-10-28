@@ -1138,8 +1138,6 @@ class TestMoEModules:
         layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
         hidden = torch.randn(512, 1, 1024, device="cuda", dtype=torch.bfloat16)
         with torch.no_grad(), deterministic_algorithms(True):
-            _InInferenceMode(layer)(hidden)
-            layer.experts.refresh_cache()
             assert_module_replays_bit_exact(
                 _InInferenceMode(layer),
                 (hidden,),
