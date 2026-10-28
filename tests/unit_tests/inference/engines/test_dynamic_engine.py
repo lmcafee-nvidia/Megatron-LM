@@ -5766,10 +5766,11 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         [AsyncScheduleMode.LEGACY, AsyncScheduleMode.ASYNC],
         ids=["legacy", "async"],
     )
+    @pytest.mark.parametrize("num_speculative_tokens", [0, 1], ids=["base", "mtp"])
     @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     @torch.inference_mode()
     def test_offload_resume_with_cuda_graphs_keeps_live_requests(
-        self, model_provider, async_sched_mode
+        self, model_provider, async_sched_mode, num_speculative_tokens
     ):
         """OFFLOAD resume recaptures CUDA graphs without disturbing in-flight requests."""
         skip_if_mamba_sequence_packing_not_available(model_provider)
@@ -5788,6 +5789,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     static_kv_memory_pointers=False,
                     suspend_resume_interval=suspend_resume_interval,
                     async_sched_mode=async_sched_mode,
+                    num_speculative_tokens=num_speculative_tokens,
                 )
             )
             live_requests_at_suspend = []
