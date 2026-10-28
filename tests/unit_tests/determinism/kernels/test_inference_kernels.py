@@ -181,9 +181,8 @@ def test_batch_invariant_swiglu_matches_training():
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("fused", [False, True], ids=["unfused", "fused"])
-@pytest.mark.parametrize("scale", [None, 8.0], ids=["unclamped", "clamped"])
-def test_batch_invariant_squared_relu_matches_training(scale, fused):
+@pytest.mark.parametrize("clamp_scale", [None, 8.0], ids=["unclamped", "clamped"])
+def test_batch_invariant_squared_relu_matches_training(clamp_scale):
     """Exercise the FP32 intermediates the training squared-ReLU fusion rounds only once."""
     from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
     from megatron.core.inference.moe.batch_invariant import squared_relu_with_probs
@@ -196,11 +195,24 @@ def test_batch_invariant_squared_relu_matches_training(scale, fused):
     probs = torch.rand(rows, device="cuda")
     perm = torch.arange(rows, device="cuda", dtype=torch.int32)
     used = _dev_scalar(rows)
-    activation = x if scale is None else (scale * torch.tanh(x.float() / scale)).to(x.dtype)
-    expected = (torch.pow(torch.relu(activation), 2) * probs[:, None]).to(x.dtype)
-    if fused:
-        expected = weighted_squared_relu_impl(x.clone(), probs[:, None], scale)
-    actual = squared_relu_with_probs(x, perm, used, probs, scale, fused_weighted=fused)
+
+    expected = weighted_squared_relu_impl(x.clone(), probs[:, None], clamp_scale)
+    actual = squared_relu_with_probs(x.clone(), perm, used, probs, clamp_scale)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("clamp_scale", [None, 8.0], ids=["unclamped", "clamped"])
+def test_batch_invariant_unfused_squared_relu_matches_training(clamp_scale):
+    """use_fused_weighted_squared_relu=False rounds the activation to BF16 before the weight."""
+    from megatron.core.inference.moe.batch_invariant import squared_relu_with_probs
+
+    seeded()
+    x = torch.randn(512, 768, device="cuda", dtype=torch.bfloat16)
+    probs = torch.rand(512, device="cuda")
+    perm, used = torch.arange(512, device="cuda", dtype=torch.int32), _dev_scalar(512)
+    act = x if clamp_scale is None else clamp_scale * torch.tanh(x.float() / clamp_scale)
+    expected = (torch.relu(act.to(x.dtype)) ** 2 * probs[:, None]).to(x.dtype)
+    actual = squared_relu_with_probs(x, perm, used, probs, clamp_scale, fused_weighted=False)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
