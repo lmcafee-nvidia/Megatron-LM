@@ -19,6 +19,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.activations import squared_relu
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE, TEFusedMLP
 from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor
@@ -661,6 +662,7 @@ class TestTEWrappers:
             moe_router_topk=2,
             moe_grouped_gemm=True,
             add_bias_linear=False,
+            activation_func=squared_relu,
             fp8="hybrid",
             fp8_recipe=global_recipe,
             fp8_param=True,
