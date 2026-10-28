@@ -14,7 +14,8 @@ import pytest
 import torch
 
 from megatron.core.activations import squared_relu
-from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.fp4_utils import get_fp4_context
+from megatron.core.fp8_utils import get_fp8_context as _get_fp8_context
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.resharding import refresh_module_caches
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -51,6 +52,13 @@ CASES = {
     "fp4-compute": dict(fp4="e2m1", fp4_recipe="nvfp4"),
     "fp4-param": dict(fp4="e2m1", fp4_recipe="nvfp4", fp4_param=True),
 }
+
+
+def get_fp8_context(config, layer_no, is_init=False):
+    """The quantization context a transformer block would use for this config."""
+    if config.fp4:
+        return get_fp4_context(config, layer_no, is_init=is_init)
+    return _get_fp8_context(config, layer_no, is_init=is_init)
 
 
 def _layer(**overrides):
