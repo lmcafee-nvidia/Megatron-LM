@@ -1444,7 +1444,9 @@ class DynamicInferenceEngineTestBase:
                 activation_func=(
                     squared_relu
                     if test_config.transformer_impl == "inference_optimized"
-                    and test_config.use_moe_layer_spec
+                    and (
+                        test_config.use_moe_layer_spec or test_config.expert_model_parallel_size > 1
+                    )
                     and not is_gdn
                     else (F.silu if is_gdn else F.gelu)
                 ),
