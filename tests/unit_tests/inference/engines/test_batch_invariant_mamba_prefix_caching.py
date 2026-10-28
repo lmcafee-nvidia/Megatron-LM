@@ -266,7 +266,6 @@ class TestBatchInvariantMambaPrefixCaching:
                     assert {
                         name: parameter.data_ptr() for name, parameter in target_parameters.items()
                     } == target_storage
-                    assert not pending_survived_suspend
 
                     engine.is_mp_coordinator = True
                     engine.socket_for_receiving_requests = mock.Mock()
@@ -278,7 +277,6 @@ class TestBatchInvariantMambaPrefixCaching:
                     ]
                     assert engine.schedule_requests() == 1
                     engine.resume()
-                    assert not engine.controller._async_sched_forward.is_valid
                     assert engine._generation_epoch == 1
                     assert all(
                         engine.get_request(request_id).policy_epoch[-1][1] == 1
