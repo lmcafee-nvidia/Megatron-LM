@@ -121,11 +121,10 @@ class TestBatchInvariantMambaPrefixCaching:
             inference_rng_tracker=True,
             mtp_num_layers=1 if speculative else None,
             num_moe_experts=8 if lifecycle_callback else None,
-            moe_router_topk=2,
             moe_grouped_gemm=bool(lifecycle_callback),
-            moe_token_dispatcher_type="alltoall",
+            moe_token_dispatcher_type="alltoall" if lifecycle_callback else "allgather",
             moe_pad_experts_for_cuda_graph_inference=bool(lifecycle_callback),
-            inference_moe_token_dispatcher_type="nccl",
+            inference_moe_token_dispatcher_type="nccl" if lifecycle_callback else "nvls",
         )
 
         def build_model(seed):
