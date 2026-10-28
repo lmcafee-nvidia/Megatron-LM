@@ -934,7 +934,6 @@ class DynamicEngineTestConfig:
     cuda_graph_warmup_steps: int = 3
     fp8: bool = False
     fp8_recipe: str = "tensorwise"
-    fp8_output_proj: bool = False
     zero_model_parameters: bool = False
     hidden_size: Optional[int] = None
     model_provider: str = "gpt"
@@ -1305,7 +1304,6 @@ class DynamicInferenceEngineTestBase:
                 and not (test_config.transformer_impl == "inference_optimized"),
                 fp8="hybrid" if test_config.fp8 else None,
                 fp8_recipe=test_config.fp8_recipe if test_config.fp8 else None,
-                fp8_output_proj=test_config.fp8_output_proj,
                 fp8_param=test_config.fp8 and test_config.fp8_recipe == "mxfp8",
                 quant_recipe=quant_recipe,
                 inference_sampling_seed=test_config.random_seed,

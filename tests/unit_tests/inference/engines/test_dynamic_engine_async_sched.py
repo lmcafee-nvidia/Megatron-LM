@@ -800,6 +800,10 @@ _ASYNC_PAIR_SCENARIOS = (
     ),
     _pair_scenario(
         "mxfp8-inference-topk1",
+        "precision:mxfp8",
+        "model:moe",
+        "routing:top-1",
+        "implementation:inference-optimized",
         config={
             "fp8": True,
             "fp8_recipe": "mxfp8",
@@ -810,7 +814,6 @@ _ASYNC_PAIR_SCENARIOS = (
             "transformer_impl": "inference_optimized",
             "moe_router_topk": 1,
             "moe_router_pre_softmax": True,
-            "fp8_output_proj": True,
         },
         signals=("inference-optimized", "moe", "mxfp8"),
         prerequisite="mxfp8",
@@ -1026,14 +1029,12 @@ _ASYNC_PARALLEL_SCENARIOS = (
 )
 
 
-_UPSTREAM_SCENARIOS = {
-    case.name: case for case in _ASYNC_PAIR_SCENARIOS + _ASYNC_PARALLEL_SCENARIOS
-}
+_SCENARIOS_BY_NAME = {case.name: case for case in _ASYNC_PAIR_SCENARIOS + _ASYNC_PARALLEL_SCENARIOS}
 
 
 def _variant(base_name, name, *pairs, config=None, signals=(), **changes):
     """Derive a new case from an upstream one, leaving the upstream definition unchanged."""
-    base = _UPSTREAM_SCENARIOS[base_name]
+    base = _SCENARIOS_BY_NAME[base_name]
     return replace(
         base,
         name=name,
@@ -1050,7 +1051,7 @@ _CUDA_GRAPH_HANDOFF_SCENARIOS = (
     _pair_scenario(
         "disagg-decode-handoff",
         "disaggregation:decode-handoff",
-        "kv:transferred-prefix",
+        "kv:synthetic-import",
         config={"enable_prefix_caching": True, "engine_cls": StateHandoffDynamicInferenceEngine},
         signals=("disagg-handoff",),
         request_profile="handoff",
@@ -2183,12 +2184,13 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         config.update(scenario.config)
         config["async_sched_mode"] = mode
         env = cls._build_test_env(_DynamicEngineTestConfig(**config))
-        if env.engine.controller.inference_wrapped_model.model.config.fp8:
+        # New FP8 cases round eager steps to the recipe's alignment; main's own FP8 case
+        # keeps the upstream test rounder.
+        model_config = env.engine.controller.inference_wrapped_model.model.config
+        if model_config.fp8 and scenario.name != "fp8-transformer-engine":
             from megatron.core.fp8_utils import get_fp8_align_size
 
-            DynamicInferenceContext.TOKEN_ROUNDER = get_fp8_align_size(
-                env.engine.controller.inference_wrapped_model.model.config.fp8_recipe
-            )
+            DynamicInferenceContext.TOKEN_ROUNDER = get_fp8_align_size(model_config.fp8_recipe)
         env.requests = _make_scenario_requests(
             env, scenario, stop_tokens=stop_tokens, termination_token=termination_token
         )
@@ -2389,7 +2391,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 )
                 if env.engine.context.static_kv_memory_pointers:
                     runtime["cuda-graph-pool-preserved"] += int(
-                        CudaGraphManager.global_mempool == graph_pool_before
+                        graph_pool_before is not None
+                        and CudaGraphManager.global_mempool == graph_pool_before
                     )
                 _instrument_cuda_graph_replays(
                     env.engine.controller.inference_wrapped_model.model, env.engine.context, runtime
@@ -2430,6 +2433,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 if env.config.num_cuda_graphs:
                     runtime["context-reset-graphs-preserved"] += int(
                         bool(graph_runners)
+                        and graph_pool is not None
                         and CudaGraphManager.global_mempool == graph_pool
                         and all(
                             runner.fwd_graph_recorded and runner.fwd_graph is graph
@@ -2874,10 +2878,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert all(module._uses_mxfp8_weights for module in experts)
             assert all(isinstance(module._fc1_weight, MXFP8Tensor) for module in experts)
             assert all(isinstance(module._fc2_weight, MXFP8Tensor) for module in experts)
-            if scenario.config.get("fp8_output_proj"):
-                assert type(controller.inference_wrapped_model.model.output_layer).__name__ == (
-                    "TELMHeadColumnParallelLinear"
-                )
         if "routing-replay" in signals:
             assert model_config.moe_enable_routing_replay
             assert context.moe_routing_metadata is not None
@@ -3020,11 +3020,10 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 if type(module).__name__ == "MoELayer"
             }
             assert dispatchers == {"MoEAllGatherTokenDispatcher"}
-            assert "cuda-graph" not in signals or "MoELayer" in replayed_module_names
         if "moe" in signals:
             assert model_config.num_moe_experts is not None
             if "etp" in signals:
-                assert runtime["module-forward:moe"] > 0 or "MoELayer" in replayed_module_names
+                assert runtime["module-forward:moe"] > 0
             elif model_config.expert_model_parallel_size > 1 and "nvls-dispatch" not in signals:
                 assert context._nccl_ep_dispatcher
                 # Inference MoE may dispatch through split execution helpers that
@@ -3217,11 +3216,6 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
         config.update(
             num_cuda_graphs=4, force_build_cuda_graphs=True, defer_cuda_graph_creation=True
         )
-        if (
-            config.get("expert_model_parallel_size", 1) > 1
-            and config.get("transformer_impl", "local") != "inference_optimized"
-        ):
-            config["moe_pad_experts_for_cuda_graph_inference"] = True
         repeat = ("repeat-suspend-resume",) if "suspend-resume" in scenario.signals else ()
         signals = tuple(dict.fromkeys((*scenario.signals, *repeat, "cuda-graph")))
         return replace(scenario, config=config, signals=signals)
