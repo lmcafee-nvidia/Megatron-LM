@@ -1772,8 +1772,17 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     "num_prefill_requests",
                     "_using_cuda_graph_this_step",
                     "is_creating_cuda_graphs",
+                    "active_attn_metadata",
                 )
             },
+            # Serial MTP after resume reads the pending step's attention metadata.
+            "mha_state": [
+                (mha, mha.state_data, mha._max_seqlen_q, mha._max_seqlen_k)
+                for mha in (
+                    self.graph_attn_metadata["mha_metadata"],
+                    self.non_graph_attn_metadata["mha_metadata"],
+                )
+            ],
             "pending_mamba_ops": (
                 list(self._pending_mamba_zeros),
                 list(self._pending_mamba_restores),
@@ -1819,6 +1828,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self.kv_block_allocator.block_routing.update(allocator_state["routing"])
         for name, value in state["attrs"].items():
             setattr(self, name, value)
+        for mha, state_data, max_seqlen_q, max_seqlen_k in state["mha_state"]:
+            mha.state_data = state_data
+            mha._max_seqlen_q = max_seqlen_q
+            mha._max_seqlen_k = max_seqlen_k
         if "mamba_free_slots" in state:
             assert self.mamba_metadata is not None
             self.mamba_metadata.request_to_mamba_state_idx.copy_(state["mamba_request_slots"])
