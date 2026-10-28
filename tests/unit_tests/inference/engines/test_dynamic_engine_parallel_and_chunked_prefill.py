@@ -197,7 +197,7 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
     def test_suspend_drains_mtp_forward_with_an_idle_ep_rank(self):
         """An idle EP rank joins the MTP draft collectives of a peer draining at suspend.
 
-        A missing collective does not raise; the expert all-to-all blocks, so this test
+        A missing collective does not raise; the expert dispatch blocks, so this test
         asserts by completing.
         """
         skip_if_mamba_sequence_packing_not_available("hybrid")
@@ -213,6 +213,8 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
                 model_provider="hybrid",
                 expert_model_parallel_size=2,
                 num_speculative_tokens=1,
+                # An MoE draft head gives every MTP draft forward an expert dispatch.
+                mtp_layer_pattern="E",
                 top_k=1,
                 context_max_requests=8,
                 async_sched_mode=AsyncScheduleMode.ASYNC,
