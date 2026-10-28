@@ -104,10 +104,6 @@ def test_flashinfer_nvfp4_token_capacity_rejects_invalid_configuration(overrides
             {**_ACTIVATIONS["swiglu"], "activation_func_clamp_value": 7.0},
             "supports only plain SwiGLU",
         ),
-        (
-            {**_ACTIVATIONS["swiglu"], "activation_func_tanh_clamp_scale_linear": 2.0},
-            "supports only plain SwiGLU",
-        ),
         ({**_ACTIVATIONS["swiglu"], "glu_linear_offset": 1.0}, "supports only plain SwiGLU"),
         (
             {**_ACTIVATIONS["swiglu"], "moe_mlp_glu_interleave_size": 64},
@@ -116,6 +112,10 @@ def test_flashinfer_nvfp4_token_capacity_rejects_invalid_configuration(overrides
         ({"fp8": "hybrid", "fp8_recipe": "mxfp8", "fp8_param": True}, "cannot be combined"),
         ({"transformer_impl": "transformer_engine"}, "requires transformer_impl"),
         ({"activation_func_tanh_clamp_scale": 10.0}, "does not support activation_func_tanh"),
+        (
+            {**_ACTIVATIONS["swiglu"], "activation_func_tanh_clamp_scale_linear": 2.0},
+            "supports only plain SwiGLU",
+        ),
     ],
 )
 def test_flashinfer_nvfp4_config_rejects_invalid_configuration(overrides, match):
@@ -235,6 +235,20 @@ def test_refit_accepts_built_nvfp4_expert_weights(monkeypatch, built):
 
     refit.reshard_model_weights(None, target, service)
     assert executed == ["plan"]
+
+
+def test_refresh_module_caches_rebuilds_routed_expert_weights(monkeypatch):
+    """The generic post-refit hook must rebuild both FlashInfer copies of the expert weights."""
+    from megatron.core.resharding import refresh_module_caches
+    from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+    refreshed = []
+    for name in ("refresh_flashinfer_mxfp8_weights", "refresh_flashinfer_nvfp4_weights"):
+        monkeypatch.setattr(InferenceGroupedMLP, name, lambda _, name=name: refreshed.append(name))
+    experts = InferenceGroupedMLP.__new__(InferenceGroupedMLP)
+    torch.nn.Module.__init__(experts)
+    refresh_module_caches(torch.nn.Sequential(experts))
+    assert refreshed == ["refresh_flashinfer_mxfp8_weights", "refresh_flashinfer_nvfp4_weights"]
 
 
 def test_gated_fc1_is_padded_per_half_and_interleaved_up_gate():
@@ -802,9 +816,7 @@ class TestNVFP4MoELayer:
                 stale, _ = layer(hidden_states.clone())
             torch.testing.assert_close(stale, before, atol=0, rtol=0)
 
-            from megatron.core.resharding.execution import refresh_module_caches
-
-            refresh_module_caches(layer)
+            assert layer.experts.refresh_flashinfer_nvfp4_weights() is True
             with InferenceMode.active():
                 refreshed, _ = layer(hidden_states.clone())
 
@@ -851,9 +863,7 @@ class TestNVFP4MoELayer:
             before_refresh = graph_output.clone()
 
             layer.experts._fc1_weight.mul_(-1)
-            from megatron.core.resharding.execution import refresh_module_caches
-
-            refresh_module_caches(layer)
+            assert layer.experts.refresh_flashinfer_nvfp4_weights() is True
             graph.replay()
             torch.testing.assert_close(graph_output, _eager(static_hidden), atol=0, rtol=0)
 

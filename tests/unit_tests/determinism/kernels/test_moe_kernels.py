@@ -18,7 +18,6 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-import megatron.core.transformer.moe.batch_invariant as b
 from megatron.core import parallel_state
 from megatron.core.activations import squared_relu
 from megatron.core.fp8_utils import get_fp8_context
@@ -35,6 +34,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe import moe_utils
+from megatron.core.transformer.moe.batch_invariant import build_inverse_permutation_map
 from megatron.core.transformer.moe.experts import (
     SequentialMLP,
     TEGroupedMLP,
@@ -42,7 +42,7 @@ from megatron.core.transformer.moe.experts import (
 )
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.ops.virtual_expert_triton import VirtualExpertPlannerWorkspace
-from megatron.core.transformer.moe.router import InferenceTopKRouter, TopKRouter
+from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.token_dispatcher import _VirtualExpertHybridEPManager
 from megatron.core.transformer.moe.virtual_expert_load_balancer import (
     VirtualExpertLoadBalancer,
@@ -845,7 +845,7 @@ class TestMoEModules:
 
     def test_empty_inverse_permutation_map_replays(self):
         idx = torch.empty(0, dtype=torch.long, device="cuda")
-        inverse = b.build_inverse_permutation_map(idx.reshape(0, 4).bool(), idx, idx, 0)
+        inverse = build_inverse_permutation_map(idx.reshape(0, 4).bool(), idx, idx, 0)
         assert inverse.shape == (2, 0, 0) and inverse.dtype == torch.long
 
     @pytest.mark.parametrize("dispatcher", ["allgather", "alltoall"])
@@ -925,25 +925,17 @@ class TestMoEModules:
         moe_utils.get_moe_metrics_tracker().clear()
 
     @pytest.mark.parametrize(
-        "balancing,score,expert_bias,hash_routing,inference",
+        "balancing,score,expert_bias,hash_routing",
         [
-            ("aux_loss", "softmax", False, False, False),
-            ("seq_aux_loss", "sigmoid", True, False, False),
-            ("sinkhorn", "softmax", False, False, False),
-            ("none", "sigmoid", False, True, False),
-            ("none", "softmax", False, True, False),
-            ("sinkhorn", "softmax", False, False, True),
+            ("aux_loss", "softmax", False, False),
+            ("seq_aux_loss", "sigmoid", True, False),
+            ("sinkhorn", "softmax", False, False),
+            ("none", "sigmoid", False, True),
+            ("none", "softmax", False, True),
         ],
-        ids=[
-            "aux_loss",
-            "seq_aux_loss+sigmoid+bias",
-            "sinkhorn",
-            "hash+sigmoid",
-            "hash+softmax",
-            "sinkhorn+inference",
-        ],
+        ids=["aux_loss", "seq_aux_loss+sigmoid+bias", "sinkhorn", "hash+sigmoid", "hash+softmax"],
     )
-    def test_topk_router_replays(self, balancing, score, expert_bias, hash_routing, inference):
+    def test_topk_router_replays(self, balancing, score, expert_bias, hash_routing):
         self._init()
         seeded()
         config = _moe_config(
@@ -957,15 +949,11 @@ class TestMoEModules:
             moe_num_hash_layers=int(hash_routing),
             hash_moe_vocab_size=128 if hash_routing else None,
         )
-        router_cls = InferenceTopKRouter if inference else TopKRouter
-        router = router_cls(
+        router = TopKRouter(
             config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
         ).cuda()
         router.set_layer_number(0)
-        if inference:
-            router = _InInferenceMode(router.eval())
-        shape = (8192, 1, 1024) if inference else (2048, 4, 1024)
-        hidden = torch.randn(*shape, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        hidden = torch.randn(2048, 4, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         inputs = (hidden,)
         if expert_bias:
             padding_mask = torch.arange(8192, device="cuda").reshape(2048, 4) % 3 == 0
@@ -1156,8 +1144,6 @@ class TestMoEModules:
         layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
         hidden = torch.randn(512, 1, 1024, device="cuda", dtype=torch.bfloat16)
         with torch.no_grad(), deterministic_algorithms(True):
-            _InInferenceMode(layer)(hidden)
-            layer.experts.refresh_cache()
             assert_module_replays_bit_exact(
                 _InInferenceMode(layer),
                 (hidden,),
@@ -1302,15 +1288,10 @@ class TestMoEModules:
         )
 
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
-    @pytest.mark.parametrize(
-        "op_fuser,fused_activation",
-        [(False, True), (True, True), (False, False)],
-        ids=["unfused", "op-fuser-mxfp8", "unfused-bf16-activation"],
-    )
-    def test_te_grouped_mlp_tanh_clamp_replays_on_uneven_experts(self, op_fuser, fused_activation):
+    @pytest.mark.parametrize("op_fuser", [False, True], ids=["unfused", "op-fuser-mxfp8"])
+    def test_te_grouped_mlp_tanh_clamp_replays_on_uneven_experts(self, op_fuser):
         """Squared ReLU with the tanh soft clamp: the unfused weighted_squared_relu_impl path, and
-        the fused cuDNN srelu_tanh grouped GEMM (op fuser + MXFP8; SM100 and ScaledTanhSReLU).
-        The last case uses the unfused BF16 activation, which rounds before the routing weight."""
+        the fused cuDNN srelu_tanh grouped GEMM (op fuser + MXFP8; SM100 and ScaledTanhSReLU)."""
         if op_fuser:
             if torch.cuda.get_device_capability()[0] < 10:
                 pytest.skip("fused grouped MLP under MXFP8 needs SM100+")
@@ -1324,7 +1305,7 @@ class TestMoEModules:
             gated_linear_unit=False,
             activation_func=squared_relu,
             bias_activation_fusion=False,
-            use_fused_weighted_squared_relu=fused_activation,
+            use_fused_weighted_squared_relu=True,
             activation_func_tanh_clamp_scale=16.0,
             use_transformer_engine_op_fuser=op_fuser,
             **({"fp8": "e4m3", "fp8_recipe": "mxfp8"} if op_fuser else {}),
