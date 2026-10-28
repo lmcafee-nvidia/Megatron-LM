@@ -62,6 +62,114 @@ from tests.unit_tests.inference.engines.test_dynamic_engine import reset_rounder
 from tests.unit_tests.test_utilities import Utils
 
 
+def _diag_flashinfer_rows(name, kernel_args, sampled, valid, metadata, active_count):
+    """DIAGNOSTIC ONLY: record FlashInfer support details for the sweep investigation."""
+    import json as _json
+
+    out_dir = os.environ.get("CAMPAIGN_TEST_OUTPUT")
+    if not out_dir or name == "sampling_from_logits":
+        return
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    values = kernel_args[0].float()
+    n, vocab = values.shape
+    joint = name == "top_k_top_p_sampling_from_logits"
+    probs_full = torch.softmax(values, dim=-1) if joint else values
+    has_k = name in {"top_k_sampling_from_probs", "top_k_top_p_sampling_from_logits"}
+    has_p = name in {"top_p_sampling_from_probs", "top_k_top_p_sampling_from_logits"}
+    top_k = kernel_args[1].long().clamp(min=1, max=vocab) if has_k else None
+    top_p = kernel_args[2 if joint else 1].float() if has_p else None
+    rows = torch.arange(n, device=values.device)
+
+    def support(sample):
+        ok = torch.ones(n, dtype=torch.bool, device=values.device)
+        probs = probs_full
+        if has_k:
+            kth = values.sort(dim=-1, descending=True).values.gather(1, (top_k - 1).unsqueeze(1))
+            keep_k = values >= kth
+            ok &= keep_k[rows, sample]
+            if joint:
+                probs = torch.softmax(values.masked_fill(~keep_k, float("-inf")), dim=-1)
+            else:
+                probs = probs_full * keep_k
+                probs = probs / probs.sum(dim=-1, keepdim=True)
+        mass_above = None
+        if has_p:
+            p_s = probs[rows, sample].unsqueeze(1)
+            mass_above = (probs * (probs > p_s)).sum(dim=-1)
+            ok &= mass_above < top_p
+        return ok, probs, mass_above
+
+    new_ok, probs_k, mass_above = support(sampled.long())
+    gen = torch.Generator(device=values.device)
+    gen.manual_seed(1234 + rank)
+    controls = {}
+    alt_full = torch.multinomial(probs_full, 1, generator=gen).squeeze(1)
+    controls["unfiltered"] = int((~support(alt_full)[0]).sum())
+    if has_k and has_p:
+        alt_k = torch.multinomial(probs_k, 1, generator=gen).squeeze(1)
+        controls["top-k-only"] = int((~support(alt_k)[0]).sum())
+        p_mass_above = torch.stack(
+            [(probs_full[r] * (probs_full[r] > probs_full[r].unsqueeze(1))).sum(dim=-1) for r in range(n)]
+        )
+        nucleus = probs_full * (p_mass_above < top_p.unsqueeze(1))
+        alt_p = torch.multinomial(nucleus / nucleus.sum(dim=-1, keepdim=True), 1, generator=gen).squeeze(1)
+        controls["top-p-only"] = int((~support(alt_p)[0]).sum())
+    record = {
+        "rank": rank,
+        "kernel": name,
+        "n": n,
+        "vocab": vocab,
+        "active_count": int(active_count),
+        "old_valid": int(valid.sum()),
+        "new_valid": int(new_ok.sum()),
+        "controls_rejected": controls,
+        "kernel_top_k_unique": sorted(set(top_k.tolist())) if has_k else None,
+        "kernel_top_p_unique": sorted(set(round(x, 7) for x in top_p.tolist())) if has_p else None,
+        "metadata_top_k": sorted(set(metadata["top_k"][:n].tolist())) if "top_k" in metadata else None,
+        "metadata_top_p": sorted(set(round(float(x), 7) for x in metadata["top_p"][:n].tolist()))
+        if "top_p" in metadata
+        else None,
+        "metadata_temperature": sorted(
+            set(round(float(x), 7) for x in metadata["temperature"][:n].tolist())
+        )
+        if "temperature" in metadata
+        else None,
+        "rows": [],
+    }
+    if has_p:
+        margin = (top_p - mass_above)
+        record["min_top_p_margin_accepted"] = float(margin[new_ok].min()) if bool(new_ok.any()) else None
+    for r in torch.nonzero(~valid | ~new_ok).flatten().tolist():
+        s = int(sampled[r])
+        row_vals = values[r]
+        sorted_vals, sorted_ids = row_vals.sort(descending=True)
+        pos = int((sorted_ids == s).nonzero()[0])
+        entry = {
+            "row": r,
+            "token": s,
+            "sort_position": pos,
+            "logit": float(row_vals[s]),
+            "strictly_greater": int((row_vals > row_vals[s]).sum()),
+            "ties": int((row_vals == row_vals[s]).sum()),
+            "old_valid": bool(valid[r]),
+            "new_valid": bool(new_ok[r]),
+        }
+        if has_k:
+            k = int(top_k[r])
+            entry.update(top_k=k, kth_logit=float(sorted_vals[k - 1]),
+                         kth_prob=float(probs_full[r].sort(descending=True).values[k - 1]),
+                         ties_with_kth=int((row_vals == sorted_vals[k - 1]).sum()),
+                         kept_by_value=int((row_vals >= sorted_vals[k - 1]).sum()))
+        entry["p_sampled_full"] = float(probs_full[r, s])
+        if has_p:
+            entry.update(top_p=float(top_p[r]), p_sampled_k=float(probs_k[r, s]),
+                         mass_strictly_above=float(mass_above[r]),
+                         mass_inclusive=float(mass_above[r] + probs_k[r, s]))
+        record["rows"].append(entry)
+    with open(os.path.join(out_dir, f"flashinfer-diag-rank{rank}.jsonl"), "a") as stream:
+        stream.write(_json.dumps(record) + "\n")
+
+
 def _make_engine(
     async_sched_mode=AsyncScheduleMode.ASYNC, engine_cls=DynamicInferenceEngine, **overrides
 ):
@@ -1895,6 +2003,9 @@ def _instrument_scenario_runtime(env, scenario, runtime, teacher_tokens=None):
                                 nucleus_probabilities.cumsum(dim=-1) - nucleus_probabilities
                             ) < top_p.unsqueeze(1)
                         valid = ((sorted_ids == sampled.unsqueeze(1)) & keep).any(dim=-1)
+                    _diag_flashinfer_rows(
+                        name, kernel_args, sampled, valid, metadata, active_count
+                    )
                     runtime["flashinfer-support-rows"] += sampled.numel()
                     runtime["flashinfer-valid-support-rows"] += int(valid.sum().item())
                     return sampled
