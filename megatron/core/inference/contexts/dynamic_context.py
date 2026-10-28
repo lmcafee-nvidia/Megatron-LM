@@ -1743,8 +1743,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     "request_last_kv_block_id",
                     "request_last_kv_block_offset",
                     "request_to_kv_block_ids",
-                    # MTP verification of a pending forward reads the logit rows it selected.
-                    "active_logit_idxs",
                 )
             },
             "request_metadata": {
