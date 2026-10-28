@@ -2311,6 +2311,19 @@ class TestInlineCaptureManager:
         assert runner.mempool == CudaGraphManager.global_mempool is not None
         assert runner.mempool != old_mempool
 
+    def test_pool_recreation_orders_side_stream_after_queued_work(self):
+        """Work issued after the shared pool is recreated must not overtake queued work."""
+        CudaGraphManager.global_mempool = None
+        x = torch.zeros(1 << 20, device="cuda")
+        torch.cuda._sleep(int(2e9))  # Keep the current stream busy.
+        x.fill_(1.0)  # Queued behind the sleep.
+        try:
+            CudaGraphManager._ensure_global_mempool()  # Switches to a side stream.
+            assert torch.all(x.clone() == 1.0)
+        finally:
+            torch.cuda.synchronize()
+            torch.cuda.set_stream(torch.cuda.default_stream())
+
     @torch.inference_mode()
     def test_eager_bypass(self):
         """eager=True must bypass graph capture entirely."""
