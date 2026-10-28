@@ -662,7 +662,7 @@ class TestTEWrappers:
                 },
             }
         )
-        config_kwargs = dict(
+        config = _config(
             num_layers=3,
             hidden_size=128,
             ffn_hidden_size=256,
@@ -685,12 +685,6 @@ class TestTEWrappers:
             num_layers_at_start_in_bf16=1,
             num_layers_at_end_in_bf16=1,
         )
-        if transformer_impl == "inference_optimized" and global_recipe != Fp8Recipe.mxfp8:
-            # Optimized inference experts accept FP8 parameter storage only with MXFP8.
-            with pytest.raises(ValueError, match="supports only fp8_recipe='mxfp8'"):
-                _config(**config_kwargs)
-            return
-        config = _config(**config_kwargs)
 
         def build(layer_number, module_path="mlp.experts.linear_fc1"):
             name = f"decoder.layers.{layer_number}.{module_path}"

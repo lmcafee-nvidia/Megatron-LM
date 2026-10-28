@@ -2191,9 +2191,11 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     ):
                         token_text = controller.tokenizer.detokenize([token])
                         assert 0 < len(top_n) <= request.sampling_params.top_n_logprobs
-                        if token_text in top_n:
+                        if request.sampling_params.top_k == 1 or token_text in top_n:
+                            assert token_text in top_n
                             assert top_n[token_text] == pytest.approx(logprob, rel=0, abs=0.1)
                         else:
+                            # A stochastic sample may fall outside the top N.
                             assert logprob <= min(top_n.values())
                     if request.sampling_params.skip_prompt_log_probs:
                         assert not request.prompt_top_n_logprobs

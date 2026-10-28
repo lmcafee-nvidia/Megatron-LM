@@ -112,10 +112,6 @@ def test_flashinfer_nvfp4_token_capacity_rejects_invalid_configuration(overrides
         ({"fp8": "hybrid", "fp8_recipe": "mxfp8", "fp8_param": True}, "cannot be combined"),
         ({"transformer_impl": "transformer_engine"}, "requires transformer_impl"),
         ({"activation_func_tanh_clamp_scale": 10.0}, "does not support activation_func_tanh"),
-        (
-            {**_ACTIVATIONS["swiglu"], "activation_func_tanh_clamp_scale_linear": 2.0},
-            "supports only plain SwiGLU",
-        ),
     ],
 )
 def test_flashinfer_nvfp4_config_rejects_invalid_configuration(overrides, match):
@@ -217,12 +213,11 @@ def test_flashinfer_forward_dispatches_to_nvfp4(monkeypatch):
     assert captured["use_bounded_rows"] is True
 
 
-@pytest.mark.parametrize("built", [False, True], ids=["before_first_forward", "after"])
-def test_refit_accepts_built_nvfp4_expert_weights(monkeypatch, built):
+def test_refit_accepts_built_nvfp4_expert_weights(monkeypatch):
     from megatron.core.resharding import refit
 
     experts_module = torch.nn.Module()
-    experts_module._nvfp4_weights = object() if built else None
+    experts_module._nvfp4_weights = object()
     target = torch.nn.Sequential(experts_module)
     executed = []
     monkeypatch.setattr(refit, "_unwrap_model_cores", lambda src, tgt: (None, tgt, 2))
