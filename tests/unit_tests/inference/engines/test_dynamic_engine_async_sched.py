@@ -854,6 +854,48 @@ _ASYNC_PARALLEL_SCENARIOS = (
         "moe-ep2-nccl", "interaction:moe-ep-ordering", config={"expert_model_parallel_size": 2}
     ),
     _nccl_moe_scenario(
+        "moe-ep2-nccl-routing-replay",
+        "interaction:moe-ep-ordering",
+        "interaction:moe-routing-replay",
+        config={
+            "expert_model_parallel_size": 2,
+            "moe_enable_routing_replay": True,
+            "return_log_probs": True,
+            "materialize_only_last_token_logits": False,
+        },
+        sampling=(
+            {
+                "temperature": 0.8,
+                "top_k": 8,
+                "top_p": 0.0,
+                "seed": 111,
+                "return_log_probs": True,
+                "top_n_logprobs": 4,
+            },
+            {
+                "temperature": 1.1,
+                "top_k": 0,
+                "top_p": 0.85,
+                "seed": 222,
+                "return_log_probs": True,
+                "top_n_logprobs": 4,
+            },
+        ),
+        signals=(
+            "full-logits",
+            "logprobs",
+            "metadata-compaction",
+            "sampled",
+            "request-seed",
+            "routing-reconstruction",
+            "temperature-filter",
+            "top-k-filter",
+            "top-n",
+            "top-p-filter",
+        ),
+        parity="reproducible",
+    ),
+    _nccl_moe_scenario(
         "moe-ep2-nvfp4-nccl",
         "precision:nvfp4",
         config={
@@ -1349,6 +1391,9 @@ def _instrument_scenario_runtime(env, scenario, runtime):
         runtime[("sampling-step", runtime["model-forward"])] += 1
         runtime[f"sampling-backend:{controller._sampling_backend}"] += 1
         runtime["metadata-consumed"] += int(active_count > 0)
+        runtime["request-seeded-samples"] += int(
+            active_count > 0 and bool((metadata["seed"][:active_count] >= 0).any())
+        )
         sampling_class = type(controller._sampling).__name__
 
         if sampling_class == "TorchSampling":
@@ -1694,6 +1739,9 @@ def _snapshot_requests(requests):
                 "generated_logprobs": _as_float_list(request.generated_log_probs),
                 "prompt_top_n": request.prompt_top_n_logprobs,
                 "generated_top_n": request.generated_top_n_logprobs,
+                "routing": (
+                    None if request.routing_indices is None else request.routing_indices.tolist()
+                ),
                 "events": [event.type for event in request.events],
             }
         )
@@ -1748,6 +1796,20 @@ def _assert_request_parity(
         _assert_top_n_parity(
             request.generated_top_n_logprobs, reference["generated_top_n"], atol, exact_top_n
         )
+        actual_routing = (
+            None if request.routing_indices is None else request.routing_indices.tolist()
+        )
+        expected_routing = reference["routing"]
+        if actual_routing is not None and expected_routing is not None and not exact_numerics:
+            # Compare routes only while both stochastic modes have the same input history.
+            shared_rows = len(actual_routing) - len(request.generated_tokens) + 1
+            for actual_token, expected_token in zip(request.generated_tokens, reference["tokens"]):
+                if actual_token != expected_token:
+                    break
+                shared_rows += 1
+            actual_routing = actual_routing[:shared_rows]
+            expected_routing = expected_routing[:shared_rows]
+        assert actual_routing == expected_routing
         if compare_events:
             assert [event.type for event in request.events] == reference["events"]
 
@@ -2041,8 +2103,12 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     ):
                         token_text = controller.tokenizer.detokenize([token])
                         assert 0 < len(top_n) <= request.sampling_params.top_n_logprobs
-                        assert token_text in top_n
-                        assert top_n[token_text] == pytest.approx(logprob, rel=0, abs=0.1)
+                        if request.sampling_params.top_k == 1 or token_text in top_n:
+                            assert token_text in top_n
+                            assert top_n[token_text] == pytest.approx(logprob, rel=0, abs=0.1)
+                        else:
+                            # A stochastic sample may fall outside the top N.
+                            assert logprob <= min(top_n.values())
                     if request.sampling_params.skip_prompt_log_probs:
                         assert not request.prompt_top_n_logprobs
                     else:
@@ -2138,6 +2204,21 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["softmax-offset-calls"] > 0
             assert runtime["softmax-offset-produced"] == runtime["softmax-offset-calls"]
             assert runtime["sink-correction-calls"] > 0
+        if "request-seed" in signals:
+            assert {request.sampling_params.seed for request in env.requests} == {111, 222}
+            assert runtime["request-seeded-samples"] > 0
+        if "routing-reconstruction" in signals:
+            assert model_config.moe_enable_routing_replay
+            for request in env.requests:
+                routing = request.routing_indices
+                assert routing is not None
+                assert routing.shape == (
+                    len(request.prompt_tokens) + len(request.generated_tokens) - 1,
+                    model_config.num_layers,
+                    model_config.moe_router_topk,
+                )
+                assert (routing >= 0).all()
+                assert (routing < model_config.num_moe_experts).all()
         if "shared-seed" in signals:
             assert not context.config.offset_sampling_seed_by_dp_rank
             assert controller.sampling_rng.initial_seed() == model_config.inference_sampling_seed
