@@ -136,7 +136,7 @@ def test_bf16_config_ignores_inactive_mxfp8_recipe_gates():
     "activation_func", [F.gelu, F.relu, F.silu, squared_relu], ids=["gelu", "relu", "silu", "relu2"]
 )
 @torch.inference_mode()
-def test_flashinfer_bf16_gelu_layer_matches_training_reference(activation_func):
+def test_flashinfer_bf16_activation_layer_matches_training_reference(activation_func):
     pytest.importorskip("flashinfer")
     from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
     from megatron.core.transformer.moe.token_dispatcher_inference import (
