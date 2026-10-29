@@ -4560,9 +4560,17 @@ class DynamicInferenceEngine(AbstractEngine):
         # We're inside a running loop - run in a separate thread. Keep this
         # outside the exception handler so a RuntimeError raised by the
         # coroutine is propagated instead of being mistaken for a missing loop.
+        # A new thread starts on CUDA device 0, so select this thread's device
+        # before the step launches kernels.
+        device = torch.cuda.current_device() if torch.cuda.is_available() else None
+
+        def run():
+            if device is not None:
+                torch.cuda.set_device(device)
+            return asyncio.run(coro)
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(asyncio.run, coro)
-            return future.result()
+            return executor.submit(run).result()
 
     def step_modern(self) -> DynamicInferenceEngineStepResult:
         """Synchronous wrapper for `self.async_step`."""
