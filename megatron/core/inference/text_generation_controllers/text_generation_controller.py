@@ -3116,7 +3116,11 @@ class TextGenerationController(MTPControllerMixin):
         )
 
     async def _run_async_sched_step_no_overlap(
-        self, *, schedule_waiting_requests: Optional[Callable[[], None]], finalize_requests=None
+        self,
+        *,
+        schedule_waiting_requests: Optional[Callable[[], None]],
+        finalize_requests=None,
+        launch_forward: bool = True,
     ) -> DynamicBatchControllerStepResult:
         """Run ``sample/MTP -> update -> admit -> forward``.
 
@@ -3127,6 +3131,8 @@ class TextGenerationController(MTPControllerMixin):
             schedule_waiting_requests (Optional[Callable[[], None]]): Engine callback
                 that admits eligible non-chunked prefill requests.
             finalize_requests: Engine callback assembling finished results before release.
+            launch_forward (bool): Whether to admit and launch the next forward. A drain
+                passes False to finish the pending forward and leave nothing pending.
 
         Returns:
             DynamicBatchControllerStepResult: Primer-only state or sampled output.
@@ -3170,29 +3176,35 @@ class TextGenerationController(MTPControllerMixin):
                     log_probs_transfer=log_probs_transfer,
                 )
 
-            # -------------------------------------------------------------------------
-            # Admit
-            # -------------------------------------------------------------------------
-            # This is the only async-scheduling admission mutation point.
-            if schedule_waiting_requests is not None:
-                schedule_waiting_requests()
+            # A drain before pause or suspend stops here, with nothing left pending.
+            if launch_forward:
+                # ---------------------------------------------------------------------
+                # Admit
+                # ---------------------------------------------------------------------
+                # This is the only async-scheduling admission mutation point.
+                if schedule_waiting_requests is not None:
+                    schedule_waiting_requests()
 
-            # -------------------------------------------------------------------------
-            # Forward
-            # -------------------------------------------------------------------------
-            active_request_count = context.total_request_count - context.paused_request_count
-            if active_request_count > 0:
-                if had_pending_forward:
-                    input_ids, position_ids, _ = self._dynamic_step_context_init()
-                    launched_decode_only = context.is_decode_only()
-                    self._run_async_sched_forward(input_ids, position_ids)
-                else:
-                    primer_launched, bookkeeping_done_event = self._run_async_sched_forward_primer()
-                    assert primer_launched, "Initial no-overlap step must launch a forward primer."
-                    launched_decode_only = context.is_decode_only()
-                    self._synchronize_async_sched_event(bookkeeping_done_event)
-            elif had_pending_forward and self.model_config.expert_model_parallel_size > 1:
-                self._run_dummy_async_sched_base_step()
+                # ---------------------------------------------------------------------
+                # Forward
+                # ---------------------------------------------------------------------
+                active_request_count = context.total_request_count - context.paused_request_count
+                if active_request_count > 0:
+                    if had_pending_forward:
+                        input_ids, position_ids, _ = self._dynamic_step_context_init()
+                        launched_decode_only = context.is_decode_only()
+                        self._run_async_sched_forward(input_ids, position_ids)
+                    else:
+                        primer_launched, bookkeeping_done_event = (
+                            self._run_async_sched_forward_primer()
+                        )
+                        assert (
+                            primer_launched
+                        ), "Initial no-overlap step must launch a forward primer."
+                        launched_decode_only = context.is_decode_only()
+                        self._synchronize_async_sched_event(bookkeeping_done_event)
+                elif had_pending_forward and self.model_config.expert_model_parallel_size > 1:
+                    self._run_dummy_async_sched_base_step()
 
         decode_only = DecodeOnly(consumed=consumed_decode_only, launched=launched_decode_only)
         if not had_pending_forward:
@@ -3583,6 +3595,7 @@ class TextGenerationController(MTPControllerMixin):
         run_async_overlap: bool = True,
         schedule_waiting_requests: Optional[Callable[[], None]] = None,
         finalize_requests: Optional[Callable[..., None]] = None,
+        finish_pending_only: bool = False,
     ) -> DynamicBatchControllerStepResult:
         """Forward step the model and update the inference context.
 
@@ -3593,6 +3606,8 @@ class TextGenerationController(MTPControllerMixin):
             schedule_waiting_requests (Optional[Callable[[], None]]): Engine callback
                 used by the no-overlap path to admit eligible prefill requests.
             finalize_requests: Engine callback assembling finished results before release.
+            finish_pending_only (bool): Sample and update the pending async forward
+                without admitting or launching another one.
 
         Returns:
             DynamicBatchControllerStepResult: One controller-step result.
@@ -3609,6 +3624,13 @@ class TextGenerationController(MTPControllerMixin):
 
         assert not skip_bookkeeping, "Async scheduling requires request bookkeeping."
         self._validate_async_sched_support_for_step(run_async_overlap)
+        if finish_pending_only:
+            assert self._async_sched_forward.is_valid, "Only a pending forward can be finished."
+            return await self._run_async_sched_step_no_overlap(
+                schedule_waiting_requests=None,
+                finalize_requests=finalize_requests,
+                launch_forward=False,
+            )
 
         active_request_count = context.total_request_count - context.paused_request_count
         if context.active_token_count == 0 and active_request_count == 0:

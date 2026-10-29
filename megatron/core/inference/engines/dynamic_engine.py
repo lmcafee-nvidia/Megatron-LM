@@ -510,6 +510,10 @@ class DynamicInferenceEngine(AbstractEngine):
     # Immutable so instances never share one task set; __init__ installs a mutable one.
     _staging_tasks: Set[asyncio.Task] = frozenset()
     _staging_tasks_peak: int = 0
+    # Under async scheduling, pause and suspend finish the pending forward.
+    _drains_async_forward: bool = False
+    # Immutable like _staging_tasks; reset() installs the list a drain at suspend fills.
+    _drained_finished_requests: Tuple[DynamicInferenceRequest, ...] = ()
 
     @deprecate_args(
         *DEPRECATED_ARGS,
@@ -535,6 +539,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Initialization options.
         self.controller = controller
         self.context = context
+        self._drains_async_forward = context.config.async_sched_mode == AsyncScheduleMode.ASYNC
 
         self.num_speculative_tokens = inference_config.num_speculative_tokens
         self.materialize_only_last_token_logits = (
@@ -807,6 +812,8 @@ class DynamicInferenceEngine(AbstractEngine):
         self.requests: Dict[int, RequestEntry] = {}
         self.waiting_request_ids = deque()
         self.failed_request_ids = []
+        # Requests finished by a drain at suspend, returned with the next step.
+        self._drained_finished_requests = []
         # Generated token count already streamed for each request.
         self._partial_emit_lengths: Dict[int, int] = {}
         self._generation_epoch: Optional[int] = None
@@ -1606,6 +1613,13 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             return
 
+        # A coordinator drains at pause. Direct callers drain here, and the requests
+        # this finishes reach them with the next step.
+        if self.state != EngineState.PAUSED and self._async_drain_runs_forward():
+            drained = self._run_coroutine_sync(self._async_drain_pending_forward())
+            if drained is not None:
+                self._drained_finished_requests.extend(drained["finished_requests"])
+
         # A suspend may be followed by an in-place weight refit. Invalidate
         # shared and request-local projected media unless explicitly permitted.
         self._invalidate_vision_state()
@@ -2078,7 +2092,11 @@ class DynamicInferenceEngine(AbstractEngine):
 
     def has_unfinished_requests(self) -> bool:
         """Test if context contains unfinished requests."""
-        return self.context.has_unfinished_requests() or len(self.waiting_request_ids) > 0
+        return (
+            self.context.has_unfinished_requests()
+            or len(self.waiting_request_ids) > 0
+            or len(self._drained_finished_requests) > 0
+        )
 
     def get_request(self, request_id: int) -> DynamicInferenceRequest:
         """Get most recent request from a request record.
@@ -4055,9 +4073,15 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 self.waiting_request_ids.extendleft(reversed(pending_request_ids))
 
-    async def async_forward(self) -> Tuple[Optional[Dict], Dict, float]:
+    async def async_forward(
+        self, finish_pending_only: bool = False
+    ) -> Tuple[Optional[Dict], Dict, float]:
         """Uses `asyncio` for continuous generation.
         Sleeps when no requests are available, until new requests have been added.
+
+        Args:
+            finish_pending_only (bool): Finish the pending async forward without
+                admitting or launching another one.
 
         Returns:
             A tuple comprised of:
@@ -4083,7 +4107,7 @@ class DynamicInferenceEngine(AbstractEngine):
             step_nvtx_range = "Decode" if self.context.num_prefill_requests == 0 else "Prefill"
             controller_kwargs = {}
         elif mode == AsyncScheduleMode.ASYNC:
-            run_async_overlap = self._should_run_async_sched_overlap()
+            run_async_overlap = not finish_pending_only and self._should_run_async_sched_overlap()
             step_nvtx_range = "AsyncOverlap" if run_async_overlap else "AsyncNoOverlap"
             controller_kwargs = {
                 "run_async_overlap": run_async_overlap,
@@ -4091,6 +4115,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     None if run_async_overlap else self.schedule_waiting_requests
                 ),
             }
+            if finish_pending_only:
+                controller_kwargs["finish_pending_only"] = True
         else:
             raise AssertionError(f"Unexpected async scheduling mode: {mode}")
 
@@ -4523,6 +4549,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
         nvtx_range_pop("console_logging")
 
+        if self._drained_finished_requests:
+            finished_requests = self._drained_finished_requests + finished_requests
+            self._drained_finished_requests = []
+
         return {
             "active_request_ids": active_request_ids,
             "finished_requests": finished_requests,
@@ -4530,19 +4560,57 @@ class DynamicInferenceEngine(AbstractEngine):
             "cuda_graph_request_count": cuda_graph_request_count,
         }
 
-    async def async_step(self) -> DynamicInferenceEngineStepResult:
+    async def async_step(
+        self, finish_pending_only: bool = False
+    ) -> DynamicInferenceEngineStepResult:
         """
         Wrapper for controller.generate_output_tokens_dynamic_batch(), to
         match vLLM API. Uses `asyncio` for continuous generation which allows this
         method to sleep and wake up when new requests are available.
 
+        Args:
+            finish_pending_only (bool): Finish the pending async forward without
+                admitting or launching another one.
+
         Returns:
             Active request IDs, finished requests, and step metadata.
         """
-        last_step_data = await self.async_forward()
+        last_step_data = await self.async_forward(finish_pending_only=finish_pending_only)
         ret = await self.async_bookkeep(*last_step_data)
         # Keep for compatibility with current test suite.
         return ret
+
+    async def _async_drain_pending_forward(self) -> Optional[DynamicInferenceEngineStepResult]:
+        """Finish the pending async forward without launching another one.
+
+        That forward has already advanced recurrent (Mamba) state, so it can be neither
+        dropped and re-run nor kept across a weight refit or CUDA graph recapture. Pause
+        and suspend therefore leave nothing pending, and a new generation epoch always
+        starts at such a drained boundary.
+
+        Returns:
+            Optional[DynamicInferenceEngineStepResult]: The drained step, if a forward
+                was pending.
+        """
+        if not self._async_drain_runs_forward():
+            return None
+        if self.controller._async_sched_forward.is_valid:
+            return await self.async_step(finish_pending_only=True)
+        self.controller._run_dummy_serial_mtp_forward()
+        return None
+
+    def _async_drain_runs_forward(self) -> bool:
+        """Whether draining before pause or suspend runs a forward on this rank.
+
+        A rank with nothing pending still runs one under EP > 1 with MTP: draining peers
+        run MTP draft forwards whose expert all-to-alls need every rank.
+        """
+        if not self._drains_async_forward:
+            return False
+        return self.controller._async_sched_forward.is_valid or (
+            self.controller.num_speculative_tokens > 0
+            and self.controller.model_config.expert_model_parallel_size > 1
+        )
 
     def _run_coroutine_sync(self, coro):
         """Run a coroutine synchronously, handling the case when already in an event loop.
@@ -4916,6 +4984,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if new_generation_epoch is not None:
             if new_generation_epoch != self._generation_epoch:
+                # Epochs change at drained boundaries: pause and suspend finish the
+                # pending forward, so one still pending here used the current weights.
                 self._invalidate_vision_state()
                 # Unlike suspend/resume, an epoch transition does not naturally
                 # re-admit requests. Refresh active request-local state here so
@@ -5222,7 +5292,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._ep_consensus_loop_counter += 1
 
                     if all_pausing:
-                        # All EP peers are PAUSING: pause immediately.
+                        # All EP peers are PAUSING: finish any pending forward, then pause.
+                        await self._async_drain_pending_forward()
                         await self._world_barrier()
                         self.state = EngineState.PAUSED
                         self._state_events[EngineState.PAUSED].set()
