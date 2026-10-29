@@ -313,4 +313,4 @@ class MXFP8ReshardTransform(ReshardTransform):
             mxfp8 = MXFP8Tensor.from_bf16(recv_buffers[0], backend=buf.backend)
             buf.data[dst_slice].copy_(mxfp8.data)
             scale_slice = _scale_slice_from_data_slice(dst_slice)
-            buf.scale[scale_slice].view(torch.uint8).copy_(get_mxfp8_scale_bytes(mxfp8))
+            buf.scale[scale_slice].view(torch.uint8).copy_(mxfp8.scale.view(torch.uint8))

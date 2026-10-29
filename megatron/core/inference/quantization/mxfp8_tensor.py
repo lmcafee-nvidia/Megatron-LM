@@ -230,15 +230,7 @@ class MXFP8Tensor:
         else:
             quantized = MXFP8Tensor.from_bf16(value, backend=self.backend)
             self.data.copy_(quantized.data)
-            if self.scale.shape == quantized.scale.shape:
-                self.scale.view(torch.uint8).copy_(quantized.scale.view(torch.uint8))
-            elif self.scale.ndim == 2:
-                self.scale.view(torch.uint8).copy_(get_mxfp8_scale_bytes(quantized))
-            else:
-                raise ValueError(
-                    "Cannot update 1D MXFP8 scale storage from a producer with shape "
-                    f"{tuple(quantized.scale.shape)}."
-                )
+            self.scale.view(torch.uint8).copy_(quantized.scale.view(torch.uint8))
         if self.dtype is None:
             self.dtype = value.dtype
         return self
