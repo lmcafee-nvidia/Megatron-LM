@@ -661,22 +661,3 @@ def reshard_model_weights(
     execute_reshard_plan(
         plan, src_core, tgt_core, service=service, group=group, transform=transform
     )
-    # Raised after the plan so that every rank has finished its collectives.
-    if tgt_core is not None and any(
-        getattr(module, "_nvfp4_weights", None) is not None for module in tgt_core.modules()
-    ):
-        raise NotImplementedError(
-            "Refit of per-token NVFP4 expert weights (inference_moe_nvfp4_recipe) is not "
-            "supported yet: the BF16 experts were updated, but the derived NVFP4 copy the "
-            "FlashInfer kernel reads was not, so generation would run on the old weights."
-        )
-    if tgt_core is not None and isinstance(transform, MXFP8ReshardTransform):
-        refreshed = False
-        for module in tgt_core.modules():
-            refresh = getattr(module, "refresh_flashinfer_mxfp8_weights", None)
-            if refresh is not None:
-                refreshed = bool(refresh()) or refreshed
-        if refreshed:
-            # Repacking is asynchronous. Synchronize before another stream replays graphs
-            # that read these derived weight buffers.
-            torch.cuda.synchronize()
