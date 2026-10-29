@@ -625,17 +625,20 @@ class TestMXFP8RefitIntegration:
 
     def test_public_refit_native_linear_scales_preserve_graph_storage(self, request):
         """A real NCCL refit updates native 2D scales and captured consumer output."""
+        import os
         from datetime import timedelta
 
         from megatron.core.inference.quantization.mxfp8_tensor import get_mxfp8_scale_bytes
 
-        if Utils.store is not None:
+        if Utils.world_size > 1:
             # Earlier tests run on each rank independently, and FlashInfer's first-use
-            # compilation can leave ranks minutes apart. The NCCL setup of the first collective
-            # below waits only a minute on the store, so the ranks meet here first.
+            # compilation can leave ranks minutes apart. Utils' NCCL setup below waits only a
+            # minute on the store, so the ranks first meet on the launcher's store.
+            host, port = os.environ["MASTER_ADDR"], int(os.environ["MASTER_PORT"])
+            store = dist.TCPStore(host, port, is_master=False, timeout=timedelta(minutes=20))
             ready = [f"mxfp8-native-refit-ready/{rank}" for rank in range(Utils.world_size)]
-            Utils.store.set(ready[Utils.rank], "1")
-            Utils.store.wait(ready, timedelta(minutes=20))
+            store.set(ready[Utils.rank], "1")
+            store.wait(ready)
         Utils.initialize_model_parallel(1, 1)
         request.addfinalizer(Utils.destroy_model_parallel)
 
