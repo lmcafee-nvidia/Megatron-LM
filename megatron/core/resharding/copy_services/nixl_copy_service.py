@@ -213,6 +213,16 @@ class NixlCopyService(CopyService):
 
         recv_descs = {op.task_id: self._mem_desc(op.tensor) for op in remote_recvs}
         if self._gathered is None:
+            import collections
+            regions = [("send", op.dest_rank, op.task_id, self._mem_desc(op.tensor), tuple(op.tensor.shape)) for op in remote_sends]
+            regions += [("recv", op.src_rank, op.task_id, self._mem_desc(op.tensor), tuple(op.tensor.shape)) for op in remote_recvs]
+            counts = collections.Counter(r[3] for r in regions)
+            for r in regions:
+                print(f"NIXLDBG rank={self.rank} {r[0]} peer={r[1]} task={r[2]} ptr={r[3][0]:#x} bytes={r[3][1]} dev={r[3][2]} shape={r[4]} dup={counts[r[3]] > 1}", flush=True)
+            local = [("lsend", op.dest_rank, op.task_id, self._mem_desc(op.tensor)) for op in self.send_ops if op.dest_rank == self.rank]
+            local += [("lrecv", op.src_rank, op.task_id, self._mem_desc(op.tensor)) for op in self.recv_ops if op.src_rank == self.rank]
+            for r in local:
+                print(f"NIXLDBG rank={self.rank} {r[0]} peer={r[1]} task={r[2]} ptr={r[3][0]:#x} bytes={r[3][1]}", flush=True)
             self._handshake(recv_descs)
         elif recv_descs != self._recv_descs:
             raise RuntimeError(
