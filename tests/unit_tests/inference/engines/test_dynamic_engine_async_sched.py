@@ -780,6 +780,49 @@ _ASYNC_SUSPEND_RESUME_SCENARIOS = (
         config={"kv_cache_management_mode": "recompute", "static_kv_memory_pointers": False},
         signals=("recompute", "suspend-resume"),
     ),
+    _pair_scenario(
+        "offload-graph-recapture-suspend-resume",
+        "kv:offload",
+        "graph:recapture",
+        config={
+            "kv_cache_management_mode": "offload",
+            "static_kv_memory_pointers": False,
+            "num_cuda_graphs": 4,
+            "force_build_cuda_graphs": True,
+            "use_cuda_graphs_for_non_decode_steps": False,
+        },
+        signals=("cuda-graph", "offload", "suspend-resume"),
+    ),
+    _pair_scenario(
+        "recompute-graph-recapture-suspend-resume",
+        "kv:recompute",
+        "graph:recapture",
+        config={
+            "kv_cache_management_mode": "recompute",
+            "static_kv_memory_pointers": False,
+            "num_cuda_graphs": 4,
+            "force_build_cuda_graphs": True,
+            "use_cuda_graphs_for_non_decode_steps": False,
+        },
+        signals=("cuda-graph", "recompute", "suspend-resume"),
+    ),
+    _pair_scenario(
+        "hybrid-offload-graph-recapture-suspend-resume",
+        "model:hybrid-mamba",
+        "kv:offload",
+        "graph:recapture",
+        config={
+            "model_provider": "hybrid",
+            "kv_cache_management_mode": "offload",
+            "static_kv_memory_pointers": False,
+            "num_cuda_graphs": 4,
+            "force_build_cuda_graphs": True,
+            "use_cuda_graphs_for_non_decode_steps": False,
+        },
+        signals=("cuda-graph", "offload", "suspend-resume"),
+        atol=5.0e-3,
+        prerequisite="mamba",
+    ),
 )
 
 _ASYNC_PARALLEL_SCENARIOS = (
@@ -1514,6 +1557,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     env.engine.controller._async_sched_forward.is_valid
                 )
                 env.engine.resume()
+                runtime["graph-steps-before-resume"] = runtime["cuda_graph_steps"]
                 for request_id in env.engine.resume_request_ids:
                     env.requests[request_id] = env.engine.get_request(request_id)
                 runtime["pending-after-resume"] += int(
@@ -1580,6 +1624,9 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["pending-after-suspend"] == runtime["pending-after-resume"] == 0
             if "static-pointers" in signals:
                 assert runtime["static-pointer-preserved"] == 1
+            if "cuda-graph" in signals:
+                # Steps after resume replay the recaptured graphs.
+                assert runtime["cuda_graph_steps"] > runtime["graph-steps-before-resume"]
         if "dp-offset" in signals:
             assert context.config.offset_sampling_seed_by_dp_rank
         if "last-logits" in signals:
