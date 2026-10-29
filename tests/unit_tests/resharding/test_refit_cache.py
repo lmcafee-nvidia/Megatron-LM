@@ -13,6 +13,7 @@ Covers:
 """
 
 from unittest.mock import MagicMock, call
+from weakref import WeakKeyDictionary
 
 import pytest
 import torch
@@ -154,6 +155,60 @@ def test_parallel_config_includes_gtp_remat_sizes():
     assert _get_parallel_config(Core()) == _config(
         tp=2, pp=3, ep=4, dp=5, expert_tp=6, gtp_remat=7, expert_gtp_remat=8
     )
+
+
+@pytest.mark.parametrize("change", ["shape", "dtype", "group"])
+def test_ordinary_model_plan_key_includes_structural_metadata(monkeypatch, change):
+    """Equal parallel sizes must not alias plans for structurally different models."""
+
+    class Group:
+        def __init__(self, ranks):
+            self.ranks = tuple(ranks)
+
+        def size(self):
+            return len(self.ranks)
+
+    class Core(nn.Module):
+        def __init__(self, shape=(4, 4), dtype=torch.float32, tp_ranks=(0, 1)):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(shape, dtype=dtype))
+            self.weight.tensor_model_parallel = True
+            self.weight.partition_dim = 0
+            self.weight.partition_stride = 1
+            tp = Group(tp_ranks)
+            singleton = Group((0,))
+            self.pg_collection = type(
+                "PG",
+                (),
+                {
+                    "tp": tp,
+                    "pp": singleton,
+                    "ep": singleton,
+                    "dp": singleton,
+                    "expt_tp": tp,
+                    "gtp_remat": None,
+                    "expt_gtp_remat": None,
+                },
+            )()
+
+    monkeypatch.setattr(refit, "_model_fingerprints", WeakKeyDictionary())
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(
+        torch.distributed, "get_process_group_ranks", lambda group: list(group.ranks)
+    )
+
+    original = Core()
+    equivalent = Core()
+    kwargs = {
+        "shape": (8, 4) if change == "shape" else (4, 4),
+        "dtype": torch.float64 if change == "dtype" else torch.float32,
+        # Same size, different membership: routing changes even though tp_size does not.
+        "tp_ranks": (0, 2) if change == "group" else (0, 1),
+    }
+    changed = Core(**kwargs)
+
+    assert _get_parallel_config(original) == _get_parallel_config(equivalent)
+    assert _get_parallel_config(original) != _get_parallel_config(changed)
 
 
 class TestPlanCacheKeyNonCollocated:
