@@ -1,13 +1,22 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
+import torch.distributed as dist
 
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.resharding.copy_services.base import CopyService
 from megatron.core.resharding.execution import execute_reshard_plan
+from megatron.core.resharding.refit import (
+    clear_all_caches,
+    prepare_swap_model_weights,
+    swap_model_weights,
+)
 from megatron.core.resharding.transforms import MXFP8ReshardTransform
 from megatron.core.resharding.utils import ReshardPlan, TransferOp
+from tests.unit_tests.test_utilities import Utils
 
 _IS_BLACKWELL = torch.cuda.is_available() and (torch.cuda.get_device_properties(0).major >= 10)
 
@@ -613,6 +622,98 @@ class TestMXFP8RefitIntegration:
         expected = MXFP8Tensor.from_bf16(full_weight)
         assert torch.equal(dst_buf.data, expected.data)
         assert torch.equal(dst_buf.scale, expected.scale)
+
+    def test_public_refit_native_linear_scales_preserve_graph_storage(self, request):
+        """A real NCCL refit updates native 2D scales and captured consumer output."""
+        import os
+        from datetime import timedelta
+
+        from megatron.core.inference.quantization.mxfp8_tensor import get_mxfp8_scale_bytes
+
+        if Utils.world_size > 1:
+            # Earlier tests run on each rank independently, and FlashInfer's first-use
+            # compilation can leave ranks minutes apart. Utils' NCCL setup below waits only a
+            # minute on the store, so the ranks first meet on the launcher's store.
+            host, port = os.environ["MASTER_ADDR"], int(os.environ["MASTER_PORT"])
+            store = dist.TCPStore(host, port, is_master=False, timeout=timedelta(minutes=20))
+            ready = [f"mxfp8-native-refit-ready/{rank}" for rank in range(Utils.world_size)]
+            store.set(ready[Utils.rank], "1")
+            store.wait(ready)
+        Utils.initialize_model_parallel(1, 1)
+        request.addfinalizer(Utils.destroy_model_parallel)
+
+        def linear_mxfp8(weight):
+            # The logical [rows, columns / 32] scales that a 2D-scale destination stores.
+            quantized = MXFP8Tensor.from_bf16(weight, backend="flashinfer")
+            scale = get_mxfp8_scale_bytes(quantized).clone()
+            return MXFP8Tensor(quantized.data, scale, "flashinfer", dtype=torch.bfloat16)
+
+        class TinyModel(torch.nn.Module):
+            def __init__(self, seed):
+                super().__init__()
+                torch.manual_seed(seed)
+                self.decoder = torch.nn.Linear(
+                    128, 64, bias=False, device="cuda", dtype=torch.bfloat16
+                )
+                group = dist.group.WORLD
+                self.pg_collection = SimpleNamespace(
+                    tp=group,
+                    pp=group,
+                    ep=group,
+                    dp=group,
+                    expt_tp=group,
+                    gtp_remat=None,
+                    expt_gtp_remat=None,
+                )
+                self.config = SimpleNamespace(num_moe_experts=None)
+
+            def forward(self, inputs):
+                weight = self.decoder.weight
+                scale_bits = weight.scale.to(torch.int32) << 23
+                scales = scale_bits.view(torch.float32).repeat_interleave(32, dim=1)
+                dequantized = weight.data.float() * scales
+                return torch.matmul(inputs.float(), dequantized.t()).to(torch.bfloat16)
+
+        source = TinyModel(111)
+        target = TinyModel(222)
+        target_buffer = linear_mxfp8(target.decoder.weight.detach())
+        assert target_buffer.scale.ndim == 2
+        clear_all_caches()
+        prepare_swap_model_weights([source], [target])
+        del target.decoder._parameters["weight"]
+        target.decoder.weight = target_buffer
+        transform = MXFP8ReshardTransform(
+            convertible_params={"decoder.weight"},
+            persistent_buffers={"weight": target_buffer},
+            buffer_key_prefix="decoder.",
+        )
+        source_weight = source.decoder.weight.detach().clone()
+        reference = linear_mxfp8(source_weight)
+        reference_model = TinyModel(333)
+        del reference_model.decoder._parameters["weight"]
+        reference_model.decoder.weight = reference
+        inputs = torch.linspace(-1, 1, 256, device="cuda", dtype=torch.bfloat16).reshape(2, 1, 128)
+        expected = reference_model(inputs)
+        pointers = (target_buffer.data.data_ptr(), target_buffer.scale.data_ptr())
+
+        target(inputs)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_output = target(inputs)
+        output_pointer = graph_output.data_ptr()
+        swap_model_weights([source], [target], refit_method="nccl", transform=transform)
+        torch.cuda.synchronize()
+
+        assert (target_buffer.data.data_ptr(), target_buffer.scale.data_ptr()) == pointers
+        assert torch.equal(target_buffer.data, reference.data)
+        assert torch.equal(target_buffer.scale, reference.scale)
+        graph.replay()
+        actual = graph_output.clone()
+        assert graph_output.data_ptr() == output_pointer
+        assert torch.equal(actual.argmax(dim=-1), expected.argmax(dim=-1))
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        clear_all_caches()
 
     def test_multi_batch_plan_quantizes_complete_parameters(self):
         """Each batch assembles every slice before quantizing its MXFP8 parameter."""
