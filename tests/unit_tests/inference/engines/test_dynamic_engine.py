@@ -1363,6 +1363,7 @@ class DynamicEngineTestConfig:
     # when a test explicitly owns that model behavior.
     use_moe_layer_spec: bool = False
     sequence_parallel: bool = False
+    inference_disable_triton_nvls_kernels: bool = False
 
     use_fixed_output_lengths: bool = False
     num_cuda_graphs: int = None
@@ -1411,6 +1412,7 @@ class DynamicEngineTestConfig:
     inference_moe_token_dispatcher_type: str = "nccl"
     moe_enable_routing_replay: bool = False
     moe_router_topk: int = 2
+    moe_router_load_balancing_type: str = "aux_loss"
     moe_router_score_function: str = "softmax"
     moe_num_hash_layers: int = 0
     moe_apply_probs_on_input: bool = False
@@ -1736,6 +1738,7 @@ class DynamicInferenceEngineTestBase:
                     else InferenceCudaGraphScope.none
                 ),
                 transformer_impl=test_config.transformer_impl,
+                inference_disable_triton_nvls_kernels=test_config.inference_disable_triton_nvls_kernels,
                 inference_grouped_gemm_backend=test_config.inference_grouped_gemm_backend,
                 inference_moe_nvfp4_recipe=test_config.inference_moe_nvfp4_recipe,
                 activation_func=(
@@ -1751,6 +1754,7 @@ class DynamicInferenceEngineTestBase:
                 ),
                 moe_enable_routing_replay=test_config.moe_enable_routing_replay,
                 moe_router_topk=test_config.moe_router_topk,
+                moe_router_load_balancing_type=test_config.moe_router_load_balancing_type,
                 moe_router_score_function=test_config.moe_router_score_function,
                 moe_apply_probs_on_input=test_config.moe_apply_probs_on_input,
                 moe_latent_size=test_config.moe_latent_size,
