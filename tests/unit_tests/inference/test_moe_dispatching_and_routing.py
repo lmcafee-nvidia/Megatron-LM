@@ -411,6 +411,13 @@ class TestNVLSAllGatherVDispatcher:
 
     @classmethod
     def setup_class(cls):
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        # Contexts built by earlier tests leave class-level dispatcher state, such as the
+        # real-token count that masks padded routing rows; start from a clean dispatcher.
+        NVLSAllGatherVDispatcher._delete_buffers()
         Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=Utils.world_size)
         _set_random_seed(seed_=123, data_parallel_random_init=False)
 
@@ -445,7 +452,7 @@ class TestNVLSAllGatherVDispatcher:
             per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
             topk=NANOV3_BASE["moe_router_topk"],
             hidden_size=NANOV3_BASE["hidden_size"],
-            ep_group=ep_group,
+            tp_ep_group=ep_group,
         )
 
         return NVLSAllGatherVDispatcher(
@@ -673,7 +680,7 @@ class TestNVLSAllGatherVDispatcher:
             per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
             topk=config.moe_router_topk,
             hidden_size=config.hidden_size,
-            ep_group=ep_group,
+            tp_ep_group=ep_group,
         )
 
         layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
@@ -876,7 +883,7 @@ class TestNVLSAllGatherVDispatcher:
                 per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
                 topk=config.moe_router_topk,
                 hidden_size=config.hidden_size,
-                ep_group=get_expert_model_parallel_group(),
+                tp_ep_group=get_expert_model_parallel_group(),
             )
         else:
             NCCLAllGatherDispatcher.allocate_buffers()
@@ -1173,7 +1180,7 @@ class TestNVLSAllGatherVDispatcher:
             per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
             topk=config.moe_router_topk,
             hidden_size=config.hidden_size,
-            ep_group=get_expert_model_parallel_group(),
+            tp_ep_group=get_expert_model_parallel_group(),
         )
         return get_inference_optimized_moe_spec()(config=config).cuda().eval()
 
@@ -1442,7 +1449,7 @@ class TestNVLSAllGatherVDispatcher:
             per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
             topk=config.moe_router_topk,
             hidden_size=config.hidden_size,
-            ep_group=get_expert_model_parallel_group(),
+            tp_ep_group=get_expert_model_parallel_group(),
         )
 
         layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
@@ -1547,7 +1554,7 @@ class TestNVLSAllGatherVDispatcher:
                 per_rank_worst_case_token_count=capacity,
                 topk=config.moe_router_topk,
                 hidden_size=config.hidden_size,
-                ep_group=ep_group,
+                tp_ep_group=ep_group,
             )
 
         allocate(8)
