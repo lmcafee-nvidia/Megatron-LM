@@ -64,6 +64,7 @@ if HAVE_TE:
         TENorm,
         TERowParallelGroupedLinear,
         TERowParallelLinear,
+        split_te_layernorm_column_parallel_linear,
         te_cross_entropy,
     )
 
@@ -556,6 +557,16 @@ class TestTEWrappers:
             contention=True,
             what=f"TELayerNormColumnParallelLinear[{normalization}]",
         )
+
+    def test_split_layernorm_column_parallel_linear_keeps_fused_device(self):
+        """MLA absorption splits the fused layer after placement; CPU init must not strand it."""
+        config = _config(normalization="RMSNorm", use_cpu_initialization=True)
+        kwargs = dict(gather_output=False, bias=True, skip_bias_add=False, is_expert=False)
+        fused = TELayerNormColumnParallelLinear(
+            HIDDEN, 3 * HIDDEN, config=config, init_method=init_method_normal(0.02), **kwargs
+        ).cuda()
+        split_norm, split_linear = split_te_layernorm_column_parallel_linear(fused, config)
+        assert split_norm.weight.is_cuda and split_linear.weight.is_cuda
 
     @pytest.mark.parametrize("normalization", ["LayerNorm", "RMSNorm"])
     def test_te_norm_replays(self, normalization):
