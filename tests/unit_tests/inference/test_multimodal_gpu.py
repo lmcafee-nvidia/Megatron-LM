@@ -57,7 +57,6 @@ from megatron.core.models.vision.vit_layer_specs import (
 )
 from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer import attention as attention_module
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.mlp import MLPSubmodules
@@ -1239,42 +1238,30 @@ def test_real_media_executes_attention_variant_and_reuses_exact_result(model_par
 
         patchers.append(mock.patch.object(Attention, "flash_decode_and_prefill", new=record_window))
     if variant == "sink":
-        if attention_module.HAVE_FA4:
-            original_fa4 = attention_module.flash_attn4_varlen_func
+        # Every flash path, FA4 included, applies the sink after the kernel from its LSE.
+        original_varlen = Attention._apply_sink_softmax_correction_varlen
+        original_bshd = Attention._apply_sink_softmax_correction_bshd
 
-            def record_fa4(*args, **kwargs):
-                companion_events.append(kwargs["learnable_sink"].detach().clone())
-                return original_fa4(*args, **kwargs)
+        def record_varlen(output, lse, softmax_offset):
+            companion_events.append("varlen")
+            return original_varlen(output, lse, softmax_offset)
 
-            patchers.append(
-                mock.patch.object(attention_module, "flash_attn4_varlen_func", new=record_fa4)
-            )
-        else:
-            original_varlen = Attention._apply_sink_softmax_correction_varlen
-            original_bshd = Attention._apply_sink_softmax_correction_bshd
+        def record_bshd(output, lse, softmax_offset):
+            companion_events.append("bshd")
+            return original_bshd(output, lse, softmax_offset)
 
-            def record_varlen(output, lse, softmax_offset):
-                companion_events.append("varlen")
-                return original_varlen(output, lse, softmax_offset)
-
-            def record_bshd(output, lse, softmax_offset):
-                companion_events.append("bshd")
-                return original_bshd(output, lse, softmax_offset)
-
-            patchers.extend(
-                [
-                    mock.patch.object(
-                        Attention,
-                        "_apply_sink_softmax_correction_varlen",
-                        new=staticmethod(record_varlen),
-                    ),
-                    mock.patch.object(
-                        Attention,
-                        "_apply_sink_softmax_correction_bshd",
-                        new=staticmethod(record_bshd),
-                    ),
-                ]
-            )
+        patchers.extend(
+            [
+                mock.patch.object(
+                    Attention,
+                    "_apply_sink_softmax_correction_varlen",
+                    new=staticmethod(record_varlen),
+                ),
+                mock.patch.object(
+                    Attention, "_apply_sink_softmax_correction_bshd", new=staticmethod(record_bshd)
+                ),
+            ]
+        )
     for patcher in patchers:
         patcher.start()
     try:
