@@ -1453,7 +1453,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 )
             self._flashinfer_activation_type = self._resolve_flashinfer_activation_type()
 
-        self._mcore_activation_type = self._resolve_mcore_activation_type()
+        self._mcore_activation_type = (
+            None
+            if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+            else self._resolve_mcore_activation_type()
+        )
         self._activation_clamp_scale = config.activation_func_tanh_clamp_scale
         # Allocate with the inference weights, after model-wide dtype conversion.
         # A registered floating-point buffer would be cast by Module.bfloat16(),
