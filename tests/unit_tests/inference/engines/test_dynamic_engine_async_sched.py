@@ -35,6 +35,7 @@ from megatron.core.inference.engines.dynamic_engine import EngineState, _get_dec
 from megatron.core.inference.inference_request import (
     DynamicInferenceEventType,
     DynamicInferenceRequest,
+    DynamicInferenceRequestRecord,
     DynamicVLMInferenceRequest,
     Status,
 )
@@ -684,7 +685,11 @@ _ASYNC_PAIR_SCENARIOS = (
     _pair_scenario(
         "mtp-depth-one",
         "speculation:mtp-depth-one",
-        config={"num_speculative_tokens": 1},
+        config={
+            "num_speculative_tokens": 1,
+            "position_embedding_type": "rope",
+            "use_flashinfer_fused_rope": False,
+        },
         signals=("mtp",),
     ),
     _pair_scenario(
@@ -708,6 +713,8 @@ _ASYNC_PAIR_SCENARIOS = (
             "num_cuda_graphs": 4,
             "force_build_cuda_graphs": True,
             "materialize_only_last_token_logits": False,
+            "position_embedding_type": "rope",
+            "use_flashinfer_fused_rope": False,
         },
         sampling=(
             {"return_log_probs": True, "skip_prompt_log_probs": False, "top_n_logprobs": 2},
@@ -850,8 +857,14 @@ _ASYNC_SUSPEND_RESUME_SCENARIOS = (
     _pair_scenario(
         "recompute-suspend-resume",
         "kv:recompute",
-        config={"kv_cache_management_mode": "recompute", "static_kv_memory_pointers": False},
-        signals=("recompute", "suspend-resume"),
+        config={
+            "kv_cache_management_mode": "recompute",
+            "static_kv_memory_pointers": False,
+            "return_log_probs": True,
+            "materialize_only_last_token_logits": False,
+        },
+        sampling=({"return_log_probs": True, "skip_prompt_log_probs": False, "top_n_logprobs": 3},),
+        signals=("recompute", "suspend-resume", "full-logits", "logprobs", "top-n"),
     ),
 )
 
@@ -1550,6 +1563,39 @@ def _instrument_scenario_runtime(env, scenario, runtime, teacher_tokens=None):
             return result
 
         controller._capture_async_sched_routing = traced_capture_routing
+
+    if "mtp" in scenario.signals and "cuda-graph" in scenario.signals:
+        model = controller._unwrapped_model
+        manager = getattr(model, "_mtp_cudagraph_manager", None)
+        assert manager is not None
+        wrapped_runners = set()
+        original_get_runner = manager.get_cudagraph_runner
+
+        def traced_get_runner(*args, **kwargs):
+            runner = original_get_runner(*args, **kwargs)
+            if id(runner) not in wrapped_runners:
+                original_replay = runner.replay_graph_capture
+
+                def traced_replay(*replay_args, _real=original_replay, **replay_kwargs):
+                    runtime["mtp-cuda-graph-replays"] += 1
+                    return _real(*replay_args, **replay_kwargs)
+
+                runner.replay_graph_capture = traced_replay
+                wrapped_runners.add(id(runner))
+            return runner
+
+        manager.get_cudagraph_runner = traced_get_runner
+        original_mtp = model.compute_mtp_single_step
+
+        def traced_mtp(*args, **kwargs):
+            result = original_mtp(*args, **kwargs)
+            eager = kwargs.get("eager", False)
+            cache_key = kwargs.get("cache_key")
+            if context.using_cuda_graph_this_step() and not eager and cache_key is not None:
+                runtime["mtp-cuda-graph-invocations"] += 1
+            return result
+
+        model.compute_mtp_single_step = traced_mtp
 
     original_forward = controller._dynamic_step_forward_logits
 
@@ -2694,6 +2740,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             if "cuda-graph" in signals:
                 owners = _recorded(runtime, "cuda-graph-replay-owner", 1)
                 assert "compute_mtp_single_step" in owners
+                assert runtime["mtp-cuda-graph-invocations"] > 0
+                assert runtime["mtp-cuda-graph-replays"] == runtime["mtp-cuda-graph-invocations"]
             if "mtp-accept-all" in signals:
                 assert accepted == proposed
                 assert context.enable_mtp_kv_cache
@@ -3435,7 +3483,10 @@ def test_post_process_enforces_per_request_logprob_policy():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.context = SimpleNamespace(kv_block_allocator=SimpleNamespace())
     engine.requests = {
-        request.request_id: SimpleNamespace(record=[request]) for request in requests
+        request.request_id: SimpleNamespace(
+            record=DynamicInferenceRequestRecord.from_request(request)
+        )
+        for request in requests
     }
     engine.finished_request_count = 0
     engine.evicted_request_count = 0
