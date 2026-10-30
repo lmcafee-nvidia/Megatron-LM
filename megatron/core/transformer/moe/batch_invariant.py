@@ -42,6 +42,9 @@ def build_inverse_permutation_map(
     assert isinstance(
         num_out_tokens, int
     ), "batch-invariant graph unpermute requires static num_out_tokens"
+    if num_tokens == 0:
+        assert num_out_tokens == 0
+        return torch.empty((2, 0, 0), device=routing_map.device, dtype=torch.long)
     assert (
         num_out_tokens % num_tokens == 0
     ), "batch-invariant graph unpermute expects fixed top-k per token"
