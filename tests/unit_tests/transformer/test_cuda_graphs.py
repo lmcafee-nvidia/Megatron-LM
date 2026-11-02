@@ -2313,12 +2313,15 @@ class TestInlineCaptureManager:
 
     def test_pool_recreation_orders_side_stream_after_queued_work(self):
         """Work issued after the shared pool is recreated must not overtake queued work."""
+        config = self._make_config()
+        module = _make_simple_module(config)
         CudaGraphManager.global_mempool = None
         x = torch.zeros(1 << 20, device="cuda")
         torch.cuda._sleep(int(2e9))  # Keep the current stream busy.
         x.fill_(1.0)  # Queued behind the sleep.
         try:
-            CudaGraphManager._ensure_global_mempool()  # Switches to a side stream.
+            # Recreating the shared pool switches to a side stream.
+            CudaGraphManager(config, base_module=module, function_name="my_op", need_backward=False)
             assert torch.all(x.clone() == 1.0)
         finally:
             torch.cuda.synchronize()
