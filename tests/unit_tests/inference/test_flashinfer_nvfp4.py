@@ -213,34 +213,6 @@ def test_flashinfer_forward_dispatches_to_nvfp4(monkeypatch):
     assert captured["use_bounded_rows"] is True
 
 
-@pytest.mark.parametrize("built", [False, True], ids=["before_first_forward", "after"])
-def test_refit_rejects_built_nvfp4_expert_weights(monkeypatch, built):
-    """A refit after the NVFP4 copy is built would leave generation on the old weights.
-
-    Before the first forward there is no copy yet; it is built from the refit weights.
-    """
-    from megatron.core.resharding import refit
-
-    experts_module = torch.nn.Module()
-    experts_module._nvfp4_weights = object() if built else None
-    target = torch.nn.Sequential(experts_module)
-    executed = []
-    monkeypatch.setattr(refit, "_unwrap_model_cores", lambda src, tgt: (None, tgt, 2))
-    monkeypatch.setattr(refit, "_build_or_get_plan", lambda *args, **kwargs: "plan")
-    monkeypatch.setattr(refit, "_harmonize_buffer_dtypes", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        refit, "execute_reshard_plan", lambda plan, *args, **kwargs: executed.append(plan)
-    )
-    service = SimpleNamespace(set_model_roles=lambda **kwargs: None)
-
-    if built:
-        with pytest.raises(NotImplementedError, match="per-token NVFP4"):
-            refit.reshard_model_weights(None, target, service)
-    else:
-        refit.reshard_model_weights(None, target, service)
-    assert executed == ["plan"], "the plan must run on every rank before raising"
-
-
 def test_gated_fc1_is_padded_per_half_and_interleaved_up_gate():
     """MCore's [gate; up] FC1 becomes FlashInfer's alternating 64-row [up, gate] blocks."""
     from megatron.core.inference.moe.flashinfer_nvfp4 import _pad_fc1
@@ -860,3 +832,55 @@ class TestNVFP4MoELayer:
         assert layer.experts._nvfp4_weights is nvfp4_weights
         assert nvfp4_weights.fc1_data.data_ptr() == fc1_data_ptr
         assert not torch.equal(graph_output, before_refresh), "refresh did not reach the graph"
+
+    @pytest.mark.parametrize("activation", _ACTIVATIONS)
+    @pytest.mark.parametrize("dispatcher", ["nccl", "nvls"])
+    def test_public_refit_refreshes_nvfp4_graph_in_place(self, dispatcher, activation):
+        """A real public refit matches a fresh NVFP4 load without recapturing its graph."""
+        from megatron.core.process_groups_config import ProcessGroupCollection
+        from megatron.core.resharding.refit import clear_all_caches, swap_model_weights
+
+        source = self._make_layer(dispatcher, activation)
+        target = self._make_layer(dispatcher, activation)
+        fresh = self._make_layer(dispatcher, activation)
+        groups = ProcessGroupCollection.use_mpu_process_groups(
+            ["tp", "pp", "ep", "dp", "expt_tp", "gtp_remat", "expt_gtp_remat"]
+        )
+        for layer in (source, target, fresh):
+            layer.pg_collection = groups
+        with torch.no_grad():
+            for parameter in source.parameters():
+                parameter.add_(0.25)
+            fresh.load_state_dict(source.state_dict())
+
+        local_tokens = 32 if dispatcher == "nccl" else 17 + torch.distributed.get_rank()
+        hidden = self._hidden_states(local_tokens, target.config.hidden_size)
+
+        def _eager(layer):
+            output, _ = layer(hidden.clone())
+            return output
+
+        clear_all_caches()
+        try:
+            with torch.no_grad(), deterministic_algorithms(True), InferenceMode.active():
+                before = _eager(target)
+                expected = _eager(fresh)
+                nvfp4_weights = target.experts._nvfp4_weights
+                fc1_data_ptr = nvfp4_weights.fc1_data.data_ptr()
+
+                for _ in range(3):
+                    target(hidden)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    graph_output, _ = target(hidden)
+
+                swap_model_weights(source, target, "nccl")
+                graph.replay()
+                torch.testing.assert_close(graph_output, _eager(target), atol=0, rtol=0)
+                torch.testing.assert_close(graph_output, expected, atol=0, rtol=0)
+
+            assert target.experts._nvfp4_weights is nvfp4_weights
+            assert nvfp4_weights.fc1_data.data_ptr() == fc1_data_ptr
+            assert not torch.equal(graph_output, before)
+        finally:
+            clear_all_caches()
