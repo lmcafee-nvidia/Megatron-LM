@@ -3243,6 +3243,19 @@ async def test_run_coroutine_sync_runs_on_callers_cuda_device():
         assert engine._run_coroutine_sync(current_device()) == caller_device
 
 
+@pytest.mark.asyncio
+async def test_run_coroutine_sync_sends_replies_it_staged():
+    async def finish(uid):
+        engine._send_requests_to_coordinator([_reply_request(uid, Status.COMPLETED, [-0.5, -0.25])])
+
+    engine = _reply_engine(_RecordingStager())
+    await finish("chatcmpl-caller-loop")  # Pending on this loop; the helper must leave it.
+    engine._run_coroutine_sync(finish("chatcmpl-helper"))
+    assert [wire["uid"] for wire in _sent_replies(engine)] == ["chatcmpl-helper"]
+    await engine._drain_staging_tasks()
+    assert len(_sent_replies(engine)) == 2
+
+
 class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
     @classmethod

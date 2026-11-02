@@ -4567,10 +4567,25 @@ class DynamicInferenceEngine(AbstractEngine):
         def run():
             if device is not None:
                 torch.cuda.set_device(device)
-            return asyncio.run(coro)
+            return asyncio.run(self._run_then_drain_staging(coro))
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             return executor.submit(run).result()
+
+    async def _run_then_drain_staging(self, coro):
+        """Await ``coro``, then the payload staging tasks it started.
+
+        asyncio.run() cancels every task still pending when its coroutine returns, so a
+        staged reply started on that temporary loop would be dropped before it is sent.
+        Tasks started earlier belong to another loop and are left alone.
+        """
+        started_before = set(self._staging_tasks)
+        try:
+            return await coro
+        finally:
+            started_here = self._staging_tasks - started_before
+            if started_here:
+                await asyncio.gather(*started_here, return_exceptions=True)
 
     def step_modern(self) -> DynamicInferenceEngineStepResult:
         """Synchronous wrapper for `self.async_step`."""
