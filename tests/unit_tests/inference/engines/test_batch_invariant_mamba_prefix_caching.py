@@ -485,6 +485,7 @@ class TestBatchInvariantMambaPrefixCaching:
                         else:
                             assert actual == expected
 
+    @pytest.mark.skipif(_FA4_SPLIT_KV_UNSUPPORTED, reason="FA4 cannot split long KV on SM90")
     @pytest.mark.parametrize(
         "training_graphs", [False, True], ids=["runtime-toggle", "training-moe"]
     )
