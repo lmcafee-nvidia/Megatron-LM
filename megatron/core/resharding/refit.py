@@ -48,6 +48,7 @@ class _ParallelConfig(NamedTuple):
     expert_tp_size: int
     gtp_remat_size: int
     expert_gtp_remat_size: int
+    metadata_fingerprint: bytes = b""
 
 
 @dataclass(frozen=True)
@@ -77,10 +78,10 @@ class _PlanCacheKey:
 
 
 def _get_parallel_config(core) -> _ParallelConfig | bytes | None:
-    """Return memoized single-model group sizes or a composite metadata fingerprint.
+    """Return group sizes plus structure, or a composite metadata fingerprint.
 
-    Equivalent composite models reuse plans without retaining model identities.
-    Metadata includes native/matching names, tensor layouts and ordered group ranks.
+    Equivalent models reuse plans without retaining model identities. Metadata
+    includes native/matching names, tensor layouts and ordered group ranks.
     """
     if core is None:
         return None
@@ -94,14 +95,22 @@ def _get_parallel_config(core) -> _ParallelConfig | bytes | None:
             fingerprint = hashlib.sha256(repr(metadata).encode()).digest()
             _model_fingerprints[core] = fingerprint
         return fingerprint
-    cached = getattr(core, "_refit_parallel_config", None)
-    if cached is not None:
-        return cached
     pg = core.pg_collection
     expt_tp = getattr(pg, 'expt_tp', None)
     gtp_remat = getattr(pg, 'gtp_remat', None)
     expt_gtp_remat = getattr(pg, 'expt_gtp_remat', None)
-    result = _ParallelConfig(
+    metadata_fingerprint = b""
+    if isinstance(core, torch.nn.Module):
+        metadata_fingerprint = _model_fingerprints.get(core)
+        if metadata_fingerprint is None:
+            num_experts = getattr(getattr(core, "config", None), "num_moe_experts", None)
+            metadata = _extract_module_metadata(
+                core, torch.distributed.get_rank(), num_experts, 0, {}
+            )
+            metadata.sort(key=lambda entry: entry.name)
+            metadata_fingerprint = hashlib.sha256(repr(metadata).encode()).digest()
+            _model_fingerprints[core] = metadata_fingerprint
+    return _ParallelConfig(
         tp_size=pg.tp.size() if pg.tp else 1,
         pp_size=pg.pp.size() if pg.pp else 1,
         ep_size=pg.ep.size() if pg.ep else 1,
@@ -109,9 +118,8 @@ def _get_parallel_config(core) -> _ParallelConfig | bytes | None:
         expert_tp_size=expt_tp.size() if expt_tp else 1,
         gtp_remat_size=gtp_remat.size() if gtp_remat else 1,
         expert_gtp_remat_size=expt_gtp_remat.size() if expt_gtp_remat else 1,
+        metadata_fingerprint=metadata_fingerprint,
     )
-    core._refit_parallel_config = result
-    return result
 
 
 def _build_plan_cache_key(
