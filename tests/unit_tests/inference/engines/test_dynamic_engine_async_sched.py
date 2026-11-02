@@ -49,6 +49,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.resharding import swap_model_weights
 from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
+from megatron.core.transformer.attention import HAVE_FA3
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.utils import is_layer_window_attention
@@ -968,6 +969,8 @@ def _check_scenario_prerequisite(scenario):
         pytest.importorskip("flashinfer")
     elif scenario.prerequisite == "flash-mla":
         pytest.importorskip("flash_mla")
+        if torch.cuda.get_device_capability()[0] < 10 and not HAVE_FA3:
+            pytest.skip("On SM90 this MLA path needs FA3; FA4 aborts compiling its prefill")
     elif scenario.prerequisite == "mamba":
         available, reason = _check_mamba_sequence_packing_support()
         if not available:
