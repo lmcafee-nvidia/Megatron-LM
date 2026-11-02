@@ -1379,10 +1379,26 @@ class TestNVLSAllGatherVDispatcher:
 
         assert evidence["expert_backend"] == ["mcore"]
 
+    def test_batch_invariant_mxfp8_moe_with_empty_ep_rank(self):
+        if Utils.world_size < 2:
+            pytest.skip("Empty-rank MXFP8 coverage requires expert parallelism.")
+
+        rank = torch.distributed.get_rank()
+        expected_total = sum(range(Utils.world_size))
+        evidence = self.test_batch_invariant_moe_matches_training(
+            "torch", None, True, False, base_local_tokens=0, collect_inference_evidence=True
+        )
+
+        assert expected_total > 0
+        assert evidence["expert_backend"] == ["mcore"]
+        assert evidence["dispatch"][0]["local_rows"] == rank
+        assert evidence["dispatch"][0]["valid_rows"] == expected_total
+        assert evidence["combine"][0]["local_output_rows"] == rank
+
     @pytest.mark.parametrize(
         ("backend", "dispatcher_type", "base_local_tokens"),
-        [("vllm", "nccl", 1)],
-        ids=["nccl-positive"],
+        [("vllm", "nvls", 0), ("vllm", "nccl", 0), ("vllm", "nccl", 1), ("torch", "nccl", 0)],
+        ids=["nvls-empty", "nccl-empty", "nccl-positive", "mcore-nccl-empty"],
     )
     def test_moe_with_variable_ep_work(self, backend, dispatcher_type, base_local_tokens):
         if Utils.world_size < 2:
