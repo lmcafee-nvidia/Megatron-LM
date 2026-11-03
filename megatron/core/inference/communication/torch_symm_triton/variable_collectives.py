@@ -599,7 +599,7 @@ def multimem_all_gather_v(
     SYMM_MEM_KERNEL_CONFIG.check_num_blocks(num_blocks)
 
     _multimem_all_gather_v_kernel[(num_blocks, 1, 1)](
-        input_tensor.data_ptr(),
+        input_tensor,
         symm_mem_hdl.multicast_ptr,
         symm_mem_hdl.signal_pad_ptrs_dev,
         local_tokens=local_tokens,
