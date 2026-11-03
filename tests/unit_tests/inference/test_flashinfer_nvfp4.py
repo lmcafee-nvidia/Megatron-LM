@@ -213,16 +213,11 @@ def test_flashinfer_forward_dispatches_to_nvfp4(monkeypatch):
     assert captured["use_bounded_rows"] is True
 
 
-@pytest.mark.parametrize("built", [False, True], ids=["before_first_forward", "after"])
-def test_refit_rejects_built_nvfp4_expert_weights(monkeypatch, built):
-    """A refit after the NVFP4 copy is built would leave generation on the old weights.
-
-    Before the first forward there is no copy yet; it is built from the refit weights.
-    """
+def test_refit_accepts_built_nvfp4_expert_weights(monkeypatch):
     from megatron.core.resharding import refit
 
     experts_module = torch.nn.Module()
-    experts_module._nvfp4_weights = object() if built else None
+    experts_module._nvfp4_weights = object()
     target = torch.nn.Sequential(experts_module)
     executed = []
     monkeypatch.setattr(refit, "_unwrap_model_cores", lambda src, tgt: (None, tgt, 2))
@@ -233,12 +228,22 @@ def test_refit_rejects_built_nvfp4_expert_weights(monkeypatch, built):
     )
     service = SimpleNamespace(set_model_roles=lambda **kwargs: None)
 
-    if built:
-        with pytest.raises(NotImplementedError, match="per-token NVFP4"):
-            refit.reshard_model_weights(None, target, service)
-    else:
-        refit.reshard_model_weights(None, target, service)
-    assert executed == ["plan"], "the plan must run on every rank before raising"
+    refit.reshard_model_weights(None, target, service)
+    assert executed == ["plan"]
+
+
+def test_refresh_module_caches_rebuilds_routed_expert_weights(monkeypatch):
+    """The generic post-refit hook must rebuild both FlashInfer copies of the expert weights."""
+    from megatron.core.resharding import refresh_module_caches
+    from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+    refreshed = []
+    for name in ("refresh_flashinfer_mxfp8_weights", "refresh_flashinfer_nvfp4_weights"):
+        monkeypatch.setattr(InferenceGroupedMLP, name, lambda _, name=name: refreshed.append(name))
+    experts = InferenceGroupedMLP.__new__(InferenceGroupedMLP)
+    torch.nn.Module.__init__(experts)
+    refresh_module_caches(torch.nn.Sequential(experts))
+    assert refreshed == ["refresh_flashinfer_mxfp8_weights", "refresh_flashinfer_nvfp4_weights"]
 
 
 def test_gated_fc1_is_padded_per_half_and_interleaved_up_gate():
