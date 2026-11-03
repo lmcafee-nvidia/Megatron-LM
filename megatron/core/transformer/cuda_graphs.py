@@ -2200,7 +2200,9 @@ class CudaGraphManager(torch.nn.Module):
                 )
                 self.cudagraph_runners.append(runner)
 
-        if runner.mempool is None:
+        # Deletion only resets captured runners; one kept from eager warmup still holds the
+        # deleted pool and must also capture into the recreated one.
+        if not runner.fwd_graph_recorded and runner.mempool != CudaGraphManager.global_mempool:
             runner.mempool = CudaGraphManager.global_mempool
         return runner
 
