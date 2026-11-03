@@ -1207,6 +1207,10 @@ def _check_scenario_prerequisite(scenario):
         pytest.importorskip("flashinfer")
     elif scenario.prerequisite == "flash-mla":
         pytest.importorskip("flash_mla")
+        from megatron.core.transformer import attention
+
+        if scenario.config.get("flash_attention_version") == 3 and not attention.HAVE_FA3:
+            pytest.skip("FA3 is not installed")
     elif scenario.prerequisite == "mamba":
         available, reason = _check_mamba_sequence_packing_support()
         if not available:
