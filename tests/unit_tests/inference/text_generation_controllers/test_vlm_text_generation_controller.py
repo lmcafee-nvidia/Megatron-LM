@@ -107,12 +107,14 @@ def test_vlm_dynamic_forward_sanitizes_preexpanded_media_sentinel():
 
 @pytest.mark.internal
 @pytest.mark.parametrize("is_video", [False, True])
-def test_vlm_vision_forward_casts_images_and_passes_tensor_input_ids(is_video):
+@pytest.mark.parametrize("tile_tags", [None, [[11, 12, 13, 14, 15, 16]]])
+def test_vlm_vision_forward_casts_images_and_passes_tensor_input_ids(is_video, tile_tags):
     module = SimpleNamespace(
         image_token_index=-200,
         vision_model=SimpleNamespace(config=SimpleNamespace(params_dtype=torch.bfloat16)),
         dynamic_resolution=False,
         add_decoder=True,
+        _tile_tags=tile_tags,
     )
 
     class WrappedVisionModel:
@@ -138,7 +140,12 @@ def test_vlm_vision_forward_casts_images_and_passes_tensor_input_ids(is_video):
     args, _ = model.call_args
     assert args[0].dtype == torch.bfloat16
     assert isinstance(args[1], torch.Tensor)
-    assert args[1].shape == (1, 0)
+    expected_input_ids = (
+        torch.empty((1, 0), dtype=torch.long)
+        if tile_tags is None
+        else torch.tensor([[module.image_token_index]])
+    )
+    assert torch.equal(args[1].cpu(), expected_input_ids)
     assert args[1].device == args[0].device
     assert module.add_decoder is True
     assert output.dtype == torch.bfloat16

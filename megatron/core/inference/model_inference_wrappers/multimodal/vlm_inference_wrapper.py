@@ -407,12 +407,18 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         old_add_decoder = module.add_decoder
         module.add_decoder = False
         media_kind = "video" if num_frames is not None else "image"
-        empty_input_ids = torch.empty((1, 0), dtype=torch.long, device=images.device)
+        # LLaVAModel uses the media sentinel to gate tile-tag embeddings even in its
+        # encoder-only path. Keep the usual empty text input for every other model.
+        encoder_input_ids = (
+            torch.full((1, 1), module.image_token_index, dtype=torch.long, device=images.device)
+            if getattr(module, "_tile_tags", None) is not None
+            else torch.empty((1, 0), dtype=torch.long, device=images.device)
+        )
         try:
             with torch.cuda.nvtx.range(f"megatron.multimodal.{media_kind}_encoder"):
                 output = self.model(
                     images,
-                    empty_input_ids,
+                    encoder_input_ids,
                     position_ids=None,
                     attention_mask=None,
                     inference_context=self.inference_context,
