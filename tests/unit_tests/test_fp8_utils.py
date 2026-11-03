@@ -169,6 +169,56 @@ class TestFP8Padding:
             # Verify output has original shape
             assert output.shape == (6, 2, 4096)  # Back to original seq_len
 
+    @pytest.mark.parametrize(
+        ("input_shape", "returns_tuple"), [((6, 5), False), ((6, 2, 3, 5), True)]
+    )
+    def test_padding_preserves_non_sequence_dimensions(self, input_shape, returns_tuple):
+        """Pad dimension zero and restore packed [tokens, hidden] and higher-rank inputs."""
+        with (
+            patch.object(fp8_utils, 'HAVE_TE', True),
+            patch.object(fp8_utils, 'Fp8Padding') as mock_pad_class,
+            patch.object(fp8_utils, 'Fp8Unpadding') as mock_unpad_class,
+        ):
+            pad = mock_pad_class.return_value
+            pad.side_effect = lambda tensor, split: (
+                torch.cat((tensor, tensor.new_zeros(10, tensor.shape[1]))),
+                [16],
+            )
+            unpad = mock_unpad_class.return_value
+            unpad.side_effect = lambda tensor, split: tensor[:6]
+            module = MockTELinear(5, 7).cuda()
+            original_forward_inputs = []
+            auxiliary = object()
+
+            def track_forward(x):
+                original_forward_inputs.append(x)
+                output = torch.nn.functional.linear(x, module.weight)
+                return (output, auxiliary) if returns_tuple else output
+
+            module.forward = track_forward
+            fp8_utils._wrap_te_linear_for_padding(module)
+            with patch(
+                'transformer_engine.pytorch.fp8.FP8GlobalStateManager.is_fp8_enabled',
+                return_value=True,
+            ):
+                input_tensor = torch.randn(*input_shape, device="cuda")
+                expected = torch.nn.functional.linear(input_tensor, module.weight)
+                output = module(input_tensor)
+
+            actual = output[0] if returns_tuple else output
+            pad.assert_called_once()
+            unpad.assert_called_once()
+            padded_input, input_split = pad.call_args.args
+            padded_output, output_split = unpad.call_args.args
+            assert padded_input.shape == (6, input_tensor[0].numel())
+            assert original_forward_inputs[0].shape == (16, *input_shape[1:])
+            assert padded_output.shape == (16, expected[0].numel())
+            assert input_split == output_split == [6]
+            assert actual.shape == (*input_shape[:-1], 7)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            if returns_tuple:
+                assert output[1] is auxiliary
+
 
 @pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
 class TestCopyTensorsToQuantizedParams:
