@@ -141,6 +141,7 @@ def mcore_fused_moe(
     disable_fused_quant_kernels: bool = False,
     out: torch.Tensor = None,
     activation_clamp_scale: Optional[float] = None,
+    fused_weighted_squared_relu: bool = True,
 ) -> torch.Tensor:
     """Fused MoE: permute -> pad -> FC1 -> activation -> FC2 -> unpad -> unpermute.
 
@@ -170,6 +171,8 @@ def mcore_fused_moe(
         activation_clamp_scale: config.activation_func_tanh_clamp_scale. When set, the
             squared-ReLU pre-activation is soft-clamped with ``s * tanh(x / s)`` before the
             square, bounding the activation output by ``s ** 2``.
+        fused_weighted_squared_relu: config.use_fused_weighted_squared_relu. In
+            batch-invariant mode, selects the corresponding training rounding order.
 
     Returns:
         [max_tokens, hidden_size] BF16 output. Only the first valid_tokens rows are
@@ -282,6 +285,7 @@ def mcore_fused_moe(
                 permuted_probs,
                 activation_clamp_scale,
                 zero_padding=use_mxfp8,
+                fused_weighted=fused_weighted_squared_relu,
             )
     else:
         activation_out = activation_func(fc1_output, permutation_map, n_used)
