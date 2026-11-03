@@ -2140,7 +2140,13 @@ class CudaGraphManager(torch.nn.Module):
         Otherwise, we assign a mempool per microbatch, which allows cudagraphs to be reused
         over different microbatches by tracking their respective fwd and bwd passes.'''
 
-        self._initialize_mempool()
+        if CudaGraphManager.global_mempool is None:
+            # Graph deletion cleared the pool. Recreate it and, as at construction, capture on
+            # a side stream ordered after work already queued on the current stream.
+            self._initialize_mempool()
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            torch.cuda.set_stream(stream)
         if self.need_backward and not _CudagraphGlobalRecord.cudagraph_created:
             _CudagraphGlobalRecord._enable_saved_tensors_observer()
 
@@ -2202,7 +2208,9 @@ class CudaGraphManager(torch.nn.Module):
                 )
                 self.cudagraph_runners.append(runner)
 
-        if runner.mempool is None:
+        # Deletion resets only captured runners; any runner that has not recorded since then
+        # must capture into the current pool.
+        if not runner.fwd_graph_recorded and runner.mempool != CudaGraphManager.global_mempool:
             runner.mempool = CudaGraphManager.global_mempool
         return runner
 
