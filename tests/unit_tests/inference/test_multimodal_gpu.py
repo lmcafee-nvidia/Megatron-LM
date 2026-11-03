@@ -349,7 +349,10 @@ def _build_te_parallel_model(topology):
 def _build_attention_variant_model(variant):
     common = _language_defaults(num_layers=1, hidden_size=32, num_attention_heads=4, kv_channels=64)
     language_config = TransformerConfig(
-        transformer_impl="local", window_size=(4, 0) if variant == "swa" else None, **common
+        transformer_impl="local",
+        window_size=(4, 0) if variant == "swa" else None,
+        softmax_type="off-by-one" if variant == "sink" else "vanilla",
+        **common,
     )
     layer_submodules = get_gpt_layer_local_submodules()
     language_spec = ModuleSpec(module=TransformerLayer, submodules=copy.deepcopy(layer_submodules))
@@ -1219,7 +1222,7 @@ def test_real_media_executes_configured_language_implementation_or_parallel_path
     assert finished.generated_tokens[0] == _greedy_token(step)
 
 
-@pytest.mark.parametrize("variant", ["swa"])
+@pytest.mark.parametrize("variant", ["swa", "sink"])
 def test_real_media_executes_attention_variant_and_reuses_exact_result(model_parallel, variant):
     model = _build_attention_variant_model(variant)
     block_size_tokens = 4
@@ -1236,6 +1239,31 @@ def test_real_media_executes_attention_variant_and_reuses_exact_result(model_par
             return original_flash(attention, *args, **kwargs)
 
         patchers.append(mock.patch.object(Attention, "flash_decode_and_prefill", new=record_window))
+    if variant == "sink":
+        # Every flash path, FA4 included, applies the sink after the kernel from its LSE.
+        original_varlen = Attention._apply_sink_softmax_correction_varlen
+        original_bshd = Attention._apply_sink_softmax_correction_bshd
+
+        def record_varlen(output, lse, softmax_offset):
+            companion_events.append("varlen")
+            return original_varlen(output, lse, softmax_offset)
+
+        def record_bshd(output, lse, softmax_offset):
+            companion_events.append("bshd")
+            return original_bshd(output, lse, softmax_offset)
+
+        patchers.extend(
+            [
+                mock.patch.object(
+                    Attention,
+                    "_apply_sink_softmax_correction_varlen",
+                    new=staticmethod(record_varlen),
+                ),
+                mock.patch.object(
+                    Attention, "_apply_sink_softmax_correction_bshd", new=staticmethod(record_bshd)
+                ),
+            ]
+        )
     for patcher in patchers:
         patcher.start()
     try:
