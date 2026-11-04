@@ -745,6 +745,55 @@ class TestDynamicContext:
         assert torch.equal(activations, expected)
 
     @pytest.mark.internal
+    @pytest.mark.parametrize("fp8", [True, False], ids=["fp8", "batch-invariant"])
+    def test_cuda_graph_ceiling_applies_only_to_model_alignment(self, fp8, monkeypatch):
+        """FP8-padded graphs stop at cuda_graph_max_tokens; batch-invariant padding still replays."""
+        monkeypatch.setattr(
+            "megatron.core.inference.batch_dimensions_utils._batch_invariant_mode_enabled",
+            lambda: not fp8,
+        )
+        alignment = 16 if fp8 else 64
+        ctx = DynamicInferenceContext(
+            model_config=TransformerConfig(
+                params_dtype=torch.bfloat16,
+                num_layers=2,
+                kv_channels=64,
+                num_attention_heads=8,
+                fp8="hybrid" if fp8 else None,
+            ),
+            inference_config=InferenceConfig(
+                max_sequence_length=256,
+                num_cuda_graphs=4,
+                use_cuda_graphs_for_non_decode_steps=True,
+                cuda_graph_max_tokens=24,
+                buffer_size_gb=0.05,
+                block_size_tokens=256,
+                max_tokens=64,
+                max_requests=8,
+                unified_memory_level=0,
+            ),
+        )
+        graph_token_counts = {dims.token_count for dims in ctx.cuda_graph_batch_dimensions_list}
+        assert all(token_count % alignment == 0 for token_count in graph_token_counts)
+        assert max(graph_token_counts) > 24
+
+        # Within the ceiling, a step replays an aligned graph. Past it, a step replays the
+        # padded graph only when the padding comes from batch-invariant mode.
+        for prompt_length, uses_graph in ((20, True), (30, not fp8)):
+            ctx.reset()
+            ctx.add_request(
+                DynamicInferenceRequest(
+                    request_id=prompt_length,
+                    prompt_tokens=torch.arange(prompt_length, device="cuda"),
+                    sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
+                )
+            )
+            ctx.initialize_attention_state()
+            assert ctx.using_cuda_graph_this_step() == uses_graph
+            if uses_graph:
+                assert ctx.padded_batch_dimensions.token_count % alignment == 0
+
+    @pytest.mark.internal
     @rounder_override(8)
     @pytest.mark.parametrize("num_speculative_tokens", [0, 2])
     def test_copy_async_sched_sample_to_forward_populates_active_and_clears_padding(

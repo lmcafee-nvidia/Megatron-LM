@@ -181,6 +181,46 @@ class TestCUDAGraphTokenCountAlignment:
 class TestGenerateCUDAGraphEdgeCases:
     """Single-process tests for graph generation edge cases."""
 
+    def test_model_alignment_pads_captures_without_exceeding_capacity(self):
+        """Quantized buckets are aligned physically, while oversized work stays eager."""
+        graph_list, token_counts = (
+            CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
+                tp_size=1,
+                num_cuda_graphs=4,
+                cuda_graph_max_tokens=80,
+                cuda_graph_mixed_prefill_request_count=2,
+                max_requests=8,
+                max_tokens=80,
+                max_sequence_length=128,
+                use_cuda_graphs_for_non_decode_steps=True,
+                token_alignment=64,
+            )
+        )
+
+        assert graph_list
+        assert token_counts == [64]
+        assert all(graph.token_count == 64 for graph in graph_list)
+        assert any(graph.prefill_req_count for graph in graph_list)
+        assert (
+            CUDAGraphBatchDimensionBuilder.match_graph_config(
+                BD(65, 1, 0), graph_list, strict=False
+            )
+            is None
+        )
+
+        with pytest.raises(AssertionError, match="token_alignment must be positive"):
+            CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
+                tp_size=1,
+                num_cuda_graphs=1,
+                cuda_graph_max_tokens=8,
+                cuda_graph_mixed_prefill_request_count=0,
+                max_requests=8,
+                max_tokens=8,
+                max_sequence_length=8,
+                use_cuda_graphs_for_non_decode_steps=False,
+                token_alignment=0,
+            )
+
     def test_generate_cuda_graph_edge_cases(self):
         """Edge cases in graph generation:
         max_tokens > max_requests, small max_tokens, step_size floor, speculative decoding.
