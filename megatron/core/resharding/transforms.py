@@ -16,6 +16,7 @@ from megatron.core.inference.quantization.mxfp8_tensor import (
     MXFP8Backend,
     MXFP8Tensor,
     ensure_mxfp8_scale_dtype,
+    get_mxfp8_scale_bytes,
     validate_mxfp8_tensor,
 )
 from megatron.core.tensor_parallel import gtp_api
@@ -208,7 +209,11 @@ class MXFP8ReshardTransform(ReshardTransform):
         if self.convert_on_send:
             bf16_data = src_data[src_slice].contiguous().to(torch.bfloat16)
             mxfp8 = MXFP8Tensor.from_bf16(bf16_data, backend=self.backend)
-            return [mxfp8.data.contiguous(), mxfp8.scale.contiguous()]
+            # Sender-side conversion is supported only with a logical 2D-scale
+            # receiver (see prepare_recv). Normalize any backend-native swizzle
+            # before transmission so the wire shape and receiver slice agree.
+            logical_scale = get_mxfp8_scale_bytes(mxfp8).contiguous().view(mxfp8.scale.dtype)
+            return [mxfp8.data.contiguous(), logical_scale]
         else:
             # BF16 on the wire — same as the default reshard path.
             return [src_data[src_slice].contiguous()]
@@ -308,4 +313,4 @@ class MXFP8ReshardTransform(ReshardTransform):
             mxfp8 = MXFP8Tensor.from_bf16(recv_buffers[0], backend=buf.backend)
             buf.data[dst_slice].copy_(mxfp8.data)
             scale_slice = _scale_slice_from_data_slice(dst_slice)
-            buf.scale[scale_slice].view(torch.uint8).copy_(mxfp8.scale.view(torch.uint8))
+            buf.scale[scale_slice].view(torch.uint8).copy_(get_mxfp8_scale_bytes(mxfp8))
