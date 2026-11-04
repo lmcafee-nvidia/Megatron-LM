@@ -145,6 +145,35 @@ def _boundary_input(rows: int, cols: int) -> torch.Tensor:
     return result
 
 
+def test_validation_rejects_noncontiguous_storage():
+    source = torch.randn(8, 128, device="cuda", dtype=torch.bfloat16)
+    quantized = MXFP8Tensor.from_bf16(source, backend="triton")
+    strided_data = torch.empty_strided(
+        quantized.shape, (1, quantized.shape[0]), device="cuda", dtype=torch.float8_e4m3fn
+    )
+    invalid = MXFP8Tensor(
+        data=strided_data, scale=quantized.scale, backend="triton", dtype=torch.bfloat16
+    )
+    with pytest.raises(ValueError, match="data must be contiguous"):
+        validate_mxfp8_tensor(invalid)
+
+    strided_scale = torch.empty(
+        quantized.scale.numel() * 2, device="cuda", dtype=torch.float8_e8m0fnu
+    )[::2]
+    invalid = MXFP8Tensor(
+        data=quantized.data, scale=strided_scale, backend="triton", dtype=torch.bfloat16
+    )
+    with pytest.raises(ValueError, match="scale must be contiguous"):
+        validate_mxfp8_tensor(invalid)
+
+    cpu_scale = quantized.scale.view(torch.uint8).cpu().view(torch.float8_e8m0fnu)
+    cross_device = MXFP8Tensor(
+        data=quantized.data, scale=cpu_scale, backend="triton", dtype=torch.bfloat16
+    )
+    with pytest.raises(ValueError, match="must both use CUDA storage"):
+        validate_mxfp8_tensor(cross_device)
+
+
 @pytest.mark.launch_on_gb200
 @pytest.mark.parametrize(
     "backend,dispatch_name",
