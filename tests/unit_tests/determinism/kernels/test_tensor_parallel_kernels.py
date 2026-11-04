@@ -16,6 +16,7 @@
 """
 
 import importlib.util
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -35,7 +36,9 @@ from megatron.core.tensor_parallel.layers import (
     VocabParallelEmbedding,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import attention_mask_func
 from megatron.core.utils import init_method_normal
@@ -264,6 +267,56 @@ class TestTensorParallelLayers:
             module, (x,), replays=3, contention=True, what="column linear[bf16 input, fp32 output]"
         )
         assert outputs["out[0]"].dtype is torch.float32
+
+    def test_local_attention_unequal_key_value_widths_replay(self):
+        """MLA's local core uses key width for scores and value width for its output."""
+        seeded()
+        config = _config(
+            hidden_size=512,
+            num_attention_heads=8,
+            num_query_groups=2,
+            kv_channels=64,
+            masked_softmax_fusion=False,
+            attention_dropout=0.0,
+        )
+        module = DotProductAttention(
+            config, 1, AttnMaskType.causal, "self", k_channels=48, v_channels=96
+        ).cuda()
+        q = torch.randn(512, 2, 8, 48, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        k = torch.randn(512, 2, 2, 48, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        v = torch.randn(512, 2, 2, 96, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        outputs, _ = assert_module_replays_bit_exact(
+            module, (q, k, v, None), replays=3, contention=True, what="local MLA attention"
+        )
+        assert outputs["out"].shape == (512, 2, 8 * 96)
+        assert module.softmax_scale == pytest.approx(48**-0.5)
+
+    def test_mla_absorption_keeps_a_non_fused_kv_up_projection(self):
+        """Local-spec MLA has a plain KV up projection, which absorption must not split."""
+        heads, key_width, value_width, rank = 4, 48, 32, 64
+        projection = ColumnParallelLinear(
+            rank,
+            heads * (key_width + value_width),
+            config=_config(hidden_size=512, num_attention_heads=heads),
+            init_method=init_method_normal(0.02),
+            bias=False,
+            gather_output=False,
+        ).cuda()
+        norm = torch.nn.LayerNorm(rank).cuda()
+        owner = SimpleNamespace(
+            config=SimpleNamespace(
+                kv_lora_rank=rank, qk_head_dim=key_width, v_head_dim=value_width
+            ),
+            num_attention_heads_per_partition=heads,
+            linear_kv_up_proj=projection,
+            kv_layernorm=norm,
+        )
+        MLASelfAttention.prepare_for_absorption(owner)
+        assert owner.linear_kv_up_proj_linear is projection
+        assert owner.kv_layernorm is norm
+        weight = projection.weight.view(heads, key_width + value_width, rank)
+        assert torch.equal(owner.up_k_weight, weight[:, :key_width])
+        assert torch.equal(owner.up_v_weight, weight[:, key_width:])
 
 
 # --- apex fused layer norm ------------------------------------------------------------------
