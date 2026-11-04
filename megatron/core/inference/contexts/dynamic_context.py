@@ -902,11 +902,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             and model_config.transformer_impl == "inference_optimized"
             and model_config.inference_moe_token_dispatcher_type == 'nvls'
         )
-        # It gathers over the tp_ep group, so it communicates for EP > 1 and also
-        # for EP == 1 with expert tensor parallelism (ETP > 1).
-        self._nvls_ep_dispatcher = (
-            get_pg_size(self.expert_tensor_and_model_parallel_group) > 1 and self._nvls_dispatcher
-        )
 
         # are we using the training a2a dispatcher for MoEs?
         # Note that this is not optimal for speed.
@@ -964,7 +959,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         InferenceAllGatherDispatcherBase.allocate_valid_tokens_tensor()
         if self._nccl_ep_dispatcher:
             NCCLAllGatherDispatcher.allocate_buffers()
-        elif self._nvls_ep_dispatcher:
+        elif self._nvls_dispatcher and get_pg_size(self.expert_tensor_and_model_parallel_group) > 1:
+            # Symmetric buffers are only needed when the tp_ep gather has more than one
+            # participant: EP > 1, or EP == 1 with expert tensor parallelism (ETP > 1).
             # Use moe_latent_size if set (latent MoE: SuperV3, UltraV3), else hidden_size.
             moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
             NVLSAllGatherVDispatcher.allocate_buffers(

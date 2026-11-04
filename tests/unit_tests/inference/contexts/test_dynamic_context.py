@@ -338,6 +338,8 @@ class TestDynamicContext:
             "_real_token_count_tensor",
             NVLSAllGatherVDispatcher._real_token_count_tensor,
         )
+        allocate_buffers = mock.Mock()
+        monkeypatch.setattr(NVLSAllGatherVDispatcher, "allocate_buffers", allocate_buffers)
         model_config = TransformerConfig(
             params_dtype=torch.bfloat16,
             num_layers=1,
@@ -369,7 +371,7 @@ class TestDynamicContext:
             ),
         )
         assert context._nvls_dispatcher
-        assert not context._nvls_ep_dispatcher
+        allocate_buffers.assert_not_called()
         assert (
             NVLSAllGatherVDispatcher._real_token_count_tensor.data_ptr()
             == context.gpu_view.real_token_count.data_ptr()
