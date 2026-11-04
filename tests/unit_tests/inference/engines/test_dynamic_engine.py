@@ -4738,8 +4738,10 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                             "cached_tokens"
                         ]
                         stream_cached = usage_records[0]["prompt_tokens_details"]["cached_tokens"]
-                        # The non-streamed reference can warm blocks for the matching stream.
-                        assert final_cached > 0
+                        # REF_ZERO releases a block once no request holds it, so only choices
+                        # of one request, in flight together, can share cached blocks.
+                        if len(final_choices) > 1:
+                            assert final_cached > 0
                         assert stream_cached >= final_cached
 
                 endpoint_prompt = " ".join(f"t{token}" for token in prompts[0])
