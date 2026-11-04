@@ -600,21 +600,6 @@ def test_huggingface_fast_incremental_detokenizer_drops_eos_and_special_map_toke
     assert streamed_text == "<think>x</think>ab"
 
 
-@pytest.mark.parametrize("remove_eos", [False, True])
-def test_huggingface_fast_incremental_detokenizer_matches_trailing_eos_policy(remove_eos):
-    tokenizer, huggingface_tokenizer = _with_chat_markers(eos_marker="<|im_end|>")
-    huggingface_tokenizer.add_special_tokens({"additional_special_tokens": ["<special>"]})
-    token_ids = huggingface_tokenizer.encode(
-        "a<special><|im_end|>b<|im_end|>", add_special_tokens=False
-    )
-    detokenizer = HuggingFaceFastIncrementalDetokenizer(tokenizer, [], remove_eos=remove_eos)
-
-    streamed_text = detokenizer.update(token_ids) + detokenizer.finish()
-    expected_tokens = token_ids[:-1] if remove_eos else token_ids
-
-    assert streamed_text == _non_streaming_text(huggingface_tokenizer, expected_tokens)
-
-
 @pytest.mark.asyncio
 async def test_openai_stream_rejects_clean_termination_without_a_final_record():
     stream = AsyncStream(request_id=1, cancel=lambda: None)
@@ -694,6 +679,22 @@ async def test_short_choice_gets_terminal_before_longer_choice_finishes():
             if choice["finish_reason"] is not None
         )
     assert terminal_indices == [0, 1]
+
+
+@pytest.mark.parametrize("remove_eos,cut", [(False, None), (True, None), (False, -1), (True, -1)])
+def test_huggingface_fast_incremental_detokenizer_matches_trailing_eos_policy(remove_eos, cut):
+    tokenizer, huggingface_tokenizer = _with_chat_markers(eos_marker="<|im_end|>")
+    huggingface_tokenizer.add_special_tokens({"additional_special_tokens": ["<special>"]})
+    token_ids = huggingface_tokenizer.encode("a<special><|im_end|>bé", add_special_tokens=False)
+    token_ids = token_ids[:cut] + [tokenizer.eod]  # cut=-1 ends inside "é"
+    detokenizer = HuggingFaceFastIncrementalDetokenizer(tokenizer, [], remove_eos=remove_eos)
+
+    held_text = detokenizer.update(token_ids[:3])  # The next offset counts the held EOS.
+    assert detokenizer.text_length == len("a<|im_end|>")
+    streamed_text = held_text + detokenizer.update(token_ids[3:]) + detokenizer.finish()
+    expected_tokens = token_ids[:-1] if remove_eos else token_ids
+
+    assert streamed_text == _non_streaming_text(huggingface_tokenizer, expected_tokens)
 
 
 def test_incremental_detokenizer_rejects_unsupported_tokenizer():
