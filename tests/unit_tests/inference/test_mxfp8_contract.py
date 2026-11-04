@@ -145,6 +145,58 @@ def _boundary_input(rows: int, cols: int) -> torch.Tensor:
     return result
 
 
+def test_hopper_mxfp8_gemm_fails_and_bf16_path_executes(monkeypatch):
+    """Hopper quantizes MXFP8, rejects its GEMM, and retains the BF16 linear path."""
+    if torch.cuda.get_device_capability()[0] >= 10:
+        pytest.skip("negative architecture contract is specific to pre-Blackwell GPUs")
+    x = torch.randn(4, 1, 128, device="cuda", dtype=torch.bfloat16)
+    weight_source = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+    weight = MXFP8Tensor.from_bf16(weight_source, backend="triton")
+    expected_data, expected_scales = _reference_quantize(weight_source)
+
+    assert torch.equal(weight.data.view(torch.uint8), expected_data.view(torch.uint8))
+    assert torch.equal(_logical_scale_bytes(weight), expected_scales)
+
+    def unexpected_dispatch(*args, **kwargs):
+        raise AssertionError("unsupported architecture reached the GEMM backend")
+
+    monkeypatch.setattr(quantization_utils, "_mm_mxfp8_torch", unexpected_dispatch)
+    with pytest.raises(RuntimeError, match="requires NVIDIA Blackwell"):
+        quantization_utils.mm_mxfp8(x, weight)
+
+    bf16_weight = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+    fallback = _apply_linear(x, bf16_weight, SimpleNamespace())
+    assert torch.equal(fallback, torch.matmul(x, bf16_weight.T))
+
+
+def test_mm_mxfp8_rejects_invalid_linear_inputs_before_dispatch(monkeypatch):
+    """Invalid activations and output buffers fail before either MXFP8 GEMM backend runs."""
+    weight = MXFP8Tensor.from_bf16(
+        torch.randn(64, 128, device="cuda", dtype=torch.bfloat16), backend="triton"
+    )
+
+    def unexpected_dispatch(*args, **kwargs):
+        raise AssertionError("invalid MXFP8 geometry reached the GEMM backend")
+
+    monkeypatch.setattr(quantization_utils, "_mm_mxfp8_torch", unexpected_dispatch)
+    with pytest.raises(ValueError, match=r"\[tokens, 1, hidden\]"):
+        quantization_utils.mm_mxfp8(
+            torch.randn(4, 128, device="cuda", dtype=torch.bfloat16), weight
+        )
+    with pytest.raises(ValueError, match="does not match weight K"):
+        quantization_utils.mm_mxfp8(
+            torch.randn(4, 1, 160, device="cuda", dtype=torch.bfloat16), weight
+        )
+    with pytest.raises(TypeError, match="linear input must use"):
+        quantization_utils.mm_mxfp8(torch.ones(4, 1, 128, device="cuda", dtype=torch.int32), weight)
+    with pytest.raises(ValueError, match="output buffer"):
+        quantization_utils.mm_mxfp8(
+            torch.randn(4, 1, 128, device="cuda", dtype=torch.bfloat16),
+            weight,
+            out=torch.empty(4, 64, device="cuda", dtype=torch.float32),
+        )
+
+
 @pytest.mark.launch_on_gb200
 @pytest.mark.parametrize(
     "backend,dispatch_name",
