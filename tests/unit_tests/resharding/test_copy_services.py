@@ -183,12 +183,20 @@ def test_nixl_service_skips_redundant_process_group_barrier():
 
 
 @pytest.mark.parametrize("service_cls", [NCCLCopyService, GlooCopyService])
-def test_local_copy_waits_for_current_stream(service_cls):
-    """A local copy must observe writes already queued on the caller's stream."""
+@pytest.mark.parametrize(
+    "inference_destination", [False, True], ids=["ordinary-destination", "inference-destination"]
+)
+def test_local_copy_waits_for_current_stream(service_cls, inference_destination):
+    """A local copy must observe writes already queued on the caller's stream.
+
+    Inference engines may create destination parameters in inference mode, and refit
+    copies into them from outside inference mode.
+    """
     Utils.initialize_distributed()
     service = service_cls()
     source = torch.zeros(1, device="cuda")
-    destination = torch.zeros_like(source)
+    with torch.inference_mode(inference_destination):
+        destination = torch.zeros_like(source)
     torch.cuda.synchronize()
 
     producer_gate = torch.cuda.Event()
