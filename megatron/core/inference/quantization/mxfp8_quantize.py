@@ -199,6 +199,15 @@ def mxfp8_quantize_into(x: torch.Tensor, out_data: torch.Tensor, out_scale: torc
     assert out_scale.dim() == 1 and out_scale.is_contiguous()
     assert out_scale.dtype in (torch.uint8, torch.float8_e8m0fnu)
 
+    # Triton pointer arithmetic below is intentionally dense row-major. Materialize
+    # arbitrary public input strides rather than silently interpreting their storage.
+    x = x.contiguous()
+    storages = (x.untyped_storage(), out_data.untyped_storage(), out_scale.untyped_storage())
+    storage_ptrs = tuple(storage.data_ptr() for storage in storages)
+    assert len(set(storage_ptrs)) == len(
+        storage_ptrs
+    ), "MXFP8 input, data output, and scale output must not share storage"
+
     scale_cols = K // MXFP8_BLOCK_SIZE
     n_row_blocks = _ceil_div(M, MXFP8_SCALE_ROW_BLOCK)
     n_col_blocks = _ceil_div(scale_cols, MXFP8_SCALE_COL_BLOCK)
@@ -275,6 +284,7 @@ def mxfp8_quantize_rows(
     assert n_rows.is_cuda and n_rows.numel() == 1
     M, K = x.shape
     assert K % MXFP8_BLOCK_SIZE == 0, f"K ({K}) must be divisible by {MXFP8_BLOCK_SIZE}"
+    x = x.contiguous()
     scale_cols = K // MXFP8_BLOCK_SIZE
     n_row_blocks = _ceil_div(M, MXFP8_SCALE_ROW_BLOCK)
     n_col_blocks = _ceil_div(scale_cols, MXFP8_SCALE_COL_BLOCK)
