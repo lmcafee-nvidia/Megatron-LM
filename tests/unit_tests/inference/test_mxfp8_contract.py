@@ -145,6 +145,115 @@ def _boundary_input(rows: int, cols: int) -> torch.Tensor:
     return result
 
 
+def test_boundary_payload_scales_and_padding_match_independent_reference():
+    """Stress 32-column groups plus 128-row/4-column scale-tile tails."""
+    x = _boundary_input(129, 160)
+    data, scale = mxfp8_quantize(x)
+    expected_data, logical_scale = _reference_quantize(x)
+    expected_scale = _swizzle_scales(logical_scale)
+
+    assert torch.unique(logical_scale).numel() > 10
+    assert torch.count_nonzero(data.view(torch.uint8)) > 0
+    assert logical_scale[32, 1].item() == 0
+    assert torch.count_nonzero(expected_data[32, 32:64].view(torch.uint8)) == 32
+    assert torch.equal(data.view(torch.uint8), expected_data.view(torch.uint8))
+    assert torch.equal(scale.view(torch.uint8), expected_scale)
+
+
+def test_conversion_verifier_decodes_e8m0_byte_zero_as_finite_scale():
+    x = torch.full(
+        (1, MXFP8_BLOCK_SIZE),
+        torch.finfo(torch.float32).tiny / 4,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    quantized = MXFP8Tensor.from_bf16(x, backend="triton")
+
+    assert quantized.scale.view(torch.uint8)[0].item() == 0
+    assert torch.all(quantized.data.float() == 0.5)
+    quantization_utils._verify_te_to_mcore_mxfp8_conversion(x, quantized)
+
+
+def test_conversion_verifier_rejects_mismatched_byte_zero_block():
+    """A byte-zero block that dequantizes to different tiny values must not pass the check."""
+    x = torch.full(
+        (1, MXFP8_BLOCK_SIZE),
+        torch.finfo(torch.float32).tiny / 4,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    quantized = MXFP8Tensor.from_bf16(x, backend="triton")
+
+    with pytest.raises(ValueError, match="sanity check failed"):
+        quantization_utils._verify_te_to_mcore_mxfp8_conversion(x * 2, quantized)
+
+
+def test_odd_live_rows_graph_replay_clears_stale_swizzled_scales():
+    """E8M0 byte-zero scales stay exact through CUDA-graph replay of the live-row quantizer.
+
+    The input carries a block of float32 ``tiny / 4`` values at row 32, so every live-row
+    count of 33 or more must encode that block with scale byte zero. Changing the live count
+    between replays must also update the scale targets and clear former ones.
+    """
+    rows, cols = 257, 160
+    x = _boundary_input(rows, cols).to(torch.bfloat16)
+    n_rows = torch.tensor([129], device="cuda", dtype=torch.int32)
+    side_stream = torch.cuda.Stream()
+    side_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side_stream):
+        mxfp8_quantize_rows(x, n_rows)
+    torch.cuda.current_stream().wait_stream(side_stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        data, scale = mxfp8_quantize_rows(x, n_rows, max_programs=7)
+    data_ptr, scale_ptr = data.data_ptr(), scale.data_ptr()
+
+    for live_rows in (129, 33, 128, 1, 257):
+        data_before_replay = data.view(torch.uint8).clone()
+        n_rows.fill_(live_rows)
+        graph.replay()
+        expected_data, logical_scale = _reference_quantize(x[:live_rows])
+        expected_logical = torch.zeros(
+            (rows, cols // MXFP8_BLOCK_SIZE), device="cuda", dtype=torch.uint8
+        )
+        expected_logical[:live_rows] = logical_scale
+        assert torch.equal(data[:live_rows].view(torch.uint8), expected_data.view(torch.uint8))
+        assert torch.equal(
+            scale.view(torch.uint8), _swizzle_scales(expected_logical, storage_rows=rows)
+        )
+        assert torch.equal(data[live_rows:].view(torch.uint8), data_before_replay[live_rows:])
+        assert (data.data_ptr(), scale.data_ptr()) == (data_ptr, scale_ptr)
+
+
+def test_quantize_into_honors_offset_views_without_touching_sentinels():
+    """E8M0 byte-zero scales stay exact when quantizing into offset output views.
+
+    The input carries a block of float32 ``tiny / 4`` values at row 32, which must be encoded
+    with scale byte zero. The exact-sized output views must not touch their surrounding
+    sentinel bytes.
+    """
+    x = _boundary_input(129, 160).to(torch.bfloat16)
+    expected_data, logical_scale = _reference_quantize(x)
+    expected_scale = _swizzle_scales(logical_scale)
+    data_storage_bytes = torch.full(
+        (x.shape[0] + 2, x.shape[1]), 0xA5, device="cuda", dtype=torch.uint8
+    )
+    data_storage = data_storage_bytes.view(torch.float8_e4m3fn)
+    scale_storage = torch.full(
+        (expected_scale.numel() + 16,), 0xA5, device="cuda", dtype=torch.uint8
+    )
+    out_data = data_storage[1:-1]
+    out_scale = scale_storage[8:-8].view(torch.float8_e8m0fnu)
+
+    mxfp8_quantize_into(x, out_data, out_scale)
+
+    assert torch.equal(out_data.view(torch.uint8), expected_data.view(torch.uint8))
+    assert torch.equal(out_scale.view(torch.uint8), expected_scale)
+    assert torch.all(data_storage_bytes[[0, -1]] == 0xA5)
+    assert torch.all(scale_storage[:8] == 0xA5)
+    assert torch.all(scale_storage[-8:] == 0xA5)
+
+
 @pytest.mark.launch_on_gb200
 @pytest.mark.parametrize(
     "backend,dispatch_name",
