@@ -5124,9 +5124,32 @@ class DynamicInferenceEngine(AbstractEngine):
         # We're inside a running loop - run in a separate thread. Keep this
         # outside the exception handler so a RuntimeError raised by the
         # coroutine is propagated instead of being mistaken for a missing loop.
+        # A new thread starts on CUDA device 0, so select this thread's device
+        # before the step launches kernels.
+        device = torch.cuda.current_device() if torch.cuda.is_available() else None
+
+        def run():
+            if device is not None:
+                torch.cuda.set_device(device)
+            return asyncio.run(self._run_then_drain_staging(coro))
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(asyncio.run, coro)
-            return future.result()
+            return executor.submit(run).result()
+
+    async def _run_then_drain_staging(self, coro):
+        """Await ``coro``, then the payload staging tasks it started.
+
+        asyncio.run() cancels every task still pending when its coroutine returns, so a
+        staged reply started on that temporary loop would be dropped before it is sent.
+        Tasks started earlier belong to another loop and are left alone.
+        """
+        started_before = set(self._staging_tasks)
+        try:
+            return await coro
+        finally:
+            started_here = self._staging_tasks - started_before
+            if started_here:
+                await asyncio.gather(*started_here, return_exceptions=True)
 
     def step_modern(self) -> DynamicInferenceEngineStepResult:
         """Synchronous wrapper for `self.async_step`."""
