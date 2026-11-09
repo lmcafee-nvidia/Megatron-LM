@@ -1980,7 +1980,9 @@ class TestMoEModules:
         finally:
             replay.clear_indices()
             replay.clear_router_replay_action()
-            RouterReplay.global_router_replay_instances.remove(replay)
+            RouterReplay.global_router_replay_instances[:] = [
+                ref for ref in RouterReplay.global_router_replay_instances if ref() is not replay
+            ]
         for reference, current in ((ref_outputs, outputs), (ref_grads, grads)):
             assert reference.keys() == current.keys()
             for name in reference:
