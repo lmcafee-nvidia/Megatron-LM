@@ -31,7 +31,8 @@ from megatron.core.inference.disaggregation.inference_state_handoff import (
 )
 from megatron.core.inference.disaggregation.pending_handoff_imports import PendingKvImport
 from megatron.core.inference.engines import DynamicInferenceEngine
-from megatron.core.inference.engines.dynamic_engine import EngineState, _get_decode_only_log_state
+from megatron.core.inference.engines.dynamic.loop import _get_decode_only_log_state
+from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.inference_request import (
     DynamicInferenceEventType,
     DynamicInferenceRequest,
@@ -76,6 +77,7 @@ def _make_engine(
         can_prepare_requests=mock.Mock(return_value=True),
         active_token_count=0,
         max_tokens=8,
+        max_prefill_tokens=8,
         chunked_prefill_request_id=-1,
     )
     model_config = SimpleNamespace(
@@ -327,11 +329,9 @@ def test_async_forward_routes_one_controller_iteration(
 
     with (
         mock.patch(
-            "megatron.core.inference.engines.dynamic_engine.nvtx_range_push"
+            "megatron.core.inference.engines.dynamic.loop.nvtx_range_push"
         ) as nvtx_range_push,
-        mock.patch(
-            "megatron.core.inference.engines.dynamic_engine.nvtx_range_pop"
-        ) as nvtx_range_pop,
+        mock.patch("megatron.core.inference.engines.dynamic.loop.nvtx_range_pop") as nvtx_range_pop,
     ):
         result, context_state, _ = asyncio.run(engine.async_forward())
 
@@ -406,8 +406,8 @@ def test_async_bookkeep_uses_consumed_chunked_prefill_request_id(track_paused_re
     }
 
     with (
-        mock.patch("megatron.core.inference.engines.dynamic_engine.nvtx_range_push"),
-        mock.patch("megatron.core.inference.engines.dynamic_engine.nvtx_range_pop"),
+        mock.patch("megatron.core.inference.engines.dynamic.loop.nvtx_range_push"),
+        mock.patch("megatron.core.inference.engines.dynamic.loop.nvtx_range_pop"),
     ):
         asyncio.run(engine.async_bookkeep(step_result, context_state, 0.0))
 
@@ -1875,14 +1875,17 @@ def _instrument_scenario_runtime(env, scenario, runtime, teacher_tokens=None):
 
     controller._compact_async_sched_forward = traced_compact
 
-    allocator = context.kv_block_allocator
-    original_deregister = allocator._deregister_blocks
+    # Deregistration lives on the allocator's per-block prefix-cache state, which only
+    # exists when prefix caching is on.
+    pc_state = context.kv_block_allocator.pc_state
+    if pc_state is not None:
+        original_deregister = pc_state.deregister_blocks
 
-    def traced_deregister(block_ids):
-        runtime["prefix-blocks-deregistered"] += block_ids.numel()
-        return original_deregister(block_ids)
+        def traced_deregister(block_ids):
+            runtime["prefix-blocks-deregistered"] += block_ids.numel()
+            return original_deregister(block_ids)
 
-    allocator._deregister_blocks = traced_deregister
+        pc_state.deregister_blocks = traced_deregister
 
     if "fused-rope" in scenario.signals:
         original_fused_rope = context.apply_fused_qk_rotary_emb
@@ -2282,7 +2285,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 ]
                 graph_ids_before = [id(runner.fwd_graph) for runner in runners_before]
                 runtime["pending-before-suspend"] += int(pending_before_suspend)
-                from megatron.core.inference.engines import dynamic_engine as dynamic_engine_module
+                from megatron.core.inference.engines.dynamic import engine as dynamic_engine_module
 
                 original_delete_cuda_graphs = dynamic_engine_module.delete_cuda_graphs
 
@@ -2520,7 +2523,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         if "last-logits" in signals:
             assert context.config.materialize_only_last_token_logits
             assert runtime["last-logits-forward"] == runtime["model-forward"]
-            assert runtime["logits-dtype:torch.bfloat16"] > 0
+            assert runtime["logits-dtype:torch.float32"] > 0
         if "graph-warmup" in signals:
             assert model_config.cuda_graph_warmup_steps == 1
             assert runtime[("cuda-graph-warmup-steps", 1)] > 0
@@ -3258,7 +3261,7 @@ class TestCudaGraphDifferential(_AsyncPairwiseHarness):
             for padded, _real, request_ids, input_ids in live_inputs:
                 inputs_by_shape_and_requests.setdefault((padded, request_ids), set()).add(input_ids)
             assert any(len(inputs) > 1 for inputs in inputs_by_shape_and_requests.values())
-            if graph_parity != "exact" or eager_logits:
+            if graph_parity != "exact" or eager_logits or not scenario.exact_top_n:
                 graph_expected = _snapshot_requests(graph_env.requests)
                 graph_requests = graph_env.requests
                 del graph_env
@@ -3390,11 +3393,11 @@ def test_async_reset_clears_pending_logits():
 
     with (
         mock.patch(
-            "megatron.core.inference.engines.dynamic_engine.torch.distributed.get_rank",
+            "megatron.core.inference.engines.dynamic.engine.torch.distributed.get_rank",
             return_value=0,
         ),
         mock.patch(
-            "megatron.core.inference.engines.dynamic_engine.torch.cuda.Event",
+            "megatron.core.inference.engines.dynamic.engine.torch.cuda.Event",
             return_value=mock.Mock(),
         ),
     ):
@@ -3432,7 +3435,7 @@ def test_async_suspend_pending_logits_lifecycle(mode, preserve_pending):
 
     with (
         mock.patch.object(DynamicInferenceEngine, "suspend_resume_ctx", return_value=nullcontext()),
-        mock.patch("megatron.core.inference.engines.dynamic_engine.InferenceMode.unset_active"),
+        mock.patch("megatron.core.inference.engines.dynamic.engine.InferenceMode.unset_active"),
     ):
         engine.suspend()
 
