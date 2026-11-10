@@ -897,6 +897,35 @@ def delete_cuda_graphs():
         runner.bwd_graph = None
         runner.mempool = None
         runner._gtp_fwd_params_to_ensure_ready = ()
+        runner._gtp_wgrad_ring_slots = []
+
+        # A retained manager reuses its runner objects after inference graph
+        # deletion. Release every captured pool buffer now, before empty_cache,
+        # while preserving only shape/type metadata used to match that runner
+        # for recapture. Some metadata objects also own shared inter-graph
+        # buffers, so clearing the visible argument tuples alone is insufficient.
+        for arg_meta in chain(
+            runner.fwd_graph_input_arg_metas, runner.fwd_graph_input_kwarg_metas.values()
+        ):
+            buffer_metadata = getattr(arg_meta, "cg_buffer_metadata", None)
+            if buffer_metadata is not None:
+                buffer_metadata.fwd_cudagraph_buffer = None
+                buffer_metadata.bwd_cudagraph_buffer = None
+
+        for name, empty_value in (
+            ("args", ()),
+            ("kwargs", {}),
+            ("outputs", None),
+            ("fwd_graph_input_args", ()),
+            ("fwd_graph_input_kwargs", {}),
+            ("fwd_graph_input_surface", ()),
+            ("fwd_graph_outputs", ()),
+            ("fwd_graph_output_surface", ()),
+            ("static_grad_inputs", ()),
+            ("static_grad_outputs", ()),
+        ):
+            if hasattr(runner, name):
+                setattr(runner, name, empty_value)
 
     # Reset global tracking state
     _CudagraphGlobalRecord.cudagraph_created = False
@@ -2114,7 +2143,13 @@ class CudaGraphManager(torch.nn.Module):
         Otherwise, we assign a mempool per microbatch, which allows cudagraphs to be reused
         over different microbatches by tracking their respective fwd and bwd passes.'''
 
-        self._initialize_mempool()
+        if CudaGraphManager.global_mempool is None:
+            # Graph deletion cleared the pool. Recreate it and, as at construction, capture on
+            # a side stream ordered after work already queued on the current stream.
+            self._initialize_mempool()
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            torch.cuda.set_stream(stream)
         if self.need_backward and not _CudagraphGlobalRecord.cudagraph_created:
             _CudagraphGlobalRecord._enable_saved_tensors_observer()
 
@@ -2176,7 +2211,9 @@ class CudaGraphManager(torch.nn.Module):
                 )
                 self.cudagraph_runners.append(runner)
 
-        if runner.mempool is None:
+        # Deletion resets only captured runners; any runner that has not recorded since then
+        # must capture into the current pool.
+        if not runner.fwd_graph_recorded and runner.mempool != CudaGraphManager.global_mempool:
             runner.mempool = CudaGraphManager.global_mempool
         return runner
 
