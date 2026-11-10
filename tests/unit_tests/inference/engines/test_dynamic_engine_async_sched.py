@@ -47,6 +47,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
+from megatron.core.transformer.attention import HAVE_FA3, HAVE_FMLA
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.utils import is_layer_window_attention
@@ -731,6 +732,24 @@ _ASYNC_PAIR_SCENARIOS = (
         atol=5.0e-3,
     ),
     _pair_scenario(
+        "mla-moe",
+        "model:mla-moe",
+        "attention:flashmla",
+        "implementation:inference-optimized",
+        config={
+            **_OPTIMIZED_MOE_CONFIG,
+            "multi_latent_attention": True,
+            "hidden_size": 256,
+            "context_block_size_tokens": 64,
+            "position_embedding_type": "rope",
+            "use_flashinfer_fused_rope": False,
+            "flash_attention_version": 3,
+        },
+        signals=("ep1-moe", "inference-optimized", "mla"),
+        prerequisite="flashmla",
+        atol=5.0e-3,
+    ),
+    _pair_scenario(
         "local-moe",
         "model:moe",
         "implementation:local",
@@ -881,6 +900,48 @@ _ASYNC_PARALLEL_SCENARIOS = (
         "moe-ep2-nccl", "interaction:moe-ep-ordering", config={"expert_model_parallel_size": 2}
     ),
     _nccl_moe_scenario(
+        "moe-ep2-nccl-routing-replay",
+        "interaction:moe-ep-ordering",
+        "interaction:moe-routing-replay",
+        config={
+            "expert_model_parallel_size": 2,
+            "moe_enable_routing_replay": True,
+            "return_log_probs": True,
+            "materialize_only_last_token_logits": False,
+        },
+        sampling=(
+            {
+                "temperature": 0.8,
+                "top_k": 8,
+                "top_p": 0.0,
+                "seed": 111,
+                "return_log_probs": True,
+                "top_n_logprobs": 4,
+            },
+            {
+                "temperature": 1.1,
+                "top_k": 0,
+                "top_p": 0.85,
+                "seed": 222,
+                "return_log_probs": True,
+                "top_n_logprobs": 4,
+            },
+        ),
+        signals=(
+            "full-logits",
+            "logprobs",
+            "metadata-compaction",
+            "sampled",
+            "request-seed",
+            "routing-reconstruction",
+            "temperature-filter",
+            "top-k-filter",
+            "top-n",
+            "top-p-filter",
+        ),
+        parity="reproducible",
+    ),
+    _nccl_moe_scenario(
         "moe-ep2-nvfp4-nccl",
         "precision:nvfp4",
         config={
@@ -993,6 +1054,9 @@ def _check_scenario_prerequisite(scenario):
     elif scenario.prerequisite == "gdn":
         if not HAVE_FLA:
             pytest.skip("GDN dynamic inference requires flash-linear-attention")
+    elif scenario.prerequisite == "flashmla":
+        if not (HAVE_FA3 and HAVE_FMLA):
+            pytest.skip("MLA dynamic decode requires FlashAttention 3 and FlashMLA")
     elif scenario.prerequisite == "transformer-engine":
         if not is_te_min_version("2.2.0"):
             pytest.skip("Transformer Engine 2.2.0 is required")
@@ -1413,6 +1477,9 @@ def _instrument_scenario_runtime(env, scenario, runtime):
         runtime[("sampling-step", runtime["model-forward"])] += 1
         runtime[f"sampling-backend:{controller._sampling_backend}"] += 1
         runtime["metadata-consumed"] += int(active_count > 0)
+        runtime["request-seeded-samples"] += int(
+            active_count > 0 and bool((metadata["seed"][:active_count] >= 0).any())
+        )
         sampling_class = type(controller._sampling).__name__
 
         if sampling_class == "TorchSampling":
@@ -1581,6 +1648,37 @@ def _instrument_scenario_runtime(env, scenario, runtime):
         module_name = type(module).__module__
         if "softmax-sink" in scenario.signals and class_name == "SelfAttention":
             _instrument_attention_runtime(module, runtime)
+        if "mla" in scenario.signals and class_name == "MLASelfAttention":
+            original_mla_attention = module.flash_decode_and_prefill
+            original_prepare_for_absorption = module.prepare_for_absorption
+            norm_hook_state = {"installed": False}
+
+            def traced_prepare_for_absorption(
+                _original=original_prepare_for_absorption, _module=module, _state=norm_hook_state
+            ):
+                result = _original()
+                if not _state["installed"]:
+
+                    def trace_norm_input(_norm, args):
+                        runtime["mla-kv-norm-inputs"] += 1
+                        runtime["mla-kv-norm-device-mismatches"] += int(
+                            _norm.weight.device != args[0].device
+                        )
+
+                    _module.kv_layernorm.register_forward_pre_hook(trace_norm_input)
+                    _state["installed"] = True
+                return result
+
+            def traced_mla_attention(*args, _original=original_mla_attention, **kwargs):
+                result = _original(*args, **kwargs)
+                step = runtime["model-forward"] + 1
+                runtime[("mla-attention-step", step)] += 1
+                is_decode_only = kwargs.get("is_decode_only", args[9] if len(args) > 9 else False)
+                runtime["flash-mla-decode"] += int(is_decode_only)
+                return result
+
+            module.prepare_for_absorption = traced_prepare_for_absorption
+            module.flash_decode_and_prefill = traced_mla_attention
         if "parallel" in scenario.signals and (
             "ColumnParallelLinear" in class_name or "RowParallelLinear" in class_name
         ):
@@ -1761,6 +1859,9 @@ def _snapshot_requests(requests):
                 "generated_logprobs": _as_float_list(request.generated_log_probs),
                 "prompt_top_n": request.prompt_top_n_logprobs,
                 "generated_top_n": request.generated_top_n_logprobs,
+                "routing": (
+                    None if request.routing_indices is None else request.routing_indices.tolist()
+                ),
                 "events": [event.type for event in request.events],
             }
         )
@@ -1815,6 +1916,20 @@ def _assert_request_parity(
         _assert_top_n_parity(
             request.generated_top_n_logprobs, reference["generated_top_n"], atol, exact_top_n
         )
+        actual_routing = (
+            None if request.routing_indices is None else request.routing_indices.tolist()
+        )
+        expected_routing = reference["routing"]
+        if actual_routing is not None and expected_routing is not None and not exact_numerics:
+            # Compare routes only while both stochastic modes have the same input history.
+            shared_rows = len(actual_routing) - len(request.generated_tokens) + 1
+            for actual_token, expected_token in zip(request.generated_tokens, reference["tokens"]):
+                if actual_token != expected_token:
+                    break
+                shared_rows += 1
+            actual_routing = actual_routing[:shared_rows]
+            expected_routing = expected_routing[:shared_rows]
+        assert actual_routing == expected_routing
         if compare_events:
             assert [event.type for event in request.events] == reference["events"]
 
@@ -2108,8 +2223,12 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     ):
                         token_text = controller.tokenizer.detokenize([token])
                         assert 0 < len(top_n) <= request.sampling_params.top_n_logprobs
-                        assert token_text in top_n
-                        assert top_n[token_text] == pytest.approx(logprob, rel=0, abs=0.1)
+                        if request.sampling_params.top_k == 1 or token_text in top_n:
+                            assert token_text in top_n
+                            assert top_n[token_text] == pytest.approx(logprob, rel=0, abs=0.1)
+                        else:
+                            # A stochastic sample may fall outside the top N.
+                            assert logprob <= min(top_n.values())
                     if request.sampling_params.skip_prompt_log_probs:
                         assert not request.prompt_top_n_logprobs
                     else:
@@ -2208,6 +2327,21 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["softmax-offset-calls"] > 0
             assert runtime["softmax-offset-produced"] == runtime["softmax-offset-calls"]
             assert runtime["sink-correction-calls"] > 0
+        if "request-seed" in signals:
+            assert {request.sampling_params.seed for request in env.requests} == {111, 222}
+            assert runtime["request-seeded-samples"] > 0
+        if "routing-reconstruction" in signals:
+            assert model_config.moe_enable_routing_replay
+            for request in env.requests:
+                routing = request.routing_indices
+                assert routing is not None
+                assert routing.shape == (
+                    len(request.prompt_tokens) + len(request.generated_tokens) - 1,
+                    model_config.num_layers,
+                    model_config.moe_router_topk,
+                )
+                assert (routing >= 0).all()
+                assert (routing < model_config.num_moe_experts).all()
         if "shared-seed" in signals:
             assert not context.config.offset_sampling_seed_by_dp_rank
             assert controller.sampling_rng.initial_seed() == model_config.inference_sampling_seed
@@ -2302,6 +2436,14 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert observed_steps("moe-kernel-step", kernel) == expert_steps
             return expert_steps
 
+        if "mla" in signals:
+            assert model_config.multi_latent_attention
+            assert model_config.cache_mla_latents
+            assert context.cache_mla_latent
+            assert runtime["flash-mla-decode"] > 0
+            assert runtime["mla-kv-norm-inputs"] > 0
+            assert runtime["mla-kv-norm-device-mismatches"] == 0
+            assert observed_steps("mla-attention-step") == observed_steps("moe-expert-step")
         if "moe" in signals:
             assert model_config.num_moe_experts is not None
             assert context._nccl_ep_dispatcher
