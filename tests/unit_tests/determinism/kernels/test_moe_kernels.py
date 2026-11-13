@@ -36,6 +36,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe import batch_invariant, moe_utils
+from megatron.core.transformer.moe.batch_invariant import build_inverse_permutation_map
 from megatron.core.transformer.moe.experts import (
     SequentialMLP,
     TEGroupedMLP,
@@ -963,6 +964,11 @@ class TestMoEModules:
     def _init(self, ep=1):
         Utils.initialize_model_parallel(expert_model_parallel_size=ep)
         model_parallel_cuda_manual_seed(123)
+
+    def test_empty_inverse_permutation_map_has_empty_shape(self):
+        idx = torch.empty(0, dtype=torch.long, device="cuda")
+        inverse = build_inverse_permutation_map(idx.reshape(0, 4).bool(), idx, idx, 0)
+        assert inverse.shape == (2, 0, 0) and inverse.dtype == torch.long
 
     @pytest.mark.parametrize("dispatcher", ["allgather", "alltoall"])
     @pytest.mark.parametrize("balancing", ["aux_loss", "seq_aux_loss"])
