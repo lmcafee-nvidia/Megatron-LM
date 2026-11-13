@@ -1536,7 +1536,7 @@ class InferenceTopKRouter(TopKRouter):
             precomputed_indices=precomputed_indices,
             allow_batch_invariant_sigmoid_topk=self.routing_type != "quantile_balancing",
         )
-        return probs.squeeze(1), top_indices.squeeze(1)
+        return probs, top_indices
 
     def forward(
         self,
