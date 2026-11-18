@@ -105,6 +105,64 @@ def test_config_accepts_vllm_mxfp8():
     assert config.inference_grouped_gemm_backend.value == "vllm"
 
 
+def test_config_rejects_non_power_of_two_nvls_expert_parallelism():
+    with pytest.raises(ValueError, match="power-of-two expert_model_parallel_size"):
+        _make_base_config(
+            num_moe_experts=12,
+            expert_model_parallel_size=3,
+            inference_moe_token_dispatcher_type="nvls",
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {
+            "inference_grouped_gemm_backend": "torch",
+            "gated_linear_unit": True,
+            "activation_func": torch.nn.functional.silu,
+            "activation_func_clamp_value": 7.0,
+        },
+        {
+            "inference_grouped_gemm_backend": "vllm",
+            "gated_linear_unit": True,
+            "activation_func": torch.nn.functional.silu,
+            "glu_linear_offset": 0.5,
+        },
+        {
+            "inference_grouped_gemm_backend": "vllm",
+            "gated_linear_unit": True,
+            "activation_func": torch.nn.functional.silu,
+            "moe_mlp_glu_interleave_size": 32,
+        },
+        {
+            "inference_grouped_gemm_backend": "torch",
+            "gated_linear_unit": True,
+            "activation_func": torch.nn.functional.silu,
+            "activation_func_tanh_clamp_scale": 2.0,
+        },
+    ],
+)
+def test_config_rejects_unimplemented_inference_expert_activation_modifiers(overrides):
+    with pytest.raises(ValueError, match="support only plain SwiGLU|does not support"):
+        _make_base_config(**overrides)
+
+
+def test_config_rejects_non_mxfp8_inference_expert_parameter_storage():
+    with pytest.raises(ValueError, match="parameter storage supports only.*mxfp8"):
+        _make_base_config(fp8="hybrid", fp8_recipe="delayed", fp8_param=True)
+
+
+def test_config_rejects_transformer_engine_fp4_inference_experts():
+    with pytest.raises(ValueError, match="does not support Transformer Engine FP4"):
+        _make_base_config(fp4="e2m1", fp4_recipe="nvfp4", fp4_param=True)
+
+
+def test_config_rejects_inference_apply_probs_on_input():
+    with pytest.raises(ValueError, match="do not support moe_apply_probs_on_input"):
+        _make_base_config(moe_apply_probs_on_input=True)
+
+
 @pytest.mark.parametrize("backend", ["torch", "vllm"])
 @pytest.mark.parametrize("gated_linear_unit", [False, True])
 def test_config_accepts_mxfp8_batch_invariant_backends(backend, gated_linear_unit):
