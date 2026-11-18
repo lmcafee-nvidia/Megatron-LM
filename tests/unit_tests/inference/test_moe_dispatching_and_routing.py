@@ -208,6 +208,16 @@ class TestInferenceTopKRouter:
         )
         assert router is not None
 
+    def test_inference_topk_one_keeps_expert_axis(self):
+        """Top-k one keeps the [tokens, topk] layout that the inference dispatchers index."""
+        router = self._make_router(moe_router_topk=1)
+        router.eval()
+        hidden = torch.randn(16, NANOV3_BASE["hidden_size"], device="cuda", dtype=torch.bfloat16)
+        with InferenceMode.active():
+            probs, indices = router(hidden)
+        assert probs.shape == (16, 1)
+        assert indices.shape == (16, 1)
+
     def test_training_mode_forward_returns_sparse(self):
         """In training mode, forward delegates to parent and returns sparse tensors."""
         router = self._make_router()
