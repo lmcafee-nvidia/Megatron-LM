@@ -242,23 +242,35 @@ def _init_moe_expert_cache(model):
 def set_moe_metadata_sync(model) -> None:
     """Set _runs_metadata_sync on inference dispatchers.
 
-    Exactly one dispatcher per forward domain fires update_metadata each step. The
-    base model and serial MTP stack are separate domains because they run at
-    different times and can have different token counts. Subsequent layers in the
-    same domain skip the redundant collective. Must be called once after the model
-    is built and put into eval mode.
+    The dispatcher metadata (the valid-token count the experts read and, at EP > 1, the
+    per-rank token layout) describes the rows of one forward pass, so exactly one dispatcher
+    per forward fires update_metadata: that of the first inference MoE layer of the main model
+    forward, and of each MTP layer. Speculative decoding runs every MTP layer as a forward
+    of its own (`forward_single_position`) on request-shaped rows, without the decoder's MoE
+    layers. All other layers skip it to avoid redundant collective calls.
+    Must be called once after the model is built and put into eval mode.
     """
+    from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+
     global moe_layer_cache, _moe_metadata_sync_initialized
     _init_moe_expert_cache(model)
     if _moe_metadata_sync_initialized:
         return
-    domains_with_owner = set()
+    if moe_layer_cache is None:
+        _init_moe_expert_cache(model)
+    # The forward each MoE layer runs in: its MTP layer, or None for the main forward.
+    forward_of = {}
+    for module in model.modules():
+        if isinstance(module, MultiTokenPredictionLayer):
+            for submodule in module.modules():
+                forward_of[id(submodule)] = id(module)
+    synced_forwards = set()
     for moe_layer in moe_layer_cache:
+        forward = forward_of.get(id(moe_layer))
         dispatcher = getattr(moe_layer, '_inference_token_dispatcher', None)
         if dispatcher is not None:
-            domain = "mtp" if getattr(moe_layer, "is_mtp_layer", False) else "base"
-            dispatcher._runs_metadata_sync = domain not in domains_with_owner
-            domains_with_owner.add(domain)
+            dispatcher._runs_metadata_sync = forward not in synced_forwards
+            synced_forwards.add(forward)
     _moe_metadata_sync_initialized = True
 
 

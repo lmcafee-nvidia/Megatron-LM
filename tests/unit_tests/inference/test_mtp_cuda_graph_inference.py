@@ -935,28 +935,29 @@ def _reset_moe_layer_cache():
     inference_utils._moe_metadata_sync_initialized = False
 
 
-def test_base_and_mtp_forwards_have_independent_moe_metadata_owners(monkeypatch):
+def test_base_and_each_mtp_forward_have_their_own_moe_metadata_owner(monkeypatch):
     from megatron.core.inference import utils as inference_utils
+    from megatron.core.transformer import multi_token_prediction
+    from megatron.core.transformer.moe import moe_layer as moe_layer_module
 
-    dispatchers = [mock.Mock() for _ in range(4)]
-    layers = [
-        SimpleNamespace(is_mtp_layer=False, _inference_token_dispatcher=dispatchers[0]),
-        SimpleNamespace(is_mtp_layer=False, _inference_token_dispatcher=dispatchers[1]),
-        SimpleNamespace(is_mtp_layer=True, _inference_token_dispatcher=dispatchers[2]),
-        SimpleNamespace(is_mtp_layer=True, _inference_token_dispatcher=dispatchers[3]),
-    ]
-    monkeypatch.setattr(inference_utils, "moe_layer_cache", layers)
-    monkeypatch.setattr(inference_utils, "_moe_layer_cache_owner", None, raising=False)
-    monkeypatch.setattr(inference_utils, "_moe_metadata_sync_initialized", False)
+    class FakeMoELayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self._inference_token_dispatcher = SimpleNamespace(_runs_metadata_sync=True)
 
-    inference_utils.set_moe_metadata_sync(mock.Mock())
+    class FakeMTPLayer(torch.nn.ModuleList):
+        pass
 
-    assert [dispatcher._runs_metadata_sync for dispatcher in dispatchers] == [
-        True,
-        False,
-        True,
-        False,
-    ]
+    monkeypatch.setattr(moe_layer_module, "MoELayer", FakeMoELayer)
+    monkeypatch.setattr(multi_token_prediction, "MultiTokenPredictionLayer", FakeMTPLayer)
+    _reset_moe_layer_cache()
+    # The decoder and each MTP layer run as separate forwards, so each gets its own owner.
+    forwards = [torch.nn.ModuleList(), FakeMTPLayer(), FakeMTPLayer()]
+    for forward in forwards:
+        forward.extend([FakeMoELayer(), FakeMoELayer()])
+    inference_utils.set_moe_metadata_sync(torch.nn.ModuleList(forwards))
+    flags = [[m._inference_token_dispatcher._runs_metadata_sync for m in f] for f in forwards]
+    assert flags == [[True, False]] * 3
 
 
 def test_moe_metadata_owners_refresh_when_model_is_recreated(monkeypatch):
@@ -966,7 +967,6 @@ def test_moe_metadata_owners_refresh_when_model_is_recreated(monkeypatch):
     class FakeMoELayer(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.is_mtp_layer = False
             self._inference_token_dispatcher = SimpleNamespace(_runs_metadata_sync=False)
 
     monkeypatch.setattr(moe_layer_module, "MoELayer", FakeMoELayer)
