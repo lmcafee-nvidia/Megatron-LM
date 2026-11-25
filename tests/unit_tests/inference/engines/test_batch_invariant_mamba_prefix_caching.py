@@ -116,6 +116,7 @@ class TestBatchInvariantMambaPrefixCaching:
                 sampling_backend="torch",
             ),
         )
+        assert torch.count_nonzero(context.memory_buffer).item() == 0
         engine = DynamicInferenceEngine(
             TextGenerationController(
                 GPTInferenceWrapper(model, context), DummyTokenizer(vocab_size=128, eod=127)
