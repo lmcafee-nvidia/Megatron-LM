@@ -589,7 +589,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "Dynamic-inference decode runs the Megatron forks causal_conv1d_update and "
         "fused_recurrent_gated_delta_rule_update (in-kernel gate), both replayed in "
         "test_ssm_kernels.py. Dynamic-inference prefill runs the GDP chunk scan with a single "
-        "Householder update, replayed with M=1 by test_chunk_gated_delta_product_varlen_replays.",
+        "Householder update, replayed with M=1 by test_chunk_gated_delta_product_varlen_replays. "
+        "In inference, KDA and GDN2 run packed single-token sequences (a context-free MTP draft "
+        "step) one step each from a zero state: on FLA's fused_recurrent_kda / "
+        "fused_recurrent_gdn2, replayed by test_fla_fused_recurrent_single_step_replays, or on "
+        "the chunked kernel of GDN2's torch backend.",
     ),
     KernelEntry(
         name="gdn_pre_gated_delta_rule_fusion",
@@ -792,7 +796,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
             R + 'test_ssm_replay.py',
         ),
         kind="dispatch",
-        notes="Selects the pip causal_conv1d / mamba_ssm kernels (causal_conv1d_fn, "
+        notes="In inference the unfused path (_static_prefill) runs packed single-token "
+        "sequences (a context-free MTP draft step) with the conv over each token alone and "
+        "seq_idx in mamba_chunk_scan_combined, replayed by "
+        "test_single_token_sequences_unfused_mixer_replays_bit_exactly. "
+        "Selects the pip causal_conv1d / mamba_ssm kernels (causal_conv1d_fn, "
         "mamba_chunk_scan_combined, mamba_split_conv1d_scan_combined, causal_conv1d_update_cuda) or "
         "the Megatron forks (ops/common, ops/mamba2: varlen scan, causal_conv1d_update, "
         "selective_state_update). Module-level replay: test_ssm_conv1d.py::TestMambaMixerDeterminism; "
@@ -821,8 +829,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "replayed in test_ssm_kernels.py. ssm_decode also drives the speculative-decoding path, "
         "where causal_conv1d_update and the fused recurrence take several draft tokens per step and "
         "fill the conv / SSM rollback snapshot buffers; both are replayed there with the snapshots "
-        "as outputs. Runtime chunkwise full-head gating and headwise helper convolution/collectives "
-        "are replayed in runtime/test_ssm_replay.py.",
+        "as outputs. Without state caches (packed single-token sequences in inference, as a "
+        "context-free MTP draft step packs them) ssm_decode runs the training path's conv "
+        "(causal_conv1d_fn or its fallback) over each token and the fused recurrence from a zero "
+        "state, replayed by the stateless case of "
+        "test_fused_recurrent_gated_delta_rule_update_replays. Runtime chunkwise full-head gating "
+        "and headwise helper convolution/collectives are replayed in runtime/test_ssm_replay.py.",
     ),
     KernelEntry(
         name="rope_dispatch",
